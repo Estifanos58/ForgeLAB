@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgelab/backend/internal/models"
+	"github.com/forgelab/backend/internal/security"
 )
 
 var (
@@ -27,22 +28,27 @@ var (
 var slugRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$`)
 
 // ProjectService handles project-related business logic.
+// ProjectService handles project-related business logic.
 type ProjectService struct {
-	db *pgxpool.Pool
+	db            *pgxpool.Pool
+	pathValidator *security.PathValidator
 }
 
 // NewProjectService creates a new ProjectService.
-func NewProjectService(db *pgxpool.Pool) *ProjectService {
-	return &ProjectService{db: db}
+func NewProjectService(db *pgxpool.Pool, validator *security.PathValidator) *ProjectService {
+	return &ProjectService{
+		db:            db,
+		pathValidator: validator,
+	}
 }
 
 // CreateProjectInput holds the data needed to create a project.
 type CreateProjectInput struct {
-	Name           string  `json:"name"`
-	RepositoryPath string  `json:"repository_path"`
-	Branch         string  `json:"branch"`
-	DockerfilePath string  `json:"dockerfile_path"`
-	BuildContext   string  `json:"build_context"`
+	Name            string  `json:"name"`
+	RepositoryPath  string  `json:"repository_path"`
+	Branch          string  `json:"branch"`
+	DockerfilePath  string  `json:"dockerfile_path"`
+	BuildContext    string  `json:"build_context"`
 	HealthCheckPath *string `json:"health_check_path"`
 }
 
@@ -59,6 +65,16 @@ type UpdateProjectInput struct {
 
 // CreateProject creates a new project for the authenticated user.
 func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, input CreateProjectInput) (*models.Project, error) {
+	// Validate and canonicalize repository path if pathValidator is present
+	repoPath := input.RepositoryPath
+	if s.pathValidator != nil && repoPath != "" {
+		canonicalPath, err := s.pathValidator.ValidateSourcePath(repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("invalid repository path: %w", err)
+		}
+		repoPath = canonicalPath
+	}
+
 	// Generate slug from name
 	slug := generateSlug(input.Name)
 
@@ -86,7 +102,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		Name:               input.Name,
 		Slug:               slug,
 		SourceType:         "local",
-		RepositoryPath:     input.RepositoryPath,
+		RepositoryPath:     repoPath,
 		Branch:             branch,
 		DockerfilePath:     dockerfilePath,
 		BuildContext:        buildContext,
@@ -119,7 +135,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 
 // GetProject retrieves a project by ID, verifying ownership.
 func (s *ProjectService) GetProject(ctx context.Context, projectID, ownerID uuid.UUID) (*models.Project, error) {
-	project, err := s.getProjectByID(ctx, projectID)
+	project, err := s.GetProjectByIDWithoutOwnership(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -221,13 +237,15 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 }
 
 // DeleteProject deletes a project and its associated resources.
-func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID uuid.UUID) error {
+func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID uuid.UUID, cleanupFunc func(ctx context.Context, projectID uuid.UUID)) error {
 	project, err := s.GetProject(ctx, projectID, ownerID)
 	if err != nil {
 		return err
 	}
 
-	// TODO: Stop running containers before deleting
+	if cleanupFunc != nil {
+		cleanupFunc(ctx, project.ID)
+	}
 
 	_, err = s.db.Exec(ctx, "DELETE FROM projects WHERE id = $1", project.ID)
 	if err != nil {
@@ -238,8 +256,8 @@ func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID u
 	return nil
 }
 
-// getProjectByID retrieves a project by ID without ownership check.
-func (s *ProjectService) getProjectByID(ctx context.Context, projectID uuid.UUID) (*models.Project, error) {
+// GetProjectByIDWithoutOwnership retrieves a project by ID without ownership check.
+func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, projectID uuid.UUID) (*models.Project, error) {
 	p := &models.Project{}
 	err := s.db.QueryRow(ctx,
 		`SELECT id, owner_id, name, slug, source_type, repository_path, branch,
@@ -260,6 +278,18 @@ func (s *ProjectService) getProjectByID(ctx context.Context, projectID uuid.UUID
 		return nil, fmt.Errorf("failed to get project: %w", err)
 	}
 	return p, nil
+}
+
+// UpdateProjectPort updates the assigned host port for a project.
+func (s *ProjectService) UpdateProjectPort(ctx context.Context, projectID uuid.UUID, port int) (*models.Project, error) {
+	_, err := s.db.Exec(ctx,
+		"UPDATE projects SET port = $1, updated_at = $2 WHERE id = $3",
+		port, time.Now(), projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update project port: %w", err)
+	}
+	return s.GetProjectByIDWithoutOwnership(ctx, projectID)
 }
 
 // generateSlug creates a URL-friendly slug from a project name.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,13 +30,26 @@ func NewDeploymentService(db *pgxpool.Pool) *DeploymentService {
 	return &DeploymentService{db: db}
 }
 
-// CreateDeployment creates a new deployment record for a project.
+// CreateDeployment creates a new deployment record for a project transactionally.
 // This does NOT start the deployment — it only creates the record.
 // The deployment worker picks up QUEUED deployments.
 func (s *DeploymentService) CreateDeployment(ctx context.Context, project *models.Project) (*models.Deployment, error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock the project row FOR UPDATE to prevent concurrent creation for the same project
+	var lockedProjectID uuid.UUID
+	err = tx.QueryRow(ctx, "SELECT id FROM projects WHERE id = $1 FOR UPDATE", project.ID).Scan(&lockedProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lock project row: %w", err)
+	}
+
 	// Check for existing active deployment
 	var activeCount int
-	err := s.db.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`SELECT COUNT(*) FROM deployments 
 		 WHERE project_id = $1 AND status IN ($2, $3, $4, $5, $6)`,
 		project.ID,
@@ -52,9 +66,9 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		return nil, ErrActiveDeployment
 	}
 
-	// Get next deploy number
+	// Get next deploy number safely inside locked transaction
 	var maxNumber *int
-	err = s.db.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		"SELECT MAX(deploy_number) FROM deployments WHERE project_id = $1",
 		project.ID,
 	).Scan(&maxNumber)
@@ -81,7 +95,7 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		CreatedAt:    now,
 	}
 
-	_, err = s.db.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		`INSERT INTO deployments (id, project_id, deploy_number, status, branch, image_tag, started_at, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		deployment.ID, deployment.ProjectID, deployment.DeployNumber,
@@ -89,16 +103,23 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		deployment.StartedAt, deployment.CreatedAt,
 	)
 	if err != nil {
+		if strings.Contains(err.Error(), "uq_active_deployment_per_project") || strings.Contains(err.Error(), "uq_deployments_project_number") {
+			return nil, ErrActiveDeployment
+		}
 		return nil, fmt.Errorf("failed to create deployment: %w", err)
 	}
 
 	// Update project status to deploying
-	_, err = s.db.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		"UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
 		models.ProjectStatusDeploying, time.Now(), project.ID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update project status: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit deployment creation: %w", err)
 	}
 
 	slog.Info("deployment created",
@@ -110,16 +131,31 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	return deployment, nil
 }
 
-// UpdateDeploymentStatus updates the status of a deployment and timestamps.
-func (s *DeploymentService) UpdateDeploymentStatus(ctx context.Context, deploymentID uuid.UUID, status string, failureReason *string) error {
+// UpdateDeploymentStatus updates the status of a deployment enforcing valid state transitions.
+func (s *DeploymentService) UpdateDeploymentStatus(ctx context.Context, deploymentID uuid.UUID, newStatus string, failureReason *string) error {
+	// 1. Fetch current status
+	var currentStatus string
+	err := s.db.QueryRow(ctx, "SELECT status FROM deployments WHERE id = $1", deploymentID).Scan(&currentStatus)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrDeploymentNotFound
+		}
+		return fmt.Errorf("failed to fetch deployment status: %w", err)
+	}
+
+	// 2. Validate state transition
+	if err := models.ValidateStateTransition(currentStatus, newStatus); err != nil {
+		return err
+	}
+
 	now := time.Now()
 
 	// Build the update query based on the new status
 	query := `UPDATE deployments SET status = $1, `
-	args := []interface{}{status}
+	args := []interface{}{newStatus}
 	argIdx := 2
 
-	switch status {
+	switch newStatus {
 	case models.DeployStatusBuilding:
 		// No additional timestamp
 	case models.DeployStatusStarting:
@@ -149,8 +185,8 @@ func (s *DeploymentService) UpdateDeploymentStatus(ctx context.Context, deployme
 	}
 
 	// Calculate duration if terminal state
-	if status == models.DeployStatusRunning || status == models.DeployStatusFailed ||
-		status == models.DeployStatusStopped || status == models.DeployStatusCrashed {
+	if newStatus == models.DeployStatusRunning || newStatus == models.DeployStatusFailed ||
+		newStatus == models.DeployStatusStopped || newStatus == models.DeployStatusCrashed {
 		query += fmt.Sprintf("duration_ms = EXTRACT(EPOCH FROM ($%d - started_at)) * 1000, ", argIdx)
 		args = append(args, now)
 		argIdx++
@@ -161,12 +197,12 @@ func (s *DeploymentService) UpdateDeploymentStatus(ctx context.Context, deployme
 	query += fmt.Sprintf(" WHERE id = $%d", argIdx)
 	args = append(args, deploymentID)
 
-	_, err := s.db.Exec(ctx, query, args...)
+	_, err = s.db.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to update deployment status: %w", err)
 	}
 
-	slog.Info("deployment status updated", "deployment_id", deploymentID, "status", status)
+	slog.Info("deployment status updated", "deployment_id", deploymentID, "status", newStatus)
 	return nil
 }
 

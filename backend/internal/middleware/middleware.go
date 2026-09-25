@@ -38,21 +38,33 @@ func GetUserEmail(ctx context.Context) (string, bool) {
 func AuthMiddleware(jwtManager *auth.JWTManager) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Extract the Authorization header
+			tokenString := ""
+
+			// 1. Try Authorization header
 			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				http.Error(w, `{"error": "authorization header required"}`, http.StatusUnauthorized)
-				return
+			if authHeader != "" {
+				parts := strings.SplitN(authHeader, " ", 2)
+				if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+					tokenString = parts[1]
+				}
 			}
 
-			// Expect "Bearer <token>"
-			parts := strings.SplitN(authHeader, " ", 2)
-			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-				http.Error(w, `{"error": "invalid authorization header format"}`, http.StatusUnauthorized)
-				return
+			// 2. Try cookie
+			if tokenString == "" {
+				if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
+					tokenString = cookie.Value
+				}
 			}
 
-			tokenString := parts[1]
+			// 3. Try query param (e.g. for WebSockets)
+			if tokenString == "" {
+				tokenString = r.URL.Query().Get("token")
+			}
+
+			if tokenString == "" {
+				http.Error(w, `{"error": "authentication required"}`, http.StatusUnauthorized)
+				return
+			}
 
 			// Validate the token
 			claims, err := jwtManager.ValidateAccessToken(tokenString)

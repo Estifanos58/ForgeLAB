@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,6 +9,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/forgelab/backend/internal/docker"
+	"github.com/forgelab/backend/internal/queue"
 	"github.com/forgelab/backend/internal/services"
 )
 
@@ -15,13 +18,22 @@ import (
 type ProjectHandler struct {
 	projectService    *services.ProjectService
 	deploymentService *services.DeploymentService
+	dockerEngine      *docker.Engine
+	deployQueue       *queue.DeploymentQueue
 }
 
 // NewProjectHandler creates a new ProjectHandler.
-func NewProjectHandler(projectService *services.ProjectService, deploymentService *services.DeploymentService) *ProjectHandler {
+func NewProjectHandler(
+	projectService *services.ProjectService,
+	deploymentService *services.DeploymentService,
+	dockerEngine *docker.Engine,
+	deployQueue *queue.DeploymentQueue,
+) *ProjectHandler {
 	return &ProjectHandler{
 		projectService:    projectService,
 		deploymentService: deploymentService,
+		dockerEngine:      dockerEngine,
+		deployQueue:       deployQueue,
 	}
 }
 
@@ -164,7 +176,12 @@ func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.projectService.DeleteProject(r.Context(), projectID, userID)
+	var cleanup func(ctx context.Context, id uuid.UUID)
+	if h.dockerEngine != nil {
+		cleanup = h.dockerEngine.CleanUpProjectContainers
+	}
+
+	err = h.projectService.DeleteProject(r.Context(), projectID, userID, cleanup)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -220,9 +237,179 @@ func (h *ProjectHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Publish deployment job to Redis queue for the worker to pick up
+	if h.deployQueue != nil {
+		if err := h.deployQueue.EnqueueDeployment(r.Context(), deployment.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to enqueue deployment job")
+			return
+		}
+	}
 
 	writeJSON(w, http.StatusCreated, deployment)
+}
+
+// Stop handles POST /api/projects/{id}/stop
+func (h *ProjectHandler) Stop(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	if err := h.dockerEngine.StopApp(r.Context(), projectID, userID); err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "application stopped"})
+}
+
+// Start handles POST /api/projects/{id}/start
+func (h *ProjectHandler) Start(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	if err := h.dockerEngine.StartApp(r.Context(), projectID, userID); err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "application started"})
+}
+
+// Restart handles POST /api/projects/{id}/restart
+func (h *ProjectHandler) Restart(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	if err := h.dockerEngine.RestartApp(r.Context(), projectID, userID); err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "application restarted"})
+}
+
+// Rollback handles POST /api/projects/{id}/rollback
+func (h *ProjectHandler) Rollback(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	if project.CurrentDeploymentID == nil {
+		writeError(w, http.StatusBadRequest, "no active deployment to rollback from")
+		return
+	}
+
+	currentDeploy, err := h.deploymentService.GetDeployment(r.Context(), *project.CurrentDeploymentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to fetch current deployment")
+		return
+	}
+
+	prevDeploy, err := h.deploymentService.GetPreviousSuccessfulDeployment(r.Context(), projectID, currentDeploy.DeployNumber)
+	if err != nil {
+		if errors.Is(err, services.ErrNoDeploymentToRollback) {
+			writeError(w, http.StatusBadRequest, "no previous successful deployment available to rollback to")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to query rollback target deployment")
+		return
+	}
+
+	// Rollback creates a NEW deployment record using the prior image tag
+	newDeploy, err := h.deploymentService.CreateDeployment(r.Context(), project)
+	if err != nil {
+		if errors.Is(err, services.ErrActiveDeployment) {
+			writeError(w, http.StatusConflict, "a deployment is already in progress")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to create rollback deployment")
+		return
+	}
+
+	// Override image_tag to use prior deployment's known-good image
+	if prevDeploy.ImageTag != nil {
+		newDeploy.ImageTag = prevDeploy.ImageTag
+	}
+
+	if h.deployQueue != nil {
+		if err := h.deployQueue.EnqueueDeployment(r.Context(), newDeploy.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to enqueue rollback deployment")
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusCreated, newDeploy)
 }
 
 // ListDeployments handles GET /api/projects/{id}/deployments

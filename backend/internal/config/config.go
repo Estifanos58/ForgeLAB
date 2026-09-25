@@ -48,8 +48,9 @@ type EncryptionConfig struct {
 
 // DockerConfig holds Docker-related settings.
 type DockerConfig struct {
-	Host    string
-	WorkDir string
+	Host               string
+	WorkDir            string
+	AllowedSourceRoots string
 }
 
 // LogConfig holds logging settings.
@@ -97,11 +98,12 @@ func Load() (*Config, error) {
 			RefreshTokenExpiry: time.Duration(refreshExpiry) * 24 * time.Hour,
 		},
 		Encryption: EncryptionConfig{
-			Key: getEnv("FORGELAB_ENCRYPTION_KEY", ""),
+			Key: getEnv("FORGELAB_ENCRYPTION_KEY", "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q="),
 		},
 		Docker: DockerConfig{
-			Host:    getEnv("DOCKER_HOST", ""),
-			WorkDir: getEnv("FORGELAB_WORK_DIR", "./data/builds"),
+			Host:               getEnv("DOCKER_HOST", ""),
+			WorkDir:            getEnv("FORGELAB_WORK_DIR", "./data/builds"),
+			AllowedSourceRoots: getEnv("FORGELAB_ALLOWED_SOURCE_ROOTS", ""),
 		},
 		Log: LogConfig{
 			Level:  getEnv("LOG_LEVEL", "debug"),

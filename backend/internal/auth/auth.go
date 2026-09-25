@@ -20,7 +20,7 @@ var (
 
 // Claims represents the JWT claims for ForgeLab access tokens.
 type Claims struct {
-	UserID uuid.UUID `json:"sub"`
+	UserID uuid.UUID `json:"user_id"`
 	Email  string    `json:"email"`
 	jwt.RegisteredClaims
 }
@@ -61,12 +61,18 @@ func (m *JWTManager) GenerateAccessToken(userID uuid.UUID, email string) (string
 
 // ValidateAccessToken validates and parses a JWT access token.
 func (m *JWTManager) ValidateAccessToken(tokenString string) (*Claims, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return m.secret, nil
-	})
+	token, err := jwt.ParseWithClaims(
+		tokenString,
+		&Claims{},
+		func(token *jwt.Token) (interface{}, error) {
+			if token.Method != jwt.SigningMethodHS256 {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return m.secret, nil
+		},
+		jwt.WithIssuer("forgelab"),
+		jwt.WithExpirationRequired(),
+	)
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
 			return nil, ErrExpiredToken
@@ -76,6 +82,17 @@ func (m *JWTManager) ValidateAccessToken(tokenString string) (*Claims, error) {
 
 	claims, ok := token.Claims.(*Claims)
 	if !ok || !token.Valid {
+		return nil, ErrInvalidToken
+	}
+
+	if claims.UserID == uuid.Nil && claims.Subject != "" {
+		parsedID, err := uuid.Parse(claims.Subject)
+		if err == nil {
+			claims.UserID = parsedID
+		}
+	}
+
+	if claims.UserID == uuid.Nil {
 		return nil, ErrInvalidToken
 	}
 

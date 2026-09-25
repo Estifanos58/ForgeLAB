@@ -31,6 +31,55 @@ services:
       timeout: 5s
       retries: 5
 
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: forgelab-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_PORT: 8080
+      SERVER_HOST: 0.0.0.0
+      DATABASE_URL: postgres://forgelab:forgelab_dev_password@postgres:5432/forgelab?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: forgelab-dev-jwt-secret-change-in-production
+      JWT_ACCESS_TOKEN_EXPIRY: 15
+      JWT_REFRESH_TOKEN_EXPIRY: 7
+      FORGELAB_ENCRYPTION_KEY: dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=
+      FORGELAB_WORK_DIR: /app/data/builds
+      LOG_LEVEL: debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - forgelab_builds:/app/data/builds
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: forgelab-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: http://localhost:8080/api
+    depends_on:
+      backend:
+        condition: service_healthy
+
 volumes:
   forgelab_pgdata:
   forgelab_redisdata:
+  forgelab_builds:

@@ -139,46 +139,55 @@ func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User
 	return user, tokens, nil
 }
 
-// RefreshTokens validates a refresh token and issues new tokens.
+// RefreshTokens validates a refresh token and issues new tokens atomically.
 func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*AuthTokens, error) {
 	tokenHash := auth.HashToken(refreshToken)
+	now := time.Now()
 
-	// Find the refresh token
-	var rt models.RefreshToken
+	// Atomically revoke the token and fetch user details only if it is not revoked and not expired
+	var rtID uuid.UUID
+	var userID uuid.UUID
 	var userEmail string
 	err := s.db.QueryRow(ctx,
-		`SELECT rt.id, rt.user_id, rt.expires_at, rt.revoked, u.email
-		 FROM refresh_tokens rt
-		 JOIN users u ON u.id = rt.user_id
-		 WHERE rt.token_hash = $1`,
-		tokenHash,
-	).Scan(&rt.ID, &rt.UserID, &rt.ExpiresAt, &rt.Revoked, &userEmail)
+		`UPDATE refresh_tokens rt
+		 SET revoked = true
+		 FROM users u
+		 WHERE rt.token_hash = $1
+		   AND rt.user_id = u.id
+		   AND rt.revoked = false
+		   AND rt.expires_at > $2
+		 RETURNING rt.id, rt.user_id, u.email`,
+		tokenHash, now,
+	).Scan(&rtID, &userID, &userEmail)
+
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// Token couldn't be revoked atomically. Let's check why to return precise error.
+			var isRevoked bool
+			var expiresAt time.Time
+			checkErr := s.db.QueryRow(ctx,
+				"SELECT revoked, expires_at FROM refresh_tokens WHERE token_hash = $1",
+				tokenHash,
+			).Scan(&isRevoked, &expiresAt)
+			if checkErr != nil {
+				if errors.Is(checkErr, pgx.ErrNoRows) {
+					return nil, ErrTokenNotFound
+				}
+				return nil, fmt.Errorf("failed to check refresh token state: %w", checkErr)
+			}
+			if isRevoked {
+				return nil, ErrTokenRevoked
+			}
+			if now.After(expiresAt) {
+				return nil, ErrTokenExpired
+			}
 			return nil, ErrTokenNotFound
 		}
-		return nil, fmt.Errorf("failed to find refresh token: %w", err)
-	}
-
-	if rt.Revoked {
-		return nil, ErrTokenRevoked
-	}
-
-	if time.Now().After(rt.ExpiresAt) {
-		return nil, ErrTokenExpired
-	}
-
-	// Revoke the old token (single-use rotation)
-	_, err = s.db.Exec(ctx,
-		"UPDATE refresh_tokens SET revoked = true WHERE id = $1",
-		rt.ID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to revoke old token: %w", err)
+		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 
 	// Generate new tokens
-	user := &models.User{ID: rt.UserID, Email: userEmail}
+	user := &models.User{ID: userID, Email: userEmail}
 	tokens, err := s.generateTokens(ctx, user)
 	if err != nil {
 		return nil, err

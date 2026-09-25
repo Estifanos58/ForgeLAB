@@ -6,25 +6,32 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	dockerclient "github.com/docker/docker/client"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
 
 	"github.com/forgelab/backend/internal/auth"
 	"github.com/forgelab/backend/internal/config"
+	"github.com/forgelab/backend/internal/crypto"
 	"github.com/forgelab/backend/internal/database"
+	"github.com/forgelab/backend/internal/docker"
 	"github.com/forgelab/backend/internal/handlers"
 	"github.com/forgelab/backend/internal/middleware"
+	"github.com/forgelab/backend/internal/network"
+	"github.com/forgelab/backend/internal/queue"
+	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
+	ws "github.com/forgelab/backend/internal/websocket"
 )
 
 func main() {
 	// Load .env file if it exists
 	if err := godotenv.Load("../.env"); err != nil {
-		// Try current directory too
 		godotenv.Load(".env")
 	}
 
@@ -54,13 +61,47 @@ func main() {
 	slog.SetDefault(logger)
 
 	// Connect to database
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	pool, err := database.Connect(ctx, cfg.Database.URL)
 	if err != nil {
 		slog.Error("failed to connect to database", "error", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	// Connect to Redis
+	redisClient, err := database.ConnectRedis(ctx, cfg.Redis.URL)
+	if err != nil {
+		slog.Warn("redis connection failed — running with fallback", "error", err)
+	}
+	if redisClient != nil {
+		defer redisClient.Close()
+	}
+
+	// Initialize Docker Client
+	dockerCli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
+	if err != nil {
+		slog.Warn("docker client initialization warning", "error", err)
+	}
+	if dockerCli != nil {
+		defer dockerCli.Close()
+	}
+
+	// Initialize helpers and security primitives
+	var allowedRoots []string
+	if cfg.Docker.AllowedSourceRoots != "" {
+		allowedRoots = strings.Split(cfg.Docker.AllowedSourceRoots, ",")
+	}
+	pathValidator := security.NewPathValidator(allowedRoots)
+	portManager := network.NewPortManager(10000, 60000)
+
+	encryptor, err := crypto.NewEncryptor(cfg.Encryption.Key)
+	if err != nil {
+		slog.Error("failed to initialize secret encryptor", "error", err)
+		os.Exit(1)
+	}
 
 	// Initialize services
 	jwtManager := auth.NewJWTManager(
@@ -70,12 +111,37 @@ func main() {
 	)
 
 	userService := services.NewUserService(pool, jwtManager)
-	projectService := services.NewProjectService(pool)
+	projectService := services.NewProjectService(pool, pathValidator)
 	deploymentService := services.NewDeploymentService(pool)
+	secretService := services.NewSecretService(pool, encryptor, projectService)
+
+	// Initialize WebSocket Hub
+	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient)
+
+	// Initialize Docker Engine
+	dockerEngine := docker.NewEngine(
+		dockerCli,
+		projectService,
+		deploymentService,
+		secretService,
+		portManager,
+		pathValidator,
+		wsHub,
+		cfg.Docker.WorkDir,
+	)
+
+	// Initialize Redis deployment queue & worker
+	var deployQueue *queue.DeploymentQueue
+	if redisClient != nil {
+		deployQueue = queue.NewDeploymentQueue(redisClient)
+		deployQueue.StartWorker(ctx, dockerEngine.ExecuteDeployment)
+		defer deployQueue.Stop()
+	}
 
 	// Initialize handlers
 	authHandler := handlers.NewAuthHandler(userService)
-	projectHandler := handlers.NewProjectHandler(projectService, deploymentService)
+	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
+	envHandler := handlers.NewEnvHandler(secretService)
 
 	// Setup router
 	r := chi.NewRouter()
@@ -93,6 +159,9 @@ func main() {
 		w.Write([]byte(`{"status": "ok", "service": "forgelab"}`))
 	})
 
+	// WebSocket endpoint
+	r.Get("/api/ws", wsHub.ServeWS)
+
 	// API routes
 	r.Route("/api", func(r chi.Router) {
 		r.Use(middleware.ContentTypeJSON)
@@ -102,6 +171,7 @@ func main() {
 			r.Post("/register", authHandler.Register)
 			r.Post("/login", authHandler.Login)
 			r.Post("/refresh", authHandler.Refresh)
+			r.Post("/logout", authHandler.Logout)
 
 			// Protected auth routes
 			r.Group(func(r chi.Router) {
@@ -121,6 +191,17 @@ func main() {
 				r.Get("/{id}", projectHandler.Get)
 				r.Patch("/{id}", projectHandler.Update)
 				r.Delete("/{id}", projectHandler.Delete)
+
+				// Application Lifecycle Controls
+				r.Post("/{id}/stop", projectHandler.Stop)
+				r.Post("/{id}/start", projectHandler.Start)
+				r.Post("/{id}/restart", projectHandler.Restart)
+				r.Post("/{id}/rollback", projectHandler.Rollback)
+
+				// Environment Variables / Secrets
+				r.Get("/{id}/env", envHandler.List)
+				r.Post("/{id}/env", envHandler.Set)
+				r.Delete("/{id}/env/{key}", envHandler.Delete)
 
 				// Deployments
 				r.Post("/{id}/deployments", projectHandler.Deploy)
@@ -148,8 +229,8 @@ func main() {
 
 		slog.Info("shutting down server...")
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelShutdown()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			slog.Error("server shutdown error", "error", err)

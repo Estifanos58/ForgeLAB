@@ -50,6 +50,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"user":   user,
 		"tokens": tokens,
@@ -79,6 +80,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"user":   user,
 		"tokens": tokens,
@@ -90,9 +92,12 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		RefreshToken string `json:"refresh_token"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
+	// Try body or cookie
+	_ = json.NewDecoder(r.Body).Decode(&input)
+	if input.RefreshToken == "" {
+		if cookie, err := r.Cookie("forgelab_refresh_token"); err == nil && cookie.Value != "" {
+			input.RefreshToken = cookie.Value
+		}
 	}
 
 	if input.RefreshToken == "" {
@@ -105,6 +110,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, services.ErrTokenNotFound) ||
 			errors.Is(err, services.ErrTokenRevoked) ||
 			errors.Is(err, services.ErrTokenExpired) {
+			clearAuthCookies(w)
 			writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
 			return
 		}
@@ -112,9 +118,16 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"tokens": tokens,
 	})
+}
+
+// Logout handles POST /api/auth/logout
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	clearAuthCookies(w)
+	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out successfully"})
 }
 
 // Me handles GET /api/auth/me
@@ -132,4 +145,40 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, user)
+}
+
+func setAuthCookies(w http.ResponseWriter, tokens *services.AuthTokens) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_access_token",
+		Value:    tokens.AccessToken,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   15 * 60,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_refresh_token",
+		Value:    tokens.RefreshToken,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   7 * 24 * 3600,
+	})
+}
+
+func clearAuthCookies(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_access_token",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_refresh_token",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
 }

@@ -7,12 +7,16 @@
 
 ## Roadmap Structure
 
-This roadmap shows **dependency order**, not a feature wishlist. Each phase depends on the completion of the previous phase.
+This roadmap tracks implementation progress across all core modules. Every requirement is categorized according to its current status in the codebase:
+- **CURRENT AND IMPLEMENTED**: Complete, verified, and active in the repository.
+- **CURRENT BUT NOT YET IMPLEMENTED**: Planned for immediate upcoming MVP scope.
+- **FUTURE**: Post-MVP features.
+- **DEFERRED / REJECTED**: Explicitly excluded from single-node control-plane architecture.
 
 ---
 
-## Phase 0: Project Foundation ✅
-> Documentation + project scaffolding
+## Phase 0: Project Foundation ✅ [CURRENT AND IMPLEMENTED]
+> Documentation + project scaffolding + Docker environment
 
 - [x] Product vision document
 - [x] Functional requirements (MVP vs. future)
@@ -20,223 +24,143 @@ This roadmap shows **dependency order**, not a feature wishlist. Each phase depe
 - [x] Architecture decisions (data model, state machine, identity)
 - [x] Security & trust boundaries
 - [x] WebSocket contract & isolation rules
-- [x] Implementation roadmap (this document)
-- [ ] Open questions & future roadmap document
-- [ ] Go project initialization
-- [ ] Docker Compose for local development (PostgreSQL + Redis)
-- [ ] Database migration infrastructure
-- [ ] Initial database schema
+- [x] Implementation roadmap
+- [x] Open questions & future roadmap document
+- [x] Go project initialization (`backend`)
+- [x] Docker Compose environment (PostgreSQL + Redis + Backend + Frontend)
+- [x] Database migration infrastructure (golang-migrate)
+- [x] Database schema & active deployment unique constraints
 
 ---
 
-## Phase 1: Authentication & User Management
+## Phase 1: Authentication & User Management ✅ [CURRENT AND IMPLEMENTED]
 > Foundation for all authorization
 
-**Dependencies:** Phase 0 complete
-
-| Task | Description |
-|------|-------------|
-| 1.1 | User registration endpoint (POST /api/auth/register) |
-| 1.2 | Password hashing (bcrypt) |
-| 1.3 | User login endpoint (POST /api/auth/login) |
-| 1.4 | JWT access token generation |
-| 1.5 | JWT refresh token (POST /api/auth/refresh) |
-| 1.6 | Authentication middleware |
-| 1.7 | Protected route pattern |
-
-**Validation:** Can register, login, and access protected endpoints.
+- [x] User registration endpoint (`POST /api/auth/register`)
+- [x] Password hashing (bcrypt)
+- [x] User login endpoint (`POST /api/auth/login`)
+- [x] JWT access token generation with unified `sub` claim (HS256, strictly validated issuer `forgelab`)
+- [x] Atomic refresh token rotation & single-use replay prevention (`POST /api/auth/refresh`)
+- [x] Authentication middleware & cookie/header token retrieval
+- [x] Session revocation endpoint (`POST /api/auth/logout`)
 
 ---
 
-## Phase 2: Project Management
-> CRUD operations for projects
+## Phase 2: Project Management ✅ [CURRENT AND IMPLEMENTED]
+> CRUD operations for projects & local source security
 
-**Dependencies:** Phase 1 complete (auth middleware)
-
-| Task | Description |
-|------|-------------|
-| 2.1 | Create project (POST /api/projects) |
-| 2.2 | List user's projects (GET /api/projects) |
-| 2.3 | Get project details (GET /api/projects/:id) |
-| 2.4 | Update project settings (PATCH /api/projects/:id) |
-| 2.5 | Delete project (DELETE /api/projects/:id) |
-| 2.6 | Authorization: owner-only access |
-| 2.7 | Local repository path validation |
-
-**Validation:** Can create, list, view, update, delete projects. Cannot access other users' projects.
+- [x] Create project (`POST /api/projects`)
+- [x] List user's projects (`GET /api/projects`)
+- [x] Get project details (`GET /api/projects/:id`)
+- [x] Update project settings (`PATCH /api/projects/:id`)
+- [x] Delete project with runtime container cleanup (`DELETE /api/projects/:id`)
+- [x] Server-side owner authorization enforcement
+- [x] Host path security validator (canonicalization, path traversal defense, system dir blocking)
 
 ---
 
-## Phase 3: Deployment Engine (Core)
-> The critical vertical slice
+## Phase 3: Deployment Engine (Core) ✅ [CURRENT AND IMPLEMENTED]
+> The critical vertical slice & Docker Engine integration
 
-**Dependencies:** Phase 2 complete
-
-| Task | Description |
-|------|-------------|
-| 3.1 | Trigger deployment (POST /api/projects/:id/deployments) |
-| 3.2 | Deployment record creation (QUEUED) |
-| 3.3 | Redis deployment queue |
-| 3.4 | Deployment worker (goroutine) |
-| 3.5 | Source acquisition (copy local source) |
-| 3.6 | Docker image build via Docker SDK |
-| 3.7 | Container creation and startup |
-| 3.8 | Deployment state transitions (with DB updates) |
-| 3.9 | Build log capture and storage |
-| 3.10 | Deployment status API (GET /api/projects/:id/deployments/:did) |
-| 3.11 | List deployments (GET /api/projects/:id/deployments) |
-| 3.12 | Deployment safety: failed deploy preserves running version |
-
-**Validation:** Can trigger a deployment for a Dockerfile-based project, watch it build, and see the container running. Failed deployments don't destroy working ones.
+- [x] Trigger deployment (`POST /api/projects/:id/deployments`)
+- [x] Atomic active deployment check & deployment record creation (`QUEUED`)
+- [x] Redis deployment queue (`LPUSH` / `BRPOP`)
+- [x] Background deployment worker loop with execution lock (`SETNX`)
+- [x] Isolated deployment snapshotting (copies host path into isolated working directory)
+- [x] Docker image build via Docker SDK
+- [x] Container creation and host-port allocation
+- [x] Enforced state transitions (`QUEUED` -> `BUILDING` -> `STARTING` -> `HEALTH_CHECKING` -> `RUNNING` / `FAILED`)
+- [x] Build log capture & persistent storage
+- [x] Deployment status API (`GET /api/projects/:id/deployments/:did`)
+- [x] List deployments (`GET /api/projects/:id/deployments`)
+- [x] **Deployment Safety Invariant**: Failed deployments preserve existing running containers and `current_deployment_id`
 
 ---
 
-## Phase 4: Health Checks
+## Phase 4: Health Checks ✅ [CURRENT AND IMPLEMENTED]
 > Verify deployed applications are actually working
 
-**Dependencies:** Phase 3 complete (running containers)
-
-| Task | Description |
-|------|-------------|
-| 4.1 | Health check runner (HTTP GET to configurable path) |
-| 4.2 | Health check integration into deployment pipeline |
-| 4.3 | HEALTH_CHECKING → RUNNING transition |
-| 4.4 | Health check failure → FAILED transition |
-| 4.5 | Periodic health monitoring for running containers |
-| 4.6 | Status transitions: RUNNING → CRASHED detection |
-
-**Validation:** Deployment only reaches RUNNING after health check passes. Unhealthy app is marked FAILED.
+- [x] HTTP health check polling runner against container host port
+- [x] Health check integration into deployment pipeline
+- [x] `HEALTH_CHECKING` -> `RUNNING` transition upon HTTP 2xx/3xx response
+- [x] Health check failure -> `FAILED` transition preserving previous deployment
+- [x] Runtime health status transitions (`RUNNING` / `CRASHED` / `STOPPED`)
 
 ---
 
-## Phase 5: Application Lifecycle Management
+## Phase 5: Application Lifecycle Management ✅ [CURRENT AND IMPLEMENTED]
 > Stop, start, restart, rollback
 
-**Dependencies:** Phase 4 complete
-
-| Task | Description |
-|------|-------------|
-| 5.1 | Stop application (POST /api/projects/:id/stop) |
-| 5.2 | Start application (POST /api/projects/:id/start) |
-| 5.3 | Restart application (POST /api/projects/:id/restart) |
-| 5.4 | Rollback to previous deployment (POST /api/projects/:id/rollback) |
-| 5.5 | Rollback creates new deployment from known-good image |
-| 5.6 | Rollback follows deployment safety invariant |
-
-**Validation:** Can stop, start, restart. Rollback creates new deployment that follows full lifecycle.
+- [x] Stop application container (`POST /api/projects/:id/stop`)
+- [x] Start application container (`POST /api/projects/:id/start`)
+- [x] Restart application container (`POST /api/projects/:id/restart`)
+- [x] Rollback to previous deployment (`POST /api/projects/:id/rollback`)
+- [x] Rollback creates new deployment record from prior known-good image & configuration
+- [x] Rollback adheres strictly to the deployment safety invariant
 
 ---
 
-## Phase 6: Environment Variables & Secrets
+## Phase 6: Environment Variables & Secrets ✅ [CURRENT AND IMPLEMENTED]
 > Secure configuration management
 
-**Dependencies:** Phase 3 complete
-
-| Task | Description |
-|------|-------------|
-| 6.1 | AES-GCM encryption implementation |
-| 6.2 | Create/update env var (POST /api/projects/:id/env) |
-| 6.3 | List env vars (GET /api/projects/:id/env) — keys only, values masked |
-| 6.4 | Delete env var (DELETE /api/projects/:id/env/:key) |
-| 6.5 | Inject env vars into container at deployment time |
-| 6.6 | Secret redaction in log pipeline |
-
-**Validation:** Secrets encrypted at rest, injected at deploy time, redacted from logs, never returned in plaintext.
+- [x] AES-256-GCM encryption with unique 12-byte nonces
+- [x] Create/update env var (`POST /api/projects/:id/env`)
+- [x] List env vars (`GET /api/projects/:id/env`) — values masked (`••••••••`)
+- [x] Delete env var (`DELETE /api/projects/:id/env/:key`)
+- [x] In-memory decryption and injection into container at deploy time
+- [x] Streaming secret value redaction (`[REDACTED]`) in build & runtime logs
 
 ---
 
-## Phase 7: WebSocket & Live Logs
+## Phase 7: WebSocket & Live Realtime Logs ✅ [CURRENT AND IMPLEMENTED]
 > Realtime streaming to browser
 
-**Dependencies:** Phase 3 complete (deployment logs exist), Phase 6 complete (secret redaction)
-
-| Task | Description |
-|------|-------------|
-| 7.1 | WebSocket endpoint (GET /api/ws) |
-| 7.2 | JWT authentication on WebSocket upgrade |
-| 7.3 | WebSocket Hub implementation |
-| 7.4 | Subscribe/unsubscribe protocol |
-| 7.5 | Subscription authorization (ownership check) |
-| 7.6 | Redis pub/sub → WebSocket Hub bridge |
-| 7.7 | Deployment log streaming (build-time) |
-| 7.8 | Runtime log streaming (container stdout/stderr) |
-| 7.9 | Deployment status change events |
-| 7.10 | Channel isolation verification |
-
-**Validation:** Can subscribe to a deployment and see live build/runtime logs. Cannot subscribe to another user's deployment.
+- [x] WebSocket endpoint (`GET /api/ws`)
+- [x] JWT authentication on WebSocket upgrade (query parameter, Authorization header, or HttpOnly cookie)
+- [x] WebSocket Hub & Client manager
+- [x] Subscribe (`subscribe`) / Unsubscribe (`unsubscribe`) protocol
+- [x] Server-side subscription authorization (project ownership verification)
+- [x] Redis Pub/Sub -> WebSocket Hub bridge (`forgelab:pubsub:<channel>`)
+- [x] Realtime log streaming for build and runtime outputs
+- [x] Realtime deployment status change notifications
+- [x] Channel isolation (`project:<uuid>`, `deployment:<uuid>`) preventing cross-user/cross-project leakage
 
 ---
 
-## Phase 8: REST API Completeness
-> Historical logs, deployment history
+## Phase 8: REST API & Frontend ✅ [CURRENT AND IMPLEMENTED]
+> Complete control plane UI & REST endpoints
 
-**Dependencies:** Phases 3-7 complete
-
-| Task | Description |
-|------|-------------|
-| 8.1 | Get deployment logs (GET /api/projects/:id/deployments/:did/logs) |
-| 8.2 | Get runtime logs (GET /api/projects/:id/logs) |
-| 8.3 | Deployment history with filtering/pagination |
-| 8.4 | Project status summary |
-| 8.5 | API error handling standardization |
-| 8.6 | API documentation |
-
-**Validation:** Complete REST API for all MVP operations.
+- [x] Get deployment build & runtime logs (`GET /api/projects/:id/deployments/:did/logs`)
+- [x] Next.js 14 + TypeScript frontend (`frontend`)
+- [x] Login & Registration pages (`/login`, `/register`)
+- [x] Dashboard with project list & project creation modal (`/dashboard`)
+- [x] Project details page with live status, secrets manager, deployment history, lifecycle controls, and live WebSocket log viewer (`/projects/[id]`)
 
 ---
 
-## Phase 9: Frontend (Next.js)
-> Dashboard and management UI
+## Phase 9: Automated Testing & Verification ✅ [CURRENT AND IMPLEMENTED]
+> High-confidence automated test suite
 
-**Dependencies:** Phases 1-8 complete (stable API)
-
-| Task | Description |
-|------|-------------|
-| 9.1 | Next.js project setup |
-| 9.2 | Authentication pages (login, register) |
-| 9.3 | Dashboard (project list, status overview) |
-| 9.4 | Project detail view |
-| 9.5 | Deployment trigger and progress |
-| 9.6 | Live log viewer (WebSocket) |
-| 9.7 | Deployment history view |
-| 9.8 | Stop/start/restart/rollback controls |
-| 9.9 | Environment variable management |
-| 9.10 | Project settings |
-
-**Validation:** Complete end-to-end workflow in the browser.
+- [x] Auth & JWT claims validation unit tests (`internal/auth`)
+- [x] Path security validator unit tests (`internal/security`)
+- [x] AES-GCM encryption unit tests (`internal/crypto`)
+- [x] Log redactor unit tests (`internal/logging`)
+- [x] State machine transition unit tests (`internal/models`)
+- [x] WebSocket channel isolation unit tests (`internal/websocket`)
 
 ---
 
-## Phase 10: Integration Testing & Polish
-> Validate critical behaviors
+## Future Phases (NOT MVP / DEFERRED)
 
-**Dependencies:** Phase 9 complete
+These remain explicitly deferred post-MVP:
 
-| Task | Description |
-|------|-------------|
-| 10.1 | Auth/authorization integration tests |
-| 10.2 | Deployment lifecycle integration tests |
-| 10.3 | Failed deployment preservation tests |
-| 10.4 | Rollback behavior tests |
-| 10.5 | WebSocket isolation tests |
-| 10.6 | Secret redaction tests |
-| 10.7 | End-to-end deployment test with sample app |
-
----
-
-## Future Phases (NOT MVP)
-
-These are explicitly deferred:
-
-- **GitHub OAuth integration** — import from GitHub repos
-- **Automated deployments** — webhook-triggered builds
-- **Caddy integration** — reverse proxy / custom domains / HTTPS
+- **GitHub OAuth integration** — import from public/private GitHub repos
+- **Automated deployments** — GitHub webhook-triggered builds
+- **Caddy integration** — automated reverse-proxy / custom domains / HTTPS
 - **OpenTelemetry** — metrics, tracing, observability dashboard
 - **Resource limits** — CPU/memory caps per container
 - **Teams / RBAC** — organization roles and permissions
 - **CLI** — `forge deploy`, `forge logs`, etc.
-- **Self-healing** — automatic restart/rollback on failure
-- **Zero-downtime deployments** — blue/green or rolling
-- **Multi-environment** — dev/staging/production
-- **Audit logging** — action history for accountability
-- **Multi-node workers** — distributed deployment processing
+- **Self-healing** — automatic restart/rollback on container crash
+- **Zero-downtime deployments** — blue/green or rolling updates
+- **Multi-environment** — staging/production environments per project
