@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: forgelab-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: forgelab
+      POSTGRES_PASSWORD: forgelab_dev_password
+      POSTGRES_DB: forgelab
+    volumes:
+      - forgelab_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forgelab"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: forgelab-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - forgelab_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  forgelab_pgdata:
+  forgelab_redisdata:
