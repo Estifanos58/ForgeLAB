@@ -1,8 +1,19 @@
 # ForgeLab — Functional Requirements (MVP)
 
-**Status:** Current  
-**Last Updated:** 2026-09-25  
-**Scope:** First vertical slice — the smallest complete end-to-end deployment lifecycle
+**Status:** Current Reference Specification  
+**Scope:** First vertical slice — the smallest complete end-to-end deployment lifecycle  
+
+---
+
+## Related Documents
+
+- [INSTRUCTION.md](../INSTRUCTION.md) — Operational memory & mandatory agent workflow
+- [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
+- [docs/04-architecture-decisions.md](04-architecture-decisions.md) — Architecture & data models
+- [docs/09-api-contract.md](09-api-contract.md) — REST & WebSocket API contracts
+- [docs/12-manual-verification.md](12-manual-verification.md) — Authoritative physical test procedures
+- [docs/13-decisions.md](13-decisions.md) — Architecture Decision Records (ADRs)
+- [docs/15-github-integration.md](15-github-integration.md) — Future GitHub integration requirements
 
 ---
 
@@ -40,7 +51,7 @@
 |----|------------|--------|
 | R3.1 | User must be able to import from a local repository path | MVP |
 | R3.2 | The mechanism for making local files available to ForgeLab must be explicitly defined | MVP |
-| R3.3 | Local import = ForgeLab reads from a path on the host machine accessible via bind mount or copy | MVP |
+| R3.3 | Local import = ForgeLab copies source from host path into an isolated build snapshot directory | MVP |
 
 ### R4. Project Import — GitHub
 

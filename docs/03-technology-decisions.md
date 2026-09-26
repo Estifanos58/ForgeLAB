@@ -1,7 +1,17 @@
 # ForgeLab — Technology Decisions
 
-**Status:** Current  
-**Last Updated:** 2026-09-25  
+**Status:** Current Reference Specification  
+**Architecture:** Single Control Plane Application  
+
+---
+
+## Related Documents
+
+- [INSTRUCTION.md](../INSTRUCTION.md) — Operational memory & mandatory agent workflow
+- [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
+- [docs/04-architecture-decisions.md](04-architecture-decisions.md) — System architecture & data models
+- [docs/11-development-environment.md](11-development-environment.md) — Host tool requirements & setup
+- [docs/13-decisions.md](13-decisions.md) — Architecture Decision Records (DEC-001 to DEC-003)
 
 ---
 

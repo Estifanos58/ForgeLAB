@@ -1,7 +1,18 @@
 # ForgeLab — Product Vision & Scope
 
-**Status:** Current  
-**Last Updated:** 2026-09-25  
+**Status:** Current Reference Specification  
+**Architecture:** Single Control Plane Application Deployment Platform  
+
+---
+
+## Related Documents
+
+- [INSTRUCTION.md](../INSTRUCTION.md) — Operational memory & mandatory agent workflow
+- [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
+- [docs/02-functional-requirements.md](02-functional-requirements.md) — MVP vs. future requirements
+- [docs/04-architecture-decisions.md](04-architecture-decisions.md) — Architecture & data models
+- [docs/13-decisions.md](13-decisions.md) — Architecture Decision Records (ADRs)
+- [docs/14-known-limitations.md](14-known-limitations.md) — Current limitations & backlog
 
 ---
 

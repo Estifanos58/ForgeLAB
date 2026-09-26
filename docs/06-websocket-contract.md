@@ -1,206 +1,254 @@
-# ForgeLab — WebSocket Contract & Realtime Isolation
+# ForgeLAB — WebSocket Contract & Realtime Architecture
 
-**Status:** Current  
-**Last Updated:** 2026-09-25  
+**Status:** Current Implementation & Future Architecture Specification  
+**Endpoint:** `GET /api/ws?token=<access_token>`  
+**Protocol:** WebSocket (RFC 6455)  
 
 ---
 
-## WebSocket Purpose
+## Related Documents
 
-WebSockets in ForgeLab provide realtime event streaming for:
+- [INSTRUCTION.md](../INSTRUCTION.md) — Operational memory & architectural constraints
+- [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
+- [docs/09-api-contract.md](09-api-contract.md) — Authoritative REST & WebSocket API specification
+- [docs/10-frontend-architecture.md](10-frontend-architecture.md) — Frontend WebSocket client hook (`useWebSocket.ts`)
+- [docs/14-known-limitations.md](14-known-limitations.md) — Known duplicate delivery investigation item
 
-- **Deployment progress** — phase transitions during build/deploy
-- **Build logs** — live output from Docker build
-- **Runtime/container logs** — live stdout/stderr from running containers
-- **Status changes** — deployment and project status updates
+---
 
-## Connection Lifecycle
+## 1. Scope Distinction: MVP Reality vs. Future Replay
 
-```
-Browser                                    ForgeLab Server
-  │                                              │
-  │  WS CONNECT /api/ws                          │
-  │  Headers: Authorization: Bearer <jwt>         │
-  │──────────────────────────────────────────────►│
-  │                                              │
-  │  ◄─── Connection accepted (or 401 rejected)  │
-  │                                              │
-  │  SUBSCRIBE { type: "subscribe",              │
-  │    channel: "deployment:<deploy-uuid>" }     │
-  │──────────────────────────────────────────────►│
-  │                                              │
-  │  ◄─── AUTH CHECK: does user own this         │
-  │       deployment's project?                  │
-  │                                              │
-  │  ◄─── { type: "subscribed",                  │
-  │         channel: "deployment:<deploy-uuid>" } │
-  │       OR                                      │
-  │  ◄─── { type: "error",                       │
-  │         code: "UNAUTHORIZED" }                │
-  │                                              │
-  │  ◄─── { type: "log", ...event data }         │
-  │  ◄─── { type: "status_change", ... }         │
-  │  ◄─── { type: "log", ...event data }         │
-  │                                              │
-  │  UNSUBSCRIBE { type: "unsubscribe",          │
-  │    channel: "deployment:<deploy-uuid>" }     │
-  │──────────────────────────────────────────────►│
-  │                                              │
-  │  CLOSE                                        │
-  │──────────────────────────────────────────────►│
+To prevent architectural confusion, ForgeLAB explicitly separates three distinct realtime layers:
+
+```text
+1. CURRENT IMPLEMENTED MVP
+   Deployment-scoped WebSocket subscriptions ("deployment:<uuid>")
+   + REST-fetched historical logs ("GET /api/projects/:id/deployments/:did/logs")
+   + live WebSocket log streaming
+
+2. EXISTING PROJECT-LEVEL CHANNEL CONTRACT
+   Channel "project:<uuid>" authorization exists in WebSocket Hub.
+   However, meaningful current event producers in the backend are limited/unestablished.
+
+3. FUTURE / PROPOSED EVENT-REPLAY ARCHITECTURE
+   A dedicated Deployment Event Service, database event ledger, and replay-on-connect
+   handshake. (PLANNED / NOT IMPLEMENTED IN CURRENT MVP).
 ```
 
-## Channel Naming Convention
+---
 
-All channels use **durable UUIDs**, never names or URLs.
+## 2. Current Implemented MVP Architecture
 
-| Channel Pattern | Purpose |
-|----------------|---------|
-| `deployment:<deployment-uuid>` | Logs and status for a specific deployment |
-| `project:<project-uuid>` | Project-level events (new deployment, status changes) |
+The MVP provides live build and runtime log observation for active deployments:
 
-## Message Types
+```text
+Docker Build / Container Logs
+               │
+               ▼
+      Docker Engine Runner
+ (internal/docker/engine.go)
+               │
+               ├──► 1. Secret Redaction & PostgreSQL Persistence (deployment_logs)
+               │
+               └──► 2. wsHub.PublishEvent("deployment:<uuid>", &EventMessage{...})
+                           │
+                           ▼
+                  WebSocket Hub & Redis Pub/Sub
+                           │
+                           ▼
+                Browser / Client (useWebSocket)
+```
 
-### Client → Server Messages
+### Connection Handshake
+- **URL:** `ws://localhost:8080/api/ws?token=<jwt_access_token>`
+- **Authentication:**
+  1. Primary: `token` query parameter.
+  2. Fallback: `Authorization: Bearer <token>` header.
+  3. Fallback: `forgelab_access_token` cookie.
+- If no valid token is provided or the token has expired, the server responds with `HTTP 401 Unauthorized` and aborts the WebSocket upgrade.
+
+---
+
+## 3. Channel Naming & Protocol
+
+All channels use durable **UUIDv4** strings. Channels are never keyed by project name, container name, or branch.
+
+| Channel Pattern | MVP Implementation Status | Purpose |
+| :--- | :--- | :--- |
+| `deployment:<deployment-uuid>` | **ACTIVELY PRODUCED & CONSUMED** | Realtime build logs, runtime stdout/stderr, and status changes. |
+| `project:<project-uuid>` | **CONTRACT SUPPORTED / NO ACTIVE PRODUCERS** | Project-wide lifecycle events (e.g. deployment queued). |
+
+### Client-to-Server Message Formats
 
 ```typescript
-// Subscribe to a channel
+// Subscribe to a deployment channel
 {
   "type": "subscribe",
-  "channel": "deployment:<uuid>"  // or "project:<uuid>"
+  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f"
 }
 
-// Unsubscribe from a channel
+// Unsubscribe from a deployment channel
 {
   "type": "unsubscribe",
-  "channel": "deployment:<uuid>"
+  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f"
 }
 
-// Ping (keepalive)
+// Heartbeat keepalive
 {
   "type": "ping"
 }
 ```
 
-### Server → Client Messages
+### Server-to-Client Message Formats
 
 ```typescript
-// Subscription confirmed
+// 1. Subscription Confirmed
 {
   "type": "subscribed",
-  "channel": "deployment:<uuid>"
+  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f"
 }
 
-// Subscription rejected
+// 2. Subscription Rejected / Authorization Error
 {
   "type": "error",
   "code": "UNAUTHORIZED",
-  "message": "You do not have access to this resource"
+  "message": "access denied to this resource"
 }
 
-// Deployment log line
+// 3. Live Log Line (Build, Startup, Health, or Runtime)
 {
   "type": "log",
-  "channel": "deployment:<uuid>",
+  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
   "data": {
-    "timestamp": "2026-09-25T20:00:00Z",
-    "phase": "build",        // source | build | startup | health | runtime
-    "stream": "stdout",      // stdout | stderr | system
-    "message": "Step 1/5 : FROM node:18-alpine"
+    "timestamp": "2026-09-26T12:00:05Z",
+    "phase": "build",        // "source" | "build" | "startup" | "health" | "runtime"
+    "stream": "stdout",      // "stdout" | "stderr" | "system"
+    "message": "Step 2/5 : RUN npm run build"
   }
 }
 
-// Deployment status change
+// 4. Deployment Status Change
 {
   "type": "status_change",
-  "channel": "deployment:<uuid>",
+  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
   "data": {
-    "deployment_id": "<uuid>",
-    "project_id": "<uuid>",
-    "previous_status": "BUILDING",
-    "new_status": "STARTING",
-    "timestamp": "2026-09-25T20:00:00Z"
+    "deployment_id": "c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
+    "project_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+    "previous_status": "building",
+    "new_status": "starting",
+    "timestamp": "2026-09-26T12:00:15Z"
   }
 }
 
-// Project-level event
-{
-  "type": "project_event",
-  "channel": "project:<uuid>",
-  "data": {
-    "event": "deployment_created",
-    "deployment_id": "<uuid>",
-    "deploy_number": 5,
-    "timestamp": "2026-09-25T20:00:00Z"
-  }
-}
-
-// Pong (keepalive response)
+// 5. Heartbeat Pong
 {
   "type": "pong"
 }
 ```
 
-## Isolation Rules (CRITICAL)
+---
 
-### Rule 1: UUID-Based Identity
+## 4. Strict Realtime Isolation Rules
 
-All WebSocket channels are identified by durable UUIDs. Never by:
-- Project name
-- Repository URL
-- Container name
-- Branch name
+1. **Server-Side Authorization:** When a client sends `{ "type": "subscribe", "channel": "deployment:<uuid>" }`, the Hub:
+   - Resolves `deployment.id == <uuid>` to find its `project_id`.
+   - Queries `projects` table to check if `project.owner_id == client.user_id`.
+   - If ownership check fails, the Hub sends an `UNAUTHORIZED` error frame and drops the subscription.
+2. **Channel Separation:** Messages published to `deployment:<uuid-A>` are routed **only** to clients registered in `channels["deployment:<uuid-A>"]`. They are never broadcast to other projects or deployments.
 
-### Rule 2: Subscription Authorization
+---
 
-When a client sends a `subscribe` message:
+## 5. Known Implementation Issue / Investigation Item
 
-1. Extract user_id from the authenticated WebSocket connection
-2. Look up the target resource (deployment → project → owner)
-3. Verify `project.owner_id == user_id`
-4. If unauthorized: send error message, do NOT subscribe
-5. If authorized: add client to channel subscriber list, send confirmation
+### Double Delivery in `PublishEvent()`
+In `backend/internal/websocket/hub.go:L123-L184`, the `PublishEvent` method currently executes:
 
-### Rule 3: Event Isolation
+```go
+// 1. Send directly to local connected subscribers
+h.mu.RLock()
+subscribers, exists := h.channels[channel]
+if exists {
+    for client := range subscribers {
+        client.send <- payload
+    }
+}
+h.mu.RUnlock()
 
-- Events published to `deployment:<uuid-A>` are NEVER delivered to subscribers of `deployment:<uuid-B>`
-- Events published to `project:<uuid-A>` are NEVER delivered to subscribers of `project:<uuid-B>`
-- Even if both projects use the same repository, they are separate entities
-
-### Rule 4: Server-Side Enforcement
-
-Isolation is enforced server-side. The client cannot bypass it by guessing UUIDs because:
-- Subscription requires valid JWT
-- Subscription requires ownership verification
-- Events are routed by exact channel match on the server
-
-## Implementation Architecture
-
-```
-Redis Pub/Sub                    WebSocket Hub                    Clients
-                                                                   
-channel: deploy:<uuid-1>  ──►  Hub receives message          ──►  Client A
-                                │                                   (subscribed to deploy:<uuid-1>)
-                                │  Check subscriber list for
-                                │  channel "deploy:<uuid-1>"
-                                │
-                                │  NOT sent to Client B
-                                │  (subscribed to deploy:<uuid-2>)
-
-channel: deploy:<uuid-2>  ──►  Hub receives message          ──►  Client B
-                                │                                   (subscribed to deploy:<uuid-2>)
-                                │  Check subscriber list for
-                                │  channel "deploy:<uuid-2>"
+// 2. Publish to Redis if configured
+if h.redisClient != nil {
+    redisChan := "forgelab:pubsub:" + channel
+    h.redisClient.Publish(h.ctx, redisChan, payload)
+}
 ```
 
-The Hub maintains a map:
-```
-channels: map[string]map[*Client]bool
-// e.g., "deployment:<uuid>" → {client1: true, client2: true}
+Simultaneously, `listenRedisPubSub()` listens on `forgelab:pubsub:*`:
+```go
+case msg, ok := <-ch:
+    channel := strings.TrimPrefix(msg.Channel, "forgelab:pubsub:")
+    h.mu.RLock()
+    subscribers, exists := h.channels[channel]
+    if exists {
+        for client := range subscribers {
+            client.send <- []byte(msg.Payload)
+        }
+    }
+    h.mu.RUnlock()
 ```
 
-Each client maintains:
+### Problem Description
+Because the same backend instance both delivers directly to local subscribers **and** republishes to Redis (which its own listener receives and forwards to the exact same local subscribers), local subscribers can receive every event **twice**.
+
+### Investigation Guidance for Future Agents:
+- **Do not silently accept this as intended behavior.**
+- In a single-instance setup, either Redis Pub/Sub should be the sole distributor, or Redis messages should include an instance originator ID (`node_id`) so the sending node skips re-broadcasting messages it originated.
+
+---
+
+## 6. Future Realtime Architecture (Not Implemented in MVP)
+
+The earlier design discussions proposed an event-sourcing and replay model:
+
+```text
+Worker
+  │
+  ▼
+Deployment Event Service
+  │
+  ├──► Database (Event Store Table)
+  │
+  └──► Redis Pub/Sub
+          │
+          ▼
+    WebSocket Gateway
+          │
+          ▼
+       Browser
 ```
-subscriptions: map[string]bool
-// e.g., {"deployment:<uuid>": true, "project:<uuid>": true}
+
+### Proposed Event Schema (Future)
+```json
+{
+  "eventId": "evt_01J8...",
+  "eventType": "DEPLOYMENT_PHASE_CHANGED",
+  "projectId": "...",
+  "deploymentId": "...",
+  "timestamp": "2026-09-26T12:00:00Z",
+  "payload": {
+    "phase": "BUILDING_IMAGE",
+    "stage": 2,
+    "totalStages": 5
+  }
+}
 ```
+
+### Proposed Progress Stages (Future)
+```text
+1. FETCHING_SOURCE
+2. BUILDING_IMAGE
+3. STARTING_CONTAINER
+4. HEALTH_CHECK
+5. DEPLOYING
+6. COMPLETED
+```
+
+> **Note:** Neither the event ledger database table nor the structured stage progression schema exists in the current MVP codebase. The current MVP uses direct phase log persistence (`deployment_logs`) and status transitions (`deployments.status`).

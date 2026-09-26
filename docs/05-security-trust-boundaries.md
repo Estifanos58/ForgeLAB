@@ -1,152 +1,185 @@
-# ForgeLab — Security & Trust Boundaries
+# ForgeLAB — Security Architecture & Trust Boundaries
 
-**Status:** Current  
-**Last Updated:** 2026-09-25  
-
----
-
-## Threat Model
-
-### Trust Boundaries
-
-```
-┌─────────────────────────────────────────────────────┐
-│                UNTRUSTED                             │
-│                                                      │
-│  ┌───────────────┐    ┌──────────────────────┐      │
-│  │ Browser/Client│    │ User Repositories    │      │
-│  │               │    │ (arbitrary code)     │      │
-│  └───────┬───────┘    └──────────┬───────────┘      │
-│          │                       │                   │
-└──────────┼───────────────────────┼───────────────────┘
-           │                       │
-     ══════╪═══════════════════════╪═══ TRUST BOUNDARY
-           │                       │
-┌──────────┼───────────────────────┼───────────────────┐
-│          ▼          TRUSTED      ▼                   │
-│  ┌──────────────┐       ┌────────────────┐           │
-│  │ ForgeLab API │       │ Docker Engine  │           │
-│  │ (Go)         │       │ (sandboxed)    │           │
-│  └──────┬───────┘       └────────────────┘           │
-│         │                                            │
-│  ┌──────┴───────┐  ┌──────────┐                     │
-│  │ PostgreSQL   │  │  Redis   │                      │
-│  └──────────────┘  └──────────┘                      │
-│                                                       │
-│               HOST MACHINE                            │
-└───────────────────────────────────────────────────────┘
-```
-
-### Threat Categories
-
-| Threat | Mitigation |
-|--------|-----------|
-| Unauthorized API access | JWT authentication on all API endpoints |
-| Cross-user data access | Authorization checks: user can only access own projects/deployments |
-| WebSocket eavesdropping | Subscription authorization — server validates user owns the project/deployment |
-| Secret leakage in logs | Secret redaction in log pipeline before storage and streaming |
-| Secret leakage in API | Secrets never returned in plaintext via API (write-only or masked) |
-| Secret leakage in DB | AES-GCM encryption at rest for secret values |
-| Arbitrary code execution | Docker container isolation; future: resource limits |
-| Host filesystem access | Containers do NOT get host filesystem access; source is copied into build context |
-| Container resource exhaustion | Future: CPU/memory limits via Docker container config |
-| Token theft | JWT short expiry + refresh token rotation; HTTPS in production |
-| SQL injection | Parameterized queries via pgx (never string concatenation) |
-| CSRF | SameSite cookies + CSRF tokens for browser requests |
+**Status:** Current Reference Specification  
+**Control Plane Trust Level:** Highly Trusted Component  
+**User Repository Trust Level:** Untrusted Input  
 
 ---
 
-## Authentication Design
+## Related Documents
 
-### ForgeLab User Authentication
-
-- **Registration:** email + password (bcrypt hashed, cost 12)
-- **Login:** email + password → JWT access token + refresh token
-- **Access Token:** Short-lived (15 min), contains user_id and email
-- **Refresh Token:** Longer-lived (7 days), stored in DB, single-use with rotation
-- **Token Storage (Client):** httpOnly secure cookies (preferred) or localStorage (development)
-
-### JWT Claims
-
-```json
-{
-  "sub": "<user-uuid>",
-  "email": "user@example.com",
-  "iat": 1695648000,
-  "exp": 1695648900
-}
-```
-
-### Authorization Model (MVP)
-
-Simple ownership-based authorization:
-
-```
-Request → Extract JWT → Validate → Extract user_id
-→ Load resource → Check resource.owner_id == user_id
-→ Allow or 403
-```
-
-Future: RBAC with roles (Owner, Admin, Developer, Viewer) layered on top.
+- [INSTRUCTION.md](../INSTRUCTION.md) — Operational memory & architectural constraints
+- [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
+- [docs/09-api-contract.md](09-api-contract.md) — Authentication headers & secret masking
+- [docs/11-development-environment.md](11-development-environment.md) — Docker socket mount & path configuration
+- [docs/14-known-limitations.md](14-known-limitations.md) — Security hardening backlog
 
 ---
 
-## Secret Management
+## 1. Primary Trust Boundary & Threat Model
 
-### Encryption
+ForgeLAB’s security model rests on a fundamental distinction between the **ForgeLAB control plane** and **user application repositories**:
 
-- **Algorithm:** AES-256-GCM
-- **Key Management:** Encryption key loaded from environment variable `FORGELAB_ENCRYPTION_KEY`
-- **Key Format:** 32-byte key (base64 encoded in env var)
-- **Storage:** Encrypted values stored as BYTEA in PostgreSQL
-
-### Secret Lifecycle
-
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                        UNTRUSTED DOMAIN                                │
+│                                                                        │
+│   ┌──────────────────────────────┐    ┌────────────────────────────┐  │
+│   │   Browser / Client Input     │    │     User Repositories      │  │
+│   │   (Untrusted web requests)   │    │  (Arbitrary untrusted code │  │
+│   │                              │    │   and untrusted Dockerfile)│  │
+│   └──────────────┬───────────────┘    └──────────────┬─────────────┘  │
+│                  │                                   │                 │
+└──────────────────┼───────────────────────────────────┼─────────────────┘
+                   │                                   │
+═══════════════════╪═══════════════════════════════════╪═══════════════════
+                   │ PRIMARY SECURITY TRUST BOUNDARY   │
+                   ▼                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                    HIGHLY TRUSTED CONTROL PLANE                        │
+│                                                                        │
+│   ┌────────────────────────────────────────────────────────────────┐  │
+│   │                  ForgeLAB Go Backend API & Worker              │  │
+│   │               • Root-equivalent Docker Socket Access           │  │
+│   │               • Database & Secret Master Encryption Keys       │  │
+│   └──────────────┬───────────────────┬───────────────────┬─────────┘  │
+│                  │                   │                   │            │
+│                  ▼                   ▼                   ▼            │
+│         ┌────────────────┐  ┌────────────────┐  ┌─────────────────┐   │
+│         │   PostgreSQL   │  │     Redis      │  │  Docker Engine  │   │
+│         │ (Encrypted DB) │  │  (Job Queue)   │  │ (/var/run/docker│   │
+│         │                │  │                │  │     .sock)      │   │
+│         └────────────────┘  └────────────────┘  └────────┬────────┘   │
+│                                                          │            │
+└──────────────────────────────────────────────────────────┼────────────┘
+                                                           │
+                                                           ▼
+                                                ┌───────────────────┐
+                                                │ Sandboxed Runtime │
+                                                │    Containers     │
+                                                │(Isolated non-root)│
+                                                └───────────────────┘
 ```
-User sets env var via API
-→ Value encrypted with AES-GCM (unique nonce per value)
-→ Stored as encrypted bytes in environment_variables table
-→ At deployment time: decrypted in memory
-→ Passed to Docker container as environment variables
-→ Never logged, never returned in plaintext via API
+
+### Critical Trust Realities:
+
+```text
+ForgeLab backend = highly trusted control-plane component.
+
+Backend has Docker Engine control via /var/run/docker.sock.
+
+User repositories = untrusted input.
+
+Repository source code must NEVER be treated as trusted merely because
+the user imported it.
+
+A compromise of the ForgeLab backend becomes a host-level Docker
+control/security event.
 ```
 
-### Secret Redaction in Logs
-
-Before any log line is stored or streamed:
-
-1. Collect all secret keys for the project
-2. Collect all decrypted secret values
-3. Replace any occurrence of a secret value in the log line with `[REDACTED]`
-4. This applies to both build logs and runtime logs
-
-### API Behavior for Secrets
-
-| Operation | Behavior |
-|-----------|----------|
-| Create/Update | Accept plaintext value, encrypt, store |
-| List | Return key names only, no values |
-| Read | Return key + masked value (`••••••••`) |
-| Delete | Delete the record |
-| Deploy-time | Decrypt in memory, pass to container |
+### Why This Trust Model Matters:
+1. **Local Repositories:** Even though a repository resides on the local host machine, the control plane must not trust its file hierarchy. A malicious repository could contain symlinks pointing to `/etc/shadow`, `C:\Windows\System32`, or developer SSH keys. `PathValidator` strictly resolves symlinks and validates canonical paths before snapshotting.
+2. **Future GitHub Repositories:** Remote repositories imported via OAuth are completely untrusted. They may contain poisoned build scripts, dependency confusion attacks, or malicious Dockerfiles.
+3. **Docker Builds:** The `docker build` process executes commands (`RUN`) as specified in the repository's `Dockerfile`. Any `RUN` command executes within the build container. Build contexts must **never** mount the host root or the Docker socket.
+4. **Runtime Containers:** User applications execute inside container sandboxes. They must never be granted `--privileged` mode, host network mode (`--net=host`), host filesystem volume mounts, or access to `/var/run/docker.sock`.
 
 ---
 
-## Container Isolation
+## 2. Authentication Architecture: Reality vs. Hardening
 
-### MVP Constraints
+### Current MVP Implementation (Reality)
+The current MVP codebase implements authentication as follows:
 
-- Containers run with default Docker isolation
-- No `--privileged` flag
-- No host network mode
-- No host filesystem bind mounts (source is copied)
-- Docker socket is NOT exposed to user containers
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                      Current MVP Auth                       │
+│                                                             │
+│   REST Authentication:                                      │
+│   • Bearer token sent in "Authorization: Bearer <token>"    │
+│   • Token stored in browser "localStorage" (forgelab_token) │
+│                                                             │
+│   WebSocket Authentication:                                 │
+│   • Token passed via query string (?token=<access_token>)   │
+│                                                             │
+│   Token Properties:                                         │
+│   • HS256 signed JWT with user_id and email                 │
+│   • 15-minute access token expiry                           │
+│   • 7-day refresh token with atomic single-use DB rotation  │
+└─────────────────────────────────────────────────────────────┘
+```
 
-### Future Constraints (Not MVP)
+### Production-Hardening Roadmap (Deferred to Post-MVP)
+The following security hardening measures are documented as future requirements:
 
-- CPU limits: `--cpus`
-- Memory limits: `--memory`
-- PID limits: `--pids-limit`
-- Read-only filesystem: `--read-only` (where applicable)
-- No-new-privileges: `--security-opt=no-new-privileges`
-- Network isolation between user containers
+1. **HttpOnly Secure Cookies:** Transition frontend token storage from `localStorage` to `HttpOnly`, `Secure`, `SameSite=Lax` cookies. (Backend handlers already set these cookies, but the frontend currently relies on `localStorage` for Bearer headers).
+2. **Eliminate Query String Tokens for WebSockets:** Query parameters can be captured in web server access logs, browser history, and proxy telemetry. Future hardening should authenticate WebSocket upgrades exclusively via HttpOnly cookies or an initial JSON authentication handshake frame.
+3. **Strict Origin Validation:** Enforce strict CSRF origin validation on the WebSocket upgrader (`CheckOrigin` currently returns `true` for development flexibility in `internal/websocket/hub.go:24-26`).
+
+---
+
+## 3. Host Path Security & Source Validation
+
+Because the MVP imports source from the host filesystem, `internal/security/PathValidator` enforces strict defense-in-depth:
+
+```text
+Candidate Path (from user)
+         │
+         ▼
+1. filepath.Abs() ──► Ensure absolute path
+         │
+         ▼
+2. filepath.EvalSymlinks() ──► Canonicalize and resolve all symlinks
+         │
+         ▼
+3. os.Stat() ──► Verify path exists and is a directory
+         │
+         ▼
+4. Restricted System Path Check ──► REJECT if matching:
+         • /etc, /var, /usr, /sys, /proc, /dev, /boot, /bin, /sbin
+         • C:\Windows, C:\Program Files, C:\Program Files (x86), C:\System Volume Information
+         │
+         ▼
+5. Boundary Check (if FORGELAB_ALLOWED_SOURCE_ROOTS is set)
+         • Ensures canonical path resides inside configured root whitelist
+         │
+         ▼
+Valid Canonical Path ──► Ready for snapshot copy
+```
+
+### Snapshot Isolation
+ForgeLAB copies the repository source into an isolated temporary directory (`data/builds/<deployment-id>`) before initiating the Docker build:
+- Prevents concurrent edits on the host filesystem from corrupting active builds.
+- Isolates build context and prevents path traversal escapes during `docker build`.
+- Snapshot directory is automatically wiped after the image build finishes.
+
+---
+
+## 4. Secret Management & Log Redaction
+
+### Encryption at Rest (AES-256-GCM)
+- Environment variables configured with `is_secret: true` are encrypted using **AES-256-GCM** before database insertion.
+- Master key is supplied via `FORGELAB_ENCRYPTION_KEY` (32 bytes, Base64-encoded).
+- Every secret encryption operation generates a unique cryptographically secure 12-byte nonce (IV). Ciphertext and nonce are stored in `environment_variables.encrypted_value`.
+
+### Log Redactor Pipeline
+Before any build log line or container runtime log line is stored in PostgreSQL or broadcast over WebSocket:
+1. `LogRedactor` loads all active plaintext secret values for the target project.
+2. It performs an in-memory scan across every log line.
+3. Any exact match with a secret value is replaced with `[REDACTED]`.
+4. Only redacted text is persisted to `deployment_logs` and streamed to WebSockets.
+
+---
+
+## 5. Container Sandboxing Constraints
+
+All user application containers created by ForgeLAB enforce these constraints:
+
+| Constraint | MVP Status | Implementation |
+| :--- | :--- | :--- |
+| **No Privileged Mode** | ENFORCED | `Privileged: false` (default in container.HostConfig) |
+| **No Host Network** | ENFORCED | Binds container port to dynamic host port on `0.0.0.0` |
+| **No Docker Socket Mount** | ENFORCED | `/var/run/docker.sock` is **never** mounted in user containers |
+| **No Host Root Mounts** | ENFORCED | User containers mount no host volumes; files exist in image layer |
+| **Restart Policy** | ENFORCED | `RestartPolicy: unless-stopped` |
+| **Resource Quotas (CPU/RAM)** | DEFERRED | Future Docker `HostConfig.Resources` limit enforcement |
+| **Read-Only Root Filesystem** | DEFERRED | Future hardening option for stateless containers |

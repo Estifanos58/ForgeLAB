@@ -1,7 +1,19 @@
 # ForgeLab — Architecture Decisions
 
-**Status:** Current  
-**Last Updated:** 2026-09-25  
+**Status:** Current Reference Specification  
+**Architecture Model:** Single Control Plane (Go + PostgreSQL + Redis + Docker Engine)  
+
+---
+
+## Related Documents
+
+- [INSTRUCTION.md](../INSTRUCTION.md) — Operational memory & architectural constraints
+- [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
+- [docs/09-api-contract.md](09-api-contract.md) — Authoritative REST & WebSocket API specification
+- [docs/11-development-environment.md](11-development-environment.md) — Development environment setup & ports
+- [docs/12-manual-verification.md](12-manual-verification.md) — Physical test procedures
+- [docs/13-decisions.md](13-decisions.md) — Architecture Decision Records (ADRs)
+- [docs/14-known-limitations.md](14-known-limitations.md) — Known limitations and investigation items
 
 ---
 
@@ -180,6 +192,17 @@ RUNNING    FAILED
 4. STOPPED can transition to RUNNING (manual start)
 5. **A FAILED deployment NEVER destroys the previous RUNNING deployment**
 
+### Deployment-Time Health Gating vs. Continuous Monitoring
+
+A critical distinction in ForgeLAB's architecture:
+
+- **Deployment-Time Health Gating (CURRENT IMPLEMENTATION):**
+  When a container is started, the deployment worker enters `HEALTH_CHECKING`. It polls the allocated container host port via HTTP (10 attempts, 2-second interval, default endpoint `/health`).
+  - If any attempt returns HTTP 2xx or 3xx: the deployment is promoted to `RUNNING`, traffic is active, and the old container is stopped.
+  - If 10 attempts fail: the deployment transitions to `FAILED`, the broken container is removed, and the previous running deployment is kept intact.
+- **Continuous Runtime Health Monitoring (FUTURE ARCHITECTURE):**
+  Continuous monitoring (background ping loops, automated crash detection, restart backoff policies, or automatic rollback on runtime container exit) is **NOT** implemented in the current MVP. The current platform does not perform self-healing during runtime.
+
 ---
 
 ## Deployment Safety Invariant
@@ -237,6 +260,15 @@ This preserves the deployment safety invariant — rollback follows the same lif
 | Image | Docker image tag | `forgelab/<project-id>:<deploy-number>` |
 
 Two projects using the same repository are **completely separate entities** with separate UUIDs, deployments, logs, and WebSocket streams.
+
+### Identifier Format Standard: UUID vs. ULID
+Historical architecture discussions evaluated ULIDs for lexicographical sorting. However, **UUIDv4 is the active standard** across the entire platform:
+- Generated in PostgreSQL via `gen_random_uuid()`
+- Modeled in Go using `github.com/google/uuid`
+- Utilized in all REST paths (`/api/projects/:id`) and WebSocket channels (`deployment:<uuid>`)
+- Enforced in database unique indexes and ownership checks
+
+ULID migration is explicitly deferred and must not be initiated without an approved Architectural Decision Record.
 
 ---
 

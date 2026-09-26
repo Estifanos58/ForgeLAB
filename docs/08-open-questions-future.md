@@ -1,7 +1,19 @@
 # ForgeLab — Open Questions & Future Roadmap
 
-**Status:** Current  
-**Last Updated:** 2026-09-25  
+**Status:** Current Reference Specification  
+**Scope:** Resolved MVP Decisions & Deferred Platform Capabilities  
+
+---
+
+## Related Documents
+
+- [INSTRUCTION.md](../INSTRUCTION.md) — Operational memory & architectural constraints
+- [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
+- [docs/04-architecture-decisions.md](04-architecture-decisions.md) — Core architectural decisions
+- [docs/11-development-environment.md](11-development-environment.md) — Development environment setup & ports
+- [docs/13-decisions.md](13-decisions.md) — Architecture Decision Records (ADRs)
+- [docs/14-known-limitations.md](14-known-limitations.md) — Known limitations and investigation items
+- [docs/15-github-integration.md](15-github-integration.md) — Future GitHub integration design
 
 ---
 
@@ -21,9 +33,9 @@ These questions were evaluated and implemented in the MVP control-plane architec
 ### OQ-2: Docker Network & Port Allocation [RESOLVED & IMPLEMENTED]
 
 **Resolution:** Standardized on `internal/network/PortManager`.
-- Assigns managed host port mappings (default range: 8000–9000).
+- Assigns managed host port mappings in the range **10000–60000** (`network.NewPortManager(10000, 60000)`).
 - Dynamically scans active ports to avoid collisions.
-- Stores assigned port in `deployments.port` database record for UI links & container mapping.
+- Stores assigned port in `projects.port` database record for UI links & container mapping.
 
 ### OQ-3: Refresh Token Security & Rotation [RESOLVED & IMPLEMENTED]
 
