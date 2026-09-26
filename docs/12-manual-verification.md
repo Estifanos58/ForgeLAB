@@ -71,6 +71,16 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 
 ## 3. Detailed Manual Verification Procedures
 
+### Execution Environment Requirement
+
+Before executing any procedure, note the distinction between development environments documented in [docs/11-development-environment.md](11-development-environment.md):
+
+- **Environment A (Host-Run Go Backend — Required for Local Repository Verification):**
+  PostgreSQL and Redis run via `docker compose up -d postgres redis`. Migrations are applied via `go run cmd/migrate/main.go up`. The Go backend runs directly on the host (`cd backend && go run cmd/server/main.go`) and frontend runs via `npm run dev`.
+  *Prerequisite Rule:* You must run the Go backend on the host for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount. The containerized backend cannot access host filesystem paths like `C:\dev\testapp` or `/home/user/app`.
+- **Environment B (Current Docker Compose Stack):**
+  `docker compose up --build` runs the backend inside a container without arbitrary host source directory mounts. Migrations are executed via `docker compose exec backend /app/forgelab-migrate up`. As documented in [docs/14-known-limitations.md](14-known-limitations.md), containerized frontend rewrites and host path inaccessibility currently prevent end-to-end local repository verification in Environment B.
+
 ---
 
 ### Procedure 1: Authentication & Token Lifecycle
@@ -85,8 +95,8 @@ Verify user registration, login, authenticated requests, cookie/token handling, 
 `NOT RECORDED`
 
 #### Prerequisites
-- Stack is running: `docker compose up --build`
-- Database migrations applied
+- Stack is running: Environment A (Host backend & host frontend with `docker compose up -d postgres redis`) or Environment B (`docker compose up --build`)
+- Database migrations applied (`go run cmd/migrate/main.go up` or `docker compose exec backend /app/forgelab-migrate up`)
 - Browser open at `http://localhost:3000`
 
 #### Test Procedure
@@ -112,7 +122,7 @@ Verify user registration, login, authenticated requests, cookie/token handling, 
 - Protected routes allow unauthenticated rendering.
 
 #### What to Inspect if it Fails
-- Backend logs: `docker compose logs backend`
+- Backend logs: `docker compose logs backend` (or host backend console output)
 - PostgreSQL `users` table: `docker compose exec postgres psql -U forgelab -c "SELECT id, email FROM users;"`
 
 #### Verification Record
@@ -136,6 +146,7 @@ Verify that projects can be created, configured, listed, and that cross-user acc
 `NOT RECORDED`
 
 #### Prerequisites
+- **Execution Environment:** Run the Go backend on the host (**Environment A**) for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount.
 - User 1 registered (`user1@example.com`)
 - User 2 registered (`user2@example.com`) in an Incognito window
 
@@ -186,6 +197,7 @@ Verify the complete vertical slice: host path validation, snapshot copy, Docker 
 `NOT RECORDED`
 
 #### Prerequisites
+- **Execution Environment:** Run the Go backend on the host (**Environment A** per [docs/11-development-environment.md](11-development-environment.md)) for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount. (The containerized backend cannot access host paths like `C:\dev\testapp` without a custom mount).
 - Prepare a minimal test application on the host machine (e.g. `C:\dev\testapp` or `/tmp/testapp`):
   - `Dockerfile`:
     ```dockerfile
@@ -252,6 +264,7 @@ Verify that a failing deployment (broken build or failed health check) fails gra
 `NOT RECORDED`
 
 #### Prerequisites
+- **Execution Environment:** Run the Go backend on the host (**Environment A**) for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount.
 - Project has a running deployment (Deployment #1 from Procedure 3 is active and serving traffic).
 
 #### Test Procedure
@@ -306,6 +319,7 @@ Verify that rollback creates a new deployment using the prior known-good deploym
 `NOT RECORDED`
 
 #### Prerequisites
+- **Execution Environment:** Run the Go backend on the host (**Environment A**) for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount.
 - Deployment #1 was successful (Release A).
 - Deployment #2 was deployed successfully with a different version (Release B).
 - Release B is currently active.
@@ -355,6 +369,7 @@ Verify that WebSocket channels are strictly isolated by UUID and that logs or st
 `NOT RECORDED`
 
 #### Prerequisites
+- **Execution Environment:** Run the Go backend on the host (**Environment A**), unless the backend container has been explicitly given access to source directories through a documented host bind mount.
 - Two separate projects created: Project A (`uuid-A`) and Project B (`uuid-B`).
 - Two browser windows opened side-by-side:
   - Window 1 viewing Project A (`/projects/uuid-A`)
@@ -410,6 +425,7 @@ Verify that environment variables marked as secrets are encrypted in the databas
 `NOT RECORDED`
 
 #### Prerequisites
+- **Execution Environment:** Run the Go backend on the host (**Environment A**) for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount.
 - Project created and ready for deployment.
 
 #### Test Procedure
@@ -468,6 +484,8 @@ Verify that `PathValidator` prevents path traversal, rejects restricted system d
 `NOT RECORDED`
 
 #### Prerequisites
+- **Execution Environment:** Run the Go backend on the host (**Environment A**).
+- **Environment Configuration:** Set `FORGELAB_ALLOWED_SOURCE_ROOTS` in `.env` and run the host Go backend. Note that `docker-compose.yml` does **not** inject `FORGELAB_ALLOWED_SOURCE_ROOTS` from host `.env` into the backend container; this boundary enforcement test requires running the backend on the host.
 - User logged in, at project creation modal.
 
 #### Test Procedure

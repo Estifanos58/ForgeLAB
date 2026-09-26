@@ -31,9 +31,10 @@ These are deliberate scoping decisions for the MVP vertical slice. They are **no
 4. **Single-Owner Tenant Model:**
    - Projects and deployments belong strictly to the creating user (`owner_id`).
    - There are no teams, organizations, or Role-Based Access Control (RBAC) permissions.
-5. **Deployment-Time Health Gating (No Continuous Self-Healing):**
+5. **Deployment-Time Health Gating (Docker Restart Policy vs ForgeLAB Self-Healing):**
    - Health checks occur **only** during deployment promotion (`HEALTH_CHECKING`).
-   - If an application crashes 30 minutes after reaching `RUNNING`, ForgeLAB does not automatically restart it, detect the crash, or trigger an automated rollback.
+   - **Docker runtime restart behavior (`IMPLEMENTED`):** Deployed application containers are configured with `RestartPolicy: { Name: "unless-stopped" }` in [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go). The Docker daemon automatically restarts stopped or crashed containers at the container-engine layer.
+   - **ForgeLAB continuous health monitoring / self-healing (`NOT IMPLEMENTED`):** ForgeLAB does not implement continuous runtime health polling, crash diagnosis, automatic rollback, health-based remediation, crash-loop detection, or automated re-promotion. If an application enters a broken state or fails long after reaching `RUNNING`, ForgeLAB control plane takes no automated remedial action.
 6. **No Zero-Downtime Rolling Traffic Shift:**
    - Promotion stops the old container and starts traffic on the new port. Because there is no proxy layer to gracefully drain connections or shift HTTP traffic, a brief connection gap can occur.
 7. **REST Pre-Fetch Required for Logs (No WebSocket Replay):**
@@ -66,6 +67,33 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Behavior:** The frontend stores the access token in `localStorage`. Access tokens expire after 15 minutes (`JWT_ACCESS_TOKEN_EXPIRY`). When the access token expires, API calls return `401 Unauthorized`, causing the frontend to immediately redirect the user to `/login`.
 - **Impact:** Active users are logged out every 15 minutes, even though a valid 7-day refresh token exists in the database and cookies.
 - **Guidance:** Implement an HTTP response interceptor in `api.ts` that catches 401 responses, calls `POST /api/auth/refresh`, updates `localStorage`, and retries the failed request before redirecting to `/login`.
+
+### 4. Docker Compose Development Stack Issues
+
+The following issues affect the fully containerized Compose environment (`docker compose up --build`), which requires reconciliation before it can be treated as a verified end-to-end development environment:
+
+#### a. Host Repository Inaccessibility in Containerized Backend
+- **Location:** [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml) (`backend` service volumes)
+- **Behavior:** The backend service mounts only `/var/run/docker.sock` and `forgelab_builds:/app/data/builds`. It does **not** mount arbitrary host filesystem paths.
+- **Impact:** When a user enters a local host repository path (such as `C:\dev\my-app` or `/home/user/my-app`), the containerized Go backend's `PathValidator` and directory copy routines cannot access the directory because it exists only on the host filesystem outside the container. Local repository creation fails unless the backend runs directly on the host (**Environment A**) or an explicit bind mount is configured.
+- **Guidance:** See [docs/11-development-environment.md](11-development-environment.md) for environment separation. A future enhancement could introduce a configurable source volume mount or an archive upload mechanism.
+
+#### b. Frontend/Backend Container Networking & Rewrite Mismatch
+- **Location:** [`frontend/next.config.js:L9-L14`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.js#L9-L14), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml) (`frontend` service)
+- **Behavior:** The Next.js configuration defines rewrites targeting `http://localhost:8080/api/:path*`:
+  ```javascript
+  {
+    source: '/api/:path*',
+    destination: 'http://localhost:8080/api/:path*',
+  }
+  ```
+- **Impact:** Inside the `forgelab-frontend` container, `localhost:8080` resolves to the frontend container's loopback interface, **not** the `forgelab-backend` container (which resides at `http://backend:8080` on the internal Compose network). Consequently, proxy rewrites fail when both services are run inside Compose containers.
+- **Guidance:** Future implementation must reconcile frontend/backend networking (for example, by supporting an environment variable such as `BACKEND_INTERNAL_URL` for server-side Next.js rewrites or introducing a unified gateway). Do not claim the fully containerized stack is physically verified end-to-end until this networking reconciliation is implemented and tested.
+
+#### c. Compose Environment Isolation from Host `.env`
+- **Location:** [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml) (`backend` service environment block)
+- **Behavior:** `docker-compose.yml` specifies explicit static environment variables and does not declare `env_file: .env`.
+- **Impact:** Variables configured in the host `.env` file (such as `FORGELAB_ALLOWED_SOURCE_ROOTS`) are **not** automatically injected into the backend container during `docker compose up`. Host `.env` values only apply when running the backend directly on the host.
 
 ---
 

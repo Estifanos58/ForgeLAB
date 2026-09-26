@@ -27,57 +27,76 @@ ForgeLAB is a single control-plane application deployment platform built in Go. 
 ## Prerequisites
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Docker Engine 24+ & Compose v2+)
-- [Go 1.21+](https://go.dev/dl/) (optional, for running local migrations or CLI tests)
-- [Node.js 18+](https://nodejs.org/) (optional, for local frontend development)
+- [Go 1.21+](https://go.dev/dl/) (required for running the host backend in Workflow A and running migrations)
+- [Node.js 18+](https://nodejs.org/) (required for running the host frontend console in Workflow A)
 
 ---
 
-## Quick Start (Docker-First Development)
+## Development Setup & Workflows
 
-The standard developer experience runs entirely through Docker Compose.
+ForgeLAB provides two setups depending on your workflow. Because ForgeLAB deploys projects from absolute directory paths on the host filesystem, the Go backend requires direct visibility into your local source tree. Full details are documented in [docs/11-development-environment.md](docs/11-development-environment.md).
 
-### 1. Copy Environment Configuration
+### Workflow A: Local-Source Development (Host-Run Backend) — Recommended
 
+In this workflow, backing services (PostgreSQL, Redis) run in Docker Compose while the Go backend and frontend run directly on the host. This ensures that arbitrary local host repository paths (e.g. `C:\dev\my-app` or `/home/user/my-app`) are naturally accessible to ForgeLAB's `PathValidator` and snapshot routines.
+
+#### 1. Start Backing Infrastructure
+Start PostgreSQL and Redis in the background:
+```bash
+docker compose up -d postgres redis
+```
+
+#### 2. Configure Environment & Run Migrations
+Copy the configuration template:
 ```bash
 cp .env.example .env
 ```
-
-Review `.env` to configure optional allowed source roots (`FORGELAB_ALLOWED_SOURCE_ROOTS`) if you wish to restrict local repository import paths.
-
-### 2. Start the Stack
-
-```bash
-docker compose up --build
-```
-
-This starts:
-- **PostgreSQL**: `localhost:5432`
-- **Redis**: `localhost:6379`
-- **Backend API**: `localhost:8080`
-- **Frontend UI**: `localhost:3000`
-
-### 3. Run Database Migrations
-
-In a separate terminal window:
-
-```bash
-docker compose exec backend /app/server -migrate
-```
-
-*(Or locally via Go)*:
+Execute schema migrations against local PostgreSQL:
 ```bash
 cd backend
 go run cmd/migrate/main.go up
 ```
 
-### 4. Access ForgeLAB
+#### 3. Run the Go Backend
+```bash
+cd backend
+go run cmd/server/main.go
+```
+The backend API is now running at `http://localhost:8080`.
 
+#### 4. Run the Next.js Frontend
+In a separate terminal:
+```bash
+cd frontend
+npm install
+npm run dev
+```
 Open [http://localhost:3000](http://localhost:3000) in your browser:
-1. Register a new user account.
-2. Log in to access the Dashboard.
-3. Import a local repository containing a `Dockerfile`.
-4. Trigger a deployment and watch live build and runtime logs stream over WebSockets!
-5. Once healthy, access your deployed application via its allocated host port in the `10000–60000` range.
+1. Register a new user account and log in.
+2. Create a project specifying an absolute repository path on your host containing a `Dockerfile`.
+3. Trigger a deployment and inspect live build and runtime logs over WebSockets.
+4. Access the deployed application on its allocated dynamic host port (`10000–60000`).
+
+---
+
+### Workflow B: Container Infrastructure Setup (Docker Compose)
+
+You can also launch all services using Docker Compose:
+```bash
+docker compose up --build
+```
+
+To run database migrations inside the container:
+```bash
+docker compose exec backend /app/forgelab-migrate up
+```
+
+#### Important Compose Limitations:
+1. **Host Repository Inaccessibility:** `docker-compose.yml` mounts only `/var/run/docker.sock` and a builds volume into the backend container. It does **not** mount arbitrary host filesystem paths. Supplying a host path like `C:\dev\my-app` to the containerized backend will fail validation.
+2. **Frontend Container Rewrite Networking:** In `frontend/next.config.js`, API rewrites target `http://localhost:8080`, which inside a container resolves to the frontend container itself rather than the `backend` Compose service.
+3. **Environment Isolation:** `docker-compose.yml` uses an explicit static environment block and does not automatically inject host `.env` settings (such as `FORGELAB_ALLOWED_SOURCE_ROOTS`).
+
+For active development with local-source deployments, use **Workflow A**.
 
 ---
 
@@ -158,7 +177,7 @@ The unit test suite covers:
 
 The `docs/` directory represents ForgeLAB's persistent engineering memory:
 
-- [docs/00-current-state.md](docs/00-current-state.md) — **Start here:** Current branch, commit, and implementation matrix
+- [docs/00-current-state.md](docs/00-current-state.md) — **Start here:** Implementation audit baseline, documentation status, and implementation matrix
 - [docs/01-product-vision.md](docs/01-product-vision.md) — Product scope, principles, and non-goals
 - [docs/02-functional-requirements.md](docs/02-functional-requirements.md) — MVP vs. future functional requirements
 - [docs/03-technology-decisions.md](docs/03-technology-decisions.md) — Tech stack rationale and rejected alternatives

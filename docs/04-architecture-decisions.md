@@ -192,16 +192,18 @@ RUNNING    FAILED
 4. STOPPED can transition to RUNNING (manual start)
 5. **A FAILED deployment NEVER destroys the previous RUNNING deployment**
 
-### Deployment-Time Health Gating vs. Continuous Monitoring
+### Deployment-Time Health Gating vs. Continuous Monitoring & Restart Behavior
 
 A critical distinction in ForgeLAB's architecture:
 
-- **Deployment-Time Health Gating (CURRENT IMPLEMENTATION):**
+- **Deployment-Time Health Gating (CURRENT IMPLEMENTATION — IMPLEMENTED):**
   When a container is started, the deployment worker enters `HEALTH_CHECKING`. It polls the allocated container host port via HTTP (10 attempts, 2-second interval, default endpoint `/health`).
   - If any attempt returns HTTP 2xx or 3xx: the deployment is promoted to `RUNNING`, traffic is active, and the old container is stopped.
   - If 10 attempts fail: the deployment transitions to `FAILED`, the broken container is removed, and the previous running deployment is kept intact.
-- **Continuous Runtime Health Monitoring (FUTURE ARCHITECTURE):**
-  Continuous monitoring (background ping loops, automated crash detection, restart backoff policies, or automatic rollback on runtime container exit) is **NOT** implemented in the current MVP. The current platform does not perform self-healing during runtime.
+- **Docker Engine Restart Behavior (CURRENT IMPLEMENTATION — IMPLEMENTED):**
+  Deployed containers are configured with `RestartPolicy: { Name: "unless-stopped" }` in [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go). The underlying Docker daemon automatically restarts stopped or crashed containers at the container-engine layer.
+- **ForgeLAB-Level Continuous Health Monitoring & Self-Healing (FUTURE ARCHITECTURE — NOT IMPLEMENTED):**
+  ForgeLAB does **not** implement continuous control-plane application health monitoring, crash diagnosis, automatic ForgeLAB-level rollback, health-based remediation, crash-loop analysis, or deployment re-promotion. Docker's container-level restart policy must not be confused with platform-level self-healing.
 
 ---
 

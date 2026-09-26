@@ -12,7 +12,7 @@ Every agent working on this codebase must adhere strictly to the following lifec
 
 ### Before Changing Any Code:
 1. **Read `INSTRUCTION.md`** (this document).
-2. **Read `docs/00-current-state.md`** to know the current branch, commit, implementation status, and verification state.
+2. **Read `docs/00-current-state.md`** to know the audited implementation baseline commit, documentation status, environment requirements, and verification state.
 3. **Read the relevant functional requirements** in [docs/02-functional-requirements.md](docs/02-functional-requirements.md).
 4. **Read the relevant architecture, security, API, or frontend document** (e.g., [docs/04-architecture-decisions.md](docs/04-architecture-decisions.md), [docs/05-security-trust-boundaries.md](docs/05-security-trust-boundaries.md), [docs/09-api-contract.md](docs/09-api-contract.md), [docs/10-frontend-architecture.md](docs/10-frontend-architecture.md), [docs/11-development-environment.md](docs/11-development-environment.md)).
 5. **Determine whether the requested task is:**
@@ -27,7 +27,7 @@ Every agent working on this codebase must adhere strictly to the following lifec
 
 ### After Implementation:
 1. **Re-check current implementation** against the modified files using static analysis and compilation checks.
-2. **Update `docs/00-current-state.md`** if the project state, commit, or capabilities matrix changed.
+2. **Update `docs/00-current-state.md`** if the project state or capabilities matrix changed.
 3. **Update the relevant architectural / contract documents** (e.g., [docs/09-api-contract.md](docs/09-api-contract.md), [docs/06-websocket-contract.md](docs/06-websocket-contract.md)).
 4. **Do not claim physical verification.** Automated tests, mocks, or compilation success are **not** physical verification.
 5. **Provide a detailed manual verification procedure** in [docs/12-manual-verification.md](docs/12-manual-verification.md) for the human project owner.
@@ -55,6 +55,14 @@ Whenever documentation and code disagree:
 2. Document the current implementation honestly.
 3. Classify older behavior as historical/proposed/future when appropriate.
 4. Do not silently change code to make the documentation true.
+
+### Durable Commit Baseline Rule
+The documentation intentionally records the implementation commit against which the implementation state was audited (`468940881338054d0771cac4be633da698a89d0f`) and the documentation overhaul commit (`fb974c216f3f3150b6e90c7da7952e4490d31f57`). It does not attempt to track repository HEAD because documentation commits themselves change HEAD.
+
+### Development Environment Reality Rule
+ForgeLAB requires access to the host filesystem to snapshot local repositories. The documentation must maintain a clear distinction between:
+- **Environment A (Host-Run Backend):** The Go backend runs directly on the host (with PostgreSQL and Redis in Compose). This is required for local host repository deployments.
+- **Environment B (Current Dockerized Backend):** All services run via `docker compose up --build`. The backend container lacks arbitrary host directory mounts and frontend rewrite proxying to `localhost:8080` does not route to `backend` across containers without configuration reconciliation.
 
 ### Physical Verification Rule
 The project's authoritative validation methodology is:

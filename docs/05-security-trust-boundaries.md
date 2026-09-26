@@ -180,6 +180,9 @@ All user application containers created by ForgeLAB enforce these constraints:
 | **No Host Network** | ENFORCED | Binds container port to dynamic host port on `0.0.0.0` |
 | **No Docker Socket Mount** | ENFORCED | `/var/run/docker.sock` is **never** mounted in user containers |
 | **No Host Root Mounts** | ENFORCED | User containers mount no host volumes; files exist in image layer |
-| **Restart Policy** | ENFORCED | `RestartPolicy: unless-stopped` |
+| **Restart Policy (Docker Engine)** | ENFORCED | `RestartPolicy: unless-stopped` (Docker daemon restarts container on crash) |
+| **Continuous Self-Healing** | NOT IMPLEMENTED | Platform-level health polling, crash-loop detection, and auto-rollback deferred |
 | **Resource Quotas (CPU/RAM)** | DEFERRED | Future Docker `HostConfig.Resources` limit enforcement |
 | **Read-Only Root Filesystem** | DEFERRED | Future hardening option for stateless containers |
+
+> **Note on Self-Healing vs Docker Restart Policy:** User containers run with Docker's `unless-stopped` restart policy (`IMPLEMENTED`), allowing the Docker engine itself to restart crashed containers. However, ForgeLAB does **not** implement platform-level continuous health monitoring, crash diagnosis, crash-loop analysis, automated rollback, or re-promotion (`NOT IMPLEMENTED`). Docker's restart policy must not be confused with platform-level self-healing.
