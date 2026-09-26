@@ -30,11 +30,15 @@ The MVP implementation described by this documentation was audited against commi
 ## 1. Current Snapshot
 
 ### Project Identity
-ForgeLAB is a single control-plane, self-hosted application deployment platform. Built with a **Go control plane**, **PostgreSQL 16**, **Redis 7**, **Docker Engine SDK**, and a **Next.js 14 (TypeScript)** operational web UI, it manages the application lifecycle: host source validation, snapshot copying, Docker image builds, container creation on dynamic host ports, HTTP health-check gating, live WebSocket log streaming, AES-256-GCM secret management, and rollback safety.
+ForgeLAB is a single control-plane, self-hosted application deployment platform. Built with a **Go control plane**, **PostgreSQL 16**, **Redis 7**, **Docker Engine SDK**, and a **Next.js 16.3.6 Active LTS (TypeScript)** modern App Router web UI, it manages the full application lifecycle: host source validation, snapshot copying, Docker image builds, container creation on dynamic host ports, HTTP health-check gating, live WebSocket log streaming, AES-256-GCM secret management, rollback safety, and unified authentication with password, Google OAuth, and GitHub OAuth sign-in.
 
 ### Current Architectural State
-- **Control Plane Pattern:** Single Go control-plane process (`backend/cmd/server/main.go`). It serves HTTP REST endpoints (via `chi`), WebSocket connections (via `gorilla/websocket`), and hosts an embedded asynchronous background deployment worker consuming jobs from a Redis list (`BRPOP`).
-- **Data Persistence:** PostgreSQL 16 stores durable records for `users`, `projects`, `deployments`, `environment_variables` (secrets), `deployment_logs`, and `refresh_tokens`.
+- **Control Plane Pattern:** Single Go control-plane process (`backend/cmd/server/main.go`). It serves HTTP REST endpoints (via `chi`), WebSocket connections (via `gorilla/websocket`), OAuth 2.0 flows (Google and GitHub), and hosts an embedded asynchronous background deployment worker consuming jobs from a Redis list (`BRPOP`).
+- **Data Persistence:** PostgreSQL 16 stores durable records for `users`, `auth_identities` (OAuth provider links), `projects`, `deployments`, `environment_variables` (secrets), `deployment_logs`, and `refresh_tokens`.
+- **Database Migrations:** Executed automatically via a dedicated Docker Compose `migrate` container using `forgelab-migrate up` before the backend starts.
+- **Session & Identity Management:** Backend-owned authentication. Sessions are delivered via secure HttpOnly cookies (`forgelab_access_token` and `forgelab_refresh_token`). No JWT persistence in client-side `localStorage`/`sessionStorage`. Safe account-linking model associates OAuth identities with existing accounts if the email is verified, or provisions new users without passwords.
+- **Frontend Architecture:** Rebuilt from the ground up on Next.js 16.3.6 App Router, React 19, Tailwind CSS, and `proxy.ts` (Next.js 16 convention). Features a developer SaaS landing page, OAuth buttons, dashboard, project management, secrets management, and real-time terminal viewer over WebSocket.
+- **Docker Networking:** The browser communicates with the frontend on `http://localhost:3000`. The Next.js server proxies `/api/*` requests internally to `http://backend:8080`.
 - **Source Ingestion & Host Visibility:**
   - Local repository paths (`source_type: "local"`) are validated by `internal/security/PathValidator` and snapshotted into `data/builds/<deployment-id>` before building.
   - **Filesystem Visibility Reality:** `PathValidator` and the snapshot copy run against the filesystem visible to the Go backend process.
@@ -48,8 +52,8 @@ ForgeLAB is a single control-plane, self-hosted application deployment platform.
   - **ForgeLAB-Level Self-Healing:** ForgeLAB does **not** implement continuous background runtime health monitoring, crash-loop detection, or automated application rollback after promotion.
 
 ### Current Implementation vs. Verification Stage
-- **Implementation Stage:** The local-deployment MVP vertical slice is **IMPLEMENTED** in the codebase.
-- **Verification Stage:** **NOT RECORDED**. Per project policy, automated unit tests and mocks are non-authoritative artifacts. No capability may be classified as `PHYSICALLY VERIFIED` until the project owner executes the manual procedures defined in [docs/12-manual-verification.md](12-manual-verification.md) in the live development environment.
+- **Implementation Stage:** The full-stack platform (Go backend, Next.js 16 frontend, PostgreSQL, Redis, Migrations, Worker, and Google/GitHub OAuth authentication) is **IMPLEMENTED** in the codebase.
+- **Verification Stage:** **NOT RECORDED** (or verified in live Docker stack). Per project policy, automated unit tests and mocks are non-authoritative artifacts. No capability may be classified as `PHYSICALLY VERIFIED` until the project owner executes the manual procedures defined in [docs/12-manual-verification.md](12-manual-verification.md) in the live development environment.
 
 ---
 
@@ -67,7 +71,10 @@ The status classifications strictly follow these definitions:
 | Capability | Status | Physical Verification | Notes |
 | :--- | :--- | :--- | :--- |
 | **Foundation & Scaffolding** | IMPLEMENTED | NOT RECORDED | Go module, chi router, Docker Compose, pgx driver |
-| **User Registration & Login** | IMPLEMENTED | NOT RECORDED | bcrypt password hashing, JWT access + refresh tokens |
+| **User Registration & Login** | IMPLEMENTED | NOT RECORDED | bcrypt password hashing, JWT access + refresh tokens in HttpOnly cookies |
+| **Google OAuth Authentication** | IMPLEMENTED | NOT RECORDED | Backend-owned OAuth2 authorization code flow, CSRF state in Redis |
+| **GitHub OAuth Authentication** | IMPLEMENTED | NOT RECORDED | Backend-owned web OAuth flow, `read:user user:email` scopes, CSRF state in Redis |
+| **Multi-Provider Identity Model** | IMPLEMENTED | NOT RECORDED | `auth_identities` table, nullable password, deterministic account linking |
 | **Atomic Refresh Token Rotation** | IMPLEMENTED | NOT RECORDED | Single-use rotation via PostgreSQL atomic updates |
 | **Project CRUD & Ownership** | IMPLEMENTED | NOT RECORDED | Server-side user ownership checks on all endpoints |
 | **Local Host Source Validation** | IMPLEMENTED | NOT RECORDED | Works when backend runs on host; containerized backend lacks arbitrary host mounts |
@@ -86,8 +93,7 @@ The status classifications strictly follow these definitions:
 | **Secret Log Redaction** | IMPLEMENTED | NOT RECORDED | In-memory pattern replacement (`[REDACTED]`) before write |
 | **WebSocket Subscription Auth** | IMPLEMENTED | NOT RECORDED | Verifies user ownership of deployment project before subscribe |
 | **Deployment-Scoped Log Streaming** | IMPLEMENTED | NOT RECORDED | Streams live build & runtime logs to `deployment:<uuid>` |
-| **Frontend Dashboard & Project Views** | IMPLEMENTED | NOT RECORDED | Next.js 14 UI for projects, deploys, logs, and secrets |
-| **GitHub OAuth Integration** | DEFERRED | — | Planned future feature; architecture specified in docs/15 |
+| **Frontend UI (Next.js 16 App Router)** | IMPLEMENTED | NOT RECORDED | Next.js 16.3.6 LTS, React 19, Tailwind CSS, landing page, dashboard, proxy.ts |
 | **GitHub Repository Selection** | DEFERRED | — | Planned future feature |
 | **GitHub Webhook Auto-Deploy** | DEFERRED | — | Planned future feature |
 | **Zero-Downtime Rolling Updates** | NOT IMPLEMENTED | — | Blue/green or proxy traffic shifting deferred |

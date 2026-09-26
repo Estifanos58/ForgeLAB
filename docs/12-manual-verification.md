@@ -38,6 +38,10 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **User Registration** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `POST /api/auth/register` & bcrypt hash |
 | **User Login** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `POST /api/auth/login` & JWT issuing |
+| **Google OAuth Sign-In** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `/api/auth/google`, consent, callback, & session |
+| **GitHub OAuth Sign-In** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `/api/auth/github`, consent, callback, & session |
+| **OAuth Identity Account Linking** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests linking verified email to existing account |
+| **OAuth Placeholder Handling** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests 503 / friendly error when unconfigured |
 | **User Logout** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `POST /api/auth/logout` & cookie clearing |
 | **Token Refresh** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests atomic single-use rotation |
 | **Authentication Failure Behavior** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests invalid/expired tokens (HTTP 401) |
@@ -124,6 +128,53 @@ Verify user registration, login, authenticated requests, cookie/token handling, 
 #### What to Inspect if it Fails
 - Backend logs: `docker compose logs backend` (or host backend console output)
 - PostgreSQL `users` table: `docker compose exec postgres psql -U forgelab -c "SELECT id, email FROM users;"`
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### Procedure 1b: Multi-Provider OAuth Authentication (Google & GitHub)
+
+#### Purpose
+Verify Google and GitHub OAuth 2.0 authorization code flows, CSRF state protection in Redis, session cookie issuance, account creation/linking in `auth_identities`, and controlled error responses when placeholder credentials are used.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED` (Requires real external Google Cloud Console & GitHub OAuth App credentials for live provider consent).
+
+#### Prerequisites
+- Stack is running via `docker compose up --build`
+- Database migrations applied (`000003_add_auth_identities.up.sql`)
+- Browser open at `http://localhost:3000/login`
+
+#### Test Procedure (A: Unconfigured / Placeholder Credentials)
+1. On `http://localhost:3000/login`, inspect the "Continue with Google" and "Continue with GitHub" buttons.
+2. Click "Continue with Google" when `GOOGLE_CLIENT_ID` is empty or placeholder.
+3. Verify that the UI displays a clean, user-friendly error banner (`Google OAuth is not configured on the backend`) rather than crashing or throwing an unhandled exception.
+4. Click "Continue with GitHub" when `GITHUB_CLIENT_ID` is empty or placeholder.
+5. Verify that the UI displays a clean error banner (`GitHub OAuth is not configured on the backend`).
+
+#### Test Procedure (B: Configured Provider Flow — with real credentials)
+1. Configure valid `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URL=http://localhost:3000/api/auth/google/callback` in `.env`.
+2. Configure valid `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `GITHUB_REDIRECT_URL=http://localhost:3000/api/auth/github/callback` in `.env`.
+3. Restart backend container: `docker compose restart backend`.
+4. Click "Continue with Google". Verify redirection to Google's consent screen (`accounts.google.com`).
+5. Grant consent. Verify Google redirects back to `http://localhost:3000/api/auth/google/callback?code=...&state=...`.
+6. Verify backend sets `forgelab_access_token` and `forgelab_refresh_token` as HttpOnly cookies and redirects to `/dashboard`.
+7. Verify `/api/auth/me` responds with the authenticated user profile.
+8. Inspect PostgreSQL `auth_identities` table:
+   ```bash
+   docker compose exec postgres psql -U forgelab -c "SELECT * FROM auth_identities;"
+   ```
+   Verify `provider = 'google'`, `provider_subject` matches Google's sub ID, and `user_id` matches the user.
+9. Log out. Repeat the flow for "Continue with GitHub". Verify GitHub identity is created and linked.
 
 #### Verification Record
 - **Status:** NOT RECORDED

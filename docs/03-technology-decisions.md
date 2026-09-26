@@ -22,11 +22,12 @@
 | Backend / Control Plane | **Go** | Deliberate learning choice. Do NOT replace with NestJS/Spring Boot. |
 | API Style | **REST** | Standard, well-understood, CLI-friendly |
 | Realtime Communication | **WebSocket** | Live logs, deployment progress, status updates |
-| Database | **PostgreSQL** | Durable state for projects, deployments, users |
-| Queue / Background Work | **Redis** | Deployment work coordination, pub/sub for realtime |
+| Database | **PostgreSQL** | Durable state for projects, deployments, users, auth identities |
+| Queue / Background Work | **Redis** | Deployment work coordination, pub/sub for realtime, single-use OAuth state storage |
 | Application Runtime | **Docker** | Container build and execution environment |
+| Authentication Providers | **Email/Password, Google OAuth, GitHub OAuth** | Multi-provider auth with backend-owned session issuing (HttpOnly cookies) |
 | Reverse Proxy | **Caddy** | Future routing/HTTPS automation (not MVP) |
-| Frontend | **Next.js + TypeScript** | Dashboard and management UI |
+| Frontend | **Next.js 16.3.6 Active LTS + React 19 + TypeScript** | Modern App Router, proxy.ts conventions, Tailwind CSS, landing page and dashboard |
 | Observability | **OpenTelemetry** | Future metrics/tracing direction (not MVP) |
 
 ## Important Technology Constraints

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -33,9 +34,18 @@ func main() {
 
 	migrationsPath := "file://migrations"
 
-	m, err := migrate.New(migrationsPath, databaseURL)
+	var m *migrate.Migrate
+	var err error
+	for attempts := 1; attempts <= 15; attempts++ {
+		m, err = migrate.New(migrationsPath, databaseURL)
+		if err == nil {
+			break
+		}
+		log.Printf("Waiting for database to accept connections (attempt %d/15): %v", attempts, err)
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
-		log.Fatalf("Failed to create migrate instance: %v", err)
+		log.Fatalf("Failed to create migrate instance after retries: %v", err)
 	}
 	defer m.Close()
 

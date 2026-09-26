@@ -3,19 +3,35 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
 
 	"github.com/forgelab/backend/internal/services"
 )
 
 // AuthHandler handles authentication-related HTTP requests.
 type AuthHandler struct {
-	userService *services.UserService
+	userService  *services.UserService
+	oauthService *services.OAuthService
+	frontendURL  string
+	cookieSecure bool
 }
 
 // NewAuthHandler creates a new AuthHandler.
-func NewAuthHandler(userService *services.UserService) *AuthHandler {
-	return &AuthHandler{userService: userService}
+func NewAuthHandler(
+	userService *services.UserService,
+	oauthService *services.OAuthService,
+	frontendURL string,
+	cookieSecure bool,
+) *AuthHandler {
+	return &AuthHandler{
+		userService:  userService,
+		oauthService: oauthService,
+		frontendURL:  frontendURL,
+		cookieSecure: cookieSecure,
+	}
 }
 
 // Register handles POST /api/auth/register
@@ -50,7 +66,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setAuthCookies(w, tokens)
+	h.setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"user":   user,
 		"tokens": tokens,
@@ -80,7 +96,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setAuthCookies(w, tokens)
+	h.setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"user":   user,
 		"tokens": tokens,
@@ -110,7 +126,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, services.ErrTokenNotFound) ||
 			errors.Is(err, services.ErrTokenRevoked) ||
 			errors.Is(err, services.ErrTokenExpired) {
-			clearAuthCookies(w)
+			h.clearAuthCookies(w)
 			writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
 			return
 		}
@@ -118,7 +134,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setAuthCookies(w, tokens)
+	h.setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"tokens": tokens,
 	})
@@ -126,7 +142,23 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 // Logout handles POST /api/auth/logout
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
-	clearAuthCookies(w)
+	refreshToken := ""
+	if cookie, err := r.Cookie("forgelab_refresh_token"); err == nil && cookie.Value != "" {
+		refreshToken = cookie.Value
+	}
+	if refreshToken == "" {
+		var input struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&input)
+		refreshToken = input.RefreshToken
+	}
+
+	if refreshToken != "" {
+		_ = h.userService.RevokeRefreshToken(r.Context(), refreshToken)
+	}
+
+	h.clearAuthCookies(w)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out successfully"})
 }
 
@@ -147,12 +179,142 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, user)
 }
 
-func setAuthCookies(w http.ResponseWriter, tokens *services.AuthTokens) {
+// GoogleLogin handles GET /api/auth/google
+func (h *AuthHandler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
+	authURL, err := h.oauthService.GetGoogleAuthURL(r.Context())
+	if err != nil {
+		if errors.Is(err, services.ErrProviderNotConfigured) {
+			writeError(w, http.StatusBadRequest, "Google authentication is not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to initiate Google authentication")
+		return
+	}
+	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
+}
+
+// GoogleCallback handles GET /api/auth/google/callback
+func (h *AuthHandler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
+	errorParam := r.URL.Query().Get("error")
+	if errorParam != "" {
+		h.redirectWithError(w, r, "Google sign-in was canceled or encountered an error")
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+	if code == "" || state == "" {
+		h.redirectWithError(w, r, "Missing authorization code or state from Google")
+		return
+	}
+
+	userInfo, err := h.oauthService.HandleGoogleCallback(r.Context(), code, state)
+	if err != nil {
+		slog.Error("google oauth callback failed", "error", err)
+		if errors.Is(err, services.ErrInvalidOAuthState) {
+			h.redirectWithError(w, r, "OAuth session expired or CSRF state invalid. Please try again.")
+			return
+		}
+		if errors.Is(err, services.ErrProviderNotConfigured) {
+			h.redirectWithError(w, r, "Google authentication is not configured on the server")
+			return
+		}
+		h.redirectWithError(w, r, "Failed to authenticate with Google")
+		return
+	}
+
+	_, tokens, err := h.userService.FindOrCreateOAuthUser(
+		r.Context(),
+		userInfo.Provider,
+		userInfo.Subject,
+		userInfo.Email,
+		userInfo.DisplayName,
+		userInfo.EmailVerified,
+	)
+	if err != nil {
+		slog.Error("failed to find or create oauth user", "error", err)
+		h.redirectWithError(w, r, err.Error())
+		return
+	}
+
+	h.setAuthCookies(w, tokens)
+	http.Redirect(w, r, h.frontendURL+"/dashboard", http.StatusTemporaryRedirect)
+}
+
+// GitHubLogin handles GET /api/auth/github
+func (h *AuthHandler) GitHubLogin(w http.ResponseWriter, r *http.Request) {
+	authURL, err := h.oauthService.GetGitHubAuthURL(r.Context())
+	if err != nil {
+		if errors.Is(err, services.ErrProviderNotConfigured) {
+			writeError(w, http.StatusBadRequest, "GitHub authentication is not configured. Please set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to initiate GitHub authentication")
+		return
+	}
+	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
+}
+
+// GitHubCallback handles GET /api/auth/github/callback
+func (h *AuthHandler) GitHubCallback(w http.ResponseWriter, r *http.Request) {
+	errorParam := r.URL.Query().Get("error")
+	if errorParam != "" {
+		h.redirectWithError(w, r, "GitHub sign-in was canceled or encountered an error")
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+	if code == "" || state == "" {
+		h.redirectWithError(w, r, "Missing authorization code or state from GitHub")
+		return
+	}
+
+	userInfo, err := h.oauthService.HandleGitHubCallback(r.Context(), code, state)
+	if err != nil {
+		slog.Error("github oauth callback failed", "error", err)
+		if errors.Is(err, services.ErrInvalidOAuthState) {
+			h.redirectWithError(w, r, "OAuth session expired or CSRF state invalid. Please try again.")
+			return
+		}
+		if errors.Is(err, services.ErrProviderNotConfigured) {
+			h.redirectWithError(w, r, "GitHub authentication is not configured on the server")
+			return
+		}
+		h.redirectWithError(w, r, "Failed to authenticate with GitHub")
+		return
+	}
+
+	_, tokens, err := h.userService.FindOrCreateOAuthUser(
+		r.Context(),
+		userInfo.Provider,
+		userInfo.Subject,
+		userInfo.Email,
+		userInfo.DisplayName,
+		userInfo.EmailVerified,
+	)
+	if err != nil {
+		slog.Error("failed to find or create oauth user", "error", err)
+		h.redirectWithError(w, r, err.Error())
+		return
+	}
+
+	h.setAuthCookies(w, tokens)
+	http.Redirect(w, r, h.frontendURL+"/dashboard", http.StatusTemporaryRedirect)
+}
+
+func (h *AuthHandler) redirectWithError(w http.ResponseWriter, r *http.Request, errMsg string) {
+	loginURL := fmt.Sprintf("%s/login?error=%s", h.frontendURL, url.QueryEscape(errMsg))
+	http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
+}
+
+func (h *AuthHandler) setAuthCookies(w http.ResponseWriter, tokens *services.AuthTokens) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "forgelab_access_token",
 		Value:    tokens.AccessToken,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   h.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   15 * 60,
 	})
@@ -161,17 +323,20 @@ func setAuthCookies(w http.ResponseWriter, tokens *services.AuthTokens) {
 		Value:    tokens.RefreshToken,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   h.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   7 * 24 * 3600,
 	})
 }
 
-func clearAuthCookies(w http.ResponseWriter) {
+func (h *AuthHandler) clearAuthCookies(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "forgelab_access_token",
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 	http.SetCookie(w, &http.Cookie{
@@ -179,6 +344,8 @@ func clearAuthCookies(w http.ResponseWriter) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 }

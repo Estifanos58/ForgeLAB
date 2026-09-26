@@ -173,7 +173,7 @@ Common status codes:
 ---
 
 ### `POST /api/auth/logout`
-- **Authentication:** None
+- **Authentication:** None (Optional session cookies)
 - **Success Response:** `200 OK`
   ```json
   {
@@ -181,12 +181,80 @@ Common status codes:
   }
   ```
 - **Side Effects:**
+  - Revokes active refresh token in PostgreSQL database if refresh cookie or header is present.
   - Clears `forgelab_access_token` and `forgelab_refresh_token` cookies (`MaxAge: -1`).
 
 ---
 
+### `GET /api/auth/google`
+- **Authentication:** None (Public)
+- **Authorization:** None
+- **Purpose:** Initiates the server-side Google OAuth 2.0 authorization code flow.
+- **Workflow:**
+  - Verifies that Google OAuth credentials (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`) are configured.
+  - Generates a cryptographically random 32-byte hexadecimal `state` parameter.
+  - Persists `oauth:state:<state>` in Redis with 10-minute TTL.
+  - Redirects browser (`302 Found`) to Google's OAuth 2.0 authorization endpoint (`https://accounts.google.com/o/oauth2/v2/auth`) with scopes `openid email profile`.
+- **Error Responses:**
+  - `503 Service Unavailable`: Google OAuth is not configured on the backend.
+
+---
+
+### `GET /api/auth/google/callback`
+- **Authentication:** None (Google callback with query parameters)
+- **Query Parameters:**
+  - `code`: Authorization code from Google.
+  - `state`: Cryptographic state parameter previously generated.
+- **Workflow:**
+  - Validates `state` against Redis (single-use delete-on-read prevents replay attacks).
+  - Exchanges authorization code with Google for tokens via back-channel HTTP POST.
+  - Fetches user profile from Google's OpenID `userinfo` endpoint.
+  - Identifies user via Google subject ID (`sub`).
+  - Finds or creates user record in `users` and records identity link in `auth_identities`.
+  - Issues ForgeLAB JWT access and refresh tokens.
+  - Sets secure HttpOnly cookies (`forgelab_access_token`, `forgelab_refresh_token`).
+  - Redirects browser (`302 Found`) to `${FRONTEND_URL}/dashboard`.
+- **Error Responses:**
+  - Redirects to `${FRONTEND_URL}/login?error=<message>` on validation, exchange, or CSRF state failure.
+
+---
+
+### `GET /api/auth/github`
+- **Authentication:** None (Public)
+- **Authorization:** None
+- **Purpose:** Initiates the server-side GitHub web application OAuth flow.
+- **Workflow:**
+  - Verifies that GitHub OAuth credentials (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`) are configured.
+  - Generates a cryptographically random 32-byte hexadecimal `state` parameter.
+  - Persists `oauth:state:<state>` in Redis with 10-minute TTL.
+  - Redirects browser (`302 Found`) to GitHub's authorization endpoint (`https://github.com/login/oauth/authorize`) with scopes `read:user user:email`. Note: Does NOT request repository access.
+- **Error Responses:**
+  - `503 Service Unavailable`: GitHub OAuth is not configured on the backend.
+
+---
+
+### `GET /api/auth/github/callback`
+- **Authentication:** None (GitHub callback with query parameters)
+- **Query Parameters:**
+  - `code`: Authorization code from GitHub.
+  - `state`: Cryptographic state parameter previously generated.
+- **Workflow:**
+  - Validates `state` against Redis (single-use delete-on-read prevents replay attacks).
+  - Exchanges authorization code with GitHub for access token via back-channel HTTP POST.
+  - Fetches GitHub profile from `https://api.github.com/user`.
+  - If primary email is private, fetches verified emails from `https://api.github.com/user/emails`.
+  - Identifies user via GitHub account ID (`id`).
+  - Finds or creates user record in `users` and records identity link in `auth_identities`.
+  - Issues ForgeLAB JWT access and refresh tokens.
+  - Sets secure HttpOnly cookies (`forgelab_access_token`, `forgelab_refresh_token`).
+  - Redirects browser (`302 Found`) to `${FRONTEND_URL}/dashboard`.
+- **Error Responses:**
+  - Redirects to `${FRONTEND_URL}/login?error=<message>` on validation, exchange, or CSRF state failure.
+
+---
+
 ### `GET /api/auth/me`
-- **Authentication:** Required (Bearer JWT)
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
 - **Success Response:** `200 OK`
   ```json
   {

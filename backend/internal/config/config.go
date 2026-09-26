@@ -16,6 +16,36 @@ type Config struct {
 	Encryption EncryptionConfig
 	Docker     DockerConfig
 	Log        LogConfig
+	App        AppConfig
+	Google     OAuthConfig
+	GitHub     OAuthConfig
+}
+
+// AppConfig holds application, CORS, and cookie settings.
+type AppConfig struct {
+	FrontendURL        string
+	CORSAllowedOrigins string
+	CookieSecure       bool
+}
+
+// OAuthConfig holds OAuth provider settings.
+type OAuthConfig struct {
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+}
+
+// IsConfigured returns true if the OAuth provider has non-placeholder credentials.
+func (o OAuthConfig) IsConfigured() bool {
+	if o.ClientID == "" || o.ClientSecret == "" {
+		return false
+	}
+	// Check for example/placeholder values
+	if o.ClientID == "example-google-client-id" || o.ClientID == "example-github-client-id" ||
+		o.ClientSecret == "example-google-client-secret" || o.ClientSecret == "example-github-client-secret" {
+		return false
+	}
+	return true
 }
 
 // ServerConfig holds HTTP server settings.
@@ -108,6 +138,21 @@ func Load() (*Config, error) {
 		Log: LogConfig{
 			Level:  getEnv("LOG_LEVEL", "debug"),
 			Format: getEnv("LOG_FORMAT", "text"),
+		},
+		App: AppConfig{
+			FrontendURL:        getEnv("FRONTEND_URL", "http://localhost:3000"),
+			CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
+			CookieSecure:       getEnv("COOKIE_SECURE", "false") == "true",
+		},
+		Google: OAuthConfig{
+			ClientID:     getEnv("GOOGLE_CLIENT_ID", ""),
+			ClientSecret: getEnv("GOOGLE_CLIENT_SECRET", ""),
+			RedirectURL:  getEnv("GOOGLE_REDIRECT_URL", "http://localhost:3000/api/auth/google/callback"),
+		},
+		GitHub: OAuthConfig{
+			ClientID:     getEnv("GITHUB_CLIENT_ID", ""),
+			ClientSecret: getEnv("GITHUB_CLIENT_SECRET", ""),
+			RedirectURL:  getEnv("GITHUB_REDIRECT_URL", "http://localhost:3000/api/auth/github/callback"),
 		},
 	}
 

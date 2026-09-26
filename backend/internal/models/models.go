@@ -11,10 +11,22 @@ import (
 type User struct {
 	ID           uuid.UUID `json:"id"`
 	Email        string    `json:"email"`
-	PasswordHash string    `json:"-"` // Never serialized to JSON
+	PasswordHash *string   `json:"-"` // Nullable for OAuth accounts; never serialized to JSON
 	DisplayName  string    `json:"display_name"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// AuthIdentity represents an external OAuth identity (Google, GitHub) linked to a user.
+type AuthIdentity struct {
+	ID              uuid.UUID `json:"id"`
+	UserID          uuid.UUID `json:"user_id"`
+	Provider        string    `json:"provider"`
+	ProviderSubject string    `json:"provider_subject"`
+	ProviderEmail   string    `json:"provider_email"`
+	EmailVerified   bool      `json:"email_verified"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Project represents a registered project in ForgeLab.

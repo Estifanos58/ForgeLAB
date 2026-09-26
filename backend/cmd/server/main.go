@@ -139,7 +139,8 @@ func main() {
 	}
 
 	// Initialize handlers
-	authHandler := handlers.NewAuthHandler(userService)
+	oauthService := services.NewOAuthService(cfg.Google, cfg.GitHub, redisClient)
+	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
 	envHandler := handlers.NewEnvHandler(secretService)
 
@@ -150,7 +151,7 @@ func main() {
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(middleware.RequestLogger)
-	r.Use(middleware.CORS)
+	r.Use(middleware.CORS(cfg.App.CORSAllowedOrigins))
 	r.Use(chimiddleware.Recoverer)
 
 	// Health check (unauthenticated)
@@ -172,6 +173,12 @@ func main() {
 			r.Post("/login", authHandler.Login)
 			r.Post("/refresh", authHandler.Refresh)
 			r.Post("/logout", authHandler.Logout)
+
+			// OAuth routes (public)
+			r.Get("/google", authHandler.GoogleLogin)
+			r.Get("/google/callback", authHandler.GoogleCallback)
+			r.Get("/github", authHandler.GitHubLogin)
+			r.Get("/github/callback", authHandler.GitHubCallback)
 
 			// Protected auth routes
 			r.Group(func(r chi.Router) {

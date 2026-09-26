@@ -29,6 +29,7 @@
 | **DEC-007** | Deployment Safety Invariant (Failed Releases Never Terminate Running Releases) | **ACTIVE** | 2026-09-25 |
 | **DEC-008** | GitHub Import via Explicit OAuth and Repository Selection | **ACTIVE** | 2026-09-25 |
 | **DEC-009** | Physical Manual Verification as Authoritative Validation Methodology | **ACTIVE** | 2026-09-26 |
+| **DEC-010** | Multi-Provider OAuth Authentication with Deferred Repository Integration | **ACTIVE** | 2026-09-26 |
 
 ---
 
@@ -151,3 +152,18 @@
   2. Eliminates false confidence where "all unit tests pass" but the application fails to deploy a container in reality.
 - **Current Implementation:** [docs/12-manual-verification.md](12-manual-verification.md).
 - **Rule for Future Agents:** Agents must not claim a feature is physically verified based on compilation, automated test passes, or static analysis.
+
+---
+
+## DEC-010: Multi-Provider OAuth Authentication with Deferred Repository Integration
+
+- **Date:** 2026-09-26
+- **Status:** **ACTIVE**
+- **Decision:** Introduce Google OAuth 2.0 and GitHub OAuth as first-class authentication providers for ForgeLAB accounts, while strictly keeping GitHub repository importing, repository browsing, webhooks, and automated deployments deferred.
+- **Reason:**
+  1. **Developer Experience:** Modern developer tools require frictionless sign-in with existing identity providers (Google and GitHub) without forcing password management.
+  2. **Security & Boundary Separation:** Decouples user authentication (verifying identity via standard OpenID Connect / OAuth user profile and verified email) from repository access (which requires high-privilege `repo` scopes, token persistence, webhook management, and clone isolation).
+  3. **Backend-Owned Session Authority:** Sessions are issued and maintained by the Go backend via secure HttpOnly cookies (`forgelab_access_token`, `forgelab_refresh_token`). No JWT persistence in client-side `localStorage`.
+  4. **Dedicated Identity Model:** Introduces the `auth_identities` table with nullable `users.password_hash` to support deterministic account linking by verified email and provider subject without fragile email-only matching.
+- **Current Implementation:** `backend/internal/services/oauth_service.go`, `backend/internal/services/user_service.go`, `backend/internal/handlers/auth_handler.go`, `backend/migrations/000003_add_auth_identities.up.sql`, `frontend/src/components/auth/oauth-buttons.tsx`.
+- **Rule for Future Agents:** Do not conflate GitHub sign-in with GitHub repository import. Keep repository importing and webhook synchronization behind explicit future design milestones as specified in DEC-008.

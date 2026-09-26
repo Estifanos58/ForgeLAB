@@ -1,7 +1,7 @@
 # Multi-stage Dockerfile for ForgeLab Go Backend Control Plane
 
 # Build stage
-FROM golang:1.24-alpine AS builder
+FROM golang:alpine AS builder
 
 WORKDIR /app
 

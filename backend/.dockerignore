@@ -1,0 +1,8 @@
+.git
+data/
+scratch/
+*.exe
+forgelab-server
+forgelab-migrate
+.env
+.env.local

@@ -1,8 +1,8 @@
 # ForgeLAB — GitHub Integration Architecture
 
-**Status:** FUTURE FEATURE — ARCHITECTURE DECIDED, IMPLEMENTATION NOT STARTED  
-**Priority:** Post-MVP Phase  
-**MVP Reality Check:** **Not implemented in current MVP codebase.** The current MVP strictly uses local host filesystem paths (`source_type: "local"`).  
+**Status:** AUTHENTICATION IMPLEMENTED; REPOSITORY IMPORT & WEBHOOKS DEFERRED  
+**Authentication Milestone:** GitHub OAuth 2.0 Web Flow is implemented strictly as a sign-in identity provider (`read:user user:email`).  
+**Repository Import Milestone:** Post-MVP Phase (Deferred). Source ingestion currently uses local filesystem paths (`source_type: "local"`).  
 
 ---
 
@@ -12,7 +12,25 @@
 - [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
 - [docs/02-functional-requirements.md](02-functional-requirements.md) — R4 GitHub import requirements
 - [docs/05-security-trust-boundaries.md](05-security-trust-boundaries.md) — Token encryption & untrusted source code trust model
-- [docs/13-decisions.md](13-decisions.md) — DEC-008: Explicit OAuth + repository selection model
+- [docs/09-api-contract.md](09-api-contract.md) — GitHub OAuth authentication endpoints (`/api/auth/github`)
+- [docs/13-decisions.md](13-decisions.md) — DEC-008 (Repository Selection) & DEC-010 (OAuth Authentication)
+
+---
+
+## 0. Current Implementation Distinction: Authentication vs. Repository Ingestion
+
+A critical architectural distinction must be maintained:
+
+1. **GitHub as an Authentication Provider (IMPLEMENTED):**
+   - Implemented via `/api/auth/github` and `/api/auth/github/callback`.
+   - Requests minimal identity scopes: `read:user user:email`.
+   - Stores user identity in the `auth_identities` table.
+   - Does **not** request or store repository access tokens (`repo` scope).
+   - Authoritative ForgeLAB session is issued via HttpOnly cookies.
+
+2. **GitHub Repository Importing & Webhooks (DEFERRED):**
+   - Importing repositories from GitHub, browsing repository trees, configuring push webhooks, and triggering automated deployments from commits remain intentionally deferred.
+   - The sections below document the future architecture for repository ingestion.
 
 ---
 

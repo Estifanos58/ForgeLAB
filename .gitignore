@@ -21,6 +21,7 @@ Thumbs.db
 # Next.js
 frontend/.next/
 frontend/out/
+*.tsbuildinfo
 
 # Go
 backend/tmp/

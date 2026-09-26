@@ -83,7 +83,7 @@ func (s *UserService) Register(ctx context.Context, input RegisterInput) (*model
 	user := &models.User{
 		ID:           uuid.New(),
 		Email:        input.Email,
-		PasswordHash: passwordHash,
+		PasswordHash: &passwordHash,
 		DisplayName:  input.DisplayName,
 		CreatedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
@@ -112,11 +112,12 @@ func (s *UserService) Register(ctx context.Context, input RegisterInput) (*model
 func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User, *AuthTokens, error) {
 	// Find user by email
 	user := &models.User{}
+	var passwordHash *string
 	err := s.db.QueryRow(ctx,
 		`SELECT id, email, password_hash, display_name, created_at, updated_at
 		 FROM users WHERE email = $1`,
 		input.Email,
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.DisplayName, &user.CreatedAt, &user.UpdatedAt)
+	).Scan(&user.ID, &user.Email, &passwordHash, &user.DisplayName, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, ErrInvalidPassword
@@ -124,10 +125,15 @@ func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User
 		return nil, nil, fmt.Errorf("failed to find user: %w", err)
 	}
 
-	// Verify password
-	if err := auth.CheckPassword(input.Password, user.PasswordHash); err != nil {
+	if passwordHash == nil || *passwordHash == "" {
 		return nil, nil, ErrInvalidPassword
 	}
+
+	// Verify password
+	if err := auth.CheckPassword(input.Password, *passwordHash); err != nil {
+		return nil, nil, ErrInvalidPassword
+	}
+	user.PasswordHash = passwordHash
 
 	// Generate tokens
 	tokens, err := s.generateTokens(ctx, user)
@@ -242,4 +248,143 @@ func (s *UserService) generateTokens(ctx context.Context, user *models.User) (*A
 		RefreshToken: refreshToken,
 		ExpiresIn:    int(s.jwtManager.RefreshTokenExpiry().Seconds()),
 	}, nil
+}
+
+// RevokeRefreshToken revokes a refresh token in the database.
+func (s *UserService) RevokeRefreshToken(ctx context.Context, refreshToken string) error {
+	if refreshToken == "" {
+		return nil
+	}
+	tokenHash := auth.HashToken(refreshToken)
+	_, err := s.db.Exec(ctx, "UPDATE refresh_tokens SET revoked = true WHERE token_hash = $1", tokenHash)
+	return err
+}
+
+// FindOrCreateOAuthUser identifies or creates a ForgeLab user from an external OAuth identity.
+// Safe account linking rules:
+// 1. Existing provider identity (provider, subject) -> return linked user
+// 2. New provider identity + verified matching email -> safely associate with existing user
+// 3. Otherwise -> create new ForgeLab user (with nullable password_hash) and link identity
+// 4. Never silently merge accounts on unverified email
+func (s *UserService) FindOrCreateOAuthUser(
+	ctx context.Context,
+	provider string,
+	subject string,
+	email string,
+	displayName string,
+	emailVerified bool,
+) (*models.User, *AuthTokens, error) {
+	// 1. Check if external identity already exists
+	var userID uuid.UUID
+	err := s.db.QueryRow(ctx,
+		`SELECT user_id FROM auth_identities WHERE provider = $1 AND provider_subject = $2`,
+		provider, subject,
+	).Scan(&userID)
+
+	if err == nil {
+		// Identity exists! Fetch the user
+		user, err := s.GetUserByID(ctx, userID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load user for existing identity: %w", err)
+		}
+		// Update auth_identities updated_at and provider_email if changed
+		_, _ = s.db.Exec(ctx,
+			`UPDATE auth_identities SET provider_email = $1, email_verified = $2, updated_at = NOW()
+			 WHERE provider = $3 AND provider_subject = $4`,
+			email, emailVerified, provider, subject,
+		)
+		tokens, err := s.generateTokens(ctx, user)
+		if err != nil {
+			return nil, nil, err
+		}
+		return user, tokens, nil
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, fmt.Errorf("failed to query auth_identities: %w", err)
+	}
+
+	// 2. Identity does NOT exist yet. Check safe account linking rules:
+	// If provider email is verified and non-empty, check if a ForgeLAB user with matching email exists.
+	if email != "" && emailVerified {
+		var existingUser models.User
+		var pwdHash *string
+		err = s.db.QueryRow(ctx,
+			`SELECT id, email, password_hash, display_name, created_at, updated_at
+			 FROM users WHERE email = $1`,
+			email,
+		).Scan(&existingUser.ID, &existingUser.Email, &pwdHash, &existingUser.DisplayName, &existingUser.CreatedAt, &existingUser.UpdatedAt)
+
+		if err == nil {
+			existingUser.PasswordHash = pwdHash
+			// Safely associate with existing user
+			_, err = s.db.Exec(ctx,
+				`INSERT INTO auth_identities (id, user_id, provider, provider_subject, provider_email, email_verified, created_at, updated_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())`,
+				uuid.New(), existingUser.ID, provider, subject, email, emailVerified,
+			)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to link identity to existing account: %w", err)
+			}
+
+			tokens, err := s.generateTokens(ctx, &existingUser)
+			if err != nil {
+				return nil, nil, err
+			}
+			slog.Info("linked oauth identity to existing user", "user_id", existingUser.ID, "provider", provider, "email", email)
+			return &existingUser, tokens, nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, fmt.Errorf("failed to query user by email: %w", err)
+		}
+	} else if email != "" && !emailVerified {
+		// Never silently merge on unverified email!
+		var count int
+		_ = s.db.QueryRow(ctx, "SELECT count(1) FROM users WHERE email = $1", email).Scan(&count)
+		if count > 0 {
+			return nil, nil, errors.New("cannot link account: OAuth provider email is unverified and matches existing account")
+		}
+	}
+
+	// 3. Create a new ForgeLAB user and link identity
+	newUser := &models.User{
+		ID:          uuid.New(),
+		Email:       email,
+		DisplayName: displayName,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO users (id, email, password_hash, display_name, created_at, updated_at)
+		 VALUES ($1, $2, NULL, $3, $4, $5)`,
+		newUser.ID, newUser.Email, newUser.DisplayName, newUser.CreatedAt, newUser.UpdatedAt,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to insert new user: %w", err)
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO auth_identities (id, user_id, provider, provider_subject, provider_email, email_verified, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())`,
+		uuid.New(), newUser.ID, provider, subject, email, emailVerified,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to insert auth_identity: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("failed to commit user creation: %w", err)
+	}
+
+	tokens, err := s.generateTokens(ctx, newUser)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	slog.Info("created new user via oauth", "user_id", newUser.ID, "provider", provider, "email", email)
+	return newUser, tokens, nil
 }
