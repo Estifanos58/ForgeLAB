@@ -45,16 +45,21 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **User Logout** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `POST /api/auth/logout` & cookie clearing |
 | **Token Refresh** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests atomic single-use rotation |
 | **Authentication Failure Behavior** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests invalid/expired tokens (HTTP 401) |
-| **Project Creation** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `POST /api/projects` & slug generation |
-| **Project Listing** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `GET /api/projects` user-scoped list |
-| **Project Ownership Enforcement** | IMPLEMENTED | NOT RECORDED | — | — | — | — | User B cannot view User A's project (HTTP 403/404) |
-| **Invalid Project Access** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests non-existent UUIDs and unauthorized access |
+| **Project Creation & Ownership** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `POST /api/projects` user-scoped ownership |
+| **Local Source Folder/Zip Upload** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests directory & archive upload to isolated workspace |
+| **Zip Slip & Traversal Guard**| IMPLEMENTED | NOT RECORDED | — | — | — | — | Rejects archive path traversal & symlink escapes |
+| **GitHub Repository Connect** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests dedicated `repo` scope OAuth flow & AES encryption |
+| **GitHub Repository Picker** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests scoped repository & branch listing API |
+| **Heuristic Runtime Detection**| IMPLEMENTED | NOT RECORDED | — | — | — | — | Inspects package.json, python, go, dockerfile |
+| **Automatic Build Strategy** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Builds non-Dockerfile apps via multi-stage generator |
+| **Dynamic Internal Port Mapping**| IMPLEMENTED | NOT RECORDED | — | — | — | — | Maps container internal port (3000, 8000) to host port |
+| **Readiness Strategies** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests HTTP, TCP, and None readiness check gating |
 | **Local Source Path Validation** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Rejects system dirs & paths outside allowed roots |
 | **Local Source Snapshotting** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Copies source to `data/builds/<id>` before build |
 | **Redis Deployment Queue** | IMPLEMENTED | NOT RECORDED | — | — | — | — | `LPUSH` enqueue and worker `BRPOP` dequeue |
 | **Docker Image Build** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Builds image from tar stream via Docker SDK |
 | **Deployment State Transitions** | IMPLEMENTED | NOT RECORDED | — | — | — | — | `QUEUED`→`CLONING`→`BUILDING`→`STARTING`→`HEALTH` |
-| **Health-Check Deployment Gate** | IMPLEMENTED | NOT RECORDED | — | — | — | — | 10 attempts HTTP polling before promotion |
+| **Health-Check Deployment Gate** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Polling gate before promotion supporting HTTP, TCP, and None |
 | **Live Build Log Streaming** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Docker build output streams to WebSocket |
 | **Live Runtime Log Streaming** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Container runtime logs stream to WebSocket |
 | **Application Stop** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Stops running container (`POST /stop`) |
@@ -185,10 +190,10 @@ Verify Google and GitHub OAuth 2.0 authorization code flows, CSRF state protecti
 
 ---
 
-### Procedure 2: Project Creation & Ownership Enforcement
+### Procedure 2: Project Creation & Multi-Source Import (Local Computer & GitHub)
 
 #### Purpose
-Verify that projects can be created, configured, listed, and that cross-user access is strictly prevented.
+Verify that users can import projects from both their local computer (direct file/archive upload) and authorized GitHub repositories, verify source isolation and security safeguards, verify heuristic runtime detection, and verify server-side ownership isolation.
 
 #### Implementation Status
 `IMPLEMENTED`
@@ -197,35 +202,69 @@ Verify that projects can be created, configured, listed, and that cross-user acc
 `NOT RECORDED`
 
 #### Prerequisites
-- **Execution Environment:** Run the Go backend on the host (**Environment A**) for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount.
-- User 1 registered (`user1@example.com`)
-- User 2 registered (`user2@example.com`) in an Incognito window
+- Live ForgeLAB stack running via Docker Compose (`docker compose up --build`).
+- User 1 registered (`user1@example.com`).
+- User 2 registered (`user2@example.com`) in an Incognito window.
+- GitHub OAuth application configured in backend environment with `repo,read:user` redirect URL.
 
-#### Test Procedure
+#### Test Procedure — Part A: Local Computer Source Upload
 1. As User 1 on `http://localhost:3000/dashboard`, click "+ Create Project".
-2. Fill in project form:
-   - Name: `Demo Web Service`
-   - Repository Path: valid local directory path containing a Dockerfile
-   - Branch: `main`
-   - Dockerfile: `Dockerfile`
-   - Build Context: `.`
-   - Health Check: `/health`
-3. Click "Create Project". Verify redirection to `/projects/<project-id>`.
-4. Copy the project UUID from the URL (`/projects/<uuid>`).
-5. As User 2 (in Incognito window), log in and verify `Demo Web Service` is **not** visible on User 2's dashboard.
-6. In User 2's browser, manually paste the URL `/projects/<user-1-project-uuid>`.
-7. Inspect the network response for `GET /api/projects/<user-1-project-uuid>`.
+2. Select the **"Import from Computer"** tab.
+3. Click **"Choose Directory"** and select a local project directory on your machine (e.g. a Node.js or Python app), or click **"Upload .zip / .tar.gz"** and select a compressed project archive.
+4. Observe upload progress:
+   - Files stream to `/api/sources/upload` and are unpacked into an isolated workspace directory (`data/sources/<source_id>`).
+   - Directories such as `node_modules`, `.git`, and `.next` are automatically excluded.
+   - Heuristic detection inspects the source and automatically advances to Step 2 ("Configure Application").
+5. Verify detected values:
+   - Detection badge shows detected framework (e.g. "Nextjs (Nodejs)" or "Fastapi (Python)").
+   - Internal Application Port is pre-filled with the framework default (e.g. 3000, 8000, or 8080).
+   - Build strategy defaults to "Automatic" (or "Dockerfile" if a Dockerfile was present).
+6. Provide a Project Name (e.g. `local-demo-app`) and click **"Create & Deploy Project"**.
+7. Verify redirection to `/projects/<project-id>`.
+
+#### Test Procedure — Part B: Zip Slip / Path Traversal Guard Verification
+1. Prepare a test zip archive containing an entry with relative traversal (e.g. `../../etc/evil.txt`).
+2. Make a direct API upload request:
+   ```bash
+   curl -i -X POST http://localhost:8080/api/sources/upload \
+     -H "Authorization: Bearer <user1-token>" \
+     -F "archive=@traversal-test.zip"
+   ```
+3. Verify response status: `422 Unprocessable Entity` or `400 Bad Request` with message `path traversal detected in source archive`.
+4. Inspect `data/sources/` on the server to verify the directory was purged immediately.
+
+#### Test Procedure — Part C: GitHub Repository Authorization & Import
+1. In ForgeLAB, click "+ Create Project" and select the **"Import from GitHub"** tab.
+2. If GitHub repository permissions have not yet been granted:
+   - Verify an informative banner explains repository permission requirements.
+   - Verify there is NO text box asking the user to paste an unauthenticated git URL.
+   - Click **"Authorize GitHub Repositories"**.
+3. Verify redirection to GitHub's authorization consent screen requesting `repo,read:user` permissions.
+4. Grant authorization. Verify GitHub redirects back to ForgeLAB (`/dashboard?github_connected=true`).
+5. Open "+ Create Project" → "Import from GitHub":
+   - Verify status shows `Connected as @<username>` with a green indicator.
+   - Verify searchable repository picker appears listing your public and private repositories.
+6. Type in the search box to filter repositories. Click on a target repository.
+7. Verify branch selector populates with branches from GitHub (defaulting to default branch).
+8. Click **"Analyze & Configure"**:
+   - Backend calls `/api/integrations/github/repositories/:owner/:repo/detect`.
+   - Advances to Step 2 with detected runtime, port, and commands populated.
+9. Click **"Create & Deploy Project"**.
+10. Verify project is created in PostgreSQL with `source_type: "github"` and `source_reference: "<owner>/<repo>"`.
+
+#### Test Procedure — Part D: Cross-User Ownership Isolation
+1. Copy the project UUID created by User 1.
+2. In User 2's Incognito browser, log in and verify User 1's project is not shown on the dashboard.
+3. Attempt to fetch User 1's project: `GET /api/projects/<user-1-project-uuid>`.
+4. Verify response is `403 Forbidden` or `404 Not Found`.
+5. In User 2's session, query `GET /api/integrations/github/repositories`.
+6. Verify User 2 does NOT see User 1's GitHub repositories or credentials.
 
 #### Expected Result
-- User 1 successfully creates and views project details.
-- User 2 cannot see User 1's project on dashboard.
-- User 2's request to `/api/projects/<user-1-project-uuid>` receives `404 Not Found` or `403 Forbidden`.
-
-#### Failure Conditions
-- User 2 can view or modify User 1's project configuration or deployments.
-
-#### What to Inspect if it Fails
-- Project service query in `backend/internal/services/project_service.go` (`GetProject` must filter by `owner_id`).
+- Local computer uploads extract cleanly to isolated workspaces without host-path dependencies.
+- Path traversal and Zip Slip attacks are blocked.
+- GitHub integration allows seamless repo/branch selection without manual URL pasting.
+- User data and repository grants remain strictly isolated per user.
 
 #### Verification Record
 - **Status:** NOT RECORDED
@@ -236,10 +275,10 @@ Verify that projects can be created, configured, listed, and that cross-user acc
 
 ---
 
-### Procedure 3: Local Deployment & Lifecycle (The Happy Path)
+### Procedure 3: Dockerfile Application Deployment
 
 #### Purpose
-Verify the complete vertical slice: host path validation, snapshot copy, Docker build, dynamic port allocation, health checking, WebSocket log streaming, and container execution.
+Verify deployment of a project containing a Dockerfile, verifying image build, container creation, dynamic host port binding, health checking, WebSocket streaming, and promotion.
 
 #### Implementation Status
 `IMPLEMENTED`
@@ -247,52 +286,99 @@ Verify the complete vertical slice: host path validation, snapshot copy, Docker 
 #### Physical Verification Status
 `NOT RECORDED`
 
-#### Prerequisites
-- **Execution Environment:** Run the Go backend on the host (**Environment A** per [docs/11-development-environment.md](11-development-environment.md)) for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount. (The containerized backend cannot access host paths like `C:\dev\testapp` without a custom mount).
-- Prepare a minimal test application on the host machine (e.g. `C:\dev\testapp` or `/tmp/testapp`):
-  - `Dockerfile`:
-    ```dockerfile
-    FROM alpine:latest
-    RUN apk add --no-cache python3
-    WORKDIR /app
-    RUN echo 'import http.server, socketserver; handler = http.server.SimpleHTTPRequestHandler; socketserver.TCPServer(("", 8080), handler).serve_forever()' > server.py
-    RUN echo '{"status":"ok"}' > health
-    CMD ["python3", "-m", "http.server", "8080"]
-    ```
-- Project created in ForgeLAB with repository path pointing to the test application.
-
 #### Test Procedure
-1. Navigate to `/projects/<id>` in ForgeLAB.
-2. Click "🚀 Deploy Release".
-3. Observe the UI:
-   - Status badge transitions: `deploying` (`queued` → `cloning` → `building` → `starting` → `health_checking` → `running`).
-   - Live Terminal header displays "WebSocket Live" (green indicator).
-   - Build logs stream line-by-line into the terminal window.
-   - Health check logs appear showing attempts and HTTP 200 pass.
-4. Verify project status updates to `running`.
-5. Locate the "Live Port" card in the Configuration panel (e.g. `http://localhost:10001`).
-6. Click the link or open a browser tab to `http://localhost:<port>/health`.
-7. Verify the response is returned from the deployed container.
-8. In ForgeLAB, test lifecycle buttons:
-   - Click "Stop" → verify status updates to `stopped` and port is inaccessible.
-   - Click "Start" → verify status returns to `running` and container serves requests.
-   - Click "Restart" → verify container restarts without errors.
+1. Create a project containing a valid `Dockerfile` (via Local Upload or GitHub Import).
+2. Ensure Build Strategy is set to **"Dockerfile"**.
+3. Navigate to the project page `/projects/<id>` in ForgeLAB.
+4. Click **"🚀 Deploy Release"**.
+5. Observe:
+   - State machine transitions: `queued` → `cloning` → `building` → `starting` → `health_checking` → `running`.
+   - Build logs stream in real-time over WebSocket.
+   - Application container is started and bound to a dynamic host port in `10000–60000`.
+   - Health check polls the endpoint and promotes release to `running`.
+6. Click the live port link and verify the application responds.
+7. Test lifecycle buttons: **Stop**, **Start**, and **Restart**.
 
 #### Expected Result
-- Complete automated deployment pipeline succeeds.
-- Logs stream smoothly over WebSockets.
-- Container is live on an allocated port in the `10000–60000` range.
-- Lifecycle controls (Stop/Start/Restart) correctly manage container state.
+- Complete Dockerfile build and deployment pipeline succeeds.
+- Terminal logs stream smoothly without duplication.
+- Application serves traffic on the allocated host port.
 
-#### Failure Conditions
-- Build stalls or does not stream logs.
-- Port collision occurs or port is not exposed on `0.0.0.0`.
-- Health check fails to detect healthy container.
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
 
-#### What to Inspect if it Fails
-- Docker Engine: `docker ps`
-- Backend worker logs: `docker compose logs backend`
-- Redis queue: `docker compose exec redis redis-cli lrange forgelab:queue:deployments 0 -1`
+---
+
+### Procedure 3b: Non-Dockerfile Application Deployment (Automatic Build Strategy)
+
+#### Purpose
+Verify deployment of an application without a Dockerfile (e.g. Node.js/Next.js, Python FastAPI/Flask, or Go) using ForgeLAB's automatic heuristic detection, automatic multi-stage build generation, and dynamic internal port mapping.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure
+1. Prepare a minimal non-Dockerfile application:
+   - **Example (Node.js/Express):** `package.json` with `"start": "node index.js"` and `index.js` listening on `process.env.PORT || 3000`.
+   - **Example (Python/FastAPI):** `requirements.txt` with `fastapi`, `uvicorn`, and `main.py` listening on port 8000.
+2. In ForgeLAB, import the application via Computer Upload or GitHub Import.
+3. Observe Step 2 ("Configure Application"):
+   - Verify Detection correctly identifies runtime (e.g. `nodejs` or `python`).
+   - Verify Build Strategy defaults to **"Automatic"**.
+   - Verify Application Port defaults to the detected port (e.g. 3000 or 8000).
+4. Click **"Create & Deploy Project"**.
+5. Observe the deployment logs:
+   - Notice the deployment engine generates a multi-stage container build tailored for the detected runtime.
+   - Logs stream the build and package installation steps.
+   - Container starts with `PORT=<internal_port>` environment variable injected.
+   - ForgeLAB binds the container's internal port to the dynamically allocated host port (e.g. host port 10005 → container port 3000).
+6. Verify deployment reaches `running`.
+7. Click the live host port URL and verify the application responds successfully.
+
+#### Expected Result
+- Applications without Dockerfiles build and deploy automatically.
+- Internal ports (e.g. 3000, 8000) are correctly mapped to external dynamic host ports.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### Procedure 3c: Generalized Health & Readiness Strategies
+
+#### Purpose
+Verify that applications without `/health` endpoints can deploy successfully using alternative readiness check strategies (`tcp` or `none`).
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure
+1. Create a project whose application serves on root `/` or does not expose a `/health` endpoint.
+2. In project configuration, set:
+   - Health Strategy: **"TCP"** (or **"None"**).
+3. Click **"🚀 Deploy Release"**.
+4. Observe deployment transition:
+   - If TCP: Worker polls TCP socket connectivity on the allocated port.
+   - Once TCP connection succeeds, release is immediately promoted to `running`.
+   - If None: Container start immediately promotes release to `running`.
+5. Verify deployment is NOT marked failed simply because `/health` was absent.
+
+#### Expected Result
+- Applications without `/health` pass readiness gating according to the selected strategy.
 
 #### Verification Record
 - **Status:** NOT RECORDED
@@ -306,7 +392,7 @@ Verify the complete vertical slice: host path validation, snapshot copy, Docker 
 ### Procedure 4: Failed Deployment & Safety Invariant Preservation
 
 #### Purpose
-Verify that a failing deployment (broken build or failed health check) fails gracefully and **never** terminates or displaces the currently running deployment.
+Verify that failing deployments (broken build, runtime crash, or failed readiness check) transition to `failed` without terminating or displacing the active healthy deployment.
 
 #### Implementation Status
 `IMPLEMENTED`
@@ -315,39 +401,24 @@ Verify that a failing deployment (broken build or failed health check) fails gra
 `NOT RECORDED`
 
 #### Prerequisites
-- **Execution Environment:** Run the Go backend on the host (**Environment A**) for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount.
-- Project has a running deployment (Deployment #1 from Procedure 3 is active and serving traffic).
+- Project has an active, running deployment serving traffic (Deployment #1).
 
 #### Test Procedure
-1. In the host test application directory, modify `Dockerfile` to introduce a build failure (e.g., `RUN non_existent_command_that_fails`).
-2. In ForgeLAB, click "🚀 Deploy Release".
-3. Observe the deployment progress:
-   - Deployment #2 is created with status `building`.
-   - Error logs appear in the terminal showing build failure.
-   - Deployment #2 transitions to `failed` with a recorded failure reason.
-4. Verify the overall project status remains `running`.
-5. Verify the active release link still points to Deployment #1's port.
-6. Open the live URL (`http://localhost:<port-deploy-1>/health`) and verify Deployment #1 is still responding.
-7. Next, fix the build error in `Dockerfile`, but configure a non-existent health check path in project settings (`/non-existent-endpoint`).
-8. Deploy Release again (Deployment #3):
-   - Image builds successfully.
-   - Container starts on a new host port.
-   - Health check logs show 10 failed retries.
-   - Deployment #3 transitions to `failed`.
-   - The broken container for Deployment #3 is stopped and cleaned up.
-9. Open Deployment #1's live URL again; verify Deployment #1 was never terminated.
+1. **Broken Build Test:**
+   - Introduce a syntax error or failing build command in project settings (e.g. Build Command: `exit 1`).
+   - Click **"Deploy Release"** (Deployment #2).
+   - Observe build fails in logs. Deployment #2 transitions to `failed`.
+   - Verify project status remains `running`.
+   - Verify Deployment #1's container remains running and continues serving requests on its port.
+2. **Broken Runtime / Readiness Failure Test:**
+   - Configure a start command that fails immediately or an unreachable HTTP health check path (`/non-existent-endpoint`).
+   - Click **"Deploy Release"** (Deployment #3).
+   - Container starts, but health check retries exhaust (10 attempts).
+   - Deployment #3 transitions to `failed` and its broken container is cleaned up.
+   - Verify Deployment #1 remains `running` and active release link is untouched.
 
 #### Expected Result
-- **Deployment Safety Invariant holds:** Broken deployments transition to `failed` without interrupting the existing active deployment.
-- `projects.current_deployment_id` stays pegged to the healthy release.
-
-#### Failure Conditions
-- Old container is stopped before new container passes health check.
-- `current_deployment_id` is updated to a failed deployment ID.
-
-#### What to Inspect if it Fails
-- `backend/internal/docker/engine.go:312-326` (promotion logic)
-- Database: `docker compose exec postgres psql -U forgelab -c "SELECT id, status, current_deployment_id FROM projects;"`
+- **Deployment Safety Invariant holds:** Active healthy deployments are never interrupted by failed releases.
 
 #### Verification Record
 - **Status:** NOT RECORDED

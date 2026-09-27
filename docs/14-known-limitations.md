@@ -15,13 +15,13 @@
 
 ---
 
-## 1. Current Implementation Limitations (MVP Boundaries)
+## 1. Current Implementation Limitations & Boundaries
 
-These are deliberate scoping decisions for the MVP vertical slice. They are **not** accidental bugs.
+These are deliberate scoping decisions for the current platform release. They are **not** accidental bugs.
 
-1. **Host Filesystem Source Only (`source_type: "local"`):**
-   - ForgeLAB imports projects from absolute directory paths on the host filesystem.
-   - It does not currently support browser-based ZIP archive uploads (`LOCAL_UPLOAD`) or remote git URL imports.
+1. **Universal Source Ingestion (Resolved in v0.2.0):**
+   - ForgeLAB now supports browser-based computer uploads (directories and `.zip`/`.tar.gz` archives) and direct GitHub repository imports with encrypted OAuth tokens.
+   - Arbitrary unauthenticated git clone URLs remain rejected for security reasons.
 2. **Dynamic Direct Host Port Mapping:**
    - Deployed containers are exposed directly on dynamically allocated host ports (`10000–60000`).
    - There is no unified reverse proxy (e.g. Caddy/Nginx) providing virtual host routing, subdomains (e.g. `project-slug.localhost`), or SSL termination.
@@ -32,7 +32,7 @@ These are deliberate scoping decisions for the MVP vertical slice. They are **no
    - Projects and deployments belong strictly to the creating user (`owner_id`).
    - There are no teams, organizations, or Role-Based Access Control (RBAC) permissions.
 5. **Deployment-Time Health Gating (Docker Restart Policy vs ForgeLAB Self-Healing):**
-   - Health checks occur **only** during deployment promotion (`HEALTH_CHECKING`).
+   - Health checks occur during deployment promotion (`HEALTH_CHECKING`) supporting `auto`, `http`, `tcp`, and `none`.
    - **Docker runtime restart behavior (`IMPLEMENTED`):** Deployed application containers are configured with `RestartPolicy: { Name: "unless-stopped" }` in [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go). The Docker daemon automatically restarts stopped or crashed containers at the container-engine layer.
    - **ForgeLAB continuous health monitoring / self-healing (`NOT IMPLEMENTED`):** ForgeLAB does not implement continuous runtime health polling, crash diagnosis, automatic rollback, health-based remediation, crash-loop detection, or automated re-promotion. If an application enters a broken state or fails long after reaching `RUNNING`, ForgeLAB control plane takes no automated remedial action.
 6. **No Zero-Downtime Rolling Traffic Shift:**

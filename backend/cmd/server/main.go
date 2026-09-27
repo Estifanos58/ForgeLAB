@@ -110,8 +110,10 @@ func main() {
 		cfg.JWT.RefreshTokenExpiry,
 	)
 
+	sourceService := services.NewSourceService(cfg.Docker.SourcesDir)
+	githubService := services.NewGitHubService(pool, encryptor, cfg.GitHub, redisClient)
 	userService := services.NewUserService(pool, jwtManager)
-	projectService := services.NewProjectService(pool, pathValidator)
+	projectService := services.NewProjectService(pool, pathValidator, sourceService, githubService)
 	deploymentService := services.NewDeploymentService(pool)
 	secretService := services.NewSecretService(pool, encryptor, projectService)
 
@@ -124,6 +126,8 @@ func main() {
 		projectService,
 		deploymentService,
 		secretService,
+		sourceService,
+		githubService,
 		portManager,
 		pathValidator,
 		wsHub,
@@ -143,6 +147,8 @@ func main() {
 	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
 	envHandler := handlers.NewEnvHandler(secretService)
+	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL)
+	sourceHandler := handlers.NewSourceHandler(sourceService)
 
 	// Setup router
 	r := chi.NewRouter()
@@ -167,6 +173,9 @@ func main() {
 	r.Route("/api", func(r chi.Router) {
 		r.Use(middleware.ContentTypeJSON)
 
+		// Public GitHub OAuth integration callback
+		r.Get("/integrations/github/callback", integrationHandler.GitHubCallback)
+
 		// Auth routes (public)
 		r.Route("/auth", func(r chi.Router) {
 			r.Post("/register", authHandler.Register)
@@ -190,6 +199,24 @@ func main() {
 		// Protected routes
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.AuthMiddleware(jwtManager))
+
+			// Source Management & Uploads
+			r.Route("/sources", func(r chi.Router) {
+				r.Post("/upload", sourceHandler.Upload)
+			})
+
+			// Integrations (GitHub Repository Access)
+			r.Route("/integrations", func(r chi.Router) {
+				r.Route("/github", func(r chi.Router) {
+					r.Get("/", integrationHandler.GetGitHubStatus)
+					r.Get("/connect", integrationHandler.ConnectGitHub)
+					r.Post("/connect", integrationHandler.ConnectGitHub)
+					r.Post("/disconnect", integrationHandler.DisconnectGitHub)
+					r.Get("/repositories", integrationHandler.ListRepositories)
+					r.Get("/repositories/{owner}/{repo}/branches", integrationHandler.ListBranches)
+					r.Post("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
+				})
+			})
 
 			// Projects
 			r.Route("/projects", func(r chi.Router) {

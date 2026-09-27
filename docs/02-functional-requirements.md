@@ -45,26 +45,24 @@
 | R2.7 | Projects have durable unique identifiers (UUIDs), not just names | MVP |
 | R2.8 | Projects have an owner (user_id) | MVP |
 
-### R3. Project Import — Local Repository
-
+### R3. Project Import — Local Computer & Filesystem
+ 
 | ID | Requirement | Status |
 |----|------------|--------|
-| R3.1 | User must be able to import from a local repository path | MVP |
-| R3.2 | The mechanism for making local files available to ForgeLab must be explicitly defined | MVP |
-| R3.3 | Local import = ForgeLab copies source from host path into an isolated build snapshot directory | MVP |
+| R3.1 | User can import project from local computer via directory or archive upload | IMPLEMENTED |
+| R3.2 | Uploads extracted to isolated per-project workspace with path-traversal & Zip Slip protection | IMPLEMENTED |
+| R3.3 | Optional legacy host filesystem path validation via whitelist boundaries | IMPLEMENTED |
 
 ### R4. Project Import — GitHub
 
 | ID | Requirement | Status |
 |----|------------|--------|
-| R4.1 | GitHub import must be explicit, permission-based, user-initiated | Future |
-| R4.2 | GitHub OAuth flow: Connect → Auth → Grant access → Show repos → Select → Import | Future |
-| R4.3 | Private repositories must be supported | Future |
-| R4.4 | Branch selection during import | Future |
-| R4.5 | GitHub tokens encrypted at rest | Future |
-| R4.6 | Foundation for future webhooks | Future |
-
-> **Note:** GitHub integration is documented here for architectural awareness but is NOT an MVP requirement. The MVP uses local repository import.
+| R4.1 | GitHub import is explicit, permission-based, user-initiated | IMPLEMENTED |
+| R4.2 | GitHub OAuth flow: Connect → Auth → Grant access → Show repos → Select → Import | IMPLEMENTED |
+| R4.3 | Private and public repositories supported under user's grant | IMPLEMENTED |
+| R4.4 | Branch selection and remote framework detection during import | IMPLEMENTED |
+| R4.5 | GitHub tokens encrypted at rest via AES-256-GCM | IMPLEMENTED |
+| R4.6 | Foundation for future automated push webhooks | Future |
 
 ### R5. Deployment Lifecycle
 
@@ -72,12 +70,12 @@
 |----|------------|--------|
 | R5.1 | Trigger deployment via API | MVP |
 | R5.2 | Queue deployment work | MVP |
-| R5.3 | Obtain project source (clone/copy) | MVP |
-| R5.4 | Build Docker image from Dockerfile | MVP |
-| R5.5 | Start application container | MVP |
+| R5.3 | Obtain project source (snapshot/tarball) | MVP |
+| R5.4 | Build container image via Dockerfile or Automatic Multi-Stage Strategy | IMPLEMENTED |
+| R5.5 | Start application container with dynamic internal port mapping | IMPLEMENTED |
 | R5.6 | Track deployment state through explicit transitions | MVP |
 | R5.7 | Expose deployment status through API | MVP |
-| R5.8 | Deployment creates a durable deployment record | MVP |
+| R5.8 | Deployment creates a durable deployment record capturing runtime & build metadata | IMPLEMENTED |
 | R5.9 | Failed deployment must NOT destroy last working deployment | MVP |
 | R5.10 | Allow stop/start/restart of running application | MVP |
 | R5.11 | Provide a basic rollback path | MVP |

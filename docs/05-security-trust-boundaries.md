@@ -85,70 +85,53 @@ control/security event.
 
 ---
 
-## 2. Authentication Architecture: Reality vs. Hardening
+## 2. Authentication Architecture & Token Security
 
-### Current MVP Implementation (Reality)
-The current MVP codebase implements authentication as follows:
+ForgeLAB implements backend-owned, cookie-based session management:
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│                      Current MVP Auth                       │
+│                 Session & Identity Security                 │
 │                                                             │
-│   REST Authentication:                                      │
-│   • Bearer token sent in "Authorization: Bearer <token>"    │
-│   • Token stored in browser "localStorage" (forgelab_token) │
+│   Transport & Storage:                                      │
+│   • Issued as HttpOnly, Secure, SameSite cookies:           │
+│     - forgelab_access_token (15-minute expiry)              │
+│     - forgelab_refresh_token (7-day expiry)                 │
+│   • Zero client-side persistence in localStorage            │
+│   • API client requests include 'credentials: include'      │
 │                                                             │
-│   WebSocket Authentication:                                 │
-│   • Token passed via query string (?token=<access_token>)   │
+│   Multi-Provider Identity:                                  │
+│   • Email/password (bcrypt hashed)                          │
+│   • Google OAuth 2.0 (OpenID profile, email verified)       │
+│   • GitHub OAuth 2.0 (read:user, user:email scopes)         │
 │                                                             │
-│   Token Properties:                                         │
-│   • HS256 signed JWT with user_id and email                 │
-│   • 15-minute access token expiry                           │
-│   • 7-day refresh token with atomic single-use DB rotation  │
+│   GitHub Repository Token Protection:                       │
+│   • Repository access tokens encrypted at rest              │
+│     using AES-256-GCM in github_integrations table          │
+│   • Tokens are never sent to browser or frontend storage    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Production-Hardening Roadmap (Deferred to Post-MVP)
-The following security hardening measures are documented as future requirements:
-
-1. **HttpOnly Secure Cookies:** Transition frontend token storage from `localStorage` to `HttpOnly`, `Secure`, `SameSite=Lax` cookies. (Backend handlers already set these cookies, but the frontend currently relies on `localStorage` for Bearer headers).
-2. **Eliminate Query String Tokens for WebSockets:** Query parameters can be captured in web server access logs, browser history, and proxy telemetry. Future hardening should authenticate WebSocket upgrades exclusively via HttpOnly cookies or an initial JSON authentication handshake frame.
-3. **Strict Origin Validation:** Enforce strict CSRF origin validation on the WebSocket upgrader (`CheckOrigin` currently returns `true` for development flexibility in `internal/websocket/hub.go:24-26`).
-
 ---
 
-## 3. Host Path Security & Source Validation
+## 3. Source Workspace Security & Ingestion Protection
 
-Because the MVP imports source from the host filesystem, `internal/security/PathValidator` enforces strict defense-in-depth:
+ForgeLAB ingests application source through two primary channels, treating all source code as untrusted input:
 
-```text
-Candidate Path (from user)
-         │
-         ▼
-1. filepath.Abs() ──► Ensure absolute path
-         │
-         ▼
-2. filepath.EvalSymlinks() ──► Canonicalize and resolve all symlinks
-         │
-         ▼
-3. os.Stat() ──► Verify path exists and is a directory
-         │
-         ▼
-4. Restricted System Path Check ──► REJECT if matching:
-         • /etc, /var, /usr, /sys, /proc, /dev, /boot, /bin, /sbin
-         • C:\Windows, C:\Program Files, C:\Program Files (x86), C:\System Volume Information
-         │
-         ▼
-5. Boundary Check (if FORGELAB_ALLOWED_SOURCE_ROOTS is set)
-         • Ensures canonical path resides inside configured root whitelist
-         │
-         ▼
-Valid Canonical Path ──► Ready for snapshot copy
-```
+### 1. Browser-Based Computer Uploads (`/api/sources/upload`)
+- **Zip Slip & Path Traversal Prevention:** Archive extraction and multipart file ingestion evaluate every relative path with `filepath.Clean`. Any entry attempting to traverse outside the allocated directory (e.g. `../`, absolute paths, or symlink escapes) is immediately rejected with `ErrPathTraversalDetected` and the directory is purged.
+- **Decompression Bomb Protection:** Imposes a strict `MaxUncompressedBytes` limit (100MB). Exceeding this limit halts decompression and wipes the target folder.
+- **Ignore Filtering:** Automatically rejects or skips build artifacts, dependencies, and version control metadata (`node_modules`, `.git`, `.next`, `dist`, `__pycache__`, etc.) during extraction.
+- **Workspace Isolation:** Each upload is stored in a dedicated, random UUID workspace (`data/sources/<source_id>`) isolated from other projects and host system directories.
 
-### Snapshot Isolation
-ForgeLAB copies the repository source into an isolated temporary directory (`data/builds/<deployment-id>`) before initiating the Docker build:
-- Prevents concurrent edits on the host filesystem from corrupting active builds.
+### 2. GitHub Repository Tarball Ingestion
+- **Server-Side Token Verification:** Only repositories accessible via the authenticated user's encrypted OAuth token are cloned/fetched.
+- **Encrypted Token Handling:** Tokens are decrypted in-memory only when communicating with `api.github.com` and are never logged or exposed to the client.
+- **Tarball Extraction Isolation:** Remote tarballs are unpacked using the same path-traversal safeguards and size limits into isolated source directories.
+
+### 3. Snapshot Isolation
+Before the Docker build engine starts, ForgeLAB snapshots the source files into `data/builds/<deployment-id>`:
+- Prevents concurrent edits from corrupting active builds.
 - Isolates build context and prevents path traversal escapes during `docker build`.
 - Snapshot directory is automatically wiped after the image build finishes.
 

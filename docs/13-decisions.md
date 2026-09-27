@@ -30,6 +30,7 @@
 | **DEC-008** | GitHub Import via Explicit OAuth and Repository Selection | **ACTIVE** | 2026-09-25 |
 | **DEC-009** | Physical Manual Verification as Authoritative Validation Methodology | **ACTIVE** | 2026-09-26 |
 | **DEC-010** | Multi-Provider OAuth Authentication with Deferred Repository Integration | **ACTIVE** | 2026-09-26 |
+| **DEC-011** | Universal Source Ingestion, GitHub Repository Integration, and Automatic Build/Runtime Strategy | **ACTIVE** | 2026-09-27 |
 
 ---
 
@@ -167,3 +168,21 @@
   4. **Dedicated Identity Model:** Introduces the `auth_identities` table with nullable `users.password_hash` to support deterministic account linking by verified email and provider subject without fragile email-only matching.
 - **Current Implementation:** `backend/internal/services/oauth_service.go`, `backend/internal/services/user_service.go`, `backend/internal/handlers/auth_handler.go`, `backend/migrations/000003_add_auth_identities.up.sql`, `frontend/src/components/auth/oauth-buttons.tsx`.
 - **Rule for Future Agents:** Do not conflate GitHub sign-in with GitHub repository import. Keep repository importing and webhook synchronization behind explicit future design milestones as specified in DEC-008.
+
+---
+
+## DEC-011: Universal Source Ingestion, GitHub Repository Integration, and Automatic Build/Runtime Strategy
+
+- **Date:** 2026-09-27
+- **Status:** **ACTIVE**
+- **Decision:** Replaced the obsolete host-filesystem-path and mandatory-Dockerfile MVP model with a universal application deployment architecture:
+  1. **Source Abstraction:** Supports `local` (isolated upload workspace snapshots) and `github` (authorized repository imports via encrypted OAuth tokens).
+  2. **Clean Authentication vs. Repository Authorization:** GitHub sign-in (`read:user user:email`) and GitHub repository authorization (`repo` scope) remain separate capabilities. Repository tokens are encrypted at rest using AES-256-GCM in `github_integrations`.
+  3. **Local Computer Import:** Users upload project directories or zip/tar.gz archives through the browser directly into a controlled, isolated source workspace with path traversal and zip slip protection, eliminating host-path inaccessibility in Docker Compose.
+  4. **Heuristic Project Detection:** Source trees are inspected to detect runtime frameworks (Node.js, Next.js, Vite, Python/FastAPI/Flask/Django, Go, Java, Rust, Dockerfile).
+  5. **Build Strategy Abstraction:** Supports `auto` (multi-stage Dockerfile generation from detected runtime) and `dockerfile` (explicit Dockerfile).
+  6. **Dynamic Internal Port & Health Strategy:** Container internal ports are dynamically mapped (e.g. 3000, 8000, 8080) to dynamic host ports. Readiness checks support `auto`, `http`, `tcp`, and `none`.
+  7. **Deployment Safety Invariant Preserved:** Failed releases are discarded; healthy releases remain active.
+- **Current Implementation:** `backend/internal/detector/`, `backend/internal/services/source_service.go`, `backend/internal/services/github_service.go`, `backend/internal/docker/engine.go`, `backend/migrations/000004_source_and_build_abstractions.up.sql`, `frontend/src/components/dashboard/create-project-modal.tsx`.
+- **Rule for Future Agents:** Do not revert to requiring host filesystem paths or mandatory Dockerfiles. Maintain source isolation and AES-256-GCM token encryption.
+

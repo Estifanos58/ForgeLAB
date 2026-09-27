@@ -29,6 +29,18 @@ type AuthIdentity struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
+// GitHubIntegration represents an authorized GitHub connection with repository access.
+type GitHubIntegration struct {
+	ID                   uuid.UUID `json:"id"`
+	UserID               uuid.UUID `json:"user_id"`
+	EncryptedAccessToken []byte    `json:"-"` // Never serialized to JSON
+	GitHubUserID         string    `json:"github_user_id"`
+	GitHubUsername       string    `json:"github_username"`
+	Scope                string    `json:"scope"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+}
+
 // Project represents a registered project in ForgeLab.
 // A project is an application that ForgeLab manages.
 // Project registration does NOT imply a running application.
@@ -37,19 +49,46 @@ type Project struct {
 	OwnerID             uuid.UUID  `json:"owner_id"`
 	Name                string     `json:"name"`
 	Slug                string     `json:"slug"`
-	SourceType          string     `json:"source_type"` // "local" or "github" (future)
-	RepositoryPath      string     `json:"repository_path"`
+	SourceType          string     `json:"source_type"` // "local" or "github"
+	SourceReference     string     `json:"source_reference"` // repo "owner/repo" or local source upload ID
+	RepositoryPath      string     `json:"repository_path"` // legacy/optional host path
 	Branch              string     `json:"branch"`
 	DockerfilePath      string     `json:"dockerfile_path"`
 	BuildContext        string     `json:"build_context"`
+	BuildStrategy       string     `json:"build_strategy"` // "auto" or "dockerfile"
+	BuildCommand        string     `json:"build_command"`
+	StartCommand        string     `json:"start_command"`
+	RuntimeType         string     `json:"runtime_type"` // "nextjs", "nodejs", "python-fastapi", "go", etc.
+	InternalPort        int        `json:"internal_port"` // 3000, 8000, 8080, etc.
 	HealthCheckPath     *string    `json:"health_check_path"` // Nullable
 	HealthCheckEnabled  bool       `json:"health_check_enabled"`
+	HealthStrategy      string     `json:"health_strategy"` // "auto", "http", "tcp", "none"
 	Status              string     `json:"status"` // inactive, deploying, running, stopped, failed
 	CurrentDeploymentID *uuid.UUID `json:"current_deployment_id"`
 	Port                *int       `json:"port"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`
 }
+
+// Source provider constants
+const (
+	SourceTypeLocal  = "local"
+	SourceTypeGitHub = "github"
+)
+
+// Build strategy constants
+const (
+	BuildStrategyAuto       = "auto"
+	BuildStrategyDockerfile = "dockerfile"
+)
+
+// Health strategy constants
+const (
+	HealthStrategyAuto = "auto"
+	HealthStrategyHTTP = "http"
+	HealthStrategyTCP  = "tcp"
+	HealthStrategyNone = "none"
+)
 
 // ProjectStatus constants
 const (
@@ -63,21 +102,28 @@ const (
 // Deployment represents a single deployment attempt for a project.
 // Each deployment is a durable record of operational history.
 type Deployment struct {
-	ID            uuid.UUID  `json:"id"`
-	ProjectID     uuid.UUID  `json:"project_id"`
-	DeployNumber  int        `json:"deploy_number"`
-	Status        string     `json:"status"`
-	CommitSHA     *string    `json:"commit_sha"`
-	Branch        string     `json:"branch"`
-	ImageTag      *string    `json:"image_tag"`
-	ContainerID   *string    `json:"container_id"`
-	StartedAt     *time.Time `json:"started_at"`
-	BuiltAt       *time.Time `json:"built_at"`
-	DeployedAt    *time.Time `json:"deployed_at"`
-	FinishedAt    *time.Time `json:"finished_at"`
-	DurationMs    *int64     `json:"duration_ms"`
-	FailureReason *string    `json:"failure_reason"`
-	CreatedAt     time.Time  `json:"created_at"`
+	ID             uuid.UUID  `json:"id"`
+	ProjectID      uuid.UUID  `json:"project_id"`
+	DeployNumber   int        `json:"deploy_number"`
+	Status         string     `json:"status"`
+	CommitSHA      *string    `json:"commit_sha"`
+	Branch         string     `json:"branch"`
+	ImageTag       *string    `json:"image_tag"`
+	ContainerID    *string    `json:"container_id"`
+	SourceRevision *string    `json:"source_revision"`
+	BuildStrategy  string     `json:"build_strategy"`
+	BuildCommand   string     `json:"build_command"`
+	StartCommand   string     `json:"start_command"`
+	RuntimeType    string     `json:"runtime_type"`
+	InternalPort   int        `json:"internal_port"`
+	HealthStrategy string     `json:"health_strategy"`
+	StartedAt      *time.Time `json:"started_at"`
+	BuiltAt        *time.Time `json:"built_at"`
+	DeployedAt     *time.Time `json:"deployed_at"`
+	FinishedAt     *time.Time `json:"finished_at"`
+	DurationMs     *int64     `json:"duration_ms"`
+	FailureReason  *string    `json:"failure_reason"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
 // Deployment status constants — see state machine in docs/04-architecture-decisions.md

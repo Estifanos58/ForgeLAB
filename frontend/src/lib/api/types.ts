@@ -25,10 +25,17 @@ export interface Project {
   name: string;
   slug: string;
   source_type: 'local' | 'github';
+  source_reference?: string;
   repository_path: string;
   branch: string;
   dockerfile_path: string;
   build_context: string;
+  build_strategy?: 'auto' | 'dockerfile';
+  build_command?: string;
+  start_command?: string;
+  runtime_type?: string;
+  internal_port?: number;
+  health_strategy?: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path: string | null;
   health_check_enabled: boolean;
   status: ProjectStatus;
@@ -88,19 +95,36 @@ export interface EnvVar {
 
 export interface CreateProjectInput {
   name: string;
-  repository_path: string;
+  source_type?: 'local' | 'github';
+  source_reference?: string;
+  repository_path?: string;
   branch?: string;
   dockerfile_path?: string;
   build_context?: string;
+  build_strategy?: 'auto' | 'dockerfile';
+  build_command?: string;
+  start_command?: string;
+  runtime_type?: string;
+  internal_port?: number;
+  health_strategy?: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path?: string;
 }
 
 export interface UpdateProjectInput {
   name?: string;
+  source_reference?: string;
+  repository_path?: string;
   branch?: string;
   dockerfile_path?: string;
   build_context?: string;
+  build_strategy?: 'auto' | 'dockerfile';
+  build_command?: string;
+  start_command?: string;
+  runtime_type?: string;
+  internal_port?: number;
+  health_strategy?: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path?: string;
+  health_check_enabled?: boolean;
 }
 
 export interface SetEnvInput {
@@ -111,4 +135,47 @@ export interface SetEnvInput {
 
 export interface ApiError {
   error: string;
+}
+
+export interface GitHubStatus {
+  connected: boolean;
+  username?: string;
+  scopes?: string[];
+  updated_at?: string;
+}
+
+export interface GitHubRepo {
+  id: number;
+  name: string;
+  full_name: string;
+  owner: string;
+  private: boolean;
+  default_branch: string;
+  description: string;
+  html_url: string;
+  updated_at: string;
+}
+
+export interface GitHubBranch {
+  name: string;
+  commit_sha: string;
+}
+
+export interface DetectionResult {
+  runtime: string;
+  framework: string;
+  build_strategy: string;
+  suggested_port: number;
+  build_command: string;
+  start_command: string;
+  health_check_path: string;
+  health_strategy: string;
+  detected_files: string[];
+}
+
+export interface SourceUploadResult {
+  source_id: string;
+  files_count: number;
+  total_bytes: number;
+  detection?: DetectionResult;
 }

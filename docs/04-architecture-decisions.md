@@ -79,11 +79,18 @@ Worker separation, multi-node scheduling, and distributed architecture are earne
 | owner_id | UUID (FK→users) | Project ownership |
 | name | VARCHAR | Display name (not used as identity) |
 | slug | VARCHAR | URL-friendly unique identifier per user |
-| source_type | VARCHAR | 'local' or 'github' (future) |
-| repository_path | VARCHAR | Local path or GitHub repo URL |
+| source_type | VARCHAR | 'local' or 'github' |
+| source_reference | VARCHAR | Repo 'owner/name' or uploaded source UUID |
+| repository_path | VARCHAR | Optional legacy host path |
 | branch | VARCHAR | Default: 'main' |
 | dockerfile_path | VARCHAR | Default: 'Dockerfile' |
 | build_context | VARCHAR | Default: '.' |
+| build_strategy | VARCHAR | 'auto' or 'dockerfile' |
+| build_command | VARCHAR | e.g. 'npm run build' |
+| start_command | VARCHAR | e.g. 'npm start' |
+| runtime_type | VARCHAR | Detected runtime (e.g. 'nodejs', 'python', 'go') |
+| internal_port | INTEGER | Application internal port (default: 8080) |
+| health_strategy | VARCHAR | 'auto', 'http', 'tcp', or 'none' |
 | health_check_path | VARCHAR | Default: '/health' (nullable) |
 | health_check_enabled | BOOLEAN | Default: true |
 | status | VARCHAR | 'inactive', 'deploying', 'running', 'stopped', 'failed' |
@@ -103,6 +110,11 @@ Worker separation, multi-node scheduling, and distributed architecture are earne
 | branch | VARCHAR | Branch at time of deployment |
 | image_tag | VARCHAR | Docker image reference |
 | container_id | VARCHAR | Docker container ID (nullable until started) |
+| build_strategy | VARCHAR | 'auto' or 'dockerfile' |
+| runtime_type | VARCHAR | Runtime at deployment time |
+| internal_port | INTEGER | Container port bound to host port |
+| build_command | VARCHAR | Build command executed |
+| start_command | VARCHAR | Container entrypoint/command |
 | started_at | TIMESTAMPTZ | When deployment was triggered |
 | built_at | TIMESTAMPTZ | When image build completed (nullable) |
 | deployed_at | TIMESTAMPTZ | When container started (nullable) |
@@ -110,6 +122,19 @@ Worker separation, multi-node scheduling, and distributed architecture are earne
 | duration_ms | BIGINT | Total deployment duration |
 | failure_reason | TEXT | Nullable — populated on failure |
 | created_at | TIMESTAMPTZ | |
+
+### GitHub Integrations
+
+| Field | Type | Notes |
+|-------|------|-------|
+| id | UUID (PK) | Unique integration record |
+| user_id | UUID (FK→users) | User granting repository authorization |
+| encrypted_access_token | BYTEA | AES-256-GCM encrypted token |
+| github_user_id | VARCHAR | GitHub account ID |
+| github_username | VARCHAR | GitHub handle for display |
+| scope | VARCHAR | Granted OAuth scopes (e.g. 'repo,read:user') |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
 
 ### Environment Variables (Secrets)
 

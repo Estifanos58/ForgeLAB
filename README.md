@@ -1,17 +1,19 @@
 # ForgeLAB — Self-Hosted Application Deployment Platform
 
-ForgeLAB is a single control-plane application deployment platform built in Go. It manages the entire container deployment lifecycle: local repository snapshotting, Docker image builds, container execution on dynamic host ports, HTTP health-check gating, live WebSocket log streaming, AES-256-GCM secret encryption, and rollback safety.
+ForgeLAB is a single control-plane application deployment platform built in Go. It manages the entire container deployment lifecycle: local computer source upload, authorized GitHub repository import, heuristic runtime framework detection, automatic multi-stage container builds, Dockerfile execution, dynamic host and internal port mapping, health/readiness check gating, live WebSocket log streaming, AES-256-GCM secret and OAuth token encryption, and rollback safety.
 
 ---
 
 ## Architecture Overview
 
 - **Backend Control Plane**: Go (REST API via `chi` + WebSockets via `gorilla/websocket`)
-- **Database**: PostgreSQL 16 (Durable records for users, projects, deployments, secrets, and logs)
+- **Database**: PostgreSQL 16 (Durable records for users, identities, projects, deployments, secrets, github integrations, and logs)
 - **Work Queue & Pub/Sub**: Redis 7 (`LPUSH` / `BRPOP` queue + Pub/Sub event bridge)
 - **Runtime Engine**: Docker Engine SDK (Direct container image build and execution)
-- **Host Port Range**: Dynamic port allocation in the range **`10000–60000`**
-- **Frontend**: Next.js 14 + TypeScript (Dark-mode operational management console)
+- **Source Ingestion**: Local computer upload (`/api/sources/upload`) & authorized GitHub repository import (`/api/integrations/github`)
+- **Build Strategy**: Automatic heuristic multi-stage container build generation & Dockerfile build strategy
+- **Host Port Range**: Dynamic port allocation in the range **`10000–60000`** with dynamic container internal port mapping
+- **Frontend**: Next.js 16.3.6 LTS + React 19 + TypeScript + Tailwind CSS (Developer infrastructure operational console)
 - **Deployment Safety Invariant**: Failed releases never terminate or replace the previous running deployment.
 
 ---

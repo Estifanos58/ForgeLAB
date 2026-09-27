@@ -86,6 +86,7 @@ Configuration is managed via `.env` with fallback defaults in `.env.example`:
 | `JWT_REFRESH_TOKEN_EXPIRY`| `7` | Refresh token lifespan in days |
 | `FORGELAB_ENCRYPTION_KEY` | `dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=` | 32-byte Base64 key for AES-256-GCM secret encryption |
 | `FORGELAB_WORK_DIR` | `/app/data/builds` | Working directory where source snapshots are staged |
+| `FORGELAB_SOURCES_DIR` | `/app/data/sources` | Working directory where uploaded source archives are extracted |
 | `FORGELAB_ALLOWED_SOURCE_ROOTS` | `""` | Comma-separated allowed host roots for repository imports |
 | `FRONTEND_URL` | `http://localhost:3000` | Frontend public URL for OAuth redirect landing |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:3000` | Permitted browser origins for CORS headers |
@@ -95,7 +96,8 @@ Configuration is managed via `.env` with fallback defaults in `.env.example`:
 | `GOOGLE_REDIRECT_URL` | `http://localhost:3000/api/auth/google/callback` | Callback URL registered with Google Cloud Console |
 | `GITHUB_CLIENT_ID` | `""` | GitHub OAuth App Client ID |
 | `GITHUB_CLIENT_SECRET` | `""` | GitHub OAuth App Client Secret |
-| `GITHUB_REDIRECT_URL` | `http://localhost:3000/api/auth/github/callback` | Callback URL registered with GitHub Developer Settings |
+| `GITHUB_REDIRECT_URL` | `http://localhost:3000/api/auth/github/callback` | Callback URL registered with GitHub Developer Settings (Sign-In) |
+| `GITHUB_REPO_REDIRECT_URL`| `http://localhost:3000/api/integrations/github/callback` | Callback URL registered with GitHub Developer Settings (Repository Import) |
 | `LOG_LEVEL` | `debug` | Logging level (`debug`, `info`, `warn`, `error`) |
 
 ---
@@ -106,6 +108,7 @@ ForgeLAB uses `golang-migrate` for SQL schema versioning. Migrations live in `ba
 - `000001_initial_schema.up.sql` (Creates users, projects, deployments, env_vars, logs, refresh_tokens)
 - `000002_add_active_deployment_unique_index.up.sql` (Enforces at most one active deployment per project)
 - `000003_add_auth_identities.up.sql` (Adds `auth_identities` table, foreign keys, and makes `password_hash` nullable)
+- `000004_source_and_build_abstractions.up.sql` (Adds `source_reference`, `build_strategy`, `build_command`, `start_command`, `runtime_type`, `internal_port`, `health_strategy` to `projects` and `deployments`, and creates `github_integrations` table)
 
 ### Automated Execution in Docker Compose
 The `migrate` service in `docker-compose.yml` automatically runs on `docker compose up`:

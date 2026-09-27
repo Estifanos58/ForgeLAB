@@ -272,21 +272,37 @@ Common status codes:
 ## 4. Project Management Endpoints (`/api/projects`)
 
 ### `POST /api/projects`
-- **Authentication:** Required (Bearer JWT)
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
 - **Request Body:**
   ```json
   {
     "name": "Production API",
-    "repository_path": "C:\\dev\\projects\\my-service",
+    "source_type": "github",
+    "source_reference": "octocat/hello-world",
     "branch": "main",
+    "build_strategy": "auto",
+    "build_command": "npm run build",
+    "start_command": "npm start",
+    "runtime_type": "node",
+    "internal_port": 3000,
+    "health_strategy": "auto",
+    "health_check_path": "/health",
     "dockerfile_path": "Dockerfile",
-    "build_context": ".",
-    "health_check_path": "/health"
+    "build_context": "."
   }
   ```
-- **Validation & Side Effects:**
-  - Validates `repository_path` with `PathValidator`: verifies path exists, is a directory, resolves symlinks, rejects system directories, and enforces `FORGELAB_ALLOWED_SOURCE_ROOTS`.
-  - Generates unique slug per user (`owner_id, slug`).
+- **Validation & Business Rules:**
+  - `name`: Required, non-empty. Unique per-user slug is generated.
+  - `source_type`: `"local"` or `"github"`. Defaults to `"local"`.
+  - For `source_type: "github"`:
+    - `source_reference`: Required (`owner/repo`).
+    - Verifies user has active GitHub repository integration with encrypted token. If missing, returns `403 Forbidden`.
+  - For `source_type: "local"`:
+    - `source_reference`: UUID of uploaded source from `/api/sources/upload`. Verifies source directory exists and is valid. If invalid/expired, returns `422 Unprocessable Entity`.
+    - `repository_path`: Optional legacy host path validated with `PathValidator` if provided directly on host.
+  - `build_strategy`: `"auto"` (multi-stage Docker build generation) or `"dockerfile"` (explicit Dockerfile). Defaults to `"auto"`.
+  - `internal_port`: Application container listening port (e.g. 3000, 8000, 8080). Defaults to 8080 if not specified.
+  - `health_strategy`: `"auto"`, `"http"`, `"tcp"`, or `"none"`. Defaults to `"auto"`.
   - Sets initial project status to `inactive`.
 - **Success Response:** `201 Created`
   ```json
@@ -295,22 +311,33 @@ Common status codes:
     "owner_id": "c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
     "name": "Production API",
     "slug": "production-api",
-    "source_type": "local",
-    "repository_path": "C:\\dev\\projects\\my-service",
+    "source_type": "github",
+    "source_reference": "octocat/hello-world",
+    "repository_path": "",
     "branch": "main",
     "dockerfile_path": "Dockerfile",
     "build_context": ".",
+    "build_strategy": "auto",
+    "build_command": "npm run build",
+    "start_command": "npm start",
+    "runtime_type": "node",
+    "internal_port": 3000,
+    "health_strategy": "auto",
     "health_check_path": "/health",
     "health_check_enabled": true,
     "status": "inactive",
     "current_deployment_id": null,
     "port": null,
-    "created_at": "2026-09-26T10:30:00Z",
-    "updated_at": "2026-09-26T10:30:00Z"
+    "created_at": "2026-09-27T10:30:00Z",
+    "updated_at": "2026-09-27T10:30:00Z"
   }
   ```
 - **Error Responses:**
-  - `400 Bad Request`: Invalid path or missing required fields.
+  - `400 Bad Request`: Malformed JSON or input validation failure (e.g. empty project name).
+  - `403 Forbidden`: GitHub repository permissions not granted / unauthorized.
+  - `409 Conflict`: A project with a similar name already exists for the user.
+  - `422 Unprocessable Entity`: Invalid or unavailable source (e.g. missing/expired local source upload).
+  - `500 Internal Server Error`: Unexpected server or database failure.
 
 ---
 
@@ -585,6 +612,179 @@ Common status codes:
 
 ---
 
+## 6. Source Management Endpoints (`/api/sources`)
+
+### `POST /api/sources/upload`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Content-Type:** `multipart/form-data`
+- **Supported Formats:**
+  1. Multiple individual files via `files` field (retaining relative paths from browser directory picker).
+  2. Single compressed archive via `archive` field (`.zip`, `.tar.gz`, or `.tgz`).
+- **Security & Validation:**
+  - Enforces Zip Slip and path traversal protection (`cleanRel` checks).
+  - Maximum uncompressed size: 100MB.
+  - Automatically skips build artifacts and VCS directories (`node_modules`, `.git`, `.next`, `dist`, `__pycache__`, etc.).
+- **Automatic Heuristic Detection:**
+  - Inspects unpacked source files using `internal/detector`.
+  - Determines `runtime`, `framework`, suggested build/start commands, suggested port, and health check endpoint.
+- **Success Response:** `201 Created`
+  ```json
+  {
+    "source_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "files_count": 42,
+    "total_bytes": 1420500,
+    "detection": {
+      "runtime": "nodejs",
+      "framework": "nextjs",
+      "build_strategy": "auto",
+      "suggested_port": 3000,
+      "build_command": "npm run build",
+      "start_command": "npm start",
+      "health_check_path": "/",
+      "health_strategy": "auto",
+      "detected_files": ["package.json", "next.config.js"]
+    }
+  }
+  ```
+- **Error Responses:**
+  - `400 Bad Request`: Empty upload or invalid archive.
+  - `413 Payload Too Large`: Source exceeds 100MB uncompressed limit.
+  - `422 Unprocessable Entity`: Path traversal or corrupt archive.
+
+---
+
+### `DELETE /api/sources/{id}`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Parameters:** `id` (UUID of source workspace)
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "message": "source workspace deleted successfully"
+  }
+  ```
+
+---
+
+## 7. GitHub Integration Endpoints (`/api/integrations/github`)
+
+### `GET /api/integrations/github`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Purpose:** Checks whether the authenticated user has granted repository-access OAuth permissions.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "connected": true,
+    "username": "octocat",
+    "scopes": ["repo", "read:user"],
+    "updated_at": "2026-09-27T08:00:00Z"
+  }
+  ```
+- **When Not Connected:** `200 OK` with `{"connected": false}`.
+
+---
+
+### `POST /api/integrations/github/connect`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Purpose:** Generates a cryptographic state parameter and returns GitHub's OAuth authorize URL requesting `repo,read:user` permissions.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "url": "https://github.com/login/oauth/authorize?client_id=...&redirect_uri=...&scope=repo%2Cread%3Auser&state=..."
+  }
+  ```
+
+---
+
+### `GET /api/integrations/github/callback`
+- **Authentication:** Public callback with `code` and `state` parameters from GitHub.
+- **Purpose:** Validates state, exchanges code for access token, fetches GitHub username, encrypts token at rest via AES-256-GCM, and upserts into `github_integrations`.
+- **Response:** `302 Found` redirecting to `${FRONTEND_URL}/dashboard?github_connected=true`.
+
+---
+
+### `POST /api/integrations/github/disconnect`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Purpose:** Disconnects repository access and deletes encrypted OAuth token from `github_integrations`.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "message": "github repository integration disconnected successfully"
+  }
+  ```
+
+---
+
+### `GET /api/integrations/github/repositories`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Query Parameters:**
+  - `page`: Page number (default: 1)
+  - `per_page`: Repositories per page (default: 30, max: 100)
+- **Purpose:** Returns repositories accessible under the user's encrypted GitHub token.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "repositories": [
+      {
+        "id": 1296269,
+        "name": "Hello-World",
+        "full_name": "octocat/Hello-World",
+        "owner": "octocat",
+        "private": false,
+        "default_branch": "main",
+        "description": "My first repository on GitHub!",
+        "html_url": "https://github.com/octocat/Hello-World",
+        "updated_at": "2026-09-27T07:00:00Z"
+      }
+    ],
+    "page": 1,
+    "per_page": 30
+  }
+  ```
+- **Error Responses:**
+  - `403 Forbidden`: GitHub repository access not authorized.
+
+---
+
+### `GET /api/integrations/github/repositories/{owner}/{repo}/branches`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Purpose:** Lists branches for an authorized repository.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "branches": [
+      {
+        "name": "main",
+        "commit_sha": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+      }
+    ]
+  }
+  ```
+
+---
+
+### `GET /api/integrations/github/repositories/{owner}/{repo}/detect`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Query Parameters:**
+  - `branch`: Git branch to inspect (default: default branch)
+  - `root_dir`: Subdirectory root path (default: ".")
+- **Purpose:** Inspects files from the GitHub repository tree to automatically detect runtime, framework, commands, and port before project creation.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "runtime": "python",
+    "framework": "fastapi",
+    "build_strategy": "auto",
+    "suggested_port": 8000,
+    "build_command": "pip install -r requirements.txt",
+    "start_command": "uvicorn main:app --host 0.0.0.0 --port 8000",
+    "health_check_path": "/health",
+    "health_strategy": "auto",
+    "detected_files": ["requirements.txt", "main.py"]
+  }
+  ```
+
+---
+
 ## 8. WebSocket Endpoint (`/api/ws`)
 
 ### Connection Handshake
@@ -654,10 +854,9 @@ Common status codes:
 
 ## 9. Future / Planned Endpoints (Not Implemented in MVP)
 
-The following endpoints were discussed in design architecture but are **not present** in the current MVP codebase:
+The following endpoints were discussed in design architecture but are **not present** in the current codebase:
 
-- `POST /api/auth/github/connect` — GitHub OAuth authorization flow.
-- `GET /api/auth/github/repositories` — List authenticated user's GitHub repositories.
 - `POST /api/webhooks/github` — Automated push deployment receiver.
 - `GET /api/metrics` — OpenTelemetry / Prometheus platform metrics.
 - `GET /api/projects/{id}/deployments/{deploymentId}/events` — Event-replay log stream.
+

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/docker/go-connections/nat"
 	"github.com/google/uuid"
 
+	"github.com/forgelab/backend/internal/detector"
 	"github.com/forgelab/backend/internal/logging"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/network"
@@ -34,6 +36,8 @@ type Engine struct {
 	projectService    *services.ProjectService
 	deploymentService *services.DeploymentService
 	secretService     *services.SecretService
+	sourceService     *services.SourceService
+	githubService     *services.GitHubService
 	portManager       *network.PortManager
 	pathValidator     *security.PathValidator
 	wsHub             *ws.Hub
@@ -45,6 +49,8 @@ func NewEngine(
 	projectService *services.ProjectService,
 	deploymentService *services.DeploymentService,
 	secretService *services.SecretService,
+	sourceService *services.SourceService,
+	githubService *services.GitHubService,
 	portManager *network.PortManager,
 	pathValidator *security.PathValidator,
 	wsHub *ws.Hub,
@@ -60,6 +66,8 @@ func NewEngine(
 		projectService:    projectService,
 		deploymentService: deploymentService,
 		secretService:     secretService,
+		sourceService:     sourceService,
+		githubService:     githubService,
 		portManager:       portManager,
 		pathValidator:     pathValidator,
 		wsHub:             wsHub,
@@ -130,38 +138,153 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 
 	// 1. CLONING / SOURCE ACQUISITION
 	updateStatus(models.DeployStatusCloning, nil)
-	emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring source snapshot for project '%s'...", project.Name))
-
-	// Validate path and create snapshot
-	canonicalSource, err := e.pathValidator.ValidateSourcePath(project.RepositoryPath)
-	if err != nil {
-		reason := fmt.Sprintf("Source path validation failed: %v", err)
-		emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
-	}
-
 	snapshotDir := filepath.Join(e.workDir, deployment.ID.String())
-	if err := copyDirectory(canonicalSource, snapshotDir); err != nil {
-		reason := fmt.Sprintf("Failed to snapshot source files: %v", err)
-		emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
-	}
+	_ = os.MkdirAll(snapshotDir, 0755)
 	defer os.RemoveAll(snapshotDir) // Clean up snapshot dir after build completes
+
+	if project.SourceType == models.SourceTypeGitHub {
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (branch: %s)...", project.SourceReference, project.Branch))
+		parts := strings.Split(project.SourceReference, "/")
+		if len(parts) != 2 {
+			reason := fmt.Sprintf("Invalid GitHub repository reference '%s'. Expected format 'owner/repo'", project.SourceReference)
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+		if e.githubService == nil {
+			reason := "GitHub integration service is not available"
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+		if err := e.githubService.AcquireRepoTarball(ctx, project.OwnerID, parts[0], parts[1], project.Branch, snapshotDir); err != nil {
+			reason := fmt.Sprintf("Failed to acquire GitHub repository archive: %v", err)
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+	} else {
+		// Local Source
+		var sourceDir string
+		if project.SourceReference != "" {
+			sourceUUID, err := uuid.Parse(project.SourceReference)
+			if err != nil {
+				reason := fmt.Sprintf("Invalid local source upload ID '%s': %v", project.SourceReference, err)
+				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
+			if e.sourceService == nil {
+				reason := "Local source upload service is not available"
+				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
+			p, err := e.sourceService.GetSourcePath(sourceUUID)
+			if err != nil {
+				reason := fmt.Sprintf("Failed to locate uploaded source files: %v", err)
+				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
+			sourceDir = p
+			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using isolated uploaded source workspace.")
+		} else if project.RepositoryPath != "" {
+			canonicalSource, err := e.pathValidator.ValidateSourcePath(project.RepositoryPath)
+			if err != nil {
+				reason := fmt.Sprintf("Source path validation failed: %v", err)
+				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
+			sourceDir = canonicalSource
+			emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring source snapshot from host path '%s'...", project.RepositoryPath))
+		} else {
+			reason := "No valid local source reference or repository path configured"
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+
+		if err := copyDirectory(sourceDir, snapshotDir); err != nil {
+			reason := fmt.Sprintf("Failed to snapshot source files: %v", err)
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+	}
 
 	emitLog(models.LogPhaseSource, models.LogStreamSystem, "Source snapshot acquired successfully.")
 
 	// 2. BUILDING DOCKER IMAGE
 	updateStatus(models.DeployStatusBuilding, nil)
-	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Building Docker image '%s'...", *deployment.ImageTag))
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Preparing build for image '%s'...", *deployment.ImageTag))
 
-	buildContextDir, _, err := e.pathValidator.ValidateBuildContextAndDockerfile(snapshotDir, project.BuildContext, project.DockerfilePath)
-	if err != nil {
-		reason := fmt.Sprintf("Build context/Dockerfile validation failed: %v", err)
+	buildContextDir := filepath.Join(snapshotDir, project.BuildContext)
+	if _, err := os.Stat(buildContextDir); err != nil {
+		reason := fmt.Sprintf("Build context directory '%s' does not exist in source snapshot", project.BuildContext)
 		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
 		return errors.New(reason)
+	}
+
+	buildStrategy := deployment.BuildStrategy
+	if buildStrategy == "" {
+		buildStrategy = project.BuildStrategy
+	}
+	if buildStrategy == "" {
+		buildStrategy = models.BuildStrategyAuto
+	}
+
+	dockerfilePath := project.DockerfilePath
+	if dockerfilePath == "" {
+		dockerfilePath = "Dockerfile"
+	}
+
+	actualDockerPath := filepath.Join(buildContextDir, dockerfilePath)
+	hasExistingDockerfile := false
+	if _, err := os.Stat(actualDockerPath); err == nil {
+		hasExistingDockerfile = true
+	}
+
+	relDockerPath := dockerfilePath
+
+	if buildStrategy == models.BuildStrategyDockerfile || (buildStrategy == models.BuildStrategyAuto && hasExistingDockerfile) {
+		if !hasExistingDockerfile {
+			reason := fmt.Sprintf("Dockerfile '%s' not found in build context", dockerfilePath)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Using Dockerfile build strategy with '%s'...", dockerfilePath))
+	} else {
+		// Automatic Build Strategy: generate container image specification
+		runtimeType := deployment.RuntimeType
+		if runtimeType == "" {
+			runtimeType = project.RuntimeType
+		}
+		intPort := deployment.InternalPort
+		if intPort <= 0 {
+			intPort = project.InternalPort
+		}
+		if intPort <= 0 {
+			intPort = 8080
+		}
+		startCmd := deployment.StartCommand
+		if startCmd == "" {
+			startCmd = project.StartCommand
+		}
+
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Generating automatic build recipe for runtime: %s (internal port: %d)...", runtimeType, intPort))
+		generatedContent := detector.GenerateDockerfile(runtimeType, intPort, startCmd)
+		genPath := filepath.Join(buildContextDir, "Dockerfile.forgelab")
+		if err := os.WriteFile(genPath, []byte(generatedContent), 0644); err != nil {
+			reason := fmt.Sprintf("Failed to write generated Dockerfile: %v", err)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+		relDockerPath = "Dockerfile.forgelab"
 	}
 
 	tarArchive, err := createTarArchive(buildContextDir)
@@ -170,11 +293,6 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
 		return errors.New(reason)
-	}
-
-	relDockerPath, _ := filepath.Rel(buildContextDir, filepath.Join(snapshotDir, project.BuildContext, project.DockerfilePath))
-	if relDockerPath == "" {
-		relDockerPath = "Dockerfile"
 	}
 
 	buildResponse, err := e.dockerClient.ImageBuild(ctx, tarArchive, types.ImageBuildOptions{
@@ -215,17 +333,24 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		return errors.New(reason)
 	}
 
+	// Internal application port
+	intPort := deployment.InternalPort
+	if intPort <= 0 {
+		intPort = project.InternalPort
+	}
+	if intPort <= 0 {
+		intPort = 8080
+	}
+
 	// Prepare container env vars
 	envSlice := make([]string, 0, len(envMap)+1)
 	for k, v := range envMap {
 		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
 	}
-	envSlice = append(envSlice, fmt.Sprintf("PORT=%d", 8080)) // Internal default port
+	envSlice = append(envSlice, fmt.Sprintf("PORT=%d", intPort))
 
 	containerName := fmt.Sprintf("forgelab-app-%s", deployment.ID.String())
-
-	// Detect target container port or default 8080/3000/80
-	targetPortStr := "8080/tcp"
+	targetPortStr := fmt.Sprintf("%d/tcp", intPort)
 
 	containerConfig := &container.Config{
 		Image: *deployment.ImageTag,
@@ -273,37 +398,90 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		return errors.New(reason)
 	}
 
-	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started on host port %d.", containerID[:12], allocatedPort))
+	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started (host port %d -> internal port %d).", containerID[:12], allocatedPort, intPort))
 
 	// 4. HEALTH CHECKING
 	updateStatus(models.DeployStatusHealthChecking, nil)
-	healthPath := "/health"
+
+	healthStrategy := deployment.HealthStrategy
+	if healthStrategy == "" {
+		healthStrategy = project.HealthStrategy
+	}
+	if healthStrategy == "" {
+		healthStrategy = models.HealthStrategyAuto
+	}
+
+	healthPath := "/"
 	if project.HealthCheckPath != nil && *project.HealthCheckPath != "" {
 		healthPath = *project.HealthCheckPath
 	}
 
-	emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Performing health check on http://127.0.0.1:%d%s...", allocatedPort, healthPath))
+	emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Performing health check (strategy: %s, port: %d, path: %s)...", healthStrategy, allocatedPort, healthPath))
 
 	healthy := false
-	healthURL := fmt.Sprintf("http://127.0.0.1:%d%s", allocatedPort, healthPath)
-	httpClient := &http.Client{Timeout: 3 * time.Second}
 
-	for attempt := 1; attempt <= 10; attempt++ {
-		time.Sleep(2 * time.Second)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
-		if err == nil {
-			res, err := httpClient.Do(req)
+	if healthStrategy == models.HealthStrategyNone {
+		// Verify container is alive
+		cJSON, err := e.dockerClient.ContainerInspect(ctx, containerID)
+		if err == nil && cJSON.State != nil && cJSON.State.Running {
+			healthy = true
+			emitLog(models.LogPhaseHealth, models.LogStreamSystem, "Health strategy 'none': container verified running.")
+		}
+	} else if healthStrategy == models.HealthStrategyTCP {
+		for attempt := 1; attempt <= 10; attempt++ {
+			time.Sleep(2 * time.Second)
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", allocatedPort), 2*time.Second)
 			if err == nil {
-				res.Body.Close()
-				if res.StatusCode >= 200 && res.StatusCode < 400 {
-					healthy = true
-					emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Health check passed (HTTP %d) on attempt %d.", res.StatusCode, attempt))
-					break
+				conn.Close()
+				healthy = true
+				emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("TCP health check passed on attempt %d.", attempt))
+				break
+			}
+			emitLog(models.LogPhaseHealth, models.LogStreamStderr, fmt.Sprintf("TCP health check attempt %d failed: %v", attempt, err))
+		}
+	} else {
+		// HTTP or Auto
+		healthURL := fmt.Sprintf("http://127.0.0.1:%d%s", allocatedPort, healthPath)
+		httpClient := &http.Client{Timeout: 3 * time.Second}
+
+		for attempt := 1; attempt <= 10; attempt++ {
+			time.Sleep(2 * time.Second)
+
+			// Verify container is still running
+			cJSON, err := e.dockerClient.ContainerInspect(ctx, containerID)
+			if err != nil || (cJSON.State != nil && !cJSON.State.Running) {
+				emitLog(models.LogPhaseHealth, models.LogStreamStderr, "Container exited unexpectedly during health check")
+				break
+			}
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+			if err == nil {
+				res, err := httpClient.Do(req)
+				if err == nil {
+					res.Body.Close()
+					if res.StatusCode >= 200 && res.StatusCode < 400 {
+						healthy = true
+						emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Health check passed (HTTP %d) on attempt %d.", res.StatusCode, attempt))
+						break
+					} else if healthStrategy == models.HealthStrategyAuto && res.StatusCode > 0 {
+						healthy = true
+						emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Health check auto-detected responsive server (HTTP %d) on attempt %d.", res.StatusCode, attempt))
+						break
+					} else {
+						emitLog(models.LogPhaseHealth, models.LogStreamStderr, fmt.Sprintf("Health check attempt %d returned HTTP %d", attempt, res.StatusCode))
+					}
 				} else {
-					emitLog(models.LogPhaseHealth, models.LogStreamStderr, fmt.Sprintf("Health check attempt %d returned HTTP %d", attempt, res.StatusCode))
+					if healthStrategy == models.HealthStrategyAuto {
+						conn, tcpErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", allocatedPort), 1*time.Second)
+						if tcpErr == nil {
+							conn.Close()
+							healthy = true
+							emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Health check auto-detected active TCP socket on attempt %d.", attempt))
+							break
+						}
+					}
+					emitLog(models.LogPhaseHealth, models.LogStreamStderr, fmt.Sprintf("Health check attempt %d failed: %v", attempt, err))
 				}
-			} else {
-				emitLog(models.LogPhaseHealth, models.LogStreamStderr, fmt.Sprintf("Health check attempt %d failed: %v", attempt, err))
 			}
 		}
 	}

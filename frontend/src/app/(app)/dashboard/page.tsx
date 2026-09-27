@@ -105,7 +105,7 @@ export default function DashboardPage() {
               </div>
               <h2 className="text-sm font-semibold text-white">No projects registered</h2>
               <p className="text-xs text-neutral-400 mt-1 max-w-sm">
-                Get started by connecting a local repository path containing a Dockerfile.
+                Deploy an application from your computer or import directly from your GitHub repositories.
               </p>
               <Button
                 variant="primary"

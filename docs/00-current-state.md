@@ -39,14 +39,19 @@ ForgeLAB is a single control-plane, self-hosted application deployment platform.
 - **Session & Identity Management:** Backend-owned authentication. Sessions are delivered via secure HttpOnly cookies (`forgelab_access_token` and `forgelab_refresh_token`). No JWT persistence in client-side `localStorage`/`sessionStorage`. Safe account-linking model associates OAuth identities with existing accounts if the email is verified, or provisions new users without passwords.
 - **Frontend Architecture:** Rebuilt from the ground up on Next.js 16.3.6 App Router, React 19, Tailwind CSS, and `proxy.ts` (Next.js 16 convention). Features a developer SaaS landing page, OAuth buttons, dashboard, project management, secrets management, and real-time terminal viewer over WebSocket.
 - **Docker Networking:** The browser communicates with the frontend on `http://localhost:3000`. The Next.js server proxies `/api/*` requests internally to `http://backend:8080`.
-- **Source Ingestion & Host Visibility:**
-  - Local repository paths (`source_type: "local"`) are validated by `internal/security/PathValidator` and snapshotted into `data/builds/<deployment-id>` before building.
-  - **Filesystem Visibility Reality:** `PathValidator` and the snapshot copy run against the filesystem visible to the Go backend process.
-    - When the backend runs directly on the host (**Environment A**), arbitrary host repository paths (e.g. `C:\dev\testapp` or `/home/user/app`) are directly accessible.
-    - When the backend runs inside the Docker Compose container (**Environment B**), arbitrary host directories are **not** mounted into the container (`docker-compose.yml` only mounts `/var/run/docker.sock` and `forgelab_builds`). Therefore, host paths are not visible inside the containerized backend.
+- **Source Ingestion & Workspace Isolation:**
+  - **Local Computer Import (`source_type: "local"`):** Users select a directory or upload a `.zip`/`.tar.gz` archive directly from their browser. Files are uploaded via `POST /api/sources/upload` and extracted into an isolated workspace directory (`data/sources/<source_id>`) with Zip Slip / path traversal protection, symlink validation, and automatic skipping of build artifacts (`node_modules`, `.git`, etc.).
+  - **GitHub Repository Import (`source_type: "github"`):** Users authorize GitHub repository access via dedicated OAuth code exchange (`repo` scope). The backend queries GitHub's API for repositories and branches, analyzes project metadata remotely for detection, and retrieves repository tarballs into isolated source workspaces. Tokens are encrypted at rest with AES-256-GCM in `github_integrations`.
+  - **Host Filesystem Path (Legacy/Fallback):** Validated by `internal/security/PathValidator` if explicitly provided when backend runs on host.
+- **Project Detection & Build Strategy:**
+  - Automated heuristic detection (`internal/detector`) analyzes metadata (`package.json`, `go.mod`, `requirements.txt`, `Cargo.toml`, `pom.xml`, `Dockerfile`) to identify language, framework, build command, start command, suggested port, and health check endpoint.
+  - Supports `auto` (automatic multi-stage Docker build generation) and `dockerfile` (explicit Dockerfile).
+- **Dynamic Port Mapping & Health Strategies:**
+  - Internal application ports are no longer assumed to be 8080; the deployment engine binds the container's internal port (e.g. 3000, 8000, 8080) to ForgeLAB's dynamically allocated external host port (`10000–60000`).
+  - Readiness checks support `auto`, `http`, `tcp`, and `none`.
 - **Port Allocation:** Dynamic host port allocation in the range **`10000–60000`** managed by `internal/network/PortManager`.
 - **Realtime Pipeline:** Deployment events and container logs are pushed to Redis Pub/Sub channels (`forgelab:pubsub:deployment:<uuid>`), bridged to an in-memory WebSocket Hub, and streamed to authenticated client subscriptions.
-- **Rollback & Safety Invariant:** When a deployment fails at any stage (snapshot, build, container startup, or HTTP health check), the previous running deployment container remains untouched, and `projects.current_deployment_id` remains unchanged. Rollback creates a new deployment referencing the prior known-good Docker image.
+- **Rollback & Safety Invariant:** When a deployment fails at any stage (snapshot, build, container startup, or readiness check), the previous running deployment container remains untouched, and `projects.current_deployment_id` remains unchanged. Rollback creates a new deployment referencing the prior known-good Docker image.
 - **Container Restart vs. Platform Self-Healing:**
   - **Docker Runtime Restart Policy:** Containers are created with `RestartPolicy: "unless-stopped"`. The Docker daemon itself automatically restarts crashed containers.
   - **ForgeLAB-Level Self-Healing:** ForgeLAB does **not** implement continuous background runtime health monitoring, crash-loop detection, or automated application rollback after promotion.
@@ -77,13 +82,20 @@ The status classifications strictly follow these definitions:
 | **Multi-Provider Identity Model** | IMPLEMENTED | NOT RECORDED | `auth_identities` table, nullable password, deterministic account linking |
 | **Atomic Refresh Token Rotation** | IMPLEMENTED | NOT RECORDED | Single-use rotation via PostgreSQL atomic updates |
 | **Project CRUD & Ownership** | IMPLEMENTED | NOT RECORDED | Server-side user ownership checks on all endpoints |
-| **Local Host Source Validation** | IMPLEMENTED | NOT RECORDED | Works when backend runs on host; containerized backend lacks arbitrary host mounts |
+| **Local Computer Source Upload** | IMPLEMENTED | NOT RECORDED | Ingests directory/archive to isolated workspace via `/api/sources/upload` |
+| **GitHub Repository Authorization** | IMPLEMENTED | NOT RECORDED | Dedicated OAuth `repo` scope flow; encrypted at rest via AES-256-GCM |
+| **GitHub Repository & Branch Picker**| IMPLEMENTED | NOT RECORDED | Scoped listing of accessible repos and branches via `/api/integrations/github` |
+| **Heuristic Runtime Detection** | IMPLEMENTED | NOT RECORDED | Heuristic inspection of package.json, go.mod, python, etc. |
+| **Automatic Build Strategy** | IMPLEMENTED | NOT RECORDED | Multi-stage Dockerfile generation without requiring user Dockerfile |
+| **Dynamic Internal Port Mapping** | IMPLEMENTED | NOT RECORDED | Container internal port (3000, 8000, etc.) mapped to dynamic host port |
+| **Readiness Strategy (HTTP/TCP/None)**| IMPLEMENTED | NOT RECORDED | Flexible health check gating supporting HTTP, TCP, and None |
+| **Local Host Source Validation** | IMPLEMENTED | NOT RECORDED | Legacy/host-only fallback for direct filesystem paths |
 | **Local Source Snapshotting** | IMPLEMENTED | NOT RECORDED | Source copied to isolated working directory before build |
 | **Redis Deployment Queue** | IMPLEMENTED | NOT RECORDED | `LPUSH` / `BRPOP` queue with `SETNX` worker concurrency lock |
 | **Docker Build Pipeline** | IMPLEMENTED | NOT RECORDED | Docker SDK ImageBuild via tar stream, log parsing |
 | **Dynamic Host Port Allocation** | IMPLEMENTED | NOT RECORDED | Scans available ports in range `10000–60000` |
 | **Deployment State Machine** | IMPLEMENTED | NOT RECORDED | Enforced: `QUEUED`→`CLONING`→`BUILDING`→`STARTING`→`HEALTH_CHECKING`→`RUNNING`/`FAILED` |
-| **Health-Check Deployment Gate** | IMPLEMENTED | NOT RECORDED | HTTP polling gate (10 attempts, 2s interval) before promotion |
+| **Health-Check Deployment Gate** | IMPLEMENTED | NOT RECORDED | Polling gate before promotion supporting HTTP, TCP, and None |
 | **Deployment Safety Invariant** | IMPLEMENTED | NOT RECORDED | Failed health checks keep previous running deployment alive |
 | **Lifecycle Controls (Stop/Start/Restart)** | IMPLEMENTED | NOT RECORDED | Container Stop/Start/Restart via Docker SDK |
 | **Rollback Execution** | IMPLEMENTED | NOT RECORDED | Creates new deployment using prior known-good image tag |
@@ -94,7 +106,6 @@ The status classifications strictly follow these definitions:
 | **WebSocket Subscription Auth** | IMPLEMENTED | NOT RECORDED | Verifies user ownership of deployment project before subscribe |
 | **Deployment-Scoped Log Streaming** | IMPLEMENTED | NOT RECORDED | Streams live build & runtime logs to `deployment:<uuid>` |
 | **Frontend UI (Next.js 16 App Router)** | IMPLEMENTED | NOT RECORDED | Next.js 16.3.6 LTS, React 19, Tailwind CSS, landing page, dashboard, proxy.ts |
-| **GitHub Repository Selection** | DEFERRED | — | Planned future feature |
 | **GitHub Webhook Auto-Deploy** | DEFERRED | — | Planned future feature |
 | **Zero-Downtime Rolling Updates** | NOT IMPLEMENTED | — | Blue/green or proxy traffic shifting deferred |
 | **Caddy Reverse Proxy & TLS** | NOT IMPLEMENTED | — | Reverse proxy routing not in MVP |

@@ -1,8 +1,9 @@
 # ForgeLAB — GitHub Integration Architecture
 
-**Status:** AUTHENTICATION IMPLEMENTED; REPOSITORY IMPORT & WEBHOOKS DEFERRED  
-**Authentication Milestone:** GitHub OAuth 2.0 Web Flow is implemented strictly as a sign-in identity provider (`read:user user:email`).  
-**Repository Import Milestone:** Post-MVP Phase (Deferred). Source ingestion currently uses local filesystem paths (`source_type: "local"`).  
+**Status:** AUTHENTICATION & REPOSITORY IMPORT IMPLEMENTED; AUTOMATED PUSH WEBHOOKS DEFERRED  
+**Authentication Milestone:** GitHub OAuth 2.0 Web Flow is implemented as a sign-in identity provider (`read:user user:email`).  
+**Repository Import Milestone:** IMPLEMENTED. Dedicated OAuth flow (`repo` scope) encrypts tokens at rest with AES-256-GCM, provides scoped repository and branch pickers, detects runtimes, and retrieves tarballs into isolated workspaces.  
+**Webhook Milestone:** Deferred (manual deploy & trigger active).
 
 ---
 
@@ -12,14 +13,14 @@
 - [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
 - [docs/02-functional-requirements.md](02-functional-requirements.md) — R4 GitHub import requirements
 - [docs/05-security-trust-boundaries.md](05-security-trust-boundaries.md) — Token encryption & untrusted source code trust model
-- [docs/09-api-contract.md](09-api-contract.md) — GitHub OAuth authentication endpoints (`/api/auth/github`)
-- [docs/13-decisions.md](13-decisions.md) — DEC-008 (Repository Selection) & DEC-010 (OAuth Authentication)
+- [docs/09-api-contract.md](09-api-contract.md) — GitHub OAuth and Repository Integration endpoints
+- [docs/13-decisions.md](13-decisions.md) — DEC-008 (Repository Selection), DEC-010 (OAuth Authentication), & DEC-011 (Universal Source Ingestion)
 
 ---
 
-## 0. Current Implementation Distinction: Authentication vs. Repository Ingestion
+## 0. Architectural Distinction: Authentication vs. Repository Ingestion
 
-A critical architectural distinction must be maintained:
+ForgeLAB strictly separates identity authentication from repository authorization:
 
 1. **GitHub as an Authentication Provider (IMPLEMENTED):**
    - Implemented via `/api/auth/github` and `/api/auth/github/callback`.
@@ -28,9 +29,17 @@ A critical architectural distinction must be maintained:
    - Does **not** request or store repository access tokens (`repo` scope).
    - Authoritative ForgeLAB session is issued via HttpOnly cookies.
 
-2. **GitHub Repository Importing & Webhooks (DEFERRED):**
-   - Importing repositories from GitHub, browsing repository trees, configuring push webhooks, and triggering automated deployments from commits remain intentionally deferred.
-   - The sections below document the future architecture for repository ingestion.
+2. **GitHub Repository Importing & Inspection (IMPLEMENTED):**
+   - Implemented via `/api/integrations/github/*` endpoints.
+   - Explicitly requests `repo,read:user` scopes during dedicated connect flow.
+   - Encrypts access tokens at rest in `github_integrations` via AES-256-GCM.
+   - Queries GitHub's API to list repositories and branches scoped to the authenticated user.
+   - Performs remote file inspection to detect runtime and build requirements before project creation.
+   - Clones/downloads tarball snapshots into project-isolated source workspaces.
+
+3. **GitHub Push Webhooks (DEFERRED):**
+   - Automated push-to-deploy webhooks remain planned for a future milestone.
+
 
 ---
 

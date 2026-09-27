@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -51,21 +53,30 @@ func (h *ProjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if input.Name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
-		return
-	}
-	if input.RepositoryPath == "" {
-		writeError(w, http.StatusBadRequest, "repository_path is required")
+	if strings.TrimSpace(input.Name) == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
 		return
 	}
 
 	project, err := h.projectService.CreateProject(r.Context(), userID, input)
 	if err != nil {
+		if errors.Is(err, services.ErrValidationFailed) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, services.ErrProjectSlugTaken) {
 			writeError(w, http.StatusConflict, "a project with a similar name already exists")
 			return
 		}
+		if errors.Is(err, services.ErrInvalidSource) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		if errors.Is(err, services.ErrGitHubNotConnected) {
+			writeError(w, http.StatusForbidden, "GitHub repository access has not been granted. Please authorize repository permissions.")
+			return
+		}
+		slog.Error("failed to create project", "user_id", userID, "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to create project")
 		return
 	}

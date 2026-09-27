@@ -18,109 +18,203 @@ import (
 )
 
 var (
-	ErrProjectNotFound    = errors.New("project not found")
-	ErrProjectSlugTaken   = errors.New("project slug already in use")
-	ErrProjectNotOwned    = errors.New("project does not belong to user")
-	ErrActiveDeployment   = errors.New("project has an active deployment in progress")
+	ErrProjectNotFound  = errors.New("project not found")
+	ErrProjectSlugTaken = errors.New("project slug already in use")
+	ErrProjectNotOwned  = errors.New("project does not belong to user")
+	ErrActiveDeployment = errors.New("project has an active deployment in progress")
+	ErrValidationFailed = errors.New("validation failed")
+	ErrInvalidSource    = errors.New("invalid or unavailable project source")
 )
 
-// slugRegexp matches valid slugs: lowercase letters, numbers, hyphens.
-var slugRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$`)
-
-// ProjectService handles project-related business logic.
 // ProjectService handles project-related business logic.
 type ProjectService struct {
 	db            *pgxpool.Pool
 	pathValidator *security.PathValidator
+	sourceService *SourceService
+	githubService *GitHubService
 }
 
 // NewProjectService creates a new ProjectService.
-func NewProjectService(db *pgxpool.Pool, validator *security.PathValidator) *ProjectService {
+func NewProjectService(
+	db *pgxpool.Pool,
+	validator *security.PathValidator,
+	sourceService *SourceService,
+	githubService *GitHubService,
+) *ProjectService {
 	return &ProjectService{
 		db:            db,
 		pathValidator: validator,
+		sourceService: sourceService,
+		githubService: githubService,
 	}
 }
 
 // CreateProjectInput holds the data needed to create a project.
 type CreateProjectInput struct {
 	Name            string  `json:"name"`
-	RepositoryPath  string  `json:"repository_path"`
+	SourceType      string  `json:"source_type"` // "local" or "github"
+	SourceReference string  `json:"source_reference"` // repo "owner/repo" or local upload source_id
+	RepositoryPath  string  `json:"repository_path"` // legacy/optional host path
 	Branch          string  `json:"branch"`
 	DockerfilePath  string  `json:"dockerfile_path"`
 	BuildContext    string  `json:"build_context"`
+	BuildStrategy   string  `json:"build_strategy"` // "auto" or "dockerfile"
+	BuildCommand    string  `json:"build_command"`
+	StartCommand    string  `json:"start_command"`
+	RuntimeType     string  `json:"runtime_type"`
+	InternalPort    int     `json:"internal_port"`
 	HealthCheckPath *string `json:"health_check_path"`
+	HealthStrategy  string  `json:"health_strategy"`
 }
 
 // UpdateProjectInput holds the data that can be updated on a project.
 type UpdateProjectInput struct {
 	Name               *string `json:"name"`
+	SourceReference    *string `json:"source_reference"`
 	RepositoryPath     *string `json:"repository_path"`
 	Branch             *string `json:"branch"`
 	DockerfilePath     *string `json:"dockerfile_path"`
 	BuildContext       *string `json:"build_context"`
+	BuildStrategy      *string `json:"build_strategy"`
+	BuildCommand       *string `json:"build_command"`
+	StartCommand       *string `json:"start_command"`
+	RuntimeType        *string `json:"runtime_type"`
+	InternalPort       *int    `json:"internal_port"`
 	HealthCheckPath    *string `json:"health_check_path"`
 	HealthCheckEnabled *bool   `json:"health_check_enabled"`
+	HealthStrategy     *string `json:"health_strategy"`
 }
 
 // CreateProject creates a new project for the authenticated user.
 func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, input CreateProjectInput) (*models.Project, error) {
-	// Validate and canonicalize repository path if pathValidator is present
-	repoPath := input.RepositoryPath
-	if s.pathValidator != nil && repoPath != "" {
-		canonicalPath, err := s.pathValidator.ValidateSourcePath(repoPath)
-		if err != nil {
-			return nil, fmt.Errorf("invalid repository path: %w", err)
-		}
-		repoPath = canonicalPath
+	name := strings.TrimSpace(input.Name)
+	if name == "" {
+		return nil, fmt.Errorf("%w: project name is required", ErrValidationFailed)
 	}
 
-	// Generate slug from name
-	slug := generateSlug(input.Name)
+	sourceType := strings.ToLower(strings.TrimSpace(input.SourceType))
+	if sourceType == "" {
+		sourceType = models.SourceTypeLocal
+	}
+	if sourceType != models.SourceTypeLocal && sourceType != models.SourceTypeGitHub {
+		return nil, fmt.Errorf("%w: unsupported source type %q", ErrValidationFailed, sourceType)
+	}
 
-	// Set defaults
-	branch := input.Branch
+	sourceRef := strings.TrimSpace(input.SourceReference)
+	repoPath := strings.TrimSpace(input.RepositoryPath)
+
+	if sourceType == models.SourceTypeGitHub {
+		if sourceRef == "" {
+			return nil, fmt.Errorf("%w: github repository (owner/name) is required", ErrValidationFailed)
+		}
+		if s.githubService != nil {
+			status, err := s.githubService.GetStatus(ctx, ownerID)
+			if err != nil || !status.Connected {
+				return nil, ErrGitHubNotConnected
+			}
+		}
+	} else if sourceType == models.SourceTypeLocal {
+		if sourceRef != "" {
+			sourceUUID, err := uuid.Parse(sourceRef)
+			if err != nil {
+				return nil, fmt.Errorf("%w: invalid source upload ID", ErrInvalidSource)
+			}
+			if s.sourceService != nil {
+				if _, err := s.sourceService.GetSourcePath(sourceUUID); err != nil {
+					return nil, fmt.Errorf("%w: source files not found or expired", ErrInvalidSource)
+				}
+			}
+		} else if repoPath != "" {
+			if s.pathValidator != nil {
+				canonicalPath, err := s.pathValidator.ValidateSourcePath(repoPath)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %v", ErrInvalidSource, err)
+				}
+				repoPath = canonicalPath
+			}
+		} else {
+			return nil, fmt.Errorf("%w: local source requires uploaded files or valid host repository path", ErrInvalidSource)
+		}
+	}
+
+	slug := generateSlug(name)
+
+	branch := strings.TrimSpace(input.Branch)
 	if branch == "" {
 		branch = "main"
 	}
-	dockerfilePath := input.DockerfilePath
+	buildStrategy := strings.ToLower(strings.TrimSpace(input.BuildStrategy))
+	if buildStrategy == "" {
+		buildStrategy = models.BuildStrategyAuto
+	}
+	dockerfilePath := strings.TrimSpace(input.DockerfilePath)
 	if dockerfilePath == "" {
 		dockerfilePath = "Dockerfile"
 	}
-	buildContext := input.BuildContext
+	buildContext := strings.TrimSpace(input.BuildContext)
 	if buildContext == "" {
 		buildContext = "."
 	}
+	internalPort := input.InternalPort
+	if internalPort <= 0 || internalPort > 65535 {
+		internalPort = 8080
+	}
+	healthStrategy := strings.ToLower(strings.TrimSpace(input.HealthStrategy))
+	if healthStrategy == "" {
+		healthStrategy = models.HealthStrategyAuto
+	}
+	runtimeType := strings.TrimSpace(input.RuntimeType)
+	if runtimeType == "" {
+		runtimeType = "generic"
+	}
+
 	healthCheckPath := "/health"
 	if input.HealthCheckPath != nil {
 		healthCheckPath = *input.HealthCheckPath
 	}
 
+	now := time.Now()
 	project := &models.Project{
 		ID:                 uuid.New(),
 		OwnerID:            ownerID,
-		Name:               input.Name,
+		Name:               name,
 		Slug:               slug,
-		SourceType:         "local",
+		SourceType:         sourceType,
+		SourceReference:    sourceRef,
 		RepositoryPath:     repoPath,
 		Branch:             branch,
 		DockerfilePath:     dockerfilePath,
-		BuildContext:        buildContext,
+		BuildContext:       buildContext,
+		BuildStrategy:      buildStrategy,
+		BuildCommand:       strings.TrimSpace(input.BuildCommand),
+		StartCommand:       strings.TrimSpace(input.StartCommand),
+		RuntimeType:        runtimeType,
+		InternalPort:       internalPort,
 		HealthCheckPath:    &healthCheckPath,
 		HealthCheckEnabled: true,
+		HealthStrategy:     healthStrategy,
 		Status:             models.ProjectStatusInactive,
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 
 	_, err := s.db.Exec(ctx,
-		`INSERT INTO projects (id, owner_id, name, slug, source_type, repository_path, branch,
-		 dockerfile_path, build_context, health_check_path, health_check_enabled, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-		project.ID, project.OwnerID, project.Name, project.Slug, project.SourceType,
+		`INSERT INTO projects (
+			id, owner_id, name, slug, source_type, source_reference, repository_path, branch,
+			dockerfile_path, build_context, build_strategy, build_command, start_command,
+			runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
+			status, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8,
+			$9, $10, $11, $12, $13,
+			$14, $15, $16, $17, $18,
+			$19, $20, $21
+		)`,
+		project.ID, project.OwnerID, project.Name, project.Slug, project.SourceType, project.SourceReference,
 		project.RepositoryPath, project.Branch, project.DockerfilePath, project.BuildContext,
-		project.HealthCheckPath, project.HealthCheckEnabled, project.Status,
-		project.CreatedAt, project.UpdatedAt,
+		project.BuildStrategy, project.BuildCommand, project.StartCommand,
+		project.RuntimeType, project.InternalPort, project.HealthCheckPath, project.HealthCheckEnabled,
+		project.HealthStrategy, project.Status, project.CreatedAt, project.UpdatedAt,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "uq_projects_owner_slug") {
@@ -150,8 +244,9 @@ func (s *ProjectService) GetProject(ctx context.Context, projectID, ownerID uuid
 // ListProjects retrieves all projects for a user.
 func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID) ([]*models.Project, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT id, owner_id, name, slug, source_type, repository_path, branch,
-		 dockerfile_path, build_context, health_check_path, health_check_enabled,
+		`SELECT id, owner_id, name, slug, source_type, source_reference, repository_path, branch,
+		 dockerfile_path, build_context, build_strategy, build_command, start_command,
+		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
 		 status, current_deployment_id, port, created_at, updated_at
 		 FROM projects WHERE owner_id = $1 ORDER BY created_at DESC`,
 		ownerID,
@@ -165,9 +260,10 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID) ([
 	for rows.Next() {
 		p := &models.Project{}
 		err := rows.Scan(
-			&p.ID, &p.OwnerID, &p.Name, &p.Slug, &p.SourceType, &p.RepositoryPath,
-			&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.HealthCheckPath,
-			&p.HealthCheckEnabled, &p.Status, &p.CurrentDeploymentID, &p.Port,
+			&p.ID, &p.OwnerID, &p.Name, &p.Slug, &p.SourceType, &p.SourceReference, &p.RepositoryPath,
+			&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
+			&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
+			&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
 			&p.CreatedAt, &p.UpdatedAt,
 		)
 		if err != nil {
@@ -190,10 +286,12 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 		return nil, err
 	}
 
-	// Apply updates
 	if input.Name != nil {
 		project.Name = *input.Name
 		project.Slug = generateSlug(*input.Name)
+	}
+	if input.SourceReference != nil {
+		project.SourceReference = *input.SourceReference
 	}
 	if input.RepositoryPath != nil {
 		project.RepositoryPath = *input.RepositoryPath
@@ -207,23 +305,44 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 	if input.BuildContext != nil {
 		project.BuildContext = *input.BuildContext
 	}
+	if input.BuildStrategy != nil {
+		project.BuildStrategy = *input.BuildStrategy
+	}
+	if input.BuildCommand != nil {
+		project.BuildCommand = *input.BuildCommand
+	}
+	if input.StartCommand != nil {
+		project.StartCommand = *input.StartCommand
+	}
+	if input.RuntimeType != nil {
+		project.RuntimeType = *input.RuntimeType
+	}
+	if input.InternalPort != nil {
+		project.InternalPort = *input.InternalPort
+	}
 	if input.HealthCheckPath != nil {
 		project.HealthCheckPath = input.HealthCheckPath
 	}
 	if input.HealthCheckEnabled != nil {
 		project.HealthCheckEnabled = *input.HealthCheckEnabled
 	}
+	if input.HealthStrategy != nil {
+		project.HealthStrategy = *input.HealthStrategy
+	}
 
 	project.UpdatedAt = time.Now()
 
 	_, err = s.db.Exec(ctx,
-		`UPDATE projects SET name = $1, slug = $2, repository_path = $3, branch = $4,
-		 dockerfile_path = $5, build_context = $6, health_check_path = $7,
-		 health_check_enabled = $8, updated_at = $9
-		 WHERE id = $10`,
-		project.Name, project.Slug, project.RepositoryPath, project.Branch,
-		project.DockerfilePath, project.BuildContext, project.HealthCheckPath,
-		project.HealthCheckEnabled, project.UpdatedAt, project.ID,
+		`UPDATE projects SET
+		 name = $1, slug = $2, source_reference = $3, repository_path = $4, branch = $5,
+		 dockerfile_path = $6, build_context = $7, build_strategy = $8, build_command = $9,
+		 start_command = $10, runtime_type = $11, internal_port = $12, health_check_path = $13,
+		 health_check_enabled = $14, health_strategy = $15, updated_at = $16
+		 WHERE id = $17`,
+		project.Name, project.Slug, project.SourceReference, project.RepositoryPath, project.Branch,
+		project.DockerfilePath, project.BuildContext, project.BuildStrategy, project.BuildCommand,
+		project.StartCommand, project.RuntimeType, project.InternalPort, project.HealthCheckPath,
+		project.HealthCheckEnabled, project.HealthStrategy, project.UpdatedAt, project.ID,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "uq_projects_owner_slug") {
@@ -260,15 +379,17 @@ func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID u
 func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, projectID uuid.UUID) (*models.Project, error) {
 	p := &models.Project{}
 	err := s.db.QueryRow(ctx,
-		`SELECT id, owner_id, name, slug, source_type, repository_path, branch,
-		 dockerfile_path, build_context, health_check_path, health_check_enabled,
+		`SELECT id, owner_id, name, slug, source_type, source_reference, repository_path, branch,
+		 dockerfile_path, build_context, build_strategy, build_command, start_command,
+		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
 		 status, current_deployment_id, port, created_at, updated_at
 		 FROM projects WHERE id = $1`,
 		projectID,
 	).Scan(
-		&p.ID, &p.OwnerID, &p.Name, &p.Slug, &p.SourceType, &p.RepositoryPath,
-		&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.HealthCheckPath,
-		&p.HealthCheckEnabled, &p.Status, &p.CurrentDeploymentID, &p.Port,
+		&p.ID, &p.OwnerID, &p.Name, &p.Slug, &p.SourceType, &p.SourceReference, &p.RepositoryPath,
+		&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
+		&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
+		&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
 		&p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
@@ -292,21 +413,15 @@ func (s *ProjectService) UpdateProjectPort(ctx context.Context, projectID uuid.U
 	return s.GetProjectByIDWithoutOwnership(ctx, projectID)
 }
 
-// generateSlug creates a URL-friendly slug from a project name.
 func generateSlug(name string) string {
 	slug := strings.ToLower(name)
-	// Replace spaces and underscores with hyphens
 	slug = strings.ReplaceAll(slug, " ", "-")
 	slug = strings.ReplaceAll(slug, "_", "-")
-	// Remove any non-alphanumeric, non-hyphen characters
 	reg := regexp.MustCompile(`[^a-z0-9-]`)
 	slug = reg.ReplaceAllString(slug, "")
-	// Collapse multiple hyphens
 	reg = regexp.MustCompile(`-+`)
 	slug = reg.ReplaceAllString(slug, "-")
-	// Trim leading/trailing hyphens
 	slug = strings.Trim(slug, "-")
-
 	if slug == "" {
 		slug = "project"
 	}

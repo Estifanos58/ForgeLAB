@@ -3,9 +3,14 @@ import {
   CreateProjectInput,
   Deployment,
   DeploymentLog,
+  DetectionResult,
   EnvVar,
+  GitHubBranch,
+  GitHubRepo,
+  GitHubStatus,
   Project,
   SetEnvInput,
+  SourceUploadResult,
   UpdateProjectInput,
   User,
 } from './types';
@@ -178,6 +183,68 @@ export const api = {
 
     async delete(projectId: string, key: string): Promise<{ message: string }> {
       return apiFetch<{ message: string }>(`/api/projects/${projectId}/env/${encodeURIComponent(key)}`, {
+        method: 'DELETE',
+      });
+    },
+  },
+
+  integrations: {
+    github: {
+      async getStatus(): Promise<GitHubStatus> {
+        return apiFetch<GitHubStatus>('/api/integrations/github');
+      },
+
+      async getConnectURL(): Promise<{ url: string }> {
+        return apiFetch<{ url: string }>('/api/integrations/github/connect', {
+          method: 'POST',
+        });
+      },
+
+      async disconnect(): Promise<{ message: string }> {
+        return apiFetch<{ message: string }>('/api/integrations/github/disconnect', {
+          method: 'POST',
+        });
+      },
+
+      async listRepositories(page = 1, perPage = 30): Promise<{ repositories: GitHubRepo[]; page: number; per_page: number }> {
+        return apiFetch<{ repositories: GitHubRepo[]; page: number; per_page: number }>(
+          `/api/integrations/github/repositories?page=${page}&per_page=${perPage}`
+        );
+      },
+
+      async listBranches(owner: string, repo: string): Promise<{ branches: GitHubBranch[] }> {
+        return apiFetch<{ branches: GitHubBranch[] }>(
+          `/api/integrations/github/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`
+        );
+      },
+
+      async detect(
+        owner: string,
+        repo: string,
+        branch?: string,
+        rootDir?: string
+      ): Promise<DetectionResult> {
+        const params = new URLSearchParams();
+        if (branch) params.set('branch', branch);
+        if (rootDir) params.set('root_dir', rootDir);
+        const query = params.toString() ? `?${params.toString()}` : '';
+        return apiFetch<DetectionResult>(
+          `/api/integrations/github/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/detect${query}`
+        );
+      },
+    },
+  },
+
+  sources: {
+    async upload(formData: FormData): Promise<SourceUploadResult> {
+      return apiFetch<SourceUploadResult>('/api/sources/upload', {
+        method: 'POST',
+        body: formData,
+      });
+    },
+
+    async delete(sourceId: string): Promise<{ message: string }> {
+      return apiFetch<{ message: string }>(`/api/sources/${encodeURIComponent(sourceId)}`, {
         method: 'DELETE',
       });
     },

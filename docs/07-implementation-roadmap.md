@@ -163,10 +163,11 @@ To maintain engineering truth, this roadmap strictly distinguishes:
 These capabilities are intentionally deferred until Phase 9 physical verification is complete:
 
 ### Phase 10: GitHub OAuth Integration & Webhooks
-- [docs/15-github-integration.md](15-github-integration.md) architecture implementation
-- OAuth application handshake and encrypted token persistence
-- Authorized repository and branch picker
-- HMAC-signed GitHub webhook receiver for automated push-to-deploy
+- [x] Dedicated OAuth application handshake (`repo,read:user` scopes) and encrypted token persistence via AES-256-GCM (`IMPLEMENTED`)
+- [x] Authorized repository and branch picker API (`GET /api/integrations/github/...`) (`IMPLEMENTED`)
+- [x] Remote framework & runtime heuristic detection (`IMPLEMENTED`)
+- [x] Automated tarball acquisition into isolated build context (`IMPLEMENTED`)
+- [ ] HMAC-signed GitHub webhook receiver for automated push-to-deploy (`DEFERRED`)
 
 ### Phase 11: Edge Routing & Reverse Proxy (Caddy)
 - Caddy reverse proxy integration via dynamic configuration API

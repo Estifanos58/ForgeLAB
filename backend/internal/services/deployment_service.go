@@ -85,21 +85,32 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	imageTag := fmt.Sprintf("forgelab/%s:%d", project.ID, deployNumber)
 
 	deployment := &models.Deployment{
-		ID:           uuid.New(),
-		ProjectID:    project.ID,
-		DeployNumber: deployNumber,
-		Status:       models.DeployStatusQueued,
-		Branch:       project.Branch,
-		ImageTag:     &imageTag,
-		StartedAt:    &now,
-		CreatedAt:    now,
+		ID:             uuid.New(),
+		ProjectID:      project.ID,
+		DeployNumber:   deployNumber,
+		Status:         models.DeployStatusQueued,
+		Branch:         project.Branch,
+		ImageTag:       &imageTag,
+		BuildStrategy:  project.BuildStrategy,
+		BuildCommand:   project.BuildCommand,
+		StartCommand:   project.StartCommand,
+		RuntimeType:    project.RuntimeType,
+		InternalPort:   project.InternalPort,
+		HealthStrategy: project.HealthStrategy,
+		StartedAt:      &now,
+		CreatedAt:      now,
 	}
 
 	_, err = tx.Exec(ctx,
-		`INSERT INTO deployments (id, project_id, deploy_number, status, branch, image_tag, started_at, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		`INSERT INTO deployments (
+			id, project_id, deploy_number, status, branch, image_tag,
+			build_strategy, build_command, start_command, runtime_type, internal_port, health_strategy,
+			started_at, created_at
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 		deployment.ID, deployment.ProjectID, deployment.DeployNumber,
 		deployment.Status, deployment.Branch, deployment.ImageTag,
+		deployment.BuildStrategy, deployment.BuildCommand, deployment.StartCommand,
+		deployment.RuntimeType, deployment.InternalPort, deployment.HealthStrategy,
 		deployment.StartedAt, deployment.CreatedAt,
 	)
 	if err != nil {
@@ -235,14 +246,16 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, deploymentID uuid
 	d := &models.Deployment{}
 	err := s.db.QueryRow(ctx,
 		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
-		 image_tag, container_id, started_at, built_at, deployed_at,
-		 finished_at, duration_ms, failure_reason, created_at
+		 image_tag, container_id, source_revision, build_strategy, build_command,
+		 start_command, runtime_type, internal_port, health_strategy,
+		 started_at, built_at, deployed_at, finished_at, duration_ms, failure_reason, created_at
 		 FROM deployments WHERE id = $1`,
 		deploymentID,
 	).Scan(
-		&d.ID, &d.ProjectID, &d.DeployNumber, &d.Status, &d.CommitSHA,
-		&d.Branch, &d.ImageTag, &d.ContainerID, &d.StartedAt, &d.BuiltAt,
-		&d.DeployedAt, &d.FinishedAt, &d.DurationMs, &d.FailureReason, &d.CreatedAt,
+		&d.ID, &d.ProjectID, &d.DeployNumber, &d.Status, &d.CommitSHA, &d.Branch,
+		&d.ImageTag, &d.ContainerID, &d.SourceRevision, &d.BuildStrategy, &d.BuildCommand,
+		&d.StartCommand, &d.RuntimeType, &d.InternalPort, &d.HealthStrategy,
+		&d.StartedAt, &d.BuiltAt, &d.DeployedAt, &d.FinishedAt, &d.DurationMs, &d.FailureReason, &d.CreatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -257,8 +270,9 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, deploymentID uuid
 func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.UUID) ([]*models.Deployment, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
-		 image_tag, container_id, started_at, built_at, deployed_at,
-		 finished_at, duration_ms, failure_reason, created_at
+		 image_tag, container_id, source_revision, build_strategy, build_command,
+		 start_command, runtime_type, internal_port, health_strategy,
+		 started_at, built_at, deployed_at, finished_at, duration_ms, failure_reason, created_at
 		 FROM deployments WHERE project_id = $1 ORDER BY deploy_number DESC`,
 		projectID,
 	)
@@ -271,9 +285,10 @@ func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.
 	for rows.Next() {
 		d := &models.Deployment{}
 		err := rows.Scan(
-			&d.ID, &d.ProjectID, &d.DeployNumber, &d.Status, &d.CommitSHA,
-			&d.Branch, &d.ImageTag, &d.ContainerID, &d.StartedAt, &d.BuiltAt,
-			&d.DeployedAt, &d.FinishedAt, &d.DurationMs, &d.FailureReason, &d.CreatedAt,
+			&d.ID, &d.ProjectID, &d.DeployNumber, &d.Status, &d.CommitSHA, &d.Branch,
+			&d.ImageTag, &d.ContainerID, &d.SourceRevision, &d.BuildStrategy, &d.BuildCommand,
+			&d.StartCommand, &d.RuntimeType, &d.InternalPort, &d.HealthStrategy,
+			&d.StartedAt, &d.BuiltAt, &d.DeployedAt, &d.FinishedAt, &d.DurationMs, &d.FailureReason, &d.CreatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan deployment: %w", err)

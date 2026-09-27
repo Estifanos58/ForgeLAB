@@ -190,3 +190,29 @@ The frontend was rewritten from the ground up to establish a serious, minimal de
 - **Terminal Viewer (`features/deployments/terminal-viewer.tsx`):** Near-black surface (`#070709`), Geist Mono telemetry, copy/clear/scroll controls, live WebSocket status dot
 - **Skeleton (`ui/skeleton.tsx`):** Dimension-matched loading states replacing generic centered spinners
 
+---
+
+## 8. Multi-Step Project Import & Detection UI
+
+The obsolete MVP host-path modal has been replaced with a modern, multi-step import modal (`components/dashboard/create-project-modal.tsx`):
+
+### Step 1: Source Ingestion
+1. **GitHub Flow:**
+   - Evaluates repository permission state (`GET /api/integrations/github`).
+   - If not connected, displays an authorization banner explaining required scopes with an "Authorize GitHub Repositories" action.
+   - Once authorized, renders a searchable list of the user's GitHub repositories with visibility badges (Public/Private), default branch tags, and timestamps.
+   - When a repository is selected, fetches branches via `/branches` and triggers automatic heuristic detection via `/detect`.
+2. **Local Computer Flow:**
+   - Provides drag-and-drop and file-picker targets supporting both direct folder upload (`webkitdirectory`) and compressed archives (`.zip`, `.tar.gz`).
+   - Streams files via `POST /api/sources/upload`, receiving the assigned `source_id` and detection results from the backend.
+
+### Step 2: Configuration & Runtime Review
+- Summarizes the imported source and detected runtime framework with a badge.
+- Allows user to choose between:
+  - **Automatic Build Strategy:** Generates a tailored multi-stage container build without requiring a Dockerfile.
+  - **Dockerfile Strategy:** Uses the existing Dockerfile in the project.
+- Configures internal container listening port (pre-populated by detection: e.g. 3000, 8000, 8080).
+- Configures health/readiness check strategy (`auto`, `http`, `tcp`, `none`) and HTTP path.
+- Customizes optional build and start commands.
+
+

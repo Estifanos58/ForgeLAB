@@ -30,9 +30,10 @@ type AppConfig struct {
 
 // OAuthConfig holds OAuth provider settings.
 type OAuthConfig struct {
-	ClientID     string
-	ClientSecret string
-	RedirectURL  string
+	ClientID        string
+	ClientSecret    string
+	RedirectURL     string
+	RepoRedirectURL string
 }
 
 // IsConfigured returns true if the OAuth provider has non-placeholder credentials.
@@ -80,6 +81,7 @@ type EncryptionConfig struct {
 type DockerConfig struct {
 	Host               string
 	WorkDir            string
+	SourcesDir         string
 	AllowedSourceRoots string
 }
 
@@ -133,6 +135,7 @@ func Load() (*Config, error) {
 		Docker: DockerConfig{
 			Host:               getEnv("DOCKER_HOST", ""),
 			WorkDir:            getEnv("FORGELAB_WORK_DIR", "./data/builds"),
+			SourcesDir:         getEnv("FORGELAB_SOURCES_DIR", "./data/sources"),
 			AllowedSourceRoots: getEnv("FORGELAB_ALLOWED_SOURCE_ROOTS", ""),
 		},
 		Log: LogConfig{
@@ -150,9 +153,10 @@ func Load() (*Config, error) {
 			RedirectURL:  getEnv("GOOGLE_REDIRECT_URL", "http://localhost:3000/api/auth/google/callback"),
 		},
 		GitHub: OAuthConfig{
-			ClientID:     getEnv("GITHUB_CLIENT_ID", ""),
-			ClientSecret: getEnv("GITHUB_CLIENT_SECRET", ""),
-			RedirectURL:  getEnv("GITHUB_REDIRECT_URL", "http://localhost:3000/api/auth/github/callback"),
+			ClientID:        getEnv("GITHUB_CLIENT_ID", ""),
+			ClientSecret:    getEnv("GITHUB_CLIENT_SECRET", ""),
+			RedirectURL:     getEnv("GITHUB_REDIRECT_URL", "http://localhost:3000/api/auth/github/callback"),
+			RepoRedirectURL: getEnv("GITHUB_REPO_REDIRECT_URL", getEnv("FRONTEND_URL", "http://localhost:3000")+"/api/integrations/github/callback"),
 		},
 	}
 
