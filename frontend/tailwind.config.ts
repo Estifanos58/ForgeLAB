@@ -11,37 +11,50 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        background: '#090d16',
-        surface: '#0f172a',
-        'surface-elevated': '#1e293b',
-        'surface-border': '#334155',
-        primary: {
-          50: '#eff6ff',
-          100: '#dbeafe',
-          200: '#bfdbfe',
-          300: '#93c5fd',
-          400: '#60a5fa',
-          500: '#3b82f6',
-          600: '#2563eb',
-          700: '#1d4ed8',
-          800: '#1e40af',
-          900: '#1e3a8a',
+        background: '#09090b',
+        foreground: '#fafafa',
+        muted: {
+          DEFAULT: '#18181b',
+          foreground: '#a1a1aa',
+          subtle: '#71717a',
         },
-        brand: {
-          cyan: '#06b6d4',
-          emerald: '#10b981',
-          violet: '#8b5cf6',
-          amber: '#f59e0b',
-          rose: '#f43f5e',
-        }
+        surface: {
+          DEFAULT: '#111113',
+          elevated: '#18181b',
+          hover: '#222226',
+          border: '#27272a',
+          'border-subtle': '#1e1e22',
+        },
+        accent: {
+          DEFAULT: '#ffffff',
+          foreground: '#09090b',
+        },
+        border: '#27272a',
+        status: {
+          running: '#22c55e',
+          deploying: '#f59e0b',
+          failed: '#ef4444',
+          stopped: '#71717a',
+        },
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+        sans: ['var(--font-geist-sans)', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
+        mono: ['var(--font-geist-mono)', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
       },
-      animation: {
-        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-      }
+      borderRadius: {
+        sm: '4px',
+        DEFAULT: '6px',
+        md: '8px',
+        lg: '10px',
+        xl: '12px',
+      },
+      boxShadow: {
+        subtle: '0 1px 2px 0 rgba(0, 0, 0, 0.4)',
+        popover: '0 4px 20px -2px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.08)',
+      },
+      transitionDuration: {
+        DEFAULT: '150ms',
+      },
     },
   },
   plugins: [],

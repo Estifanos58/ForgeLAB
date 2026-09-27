@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api/client';
 import { Project } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
-import { Rocket, Square, Play, RotateCcw, History, Trash2 } from 'lucide-react';
+import { Play, RotateCcw, Square, History, Trash2, Rocket } from 'lucide-react';
 
 interface LifecycleControlsProps {
   project: Project;
@@ -60,7 +60,7 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
     }
   };
 
-  const isDeploying = project.status === 'deploying';
+  const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(project.status);
   const isRunning = project.status === 'running';
   const isStopped = project.status === 'stopped';
 
@@ -73,9 +73,9 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
         disabled={isDeploying || loadingAction !== null}
         loading={loadingAction === 'deploy' || isDeploying}
         onClick={handleDeploy}
-        icon={<Rocket className="w-4 h-4" />}
+        icon={<Rocket className="w-3.5 h-3.5" />}
       >
-        {isDeploying ? 'Deploying...' : 'Deploy Release'}
+        {isDeploying ? 'Deploying...' : 'Deploy'}
       </Button>
 
       {/* Conditional Lifecycle Controls */}
@@ -87,7 +87,7 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
             disabled={loadingAction !== null}
             loading={loadingAction === 'restart'}
             onClick={handleRestart}
-            icon={<RotateCcw className="w-3.5 h-3.5" />}
+            icon={<RotateCcw className="w-3 h-3" />}
           >
             Restart
           </Button>
@@ -97,7 +97,7 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
             disabled={loadingAction !== null}
             loading={loadingAction === 'stop'}
             onClick={handleStop}
-            icon={<Square className="w-3.5 h-3.5" />}
+            icon={<Square className="w-3 h-3" />}
           >
             Stop
           </Button>
@@ -106,12 +106,12 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
 
       {isStopped && (
         <Button
-          variant="success"
+          variant="secondary"
           size="sm"
           disabled={loadingAction !== null}
           loading={loadingAction === 'start'}
           onClick={handleStart}
-          icon={<Play className="w-3.5 h-3.5" />}
+          icon={<Play className="w-3 h-3" />}
         >
           Start
         </Button>
@@ -124,7 +124,7 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
         disabled={isDeploying || !project.current_deployment_id || loadingAction !== null}
         loading={loadingAction === 'rollback'}
         onClick={handleRollback}
-        icon={<History className="w-3.5 h-3.5" />}
+        icon={<History className="w-3 h-3" />}
         title="Rollback to previous known-good deployment"
       >
         Rollback
@@ -137,10 +137,10 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
         disabled={loadingAction !== null}
         loading={loadingAction === 'delete'}
         onClick={handleDelete}
-        className="text-slate-500 hover:text-rose-400 hover:bg-rose-950/30"
+        className="text-neutral-500 hover:text-red-400 hover:bg-red-950/20"
         title="Delete project"
       >
-        <Trash2 className="w-4 h-4" />
+        <Trash2 className="w-3.5 h-3.5" />
       </Button>
     </div>
   );

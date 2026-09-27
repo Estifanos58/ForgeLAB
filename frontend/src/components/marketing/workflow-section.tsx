@@ -5,67 +5,72 @@ export function WorkflowSection() {
   const steps = [
     {
       step: '01',
-      title: 'Import Repository',
+      title: 'Repository Ingestion',
       description:
         'Point ForgeLAB to a local repository path containing a Dockerfile. ForgeLAB validates path security and verifies directory boundaries.',
-      icon: <GitBranch className="w-5 h-5 text-primary-400" />,
+      icon: <GitBranch className="w-4 h-4 text-neutral-400" />,
     },
     {
       step: '02',
-      title: 'Source Snapshot & Build',
+      title: 'Snapshot & Build',
       description:
         'ForgeLAB takes an immutable point-in-time snapshot to data/builds/<id>, then builds an optimized container image via the Docker SDK.',
-      icon: <Layers className="w-5 h-5 text-brand-cyan" />,
+      icon: <Layers className="w-4 h-4 text-neutral-400" />,
     },
     {
       step: '03',
-      title: 'Health-Gated Startup',
+      title: 'Port Binding & Health Gate',
       description:
         'The container is launched on a dynamic host port (10000–60000). ForgeLAB polls the HTTP health endpoint before routing or promotion.',
-      icon: <ShieldCheck className="w-5 h-5 text-emerald-400" />,
+      icon: <ShieldCheck className="w-4 h-4 text-neutral-400" />,
     },
     {
       step: '04',
-      title: 'Live Telemetry & Safety',
+      title: 'Promotion & Safety Invariant',
       description:
         'Live logs stream directly over scoped WebSockets. If a build or health check fails, the previous release continues running untouched.',
-      icon: <Activity className="w-5 h-5 text-amber-400" />,
+      icon: <Activity className="w-4 h-4 text-neutral-400" />,
     },
   ];
 
   return (
-    <section id="workflow" className="py-20 border-t border-surface-border/40 relative">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="text-center max-w-2xl mx-auto mb-16">
-          <h2 className="text-xs font-semibold text-primary-400 uppercase tracking-widest mb-2">The Architecture In Action</h2>
-          <h3 className="text-3xl sm:text-4xl font-bold text-white tracking-tight">
-            How ForgeLAB Deploys Your Applications
-          </h3>
-          <p className="mt-3 text-sm text-slate-400">
-            A deterministic, four-stage lifecycle designed for safety, reproducibility, and total observability.
+    <section id="workflow" className="py-16 sm:py-20 border-t border-surface-border">
+      <div className="max-w-5xl mx-auto px-4 sm:px-6">
+        {/* Section Heading */}
+        <div className="max-w-2xl mb-12">
+          <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-500 mb-1.5">
+            Deployment Lifecycle
+          </div>
+          <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
+            Deterministic four-stage release pipeline
+          </h2>
+          <p className="mt-2 text-xs sm:text-sm text-neutral-400 leading-relaxed">
+            From local repository to health-checked container with guaranteed zero-downtime safety.
           </p>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        {/* Steps Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {steps.map((s, idx) => (
             <div
               key={idx}
-              className="relative p-6 rounded-2xl border border-surface-border/80 bg-surface/60 backdrop-blur-sm hover:border-slate-600 transition-all flex flex-col justify-between group"
+              className="p-4 rounded-md border border-surface-border bg-surface flex flex-col justify-between"
             >
               <div>
-                <div className="flex items-center justify-between mb-4">
-                  <div className="w-10 h-10 rounded-xl bg-surface-elevated border border-surface-border flex items-center justify-center group-hover:scale-105 transition-transform">
+                <div className="flex items-center justify-between mb-3 text-xs font-mono">
+                  <span className="text-neutral-500 font-bold">{s.step}</span>
+                  <div className="w-6 h-6 rounded border border-surface-border bg-surface-elevated flex items-center justify-center">
                     {s.icon}
                   </div>
-                  <span className="text-xl font-extrabold text-slate-700 group-hover:text-slate-500 transition-colors">
-                    {s.step}
-                  </span>
                 </div>
-                <h4 className="text-base font-semibold text-white mb-2">{s.title}</h4>
-                <p className="text-xs text-slate-400 leading-relaxed">{s.description}</p>
+                <h3 className="text-xs sm:text-sm font-semibold text-white tracking-tight mb-1.5">
+                  {s.title}
+                </h3>
+                <p className="text-xs text-neutral-400 leading-relaxed">{s.description}</p>
               </div>
-              <div className="mt-6 pt-3 border-t border-surface-border/40 flex items-center text-[11px] text-slate-500 font-mono">
-                <span>Phase: {s.title.toLowerCase().replace(/\s+/g, '-')}</span>
+
+              <div className="mt-4 pt-2.5 border-t border-surface-border/60 text-[10px] font-mono text-neutral-500">
+                Phase {idx + 1} of 4
               </div>
             </div>
           ))}

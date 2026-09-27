@@ -3,72 +3,81 @@
 import React from 'react';
 import Link from 'next/link';
 import { useAuth } from '@/features/auth/use-auth';
-import { Terminal, LogOut, User as UserIcon, LayoutDashboard } from 'lucide-react';
+import { Terminal, LogOut, User as UserIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 interface AppHeaderProps {
   breadcrumbs?: { label: string; href?: string }[];
+  activeTab?: string;
 }
 
 export function AppHeader({ breadcrumbs }: AppHeaderProps) {
   const { user, logout } = useAuth();
 
   return (
-    <header className="sticky top-0 z-40 w-full border-b border-surface-border/60 bg-background/80 backdrop-blur-md">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+    <header className="sticky top-0 z-40 w-full border-b border-surface-border bg-background">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 h-12 flex items-center justify-between">
         {/* Left: Brand + Breadcrumbs */}
-        <div className="flex items-center gap-4">
-          <Link href="/dashboard" className="flex items-center gap-2 group">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-primary-500 to-brand-cyan flex items-center justify-center shadow-md shadow-primary-500/20 group-hover:scale-105 transition-transform">
-              <Terminal className="w-4 h-4 text-white" />
+        <div className="flex items-center gap-3">
+          <Link href="/dashboard" className="flex items-center gap-2 select-none shrink-0">
+            <div className="w-5 h-5 rounded border border-surface-border bg-surface-elevated flex items-center justify-center text-white">
+              <Terminal className="w-3 h-3" />
             </div>
-            <div className="flex items-baseline gap-0.5">
-              <span className="text-lg font-bold text-white">Forge</span>
-              <span className="text-lg font-bold bg-gradient-to-r from-primary-400 to-brand-cyan bg-clip-text text-transparent">
-                LAB
-              </span>
-            </div>
+            <span className="text-xs font-semibold tracking-tight text-white hidden sm:inline">
+              ForgeLAB
+            </span>
           </Link>
 
-          {breadcrumbs && breadcrumbs.length > 0 && (
-            <div className="flex items-center gap-2 text-sm text-slate-400 border-l border-surface-border pl-4">
-              <Link href="/dashboard" className="hover:text-slate-200 transition-colors flex items-center gap-1">
-                <LayoutDashboard className="w-3.5 h-3.5" />
-                <span>Projects</span>
-              </Link>
-              {breadcrumbs.map((b, idx) => (
+          <span className="text-neutral-600 text-xs select-none">/</span>
+
+          <nav className="flex items-center gap-1.5 text-xs font-medium" aria-label="Breadcrumb">
+            <Link
+              href="/dashboard"
+              className="text-neutral-400 hover:text-white transition-colors"
+            >
+              Projects
+            </Link>
+
+            {breadcrumbs &&
+              breadcrumbs.map((b, idx) => (
                 <React.Fragment key={idx}>
-                  <span className="text-slate-600">/</span>
+                  <span className="text-neutral-600 text-xs select-none">/</span>
                   {b.href ? (
-                    <Link href={b.href} className="hover:text-slate-200 transition-colors">
+                    <Link
+                      href={b.href}
+                      className="text-neutral-400 hover:text-white transition-colors truncate max-w-[160px]"
+                    >
                       {b.label}
                     </Link>
                   ) : (
-                    <span className="text-slate-200 font-medium truncate max-w-[200px]">{b.label}</span>
+                    <span className="text-white font-medium truncate max-w-[180px] font-mono text-[11px]">
+                      {b.label}
+                    </span>
                   )}
                 </React.Fragment>
               ))}
-            </div>
-          )}
+          </nav>
         </div>
 
         {/* Right: Authenticated User + Logout */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           {user && (
-            <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-elevated/60 border border-surface-border text-xs text-slate-300">
-              <UserIcon className="w-3.5 h-3.5 text-primary-400" />
-              <span className="font-medium text-white">{user.display_name || user.email.split('@')[0]}</span>
-              <span className="text-slate-500">({user.email})</span>
+            <div className="hidden sm:flex items-center gap-1.5 px-2 py-1 rounded border border-surface-border bg-surface text-[11px] text-neutral-400">
+              <UserIcon className="w-3 h-3 text-neutral-500" />
+              <span className="font-mono text-neutral-200">
+                {user.display_name || user.email.split('@')[0]}
+              </span>
             </div>
           )}
           <Button
             size="sm"
             variant="ghost"
             onClick={logout}
-            icon={<LogOut className="w-4 h-4" />}
+            className="h-7 text-xs text-neutral-400 hover:text-white"
             title="Sign out of ForgeLAB"
           >
-            Logout
+            <LogOut className="w-3.5 h-3.5 mr-1" />
+            <span>Sign Out</span>
           </Button>
         </div>
       </div>

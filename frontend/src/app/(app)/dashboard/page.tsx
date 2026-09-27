@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useState, useCallback } from 'react';
+import Link from 'next/link';
 import { api } from '@/lib/api/client';
 import { Project } from '@/lib/api/types';
 import { AppHeader } from '@/components/layout/app-header';
@@ -8,9 +9,10 @@ import { ProjectStats } from '@/components/dashboard/project-stats';
 import { ProjectCard } from '@/components/dashboard/project-card';
 import { CreateProjectModal } from '@/components/dashboard/create-project-modal';
 import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
 import { Alert } from '@/components/ui/alert';
-import { Spinner } from '@/components/ui/spinner';
-import { Plus, FolderGit2, RefreshCw } from 'lucide-react';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Plus, RefreshCw, ExternalLink, GitBranch, FolderGit2 } from 'lucide-react';
 
 export default function DashboardPage() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -38,17 +40,17 @@ export default function DashboardPage() {
     <div className="min-h-screen flex flex-col bg-background">
       <AppHeader />
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-        {/* Top Header Row */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8 space-y-6">
+        {/* Page Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-white tracking-tight">Project Dashboard</h1>
-            <p className="text-xs sm:text-sm text-slate-400 mt-1">
-              Manage, monitor, and deploy your local application repositories
+            <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight">Projects</h1>
+            <p className="text-xs sm:text-sm text-neutral-400 mt-0.5">
+              Manage and monitor your self-hosted application repositories
             </p>
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2">
             <Button
               variant="outline"
               size="sm"
@@ -62,7 +64,7 @@ export default function DashboardPage() {
               variant="primary"
               size="sm"
               onClick={() => setIsModalOpen(true)}
-              icon={<Plus className="w-4 h-4" />}
+              icon={<Plus className="w-3.5 h-3.5" />}
             >
               Create Project
             </Button>
@@ -76,46 +78,123 @@ export default function DashboardPage() {
           </Alert>
         )}
 
-        {/* Project Stats Summary */}
+        {/* Compact Statistics Row */}
         <ProjectStats projects={projects} />
 
         {/* Main Projects Section */}
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
-              Registered Applications ({projects.length})
-            </h2>
+        <div className="space-y-3">
+          <div className="flex items-center justify-between text-xs font-mono text-neutral-400">
+            <span>All Projects ({projects.length})</span>
           </div>
 
           {loading ? (
-            <div className="flex flex-col items-center justify-center p-16 rounded-2xl border border-surface-border bg-surface/30">
-              <Spinner size="lg" />
-              <p className="text-xs text-slate-400 mt-3 font-mono">Loading projects...</p>
+            /* Skeleton Loading State matching table structure */
+            <div className="rounded-md border border-surface-border bg-surface overflow-hidden">
+              <div className="p-4 space-y-3">
+                <Skeleton className="h-6 w-full max-w-md" />
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+              </div>
             </div>
           ) : projects.length === 0 ? (
-            <div className="flex flex-col items-center justify-center p-16 rounded-2xl border border-dashed border-surface-border bg-surface/20 text-center">
-              <div className="w-12 h-12 rounded-xl bg-surface-elevated flex items-center justify-center mb-4 text-slate-500">
-                <FolderGit2 className="w-6 h-6" />
+            /* Clean Empty State */
+            <div className="flex flex-col items-center justify-center p-12 sm:p-16 rounded-md border border-dashed border-surface-border bg-surface/50 text-center">
+              <div className="w-9 h-9 rounded border border-surface-border bg-surface-elevated flex items-center justify-center mb-3 text-neutral-400">
+                <FolderGit2 className="w-4 h-4" />
               </div>
-              <h3 className="text-base font-semibold text-white">No projects registered</h3>
-              <p className="text-xs text-slate-400 mt-1 max-w-sm">
+              <h2 className="text-sm font-semibold text-white">No projects registered</h2>
+              <p className="text-xs text-neutral-400 mt-1 max-w-sm">
                 Get started by connecting a local repository path containing a Dockerfile.
               </p>
               <Button
                 variant="primary"
                 size="sm"
-                className="mt-5"
+                className="mt-4"
                 onClick={() => setIsModalOpen(true)}
-                icon={<Plus className="w-4 h-4" />}
+                icon={<Plus className="w-3.5 h-3.5" />}
               >
                 Create Project
               </Button>
             </div>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-              {projects.map((p) => (
-                <ProjectCard key={p.id} project={p} />
-              ))}
+            <div>
+              {/* Desktop Table View */}
+              <div className="hidden sm:block rounded-md border border-surface-border bg-surface overflow-hidden">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="border-b border-surface-border bg-surface-elevated/40 text-[11px] font-mono text-neutral-500 uppercase tracking-wider">
+                      <th className="py-2.5 px-4 font-medium">Project</th>
+                      <th className="py-2.5 px-4 font-medium">Status</th>
+                      <th className="py-2.5 px-4 font-medium">Branch</th>
+                      <th className="py-2.5 px-4 font-medium">Port</th>
+                      <th className="py-2.5 px-4 font-medium">Created</th>
+                      <th className="py-2.5 px-4 font-medium text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-surface-border font-sans">
+                    {projects.map((p) => (
+                      <tr
+                        key={p.id}
+                        className="hover:bg-surface-elevated/40 transition-colors group"
+                      >
+                        <td className="py-3 px-4">
+                          <Link
+                            href={`/projects/${p.id}`}
+                            className="font-semibold text-white hover:underline block tracking-tight"
+                          >
+                            {p.name}
+                          </Link>
+                          <span className="font-mono text-[11px] text-neutral-500 block truncate max-w-xs" title={p.repository_path}>
+                            {p.slug} • {p.repository_path}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4 whitespace-nowrap">
+                          <Badge status={p.status} />
+                        </td>
+                        <td className="py-3 px-4 whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1 font-mono text-[11px] text-neutral-300">
+                            <GitBranch className="w-3 h-3 text-neutral-500" />
+                            <span>{p.branch}</span>
+                          </span>
+                        </td>
+                        <td className="py-3 px-4 whitespace-nowrap">
+                          {p.status === 'running' && p.port ? (
+                            <a
+                              href={`http://localhost:${p.port}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1 font-mono text-[11px] text-emerald-400 hover:underline"
+                            >
+                              <span>:{p.port}</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          ) : (
+                            <span className="font-mono text-[11px] text-neutral-500">—</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 whitespace-nowrap font-mono text-[11px] text-neutral-400">
+                          {new Date(p.created_at).toLocaleDateString()}
+                        </td>
+                        <td className="py-3 px-4 whitespace-nowrap text-right">
+                          <Link href={`/projects/${p.id}`}>
+                            <Button size="sm" variant="outline" className="h-7 text-xs">
+                              Manage
+                            </Button>
+                          </Link>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Mobile Stacked List View */}
+              <div className="sm:hidden space-y-3">
+                {projects.map((p) => (
+                  <ProjectCard key={p.id} project={p} />
+                ))}
+              </div>
             </div>
           )}
         </div>

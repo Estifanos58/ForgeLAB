@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Alert } from '@/components/ui/alert';
 import { OAuthButtons } from '@/components/auth/oauth-buttons';
-import { Terminal, Lock, Mail } from 'lucide-react';
+import { Terminal } from 'lucide-react';
 
 export function LoginForm() {
   const { login, error: authError, clearError } = useAuth();
@@ -44,22 +44,22 @@ export function LoginForm() {
   const activeError = localError || authError;
 
   return (
-    <div className="w-full max-w-md mx-auto p-8 rounded-2xl border border-surface-border bg-surface/90 shadow-2xl backdrop-blur-md">
+    <div className="w-full max-w-sm mx-auto p-6 sm:p-7 rounded-lg border border-surface-border bg-surface shadow-subtle">
       {/* Brand Header */}
-      <div className="text-center mb-8">
-        <Link href="/" className="inline-flex items-center gap-2 group mb-4">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-brand-cyan flex items-center justify-center shadow-lg shadow-primary-500/25 group-hover:scale-105 transition-transform">
-            <Terminal className="w-5 h-5 text-white" />
+      <div className="text-center mb-6">
+        <Link href="/" className="inline-flex items-center gap-2 mb-3 group">
+          <div className="w-7 h-7 rounded border border-surface-border bg-surface-elevated flex items-center justify-center text-white">
+            <Terminal className="w-3.5 h-3.5" />
           </div>
-          <span className="text-2xl font-bold tracking-tight text-white">ForgeLAB</span>
+          <span className="text-base font-semibold tracking-tight text-white">ForgeLAB</span>
         </Link>
-        <h2 className="text-xl font-bold text-white tracking-tight">Welcome back</h2>
-        <p className="text-xs text-slate-400 mt-1">Sign in to manage your deployed applications</p>
+        <h1 className="text-lg font-semibold text-white tracking-tight">Sign in to your account</h1>
+        <p className="text-xs text-neutral-400 mt-1">Access your projects and deployment console</p>
       </div>
 
       {/* Error Alert */}
       {activeError && (
-        <div className="mb-6">
+        <div className="mb-4">
           <Alert variant="error" onClose={() => setLocalError(null)}>
             {activeError}
           </Alert>
@@ -67,29 +67,28 @@ export function LoginForm() {
       )}
 
       {/* 1-Click OAuth Providers */}
-      <div className="space-y-3 mb-6">
+      <div className="mb-4">
         <OAuthButtons mode="login" onError={(msg) => setLocalError(msg)} />
       </div>
 
       {/* Divider */}
-      <div className="relative flex items-center justify-center mb-6">
+      <div className="relative flex items-center justify-center my-4">
         <div className="border-t border-surface-border w-full" />
-        <span className="bg-surface px-3 text-xs uppercase tracking-wider text-slate-500 font-medium">
-          Or continue with email
+        <span className="bg-surface px-2.5 text-[11px] uppercase tracking-wider text-neutral-500 font-mono">
+          or
         </span>
       </div>
 
       {/* Password Form */}
-      <form onSubmit={handleSubmit} className="space-y-4">
+      <form onSubmit={handleSubmit} className="space-y-3.5">
         <Input
           label="Email address"
           type="email"
           required
           autoComplete="email"
-          placeholder="developer@example.com"
+          placeholder="name@example.com"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
-          icon={<Mail className="w-4 h-4" />}
         />
 
         <Input
@@ -100,19 +99,18 @@ export function LoginForm() {
           placeholder="••••••••"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          icon={<Lock className="w-4 h-4" />}
         />
 
-        <Button type="submit" variant="primary" size="md" loading={loading} className="w-full mt-2">
-          Sign in
+        <Button type="submit" variant="primary" size="md" loading={loading} className="w-full mt-1">
+          Continue with Email
         </Button>
       </form>
 
       {/* Footer link */}
-      <div className="mt-6 text-center text-xs text-slate-400">
+      <div className="mt-5 pt-4 border-t border-surface-border text-center text-xs text-neutral-400">
         Don&apos;t have an account?{' '}
-        <Link href="/register" className="text-primary-400 hover:text-primary-300 font-medium">
-          Create an account
+        <Link href="/register" className="text-white hover:underline underline-offset-2 font-medium">
+          Sign up
         </Link>
       </div>
     </div>

@@ -59,7 +59,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       isOpen={isOpen}
       onClose={onClose}
       title="Create New Project"
-      description="Register a repository source containing a Dockerfile for automated builds and deployment management."
+      description="Connect a host repository with a Dockerfile for automated builds and deployment management."
       maxWidth="lg"
     >
       {error && (
@@ -70,31 +70,33 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         </div>
       )}
 
-      <form onSubmit={handleSubmit} className="space-y-4">
+      <form onSubmit={handleSubmit} className="space-y-3.5">
         <Input
           label="Project Name"
           required
-          placeholder="e.g. Payments Gateway API"
+          placeholder="e.g. payments-api"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          helperText="A friendly display name for your service."
+          helperText="A unique identifier and display name for this service."
         />
 
         <Input
           label="Repository Path (Host Directory)"
           required
-          placeholder="e.g. C:\dev\projects\my-service or /home/user/apps/my-service"
+          placeholder="e.g. C:\dev\projects\payments-api or /home/user/apps/payments-api"
           value={repositoryPath}
           onChange={(e) => setRepositoryPath(e.target.value)}
-          helperText="Absolute filesystem path on the host where source files live."
+          helperText="Absolute filesystem path on the host where project files live."
+          className="font-mono text-xs"
         />
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Input
             label="Git Branch"
             placeholder="main"
             value={branch}
             onChange={(e) => setBranch(e.target.value)}
+            className="font-mono text-xs"
           />
 
           <Input
@@ -102,15 +104,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             placeholder="Dockerfile"
             value={dockerfilePath}
             onChange={(e) => setDockerfilePath(e.target.value)}
+            className="font-mono text-xs"
           />
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Input
             label="Build Context"
             placeholder="."
             value={buildContext}
             onChange={(e) => setBuildContext(e.target.value)}
+            className="font-mono text-xs"
           />
 
           <Input
@@ -118,15 +122,16 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             placeholder="/health"
             value={healthCheckPath}
             onChange={(e) => setHealthCheckPath(e.target.value)}
-            helperText="HTTP endpoint polled before release promotion."
+            helperText="HTTP path polled before promotion."
+            className="font-mono text-xs"
           />
         </div>
 
-        <div className="pt-4 border-t border-surface-border/50 flex items-center justify-end gap-3">
-          <Button type="button" variant="ghost" onClick={onClose} disabled={loading}>
+        <div className="pt-3 border-t border-surface-border flex items-center justify-end gap-2">
+          <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={loading}>
             Cancel
           </Button>
-          <Button type="submit" variant="primary" loading={loading}>
+          <Button type="submit" variant="primary" size="sm" loading={loading}>
             Create Project
           </Button>
         </div>

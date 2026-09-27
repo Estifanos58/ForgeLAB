@@ -10,9 +10,10 @@ export interface BadgeProps {
 }
 
 export function Badge({ status, variant, className, children, showDot = true }: BadgeProps) {
-  // Map deployment and project statuses to colors
   let computedVariant = variant || 'neutral';
   const normStatus = (status || '').toLowerCase();
+
+  const isLive = ['deploying', 'building', 'starting', 'health_checking', 'cloning'].includes(normStatus);
 
   if (!variant && status) {
     switch (normStatus) {
@@ -32,8 +33,6 @@ export function Badge({ status, variant, className, children, showDot = true }: 
         computedVariant = 'danger';
         break;
       case 'stopped':
-        computedVariant = 'neutral';
-        break;
       case 'inactive':
       default:
         computedVariant = 'neutral';
@@ -41,22 +40,22 @@ export function Badge({ status, variant, className, children, showDot = true }: 
     }
   }
 
-  const variants = {
-    success: 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300 shadow-sm shadow-emerald-900/30',
-    warning: 'bg-amber-950/70 border-amber-500/40 text-amber-300 shadow-sm shadow-amber-900/30',
-    danger: 'bg-rose-950/70 border-rose-500/40 text-rose-300 shadow-sm shadow-rose-900/30',
-    info: 'bg-primary-950/70 border-primary-500/40 text-primary-300 shadow-sm shadow-primary-900/30',
-    neutral: 'bg-slate-900 border-slate-700/60 text-slate-300',
-    default: 'bg-slate-900 border-slate-700/60 text-slate-300',
+  const dotColors = {
+    success: 'bg-emerald-500',
+    warning: cn('bg-amber-400', isLive && 'animate-pulse'),
+    danger: 'bg-red-500',
+    info: 'bg-blue-400',
+    neutral: 'bg-neutral-500',
+    default: 'bg-neutral-400',
   };
 
-  const dotColors = {
-    success: 'bg-emerald-400 animate-pulse',
-    warning: 'bg-amber-400 animate-ping',
-    danger: 'bg-rose-400',
-    info: 'bg-primary-400',
-    neutral: 'bg-slate-400',
-    default: 'bg-slate-400',
+  const textColors = {
+    success: 'text-emerald-400',
+    warning: 'text-amber-400',
+    danger: 'text-red-400',
+    info: 'text-blue-400',
+    neutral: 'text-neutral-400',
+    default: 'text-neutral-300',
   };
 
   const displayText = children || (status ? status.replace(/_/g, ' ') : '');
@@ -64,17 +63,19 @@ export function Badge({ status, variant, className, children, showDot = true }: 
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium uppercase tracking-wider border',
-        variants[computedVariant],
+        'inline-flex items-center gap-1.5 px-2 py-0.5 rounded border border-surface-border bg-surface-elevated/80 text-[11px] font-mono leading-none select-none',
         className
       )}
     >
       {showDot && (
-        <span className="relative flex h-2 w-2">
-          <span className={cn('relative inline-flex rounded-full h-2 w-2', dotColors[computedVariant])} />
-        </span>
+        <span
+          className={cn('inline-block h-1.5 w-1.5 rounded-full shrink-0', dotColors[computedVariant])}
+          aria-hidden="true"
+        />
       )}
-      {displayText}
+      <span className={cn('capitalize font-sans font-medium', textColors[computedVariant])}>
+        {displayText}
+      </span>
     </span>
   );
 }

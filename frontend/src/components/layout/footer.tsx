@@ -1,85 +1,72 @@
 import React from 'react';
 import Link from 'next/link';
-import { Terminal, Shield, Cpu, RefreshCw, Database } from 'lucide-react';
+import { Terminal } from 'lucide-react';
 
 export function Footer() {
   return (
-    <footer className="w-full border-t border-surface-border/60 bg-surface/30 backdrop-blur-sm py-12">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-8 mb-8">
-          <div className="space-y-3 md:col-span-2">
+    <footer className="w-full border-t border-surface-border bg-background py-10 text-xs">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6">
+        <div className="flex flex-col md:flex-row items-start justify-between gap-8 mb-8">
+          <div className="space-y-2 max-w-sm">
             <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-primary-500 to-brand-cyan flex items-center justify-center">
-                <Terminal className="w-4 h-4 text-white" />
+              <div className="w-5 h-5 rounded border border-surface-border bg-surface-elevated flex items-center justify-center text-white">
+                <Terminal className="w-3 h-3" />
               </div>
-              <span className="text-lg font-bold text-white">ForgeLAB</span>
+              <span className="font-semibold text-white">ForgeLAB</span>
             </div>
-            <p className="text-sm text-slate-400 max-w-sm leading-relaxed">
-              Self-hosted application deployment platform. Docker-based builds, deployment lifecycle orchestration,
-              health-gated rollouts, and isolated realtime telemetry.
+            <p className="text-neutral-400 leading-relaxed text-[11px]">
+              Self-hosted application deployment platform. Docker builds, health-check gated releases, and zero-downtime rollback safety.
             </p>
-            <div className="flex items-center gap-4 text-xs text-slate-500 pt-2">
-              <span className="flex items-center gap-1">
-                <Cpu className="w-3.5 h-3.5 text-primary-400" /> Go Control Plane
-              </span>
-              <span className="flex items-center gap-1">
-                <Database className="w-3.5 h-3.5 text-brand-cyan" /> PostgreSQL 16
-              </span>
-              <span className="flex items-center gap-1">
-                <RefreshCw className="w-3.5 h-3.5 text-amber-400" /> Redis 7
-              </span>
+          </div>
+
+          <div className="flex flex-wrap gap-8 text-neutral-400">
+            <div>
+              <div className="font-semibold text-neutral-200 mb-2">Platform</div>
+              <ul className="space-y-1.5">
+                <li>
+                  <Link href="#features" className="hover:text-white transition-colors">
+                    Features
+                  </Link>
+                </li>
+                <li>
+                  <Link href="#workflow" className="hover:text-white transition-colors">
+                    Workflow
+                  </Link>
+                </li>
+                <li>
+                  <Link href="#architecture" className="hover:text-white transition-colors">
+                    Architecture
+                  </Link>
+                </li>
+              </ul>
             </div>
-          </div>
 
-          <div>
-            <h4 className="text-xs font-semibold text-white uppercase tracking-wider mb-3">Platform</h4>
-            <ul className="space-y-2 text-sm text-slate-400">
-              <li>
-                <Link href="#features" className="hover:text-white transition-colors">
-                  Docker Builds
-                </Link>
-              </li>
-              <li>
-                <Link href="#workflow" className="hover:text-white transition-colors">
-                  Health Check Gates
-                </Link>
-              </li>
-              <li>
-                <Link href="#architecture" className="hover:text-white transition-colors">
-                  Rollback Invariant
-                </Link>
-              </li>
-              <li>
-                <Link href="/dashboard" className="hover:text-white transition-colors">
-                  Project Console
-                </Link>
-              </li>
-            </ul>
-          </div>
-
-          <div>
-            <h4 className="text-xs font-semibold text-white uppercase tracking-wider mb-3">Security & Trust</h4>
-            <ul className="space-y-2 text-sm text-slate-400">
-              <li className="flex items-center gap-1.5">
-                <Shield className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Zero Cloud Dependency</span>
-              </li>
-              <li>
-                <span className="hover:text-white transition-colors">AES-256-GCM Secrets</span>
-              </li>
-              <li>
-                <span className="hover:text-white transition-colors">Single Control Plane</span>
-              </li>
-              <li>
-                <span className="hover:text-white transition-colors">HttpOnly Sessions</span>
-              </li>
-            </ul>
+            <div>
+              <div className="font-semibold text-neutral-200 mb-2">Resources</div>
+              <ul className="space-y-1.5">
+                <li>
+                  <a
+                    href="https://github.com/Estifanos58/ForgeLAB"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="hover:text-white transition-colors"
+                  >
+                    GitHub
+                  </a>
+                </li>
+                <li>
+                  <Link href="/dashboard" className="hover:text-white transition-colors">
+                    Dashboard
+                  </Link>
+                </li>
+              </ul>
+            </div>
           </div>
         </div>
 
-        <div className="pt-8 border-t border-surface-border/40 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-4">
-          <p>© {new Date().getFullYear()} ForgeLAB. Open-source local-first developer infrastructure.</p>
-          <p>Built with Go, Docker, PostgreSQL, Redis & Next.js 16 Active LTS.</p>
+        <div className="pt-6 border-t border-surface-border flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] text-neutral-500 font-mono">
+          <div>© {new Date().getFullYear()} ForgeLAB. Open source under MIT.</div>
+          <div>Local-first developer infrastructure</div>
         </div>
       </div>
     </footer>

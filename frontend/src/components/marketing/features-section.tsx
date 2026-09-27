@@ -4,67 +4,87 @@ import { Box, Lock, RefreshCcw, Radio, ShieldAlert, Cpu } from 'lucide-react';
 export function FeaturesSection() {
   const features = [
     {
-      title: 'Docker-Native Execution',
+      title: 'Docker SDK Builds',
       description:
         'Direct integration with the Docker Engine SDK. Generates reproducible container images from standard Dockerfiles with zero external dependencies.',
-      icon: <Box className="w-5 h-5 text-primary-400" />,
+      tech: 'Docker Engine API v1.45',
+      icon: <Box className="w-4 h-4 text-neutral-300" />,
     },
     {
       title: 'Deployment Safety Invariant',
       description:
-        'A failed release never kills an active container. Traffic is only promoted after the new deployment successfully passes its health-check gate.',
-      icon: <ShieldAlert className="w-5 h-5 text-emerald-400" />,
+        'A failed release never kills an active container. Routing is only promoted after the new deployment passes its HTTP health-check gate.',
+      tech: '10 attempts • 2s interval',
+      icon: <ShieldAlert className="w-4 h-4 text-neutral-300" />,
     },
     {
       title: 'AES-256-GCM Secret Security',
       description:
         'Environment variables are encrypted at rest with unique 12-byte nonces. Plaintext secrets are automatically redacted from build & runtime logs.',
-      icon: <Lock className="w-5 h-5 text-brand-cyan" />,
+      tech: 'In-memory log redactor',
+      icon: <Lock className="w-4 h-4 text-neutral-300" />,
     },
     {
       title: 'Scoped Realtime WebSockets',
       description:
         'Log streams and status events are isolated strictly by deployment UUID. Client subscriptions are verified by server-side ownership authorization.',
-      icon: <Radio className="w-5 h-5 text-brand-violet" />,
+      tech: 'Redis Pub/Sub bridge',
+      icon: <Radio className="w-4 h-4 text-neutral-300" />,
     },
     {
       title: 'Instant Release Rollback',
       description:
         'Roll back instantly by creating a release from a prior known-good container image tag, passing through the same validated health check gate.',
-      icon: <RefreshCcw className="w-5 h-5 text-amber-400" />,
+      tech: 'Zero-downtime safety',
+      icon: <RefreshCcw className="w-4 h-4 text-neutral-300" />,
     },
     {
-      title: 'Lean Go Control Plane',
+      title: 'Single Go Control Plane',
       description:
-        'Fast single-binary control plane utilizing chi router, pgx connection pooling, and embedded Redis job workers. Low memory, zero bloat.',
-      icon: <Cpu className="w-5 h-5 text-rose-400" />,
+        'Fast single-binary control plane utilizing Chi router, pgx connection pooling, and embedded Redis job workers. Low memory, zero bloat.',
+      tech: 'Go 1.24 + Chi + pgx',
+      icon: <Cpu className="w-4 h-4 text-neutral-300" />,
     },
   ];
 
   return (
-    <section id="features" className="py-20 border-t border-surface-border/40 relative">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="text-center max-w-2xl mx-auto mb-16">
-          <h2 className="text-xs font-semibold text-primary-400 uppercase tracking-widest mb-2">Platform Capabilities</h2>
-          <h3 className="text-3xl sm:text-4xl font-bold text-white tracking-tight">
-            Enterprise Deployment Primitives
-          </h3>
-          <p className="mt-3 text-sm text-slate-400">
-            Engineered for developers who want full transparency and total control over their application infrastructure.
+    <section id="features" className="py-16 sm:py-20 border-t border-surface-border">
+      <div className="max-w-5xl mx-auto px-4 sm:px-6">
+        {/* Section Heading */}
+        <div className="max-w-2xl mb-12">
+          <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-500 mb-1.5">
+            Core Architecture
+          </div>
+          <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
+            Engineered for deterministic self-hosting
+          </h2>
+          <p className="mt-2 text-xs sm:text-sm text-neutral-400 leading-relaxed">
+            Every layer of ForgeLAB is built around explicit lifecycle boundaries, process isolation, and minimal operational overhead.
           </p>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {/* Editorial Grid with shared 1px borders */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 border-t border-l border-surface-border">
           {features.map((f, idx) => (
             <div
               key={idx}
-              className="p-6 rounded-2xl border border-surface-border/80 bg-surface/50 backdrop-blur-sm hover:border-slate-600 hover:bg-surface/75 transition-all group"
+              className="p-5 border-r border-b border-surface-border bg-surface/40 hover:bg-surface-elevated/40 transition-colors flex flex-col justify-between"
             >
-              <div className="w-10 h-10 rounded-xl bg-surface-elevated border border-surface-border flex items-center justify-center mb-4 group-hover:scale-105 transition-transform">
-                {f.icon}
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <div className="w-6 h-6 rounded border border-surface-border bg-surface-elevated flex items-center justify-center shrink-0">
+                    {f.icon}
+                  </div>
+                  <h3 className="text-sm font-semibold text-white tracking-tight">{f.title}</h3>
+                </div>
+                <p className="text-xs text-neutral-400 leading-relaxed">{f.description}</p>
               </div>
-              <h4 className="text-base font-semibold text-white mb-2">{f.title}</h4>
-              <p className="text-xs text-slate-400 leading-relaxed">{f.description}</p>
+
+              <div className="mt-4 pt-3 border-t border-surface-border/60">
+                <span className="font-mono text-[10px] text-neutral-500 uppercase tracking-wider">
+                  {f.tech}
+                </span>
+              </div>
             </div>
           ))}
         </div>

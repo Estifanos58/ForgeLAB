@@ -1,44 +1,43 @@
 import React from 'react';
 import Link from 'next/link';
-import { ArrowRight, Terminal } from 'lucide-react';
+import { ArrowRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 export function CtaSection() {
   return (
-    <section className="py-20 relative overflow-hidden">
-      {/* Background glow */}
-      <div className="absolute inset-0 bg-gradient-to-t from-primary-950/30 via-transparent to-transparent pointer-events-none" />
-
-      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 relative">
-        <div className="rounded-3xl border border-surface-border bg-gradient-to-br from-surface via-surface-elevated/80 to-surface p-8 sm:p-14 text-center shadow-2xl relative overflow-hidden">
-          <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-primary-500 to-brand-cyan flex items-center justify-center mx-auto mb-6 shadow-lg shadow-primary-500/20">
-            <Terminal className="w-6 h-6 text-white" />
-          </div>
-
-          <h2 className="text-3xl sm:text-4xl font-extrabold text-white tracking-tight">
-            Ready to Take Control of Your Deployments?
+    <section className="py-16 sm:py-20 border-t border-surface-border">
+      <div className="max-w-5xl mx-auto px-4 sm:px-6">
+        <div className="rounded-lg border border-surface-border bg-surface p-6 sm:p-10 text-center space-y-4">
+          <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
+            Run ForgeLAB on your local machine
           </h2>
-          <p className="mt-4 text-base text-slate-300 max-w-xl mx-auto leading-relaxed">
-            Run ForgeLAB on your local machine with Docker Compose. Zero cloud bills, total transparency, and reliable
-            deployment primitives.
+          <p className="text-xs sm:text-sm text-neutral-400 max-w-lg mx-auto leading-relaxed">
+            Zero cloud configuration, zero unexpected bills. Deploy with Docker Compose in seconds.
           </p>
 
-          <div className="mt-8 flex flex-wrap items-center justify-center gap-4">
+          <div className="pt-2 flex flex-wrap items-center justify-center gap-3">
             <Link href="/register">
-              <Button size="lg" variant="primary" icon={<ArrowRight className="w-4 h-4" />}>
-                Create an Account
+              <Button size="md" variant="primary">
+                Get Started
+                <ArrowRight className="w-3.5 h-3.5 ml-1" />
               </Button>
             </Link>
-            <Link href="/login">
-              <Button size="lg" variant="secondary">
-                Sign In
+            <a
+              href="https://github.com/Estifanos58/ForgeLAB"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <Button size="md" variant="secondary">
+                View Repository
               </Button>
-            </Link>
+            </a>
           </div>
 
-          <p className="mt-5 text-xs text-slate-500 font-mono">
-            $ docker compose up --build
-          </p>
+          <div className="pt-3">
+            <code className="inline-block px-3 py-1.5 rounded border border-surface-border bg-[#0a0a0c] text-[11px] font-mono text-neutral-400 select-all">
+              docker compose up --build
+            </code>
+          </div>
         </div>
       </div>
     </section>

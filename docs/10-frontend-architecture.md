@@ -161,3 +161,32 @@ With this release:
 1. **Eliminated `localStorage` Token Risk:** Raw JWTs are no longer stored in client storage. Sessions rely entirely on HttpOnly cookies.
 2. **Containerized Multi-Stage Production Build:** Upgraded from `next dev` to a production multi-stage Alpine build with `next build` and `next start`.
 3. **Docker Networking Alignment:** Internal Docker communication now points to `http://backend:8080` instead of loopback `http://localhost:8080`.
+
+---
+
+## 7. Visual Design System & UI Specifications
+
+The frontend was rewritten from the ground up to establish a serious, minimal developer infrastructure aesthetic inspired by the principles behind Vercel/Geist:
+
+### Monochromatic-First Color System
+- **Page Background:** Near-black (`#09090b`)
+- **Elevated Surfaces:** Flat dark neutral grays (`#111113`, `#18181b`)
+- **Borders:** Thin 1px neutral borders (`#27272a`) as the primary boundary separator
+- **Primary Text:** Crisp near-white (`#fafafa`)
+- **Muted Text:** Neutral grays (`#a1a1aa`, `#71717a`)
+- **Primary Action Contrast:** High-contrast solid white buttons (`text-neutral-950`) without decorative glowing gradients
+
+### Typography Hierarchy
+- **UI Typography:** Geist Sans (`geist/font/sans`) for layout, headings, and product interface
+- **Technical Typography:** Geist Mono (`geist/font/mono`) for repository paths, branch names, dynamic ports, deployment/container IDs, terminal logs, and environment secrets
+- **Hierarchy:** Page titles (20–28px), Section headings (14–18px), Card/table titles (13–14px), Body (13–14px), Metadata/Terminal logs (11–12px)
+
+### Component Primitives
+- **Button (`ui/button.tsx`):** Restrained variants (`primary`, `secondary`, `outline`, `ghost`, `danger`, `success`), 150ms transition, no scale transforms, no color shadows
+- **Input (`ui/input.tsx`):** Clean dark surface (`#0a0a0c`), subtle border, accessible focus ring (`focus-visible:ring-1 focus-visible:ring-neutral-400`)
+- **Card (`ui/card.tsx`):** Flat container with 1px border, 6–8px radius, zero backdrop-blur or decorative shadows
+- **Badge (`ui/badge.tsx`):** Compact status dot + text label (`● running`, `● deploying`, `● failed`, `● stopped`), animation strictly limited to genuinely live processes
+- **Modal (`ui/modal.tsx`):** Accessible dialog with Escape key and backdrop click handling, subtle popover shadow, compact close button
+- **Terminal Viewer (`features/deployments/terminal-viewer.tsx`):** Near-black surface (`#070709`), Geist Mono telemetry, copy/clear/scroll controls, live WebSocket status dot
+- **Skeleton (`ui/skeleton.tsx`):** Dimension-matched loading states replacing generic centered spinners
+

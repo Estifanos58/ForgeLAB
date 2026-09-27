@@ -14,6 +14,7 @@ interface TerminalViewerProps {
 
 export function TerminalViewer({ logs, connected, onClear, deploymentNumber }: TerminalViewerProps) {
   const terminalEndRef = useRef<HTMLDivElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [copied, setCopied] = useState(false);
 
@@ -35,61 +36,63 @@ export function TerminalViewer({ logs, connected, onClear, deploymentNumber }: T
   const getStreamColor = (stream: string) => {
     switch (stream) {
       case 'stderr':
-        return 'text-rose-400';
+        return 'text-red-400';
       case 'system':
-        return 'text-brand-cyan font-medium';
+        return 'text-neutral-200 font-medium';
       case 'stdout':
       default:
-        return 'text-slate-200';
+        return 'text-neutral-300';
     }
   };
 
-  const getPhaseBadge = (phase: string) => {
+  const getPhaseColor = (phase: string) => {
     switch (phase) {
       case 'build':
-        return 'text-primary-400 border-primary-500/30';
+        return 'text-neutral-300 border-neutral-700';
       case 'startup':
-        return 'text-amber-400 border-amber-500/30';
+        return 'text-amber-400 border-amber-900/50';
       case 'health':
-        return 'text-emerald-400 border-emerald-500/30';
+        return 'text-emerald-400 border-emerald-900/50';
       case 'source':
-        return 'text-brand-cyan border-brand-cyan/30';
+        return 'text-neutral-400 border-neutral-700';
       default:
-        return 'text-slate-400 border-slate-700';
+        return 'text-neutral-500 border-neutral-800';
     }
   };
 
   return (
-    <div className="flex flex-col h-full rounded-2xl border border-surface-border bg-background shadow-2xl overflow-hidden font-mono text-xs">
-      {/* Terminal Title Bar */}
-      <div className="flex items-center justify-between px-4 py-2.5 bg-surface border-b border-surface-border select-none">
+    <div className="flex flex-col h-full rounded-md border border-surface-border bg-[#09090b] shadow-subtle overflow-hidden font-mono text-xs">
+      {/* Terminal Toolbar */}
+      <div className="flex items-center justify-between px-3.5 py-2 bg-surface-elevated/70 border-b border-surface-border select-none">
         <div className="flex items-center gap-2">
-          <Terminal className="w-4 h-4 text-slate-400" />
-          <span className="text-white font-sans text-xs font-semibold">
-            Deployment Terminal {deploymentNumber ? `#${deploymentNumber}` : ''}
+          <Terminal className="w-3.5 h-3.5 text-neutral-400" />
+          <span className="text-white text-xs font-semibold font-sans">
+            Terminal {deploymentNumber ? `#${deploymentNumber}` : ''}
           </span>
-          <div className="flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded-full bg-surface-elevated text-[11px] font-sans">
+          <div className="flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded border border-surface-border bg-surface text-[10px]">
             <span
               className={cn(
-                'w-2 h-2 rounded-full',
-                connected ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
+                'w-1.5 h-1.5 rounded-full',
+                connected ? 'bg-emerald-500' : 'bg-neutral-600'
               )}
             />
-            <span className="text-slate-400">{connected ? 'Live WS' : 'Disconnected'}</span>
+            <span className="text-neutral-400 font-mono">
+              {connected ? 'live' : 'offline'}
+            </span>
           </div>
         </div>
 
-        {/* Action Controls */}
-        <div className="flex items-center gap-2 font-sans">
+        {/* Toolbar Controls */}
+        <div className="flex items-center gap-1 font-sans">
           <button
             onClick={() => setAutoScroll(!autoScroll)}
             className={cn(
               'px-2 py-1 rounded text-[11px] flex items-center gap-1 border transition-colors',
               autoScroll
-                ? 'bg-primary-950/70 border-primary-500/40 text-primary-300'
-                : 'bg-surface-elevated border-surface-border text-slate-400 hover:text-white'
+                ? 'bg-neutral-800 border-neutral-600 text-white'
+                : 'bg-transparent border-surface-border text-neutral-400 hover:text-white'
             )}
-            title="Auto-scroll on new logs"
+            title="Auto-scroll"
           >
             <ArrowDown className="w-3 h-3" />
             <span>Scroll</span>
@@ -97,8 +100,8 @@ export function TerminalViewer({ logs, connected, onClear, deploymentNumber }: T
 
           <button
             onClick={handleCopyLogs}
-            className="p-1 text-slate-400 hover:text-white hover:bg-surface-elevated rounded transition-colors"
-            title="Copy all logs"
+            className="p-1 text-neutral-400 hover:text-white hover:bg-surface-elevated rounded transition-colors"
+            title="Copy logs"
           >
             {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
           </button>
@@ -106,7 +109,7 @@ export function TerminalViewer({ logs, connected, onClear, deploymentNumber }: T
           {onClear && (
             <button
               onClick={onClear}
-              className="p-1 text-slate-400 hover:text-rose-400 hover:bg-surface-elevated rounded transition-colors"
+              className="p-1 text-neutral-400 hover:text-red-400 hover:bg-surface-elevated rounded transition-colors"
               title="Clear terminal view"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -115,24 +118,27 @@ export function TerminalViewer({ logs, connected, onClear, deploymentNumber }: T
         </div>
       </div>
 
-      {/* Terminal Output Area */}
-      <div className="flex-1 p-4 overflow-y-auto space-y-1.5 min-h-[350px] max-h-[550px] bg-background/95">
+      {/* Terminal Logs Output */}
+      <div
+        ref={containerRef}
+        className="flex-1 p-3.5 overflow-y-auto space-y-1 min-h-[360px] max-h-[580px] bg-[#070709] text-[11px] leading-relaxed"
+      >
         {logs.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-48 text-slate-600 font-sans">
-            <Terminal className="w-8 h-8 mb-2 opacity-50" />
-            <p className="text-xs">No logs recorded yet. Trigger a release to observe build & runtime telemetry.</p>
+          <div className="flex flex-col items-center justify-center h-48 text-neutral-500 font-sans text-xs">
+            <Terminal className="w-6 h-6 mb-2 opacity-30" />
+            <p>No log records for this release. Trigger a deployment to view telemetry.</p>
           </div>
         ) : (
           logs.map((log, idx) => (
-            <div key={log.id || idx} className="flex items-start gap-2.5 leading-relaxed hover:bg-surface/50 px-1 rounded">
-              <span className="text-slate-600 shrink-0 select-none text-[11px]">
+            <div key={log.id || idx} className="flex items-start gap-2 hover:bg-white/[0.02] px-1 rounded">
+              <span className="text-neutral-600 shrink-0 select-none text-[10px]">
                 {new Date(log.timestamp).toLocaleTimeString()}
               </span>
 
               <span
                 className={cn(
-                  'px-1.5 py-0.2 rounded border text-[10px] uppercase font-sans shrink-0',
-                  getPhaseBadge(log.phase)
+                  'px-1 py-0.2 rounded border text-[9px] uppercase tracking-wider shrink-0',
+                  getPhaseColor(log.phase)
                 )}
               >
                 {log.phase}

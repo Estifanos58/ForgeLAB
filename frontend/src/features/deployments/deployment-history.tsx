@@ -3,7 +3,7 @@
 import React from 'react';
 import { Deployment } from '@/lib/api/types';
 import { Badge } from '@/components/ui/badge';
-import { Clock, AlertTriangle } from 'lucide-react';
+import { Clock, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
 interface DeploymentHistoryProps {
@@ -19,7 +19,7 @@ export function DeploymentHistory({
 }: DeploymentHistoryProps) {
   if (deployments.length === 0) {
     return (
-      <div className="p-6 text-center text-xs text-slate-500 font-sans border border-surface-border rounded-xl bg-surface/40">
+      <div className="p-6 text-center text-xs text-neutral-500 rounded-md border border-surface-border bg-surface">
         No deployments recorded yet.
       </div>
     );
@@ -32,7 +32,7 @@ export function DeploymentHistory({
   };
 
   return (
-    <div className="space-y-2 max-h-[400px] overflow-y-auto pr-1">
+    <div className="divide-y divide-surface-border rounded-md border border-surface-border bg-surface max-h-[420px] overflow-y-auto">
       {deployments.map((d) => {
         const isSelected = d.id === selectedDeploymentId;
         const duration = formatDuration(d.duration_ms);
@@ -43,30 +43,32 @@ export function DeploymentHistory({
             type="button"
             onClick={() => onSelectDeployment(d)}
             className={cn(
-              'w-full text-left p-3 rounded-xl border transition-all select-none',
+              'w-full text-left p-3 transition-colors text-xs select-none block',
               isSelected
-                ? 'bg-surface-elevated border-primary-500/60 shadow-md shadow-primary-950'
-                : 'bg-surface/60 border-surface-border hover:bg-surface-elevated/40 hover:border-slate-600'
+                ? 'bg-surface-elevated text-white'
+                : 'hover:bg-surface-elevated/40 text-neutral-300'
             )}
           >
-            <div className="flex items-center justify-between gap-2 mb-1">
-              <span className="font-mono text-xs font-bold text-white">#{d.deploy_number}</span>
-              <Badge status={d.status} />
-            </div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="font-mono font-semibold text-white">#{d.deploy_number}</span>
+                <Badge status={d.status} />
+              </div>
 
-            <div className="flex items-center justify-between text-[11px] text-slate-400 mt-2 font-mono">
-              <span>{new Date(d.created_at).toLocaleDateString()} {new Date(d.created_at).toLocaleTimeString()}</span>
-              {duration && (
-                <span className="flex items-center gap-1 text-slate-400">
-                  <Clock className="w-3 h-3 text-slate-500" />
-                  {duration}
-                </span>
-              )}
+              <div className="flex items-center gap-2 font-mono text-[11px] text-neutral-400">
+                {duration && (
+                  <span className="flex items-center gap-1 text-neutral-400">
+                    <Clock className="w-3 h-3 text-neutral-500" />
+                    <span>{duration}</span>
+                  </span>
+                )}
+                <span>{new Date(d.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+              </div>
             </div>
 
             {d.failure_reason && (
-              <div className="mt-2 pt-2 border-t border-rose-900/30 flex items-start gap-1.5 text-[11px] text-rose-300">
-                <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-rose-400 mt-0.5" />
+              <div className="mt-1.5 pt-1.5 border-t border-red-900/30 flex items-start gap-1.5 text-[11px] text-red-300 font-mono">
+                <AlertCircle className="w-3 h-3 text-red-400 shrink-0 mt-0.5" />
                 <span className="truncate">{d.failure_reason}</span>
               </div>
             )}

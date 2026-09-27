@@ -4,7 +4,7 @@ import { Loader2 } from 'lucide-react';
 
 export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger' | 'success';
-  size?: 'sm' | 'md' | 'lg';
+  size?: 'sm' | 'md' | 'lg' | 'icon';
   loading?: boolean;
   icon?: React.ReactNode;
 }
@@ -12,27 +12,28 @@ export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElemen
 export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
   ({ className, variant = 'primary', size = 'md', loading = false, disabled, children, icon, ...props }, ref) => {
     const baseStyles =
-      'inline-flex items-center justify-center font-medium rounded-lg transition-all duration-150 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50 disabled:cursor-not-allowed select-none';
+      'inline-flex items-center justify-center font-medium rounded-md transition-colors duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-300 disabled:opacity-40 disabled:pointer-events-none select-none border text-xs sm:text-sm';
 
     const variants = {
       primary:
-        'bg-primary-600 hover:bg-primary-500 text-white shadow-lg shadow-primary-600/25 focus:ring-primary-500 active:scale-[0.98]',
+        'bg-white text-neutral-950 border-white hover:bg-neutral-200 hover:border-neutral-200 font-semibold shadow-sm',
       secondary:
-        'bg-surface-elevated hover:bg-slate-700 text-slate-100 border border-surface-border focus:ring-slate-500 active:scale-[0.98]',
+        'bg-surface-elevated text-neutral-200 border-surface-border hover:bg-surface-hover hover:border-neutral-600 hover:text-white shadow-subtle',
       outline:
-        'border border-surface-border hover:border-slate-500 text-slate-300 hover:text-white bg-transparent focus:ring-slate-400',
+        'bg-transparent text-neutral-300 border-surface-border hover:border-neutral-500 hover:text-white',
       ghost:
-        'text-slate-400 hover:text-white hover:bg-surface-elevated/60 focus:ring-slate-500',
+        'bg-transparent text-neutral-400 border-transparent hover:bg-surface-elevated hover:text-white',
       danger:
-        'bg-rose-600 hover:bg-rose-500 text-white shadow-lg shadow-rose-600/25 focus:ring-rose-500 active:scale-[0.98]',
+        'bg-red-950/30 text-red-300 border-red-900/50 hover:bg-red-900/30 hover:border-red-700/60 hover:text-red-200',
       success:
-        'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/25 focus:ring-emerald-500 active:scale-[0.98]',
+        'bg-emerald-950/30 text-emerald-300 border-emerald-900/50 hover:bg-emerald-900/30 hover:border-emerald-700/60 hover:text-emerald-200',
     };
 
     const sizes = {
-      sm: 'text-xs px-3 py-1.5 gap-1.5',
-      md: 'text-sm px-4 py-2 gap-2',
-      lg: 'text-base px-5 py-2.5 gap-2.5',
+      sm: 'h-7 px-2.5 text-xs gap-1.5',
+      md: 'h-8 sm:h-9 px-3.5 text-xs sm:text-sm gap-2',
+      lg: 'h-10 px-4 text-sm gap-2',
+      icon: 'h-8 w-8 p-0',
     };
 
     return (
@@ -42,7 +43,7 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
         className={cn(baseStyles, variants[variant], sizes[size], className)}
         {...props}
       >
-        {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : icon ? icon : null}
+        {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : icon ? icon : null}
         {children}
       </button>
     );

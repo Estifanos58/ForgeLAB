@@ -12,36 +12,36 @@ export interface AlertProps {
 
 export function Alert({ variant = 'info', title, children, onClose, className }: AlertProps) {
   const styles = {
-    error: 'bg-rose-950/60 border-rose-600/40 text-rose-200',
-    warning: 'bg-amber-950/60 border-amber-600/40 text-amber-200',
-    success: 'bg-emerald-950/60 border-emerald-600/40 text-emerald-200',
-    info: 'bg-primary-950/60 border-primary-600/40 text-primary-200',
+    error: 'bg-red-950/20 border-red-900/40 text-red-200',
+    warning: 'bg-amber-950/20 border-amber-900/40 text-amber-200',
+    success: 'bg-emerald-950/20 border-emerald-900/40 text-emerald-200',
+    info: 'bg-neutral-900/60 border-neutral-800 text-neutral-300',
   };
 
   const icons = {
-    error: <AlertCircle className="w-5 h-5 text-rose-400 shrink-0" />,
-    warning: <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />,
-    success: <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />,
-    info: <Info className="w-5 h-5 text-primary-400 shrink-0" />,
+    error: <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />,
+    warning: <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />,
+    success: <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />,
+    info: <Info className="w-4 h-4 text-neutral-400 shrink-0 mt-0.5" />,
   };
 
   return (
     <div
       role="alert"
-      className={cn('flex items-start gap-3 p-4 rounded-xl border backdrop-blur-sm text-sm', styles[variant], className)}
+      className={cn('flex items-start gap-2.5 p-3 rounded-md border text-xs leading-relaxed', styles[variant], className)}
     >
       {icons[variant]}
       <div className="flex-1">
-        {title && <h5 className="font-semibold mb-1">{title}</h5>}
-        <div className="text-xs leading-relaxed opacity-90">{children}</div>
+        {title && <h5 className="font-semibold text-white mb-0.5">{title}</h5>}
+        <div className="text-neutral-300">{children}</div>
       </div>
       {onClose && (
         <button
           onClick={onClose}
-          className="text-current opacity-60 hover:opacity-100 p-1 -mr-1 -mt-1 rounded"
+          className="text-neutral-400 hover:text-white p-0.5 -mr-1 -mt-0.5 rounded transition-colors"
           aria-label="Dismiss alert"
         >
-          <X className="w-4 h-4" />
+          <X className="w-3.5 h-3.5" />
         </button>
       )}
     </div>
