@@ -1,15 +1,19 @@
 package services_test
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/textproto"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -280,4 +284,381 @@ func TestSourceService_GetSourcePath_NotFound(t *testing.T) {
 	_, err = svc.GetSourcePath(context.Background(), uuid.New(), uuid.New())
 	assert.ErrorIs(t, err, services.ErrSourceDirNotFound)
 }
+
+type streamFile struct {
+	field    string
+	filename string
+	content  []byte
+}
+
+func createMultipartStream(files ...streamFile) (*multipart.Reader, func()) {
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+
+	done := make(chan struct{})
+	go func() {
+		defer pw.Close()
+		defer writer.Close()
+		defer close(done)
+
+		for _, f := range files {
+			h := make(textproto.MIMEHeader)
+			fieldName := f.field
+			if fieldName == "" {
+				fieldName = "files"
+			}
+			h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, f.filename))
+			part, err := writer.CreatePart(h)
+			if err != nil {
+				return
+			}
+			if _, err := part.Write(f.content); err != nil {
+				return
+			}
+		}
+	}()
+
+	cleanup := func() {
+		_ = pr.Close()
+		<-done
+	}
+
+	return multipart.NewReader(pr, writer.Boundary()), cleanup
+}
+
+func TestSourceService_IngestMultipartStream_ValidDirectory(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	reader, cleanup := createMultipartStream(
+		streamFile{filename: "my-node-app/package.json", content: []byte(`{"name":"my-node-app","scripts":{"start":"node index.js"}}`)},
+		streamFile{filename: "my-node-app/index.js", content: []byte(`console.log("hello world");`)},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.NotEqual(t, uuid.Nil, res.SourceID)
+	assert.Equal(t, 2, res.FilesCount)
+	assert.Equal(t, services.SourceStatusProcessing, res.Status)
+
+	// Workspace path on disk should be normalized (no my-node-app/ wrapper)
+	path, err := svc.GetSourcePath(context.Background(), ownerID, res.SourceID)
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(path, "package.json"))
+	assert.FileExists(t, filepath.Join(path, "index.js"))
+	assert.NoDirExists(t, filepath.Join(path, "my-node-app"))
+
+	// Wait briefly for background detection
+	var status *services.SourceUploadResult
+	for i := 0; i < 20; i++ {
+		status, err = svc.GetSourceStatus(context.Background(), ownerID, res.SourceID)
+		require.NoError(t, err)
+		if status.Status == services.SourceStatusReady {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	assert.Equal(t, services.SourceStatusReady, status.Status)
+	assert.Equal(t, "nodejs", status.Runtime)
+}
+
+func TestSourceService_IngestMultipartStream_NestedDirectories(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	reader, cleanup := createMultipartStream(
+		streamFile{filename: "app/src/components/Button.tsx", content: []byte(`export const Button = () => null;`)},
+		streamFile{filename: "app/src/lib/utils.ts", content: []byte(`export const add = (a: number, b: number) => a + b;`)},
+		streamFile{filename: "app/public/assets/icon.svg", content: []byte(`<svg></svg>`)},
+		streamFile{filename: "app/package.json", content: []byte(`{"name":"nested-app"}`)},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.NoError(t, err)
+	assert.Equal(t, 4, res.FilesCount)
+
+	path, err := svc.GetSourcePath(context.Background(), ownerID, res.SourceID)
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(path, "src", "components", "Button.tsx"))
+	assert.FileExists(t, filepath.Join(path, "src", "lib", "utils.ts"))
+	assert.FileExists(t, filepath.Join(path, "public", "assets", "icon.svg"))
+	assert.FileExists(t, filepath.Join(path, "package.json"))
+}
+
+func TestSourceService_IngestMultipartStream_IgnoredDirectories(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	reader, cleanup := createMultipartStream(
+		streamFile{filename: "proj/package.json", content: []byte(`{"name":"app"}`)},
+		streamFile{filename: "proj/node_modules/foo/index.js", content: []byte(`// ignored`)},
+		streamFile{filename: "proj/.git/HEAD", content: []byte(`ref: refs/heads/main`)},
+		streamFile{filename: "proj/.next/cache/turbopack.bin", content: []byte(`binary cache`)},
+		streamFile{filename: "proj/dist/bundle.js", content: []byte(`bundled`)},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.FilesCount) // Only package.json accepted
+
+	path, err := svc.GetSourcePath(context.Background(), ownerID, res.SourceID)
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(path, "package.json"))
+	assert.NoDirExists(t, filepath.Join(path, "node_modules"))
+	assert.NoDirExists(t, filepath.Join(path, ".git"))
+	assert.NoDirExists(t, filepath.Join(path, ".next"))
+	assert.NoDirExists(t, filepath.Join(path, "dist"))
+}
+
+func TestSourceService_IngestMultipartStream_PathTraversal(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	reader, cleanup := createMultipartStream(
+		streamFile{filename: "../../etc/shadow", content: []byte(`root:$6$xxx`)},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.ErrorIs(t, err, services.ErrPathTraversalDetected)
+
+	// Confirm staging directory is purged
+	uploadsDir := filepath.Join(tempDir, ".uploads")
+	entries, _ := os.ReadDir(uploadsDir)
+	assert.Empty(t, entries)
+}
+
+func TestSourceService_IngestMultipartStream_SizeLimitExceeded(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	overflow := make([]byte, services.MaxUncompressedBytes+1024)
+	reader, cleanup := createMultipartStream(
+		streamFile{filename: "huge.bin", content: overflow},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.ErrorIs(t, err, services.ErrArchiveTooLarge)
+
+	// Staging dir should be cleaned up
+	uploadsDir := filepath.Join(tempDir, ".uploads")
+	entries, _ := os.ReadDir(uploadsDir)
+	assert.Empty(t, entries)
+}
+
+func TestSourceService_IngestMultipartStream_ManyFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	var files []streamFile
+	files = append(files, streamFile{filename: "bulk/package.json", content: []byte(`{"name":"bulk"}`)})
+	for i := 0; i < 100; i++ {
+		files = append(files, streamFile{
+			filename: fmt.Sprintf("bulk/src/module_%d/file_%d.txt", i/10, i),
+			content:  []byte(fmt.Sprintf("content of file %d", i)),
+		})
+	}
+
+	reader, cleanup := createMultipartStream(files...)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.NoError(t, err)
+	assert.Equal(t, 101, res.FilesCount)
+
+	path, err := svc.GetSourcePath(context.Background(), ownerID, res.SourceID)
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(path, "package.json"))
+	assert.FileExists(t, filepath.Join(path, "src", "module_5", "file_55.txt"))
+}
+
+func TestSourceService_IngestMultipartStream_Empty(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	reader, cleanup := createMultipartStream(
+		streamFile{filename: "app/node_modules/fake.js", content: []byte(`ignored`)},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.Contains(t, err.Error(), "no files")
+}
+
+func TestSourceService_IngestMultipartStream_ContextCancellation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel before or during stream
+	cancel()
+
+	reader, cleanup := createMultipartStream(
+		streamFile{filename: "app/package.json", content: []byte(`{"name":"cancelled"}`)},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(ctx, ownerID, reader)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	// Confirm incomplete workspace was cleaned up
+	uploadsDir := filepath.Join(tempDir, ".uploads")
+	entries, _ := os.ReadDir(uploadsDir)
+	assert.Empty(t, entries)
+}
+
+func TestSourceService_IngestMultipartStream_ArchiveZip(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	// Build zip archive in memory
+	buf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(buf)
+	f, err := zipWriter.Create("archive-app/package.json")
+	require.NoError(t, err)
+	_, _ = f.Write([]byte(`{"name":"zip-app","scripts":{"start":"node index.js"}}`))
+	f2, err := zipWriter.Create("archive-app/index.js")
+	require.NoError(t, err)
+	_, _ = f2.Write([]byte(`console.log("from zip");`))
+	require.NoError(t, zipWriter.Close())
+
+	reader, cleanup := createMultipartStream(
+		streamFile{field: "archive", filename: "project.zip", content: buf.Bytes()},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, 2, res.FilesCount)
+
+	path, err := svc.GetSourcePath(context.Background(), ownerID, res.SourceID)
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(path, "package.json"))
+	assert.FileExists(t, filepath.Join(path, "index.js"))
+	assert.NoDirExists(t, filepath.Join(path, "archive-app"))
+}
+
+func TestSourceService_IngestMultipartStream_ArchiveTarGz(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+
+	// Build tar.gz archive in memory
+	buf := new(bytes.Buffer)
+	gw := gzip.NewWriter(buf)
+	tw := tar.NewWriter(gw)
+
+	content := []byte(`{"name":"targz-app"}`)
+	hdr := &tar.Header{
+		Name: "targz-app/package.json",
+		Mode: 0644,
+		Size: int64(len(content)),
+	}
+	require.NoError(t, tw.WriteHeader(hdr))
+	_, _ = tw.Write(content)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gw.Close())
+
+	reader, cleanup := createMultipartStream(
+		streamFile{field: "archive", filename: "project.tar.gz", content: buf.Bytes()},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, 1, res.FilesCount)
+
+	path, err := svc.GetSourcePath(context.Background(), ownerID, res.SourceID)
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(path, "package.json"))
+	assert.NoDirExists(t, filepath.Join(path, "targz-app"))
+}
+
+func TestSourceService_GetSourceStatus_ReadyAndOwnership(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-stream-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	svc := services.NewSourceService(nil, tempDir)
+	ownerID := uuid.New()
+	intruderID := uuid.New()
+
+	reader, cleanup := createMultipartStream(
+		streamFile{filename: "app/main.go", content: []byte("package main\nfunc main() {}")},
+		streamFile{filename: "app/go.mod", content: []byte("module myapp\ngo 1.22")},
+	)
+	defer cleanup()
+
+	res, err := svc.IngestMultipartStream(context.Background(), ownerID, reader)
+	require.NoError(t, err)
+
+	// Owner can get status
+	status, err := svc.GetSourceStatus(context.Background(), ownerID, res.SourceID)
+	require.NoError(t, err)
+	assert.Equal(t, res.SourceID, status.SourceID)
+	assert.Equal(t, 2, status.FilesCount)
+
+	// Intruder gets ErrUnauthorizedSource
+	_, err = svc.GetSourceStatus(context.Background(), intruderID, res.SourceID)
+	assert.ErrorIs(t, err, services.ErrUnauthorizedSource)
+
+	// Non-existent source gets ErrSourceDirNotFound
+	_, err = svc.GetSourceStatus(context.Background(), ownerID, uuid.New())
+	assert.ErrorIs(t, err, services.ErrSourceDirNotFound)
+}
+
 

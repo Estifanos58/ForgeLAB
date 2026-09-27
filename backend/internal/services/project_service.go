@@ -94,16 +94,20 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 
 	sourceType := strings.ToLower(strings.TrimSpace(input.SourceType))
 	if sourceType == "" {
-		sourceType = models.SourceTypeLocal
-	}
-	if sourceType != models.SourceTypeLocal && sourceType != models.SourceTypeGitHub {
-		return nil, fmt.Errorf("%w: unsupported source type %q", ErrValidationFailed, sourceType)
+		if strings.TrimSpace(input.RepositoryPath) != "" {
+			sourceType = models.SourceTypeLocalDirectory
+		} else if strings.TrimSpace(input.SourceReference) != "" {
+			sourceType = models.SourceTypeLocalUpload
+		} else {
+			sourceType = models.SourceTypeLocalDirectory
+		}
 	}
 
 	sourceRef := strings.TrimSpace(input.SourceReference)
 	repoPath := strings.TrimSpace(input.RepositoryPath)
 
-	if sourceType == models.SourceTypeGitHub {
+	switch sourceType {
+	case models.SourceTypeGitHub:
 		if sourceRef == "" {
 			return nil, fmt.Errorf("%w: github repository (owner/name) is required", ErrValidationFailed)
 		}
@@ -113,8 +117,46 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				return nil, ErrGitHubNotConnected
 			}
 		}
-	} else if sourceType == models.SourceTypeLocal {
-		if sourceRef != "" {
+	case models.SourceTypeLocalDirectory:
+		if repoPath == "" {
+			return nil, fmt.Errorf("%w: repository path is required for local directory projects", ErrValidationFailed)
+		}
+		if s.pathValidator != nil {
+			canonicalPath, err := s.pathValidator.ValidateSourcePath(repoPath)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrInvalidSource, err)
+			}
+			repoPath = canonicalPath
+		}
+		sourceRef = "" // Clear source_reference for local directory
+	case models.SourceTypeLocalUpload:
+		if sourceRef == "" {
+			return nil, fmt.Errorf("%w: source upload ID is required for uploaded archive projects", ErrValidationFailed)
+		}
+		sourceUUID, err := uuid.Parse(sourceRef)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid source upload ID", ErrInvalidSource)
+		}
+		if s.sourceService != nil {
+			if _, err := s.sourceService.GetSourcePath(ctx, ownerID, sourceUUID); err != nil {
+				return nil, fmt.Errorf("%w: source files not found, expired, or access denied", ErrInvalidSource)
+			}
+		}
+		repoPath = "" // Clear repository_path for uploaded sources
+	case models.SourceTypeLocal:
+		// Legacy alias
+		if repoPath != "" {
+			sourceType = models.SourceTypeLocalDirectory
+			if s.pathValidator != nil {
+				canonicalPath, err := s.pathValidator.ValidateSourcePath(repoPath)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %v", ErrInvalidSource, err)
+				}
+				repoPath = canonicalPath
+			}
+			sourceRef = ""
+		} else if sourceRef != "" {
+			sourceType = models.SourceTypeLocalUpload
 			sourceUUID, err := uuid.Parse(sourceRef)
 			if err != nil {
 				return nil, fmt.Errorf("%w: invalid source upload ID", ErrInvalidSource)
@@ -124,17 +166,12 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 					return nil, fmt.Errorf("%w: source files not found, expired, or access denied", ErrInvalidSource)
 				}
 			}
-		} else if repoPath != "" {
-			if s.pathValidator != nil {
-				canonicalPath, err := s.pathValidator.ValidateSourcePath(repoPath)
-				if err != nil {
-					return nil, fmt.Errorf("%w: %v", ErrInvalidSource, err)
-				}
-				repoPath = canonicalPath
-			}
+			repoPath = ""
 		} else {
 			return nil, fmt.Errorf("%w: local source requires uploaded files or valid host repository path", ErrInvalidSource)
 		}
+	default:
+		return nil, fmt.Errorf("%w: unsupported source type %q", ErrValidationFailed, sourceType)
 	}
 
 	slug := generateSlug(name)
@@ -306,7 +343,17 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 		project.SourceReference = newRef
 	}
 	if input.RepositoryPath != nil {
-		project.RepositoryPath = *input.RepositoryPath
+		newPath := strings.TrimSpace(*input.RepositoryPath)
+		if newPath != "" && (project.SourceType == models.SourceTypeLocalDirectory || project.SourceType == models.SourceTypeLocal) {
+			if s.pathValidator != nil {
+				canonical, err := s.pathValidator.ValidateSourcePath(newPath)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %v", ErrInvalidSource, err)
+				}
+				newPath = canonical
+			}
+		}
+		project.RepositoryPath = newPath
 	}
 	if input.Branch != nil {
 		project.Branch = *input.Branch

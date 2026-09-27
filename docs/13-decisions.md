@@ -25,12 +25,15 @@
 | **DEC-003** | Redis for Queue and Pub/Sub (No Kafka) | **ACTIVE** | 2026-09-25 |
 | **DEC-004** | UUIDv4 Identifiers Standard (ULID Migration Deferred) | **ACTIVE** | 2026-09-25 |
 | **DEC-005** | Deployment-Scoped WebSocket Isolation | **ACTIVE** | 2026-09-25 |
-| **DEC-006** | Local Source Snapshotting Prior to Docker Build | **ACTIVE** | 2026-09-25 |
+| **DEC-006** | Local Source Snapshotting Prior to Docker Build | **PARTIALLY SUPERSEDED (DEC-014)** | 2026-09-25 |
 | **DEC-007** | Deployment Safety Invariant (Failed Releases Never Terminate Running Releases) | **ACTIVE** | 2026-09-25 |
 | **DEC-008** | GitHub Import via Explicit OAuth and Repository Selection | **ACTIVE** | 2026-09-25 |
 | **DEC-009** | Physical Manual Verification as Authoritative Validation Methodology | **ACTIVE** | 2026-09-26 |
 | **DEC-010** | Multi-Provider OAuth Authentication with Deferred Repository Integration | **ACTIVE** | 2026-09-26 |
 | **DEC-011** | Universal Source Ingestion, GitHub Repository Integration, and Automatic Build/Runtime Strategy | **ACTIVE** | 2026-09-27 |
+| **DEC-012** | Authentication Boundary Proxy, Source Workspace Ownership, and Detector Hardening | **ACTIVE** | 2026-09-27 |
+| **DEC-013** | Streaming Source Ingestion, Staged Workspaces, and Asynchronous Processing Lifecycle | **ACTIVE** | 2026-09-27 |
+| **DEC-014** | Direct Local-Directory Deployment, Streaming Docker Build Context, and Early `.dockerignore` Pruning | **ACTIVE** | 2026-09-27 |
 
 ---
 
@@ -105,14 +108,14 @@
 ## DEC-006: Local Source Snapshotting Prior to Docker Build
 
 - **Date:** 2026-09-25
-- **Status:** **ACTIVE**
-- **Decision:** ForgeLAB copies the repository source from the host path into an isolated temporary directory (`data/builds/<deployment-id>`) before initiating `docker build`.
+- **Status:** **PARTIALLY SUPERSEDED BY DEC-014**
+- **Decision:** Historically, ForgeLAB copied the repository source from the host path into an isolated temporary directory (`data/builds/<deployment-id>`) before initiating `docker build`.
 - **Reason:**
   1. **Build Context Isolation:** Edits made by the developer on the host machine while a build is in progress will not corrupt or invalidate the image build context.
   2. **Reproducibility:** Builds are executed from an immutable point-in-time snapshot.
   3. **Security:** Avoids mounting the host filesystem directly into the Docker daemon during build execution.
-- **Current Implementation:** `backend/internal/docker/engine.go:144-152` (`copyDirectory`).
-- **Rule for Future Agents:** Do not replace the snapshot copy mechanism with direct host bind-mount builds unless an explicit caching/performance ADR is established.
+- **Current Implementation:** For `local_directory` deployments, direct build mode is now the default (DEC-014), eliminating full filesystem duplication. Snapshot mode is retained as a configurable option (`FORGELAB_LOCAL_BUILD_MODE=snapshot`) and for uploaded source workspaces (`local_upload`).
+- **Rule for Future Agents:** For `local_directory`, default to direct filesystem builds. Do not force an intermediate source copy into `data/builds/<deployment-id>` unless snapshot mode is explicitly enabled.
 
 ---
 
@@ -208,5 +211,39 @@
   13. **Client-Side Pre-Upload Filtering & Measurable Progress:** Implemented path-segment-based pre-upload filtering (`node_modules`, `.git`, `.next`, `dist`, `build`, `.venv`, etc.) and client-side 100MB size validation. Replaced opaque `fetch()` with `XMLHttpRequest` progress reporting to provide dynamic file counts and accurate upload percentages.
 - **Current Implementation:** `frontend/src/app/api/[[...path]]/route.ts`, `frontend/src/lib/api/client.ts`, `frontend/src/lib/source-utils.ts`, `frontend/src/features/auth/auth-context.tsx`, `frontend/src/components/dashboard/create-project-modal.tsx`, `backend/internal/services/source_service.go`, `backend/internal/services/github_service.go`, `backend/internal/handlers/source_handler.go`, `backend/internal/detector/detector.go`, `backend/internal/docker/engine.go`, `backend/cmd/server/main.go`, `docker-compose.yml`.
 - **Rule for Future Agents:** Do not restore global `ReadTimeout` to `http.Server`. Maintain client-side pre-filtering and `source_workspaces` ownership checks.
+
+---
+
+## DEC-013: Streaming Source Ingestion, Staged Workspaces, and Asynchronous Processing Lifecycle
+
+- **Date:** 2026-09-27
+- **Status:** **ACTIVE**
+- **Decision:** Removed the `r.ParseMultipartForm` disk-spooling bottleneck and decoupled network upload from server-side source analysis:
+  1. **Streaming Multipart Ingestion:** Replaced `r.ParseMultipartForm` in `SourceHandler.UploadSource` with sequential part consumption via `r.MultipartReader()`. Files stream directly from the incoming HTTP stream into their destination paths within an isolated temporary staging directory (`data/sources/.uploads/<source_id>/`), completely eliminating intermediate temporary file creation and reopen-copy overhead.
+  2. **Controlled Upload Staging & Atomic Finalization:** Uploads write exclusively into `.uploads/<source_id>/`. Incomplete or cancelled uploads never appear as valid workspaces. Upon complete streaming success, root directory normalization runs in-place, and the directory is atomically renamed to `data/sources/<source_id>/`.
+  3. **Decoupled Asynchronous Processing Lifecycle:** The upload endpoint returns `201 Created` immediately with `{ "source_id": "...", "status": "processing", "phase": "finalizing" }` once bytes are staged. Long-running heuristic detection (`internal/detector`) executes in a background goroutine, updating database lifecycle columns (`status`, `phase`, `processed_files`, `processed_bytes`, `detection_result`, `error`).
+  4. **Authenticated Source Status Polling (`GET /api/sources/{id}`):** Introduced an authenticated status retrieval endpoint enforcing source ownership. Returns current processing status, phase, metrics, and detection without exposing internal filesystem paths.
+  5. **Reliable Cancellation & Clean Failure Recovery:** The browser upload uses `AbortController` bound to the active `XMLHttpRequest`. Aborting cancels the request, signaling Go's `r.Context().Done()`. The streaming reader terminates immediately, purges `.uploads/<source_id>/`, and rolls back any partial database records.
+  6. **Safe Authentication & Timeout Management:** Upload XHR enforces a 10-minute network timeout (`xhr.timeout = 600000`) and removes blind 401 retries that previously risked re-uploading entire multi-megabyte payloads.
+  7. **Explicit Frontend State Machine & Honest Progress:** Refactored `CreateProjectModal` from boolean flags to an explicit `ImportPhase` (`idle`, `preparing`, `uploading`, `processing`, `ready`, `failed`, `cancelled`). Network progress honestly displays byte transfer (0–100%, rate, ETA). The UI transitions to server processing status and advances to application configuration only when the source workspace reaches `ready`.
+- **Current Implementation:** `backend/internal/services/source_service.go`, `backend/internal/handlers/source_handler.go`, `backend/migrations/000006_extend_source_workspaces_lifecycle.up.sql`, `frontend/src/lib/api/client.ts`, `frontend/src/components/dashboard/create-project-modal.tsx`.
+- **Rule for Future Agents:** Do not reintroduce `r.ParseMultipartForm` for directory uploads. Ensure all source uploads stage under `.uploads/` before atomic finalization. Preserve asynchronous status polling and ownership verification on `GET /api/sources/{id}`.
+
+---
+
+## DEC-014: Direct Local-Directory Deployment, Streaming Docker Build Context, and Early `.dockerignore` Pruning
+
+- **Date:** 2026-09-27
+- **Status:** **ACTIVE**
+- **Decision:** Replaced the browser-side folder upload pipeline (`webkitdirectory` -> huge `FormData` -> `POST /api/sources/upload`) with direct local-directory ingestion and streaming Docker builds:
+  1. **Direct Local Source Ingestion (`local_directory`):** In local development and self-hosted environments, ForgeLAB accepts and validates an existing local repository path via `POST /api/sources/local/validate` instead of transferring directory contents over HTTP. The backend inspects the directory directly for detection metadata.
+  2. **Path Boundary & Host-to-Container Translation:** Security is enforced via `PathValidator` with `FORGELAB_ALLOWED_SOURCE_ROOTS`. For containerized deployments, paths are safely translated from host roots (`FORGELAB_HOST_SOURCE_ROOT`) to container mounts (`/host-projects:ro`) without exposing the entire host filesystem or trusting raw container paths from clients.
+  3. **Streaming Docker Build Context (`io.Pipe`):** Eliminated the in-memory `bytes.Buffer` tar archiving bottleneck (`createTarArchive`). Build contexts are walked on the fly and written into an `io.Pipe()` via `tar.Writer`, consumed concurrently by Docker's `ImageBuild` stream. Context materialization in RAM is eliminated.
+  4. **Early `.dockerignore` Directory Pruning:** Integrated standard `.dockerignore` matching (`CanSkipDir`). Ignored directories (e.g., `node_modules`, `.git`, `.next`, `dist`, `.venv`) are skipped *before* filesystem descent, preventing traversal of tens of thousands of excluded files.
+  5. **Direct Build Mode (Zero Duplication):** Direct directory projects build straight from the validated directory source without intermediate copying into `data/builds/<deployment-id>`, while virtual files (such as generated `Dockerfile.forgelab`) are streamed into the TAR payload in-memory without mutating read-only source mounts.
+  6. **Retained Archive Upload Fallback:** The uploaded source workflow (`local_upload` via .zip/.tar.gz) remains available as an explicit fallback for remote clients or environments without shared filesystem access.
+- **Current Implementation:** `backend/internal/security/path_validator.go`, `backend/internal/docker/dockerignore.go`, `backend/internal/docker/tar_streamer.go`, `backend/internal/docker/engine.go`, `backend/internal/handlers/source_handler.go`, `backend/internal/services/project_service.go`, `frontend/src/components/dashboard/create-project-modal.tsx`.
+- **Rule for Future Agents:** Never construct a Docker build context in a `bytes.Buffer`. Never force `webkitdirectory` browser uploads for local directories when direct filesystem access is available. Always prune ignored directories early during traversal.
+
 
 

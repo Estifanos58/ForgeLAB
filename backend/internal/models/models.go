@@ -49,9 +49,9 @@ type Project struct {
 	OwnerID             uuid.UUID  `json:"owner_id"`
 	Name                string     `json:"name"`
 	Slug                string     `json:"slug"`
-	SourceType          string     `json:"source_type"` // "local" or "github"
-	SourceReference     string     `json:"source_reference"` // repo "owner/repo" or local source upload ID
-	RepositoryPath      string     `json:"repository_path"` // legacy/optional host path
+	SourceType          string     `json:"source_type"` // "local_directory", "local_upload", "github", or legacy "local"
+	SourceReference     string     `json:"source_reference"` // repo "owner/repo" or local upload source_id
+	RepositoryPath      string     `json:"repository_path"` // host path for local_directory projects
 	Branch              string     `json:"branch"`
 	DockerfilePath      string     `json:"dockerfile_path"`
 	BuildContext        string     `json:"build_context"`
@@ -72,8 +72,10 @@ type Project struct {
 
 // Source provider constants
 const (
-	SourceTypeLocal  = "local"
-	SourceTypeGitHub = "github"
+	SourceTypeLocal          = "local"           // legacy alias
+	SourceTypeLocalDirectory = "local_directory" // direct host project directory
+	SourceTypeLocalUpload    = "local_upload"    // uploaded zip/tar.gz source workspace
+	SourceTypeGitHub         = "github"          // GitHub repository
 )
 
 // Build strategy constants

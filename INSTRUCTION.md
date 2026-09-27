@@ -122,9 +122,11 @@ Deployment C follows normal deployment pipeline (container creation, port alloca
 Deployment C is promoted to current ONLY after passing health check
 ```
 
-### Invariant 3: Source Snapshotting Before Build
-- ForgeLAB copies local repository source into an isolated build directory (`data/builds/<deployment-id>`) before building.
-- Build context is isolated from concurrent host edits; build runs from a durable point-in-time snapshot.
+### Invariant 3: Direct Build Mode & Streaming Docker Build Context
+- For direct local-directory deployments (`source_type: "local_directory"`), ForgeLAB builds directly from the validated host directory without duplicating tens of thousands of files into `data/builds/<deployment-id>`.
+- The Docker build context is streamed concurrently using `io.Pipe()` and `tar.Writer`, completely eliminating in-memory `bytes.Buffer` buffering.
+- `.dockerignore` rules early-prune ignored directories (e.g. `node_modules`, `.git`, `.next`, cache dirs) before filesystem descent.
+- Snapshot mode is preserved as a configurable option or for uploaded archives (`data/sources/<source-id>`) where isolated extraction is appropriate.
 
 ### Invariant 4: Server-Side Authorization & Channel Isolation
 - Projects and deployments belong to a specific `owner_id` (User UUID).
@@ -141,15 +143,19 @@ Deployment C is promoted to current ONLY after passing health check
 
 ### Current Implemented MVP Scope:
 - User registration, login, JWT token auth, atomic refresh token rotation
-- Project CRUD, ownership enforcement, host path security validation (`PathValidator`)
-- Host source snapshotting, Docker SDK image builds, dynamic host port allocation (`10000–60000`)
+- Project CRUD, ownership enforcement, host path security validation (`PathValidator` with allowed roots and host-to-container translation)
+- Direct local-directory deployment (`source_type: "local_directory"`): directory validation (`POST /api/sources/local/validate`), zero-upload ingestion, direct filesystem build source
+- Streaming Docker build context (`io.Pipe()`) with `.dockerignore` early directory pruning (eliminating in-memory `bytes.Buffer`)
+- Local archive upload fallback (`source_type: "local_upload"`) via `/api/sources/upload` and isolated source workspaces
+- Authorized GitHub repository import (`source_type: "github"`) with encrypted tokens and remote detection
+- Docker SDK image builds, dynamic host port allocation (`10000–60000`)
 - Deployment state transitions (`QUEUED` → `CLONING` → `BUILDING` → `STARTING` → `HEALTH_CHECKING` → `RUNNING` / `FAILED`)
 - Deployment-time HTTP health check gating (10 attempts, 2-second interval)
 - Application lifecycle controls: Stop, Start, Restart
 - Rollback creating a new release from prior known-good image
 - AES-256-GCM encrypted environment variables & streaming log secret redactor
 - Scoped WebSocket log and status streaming (`deployment:<uuid>`)
-- Next.js 14 frontend: Dashboard, project settings, secrets manager, and live terminal viewer
+- Next.js 16 frontend: Dashboard, project settings, secrets manager, live terminal viewer, and dual-mode computer import modal (Existing Directory + Upload Archive)
 
 ### Explicitly Deferred Future Scope (Do NOT Implement):
 - GitHub OAuth integration & repository browser (see [docs/15-github-integration.md](docs/15-github-integration.md))

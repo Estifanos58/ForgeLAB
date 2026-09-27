@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/forgelab/backend/internal/models"
+	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
 )
 
@@ -111,6 +112,52 @@ func TestProjectService_CreateProject_LocalSource_ValidFiles(t *testing.T) {
 			Name:            "My Local Project",
 			SourceType:      models.SourceTypeLocal,
 			SourceReference: sourceID.String(),
+		})
+	})
+}
+
+func TestProjectService_CreateProject_LocalDirectory(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-proj-localdir-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	subDir := filepath.Join(tempDir, "my-app")
+	require.NoError(t, os.MkdirAll(subDir, 0755))
+
+	validator := security.NewPathValidator([]string{tempDir})
+	projectSvc := services.NewProjectService(nil, validator, nil, nil)
+	ctx := context.Background()
+	ownerID := uuid.New()
+
+	t.Run("missing repository path", func(t *testing.T) {
+		_, err := projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+			Name:           "Local Dir Project",
+			SourceType:     models.SourceTypeLocalDirectory,
+			RepositoryPath: "",
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, services.ErrValidationFailed)
+		assert.Contains(t, err.Error(), "repository path is required")
+	})
+
+	t.Run("non-existent repository path", func(t *testing.T) {
+		_, err := projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+			Name:           "Local Dir Project",
+			SourceType:     models.SourceTypeLocalDirectory,
+			RepositoryPath: filepath.Join(tempDir, "does-not-exist"),
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, services.ErrInvalidSource)
+	})
+
+	t.Run("valid local directory passes validation", func(t *testing.T) {
+		// Passes source validation, panics on nil DB
+		assert.Panics(t, func() {
+			_, _ = projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+				Name:           "Local Dir Project",
+				SourceType:     models.SourceTypeLocalDirectory,
+				RepositoryPath: subDir,
+			})
 		})
 	})
 }

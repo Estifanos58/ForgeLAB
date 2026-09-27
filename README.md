@@ -1,6 +1,6 @@
 # ForgeLAB — Self-Hosted Application Deployment Platform
 
-ForgeLAB is a single control-plane application deployment platform built in Go. It manages the entire container deployment lifecycle: local computer source upload, authorized GitHub repository import, heuristic runtime framework detection, automatic multi-stage container builds, Dockerfile execution, dynamic host and internal port mapping, health/readiness check gating, live WebSocket log streaming, AES-256-GCM secret and OAuth token encryption, and rollback safety.
+ForgeLAB is a single control-plane application deployment platform built in Go. It manages the entire container deployment lifecycle: direct local-directory deployment without browser upload, optional archive upload fallback, authorized GitHub repository import, heuristic runtime framework detection, automatic multi-stage container builds, Dockerfile execution, dynamic host and internal port mapping, health/readiness check gating, live WebSocket log streaming, AES-256-GCM secret and OAuth token encryption, and rollback safety.
 
 ---
 
@@ -10,7 +10,7 @@ ForgeLAB is a single control-plane application deployment platform built in Go. 
 - **Database**: PostgreSQL 16 (Durable records for users, identities, projects, deployments, secrets, github integrations, and logs)
 - **Work Queue & Pub/Sub**: Redis 7 (`LPUSH` / `BRPOP` queue + Pub/Sub event bridge)
 - **Runtime Engine**: Docker Engine SDK (Direct container image build and execution)
-- **Source Ingestion**: Local computer upload (`/api/sources/upload`) & authorized GitHub repository import (`/api/integrations/github`)
+- **Source Ingestion**: Direct local-directory deployment (`POST /api/sources/local/validate`), optional archive upload (`/api/sources/upload`), & authorized GitHub repository import (`/api/integrations/github`)
 - **Build Strategy**: Automatic heuristic multi-stage container build generation & Dockerfile build strategy
 - **Host Port Range**: Dynamic port allocation in the range **`10000–60000`** with dynamic container internal port mapping
 - **Frontend**: Next.js 16.3.6 LTS + React 19 + TypeScript + Tailwind CSS (Developer infrastructure operational console)
@@ -93,10 +93,10 @@ To run database migrations inside the container:
 docker compose exec backend /app/forgelab-migrate up
 ```
 
-#### Important Compose Limitations:
-1. **Host Repository Inaccessibility:** `docker-compose.yml` mounts only `/var/run/docker.sock` and a builds volume into the backend container. It does **not** mount arbitrary host filesystem paths. Supplying a host path like `C:\dev\my-app` to the containerized backend will fail validation.
-2. **Frontend Container Rewrite Networking:** In `frontend/next.config.js`, API rewrites target `http://localhost:8080`, which inside a container resolves to the frontend container itself rather than the `backend` Compose service.
-3. **Environment Isolation:** `docker-compose.yml` uses an explicit static environment block and does not automatically inject host `.env` settings (such as `FORGELAB_ALLOWED_SOURCE_ROOTS`).
+#### Containerized Local-Source Support:
+1. **Configured Host Source Root:** In `docker-compose.yml`, the backend container mounts `${FORGELAB_HOST_SOURCE_ROOT:-./}:/host-projects:ro` as a read-only volume. When running ForgeLAB in Docker, configure `FORGELAB_HOST_SOURCE_ROOT` to your host projects directory (e.g. `C:\Users\username\Projects` or `/home/user/projects`). The backend automatically translates host paths to the container mount safely.
+2. **Path Security:** ForgeLAB enforces `FORGELAB_ALLOWED_SOURCE_ROOTS` so that only directories within permitted roots can be validated or deployed.
+3. **No File Uploads Needed:** Direct local-directory deployment streams the Docker build context directly from the filesystem with `.dockerignore` pruning, eliminating browser uploads and disk duplication.
 
 For active development with local-source deployments, use **Workflow A**.
 

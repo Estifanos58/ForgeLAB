@@ -202,12 +202,35 @@ The obsolete MVP host-path modal has been replaced with a modern, multi-step imp
    - If not connected, displays an authorization banner explaining required scopes with an "Authorize GitHub Repositories" action.
    - Once authorized, renders a searchable list of the user's GitHub repositories with visibility badges (Public/Private), default branch tags, and timestamps.
    - When a repository is selected, fetches branches via `/branches` and triggers automatic heuristic detection via `/detect`.
-2. **Local Computer Flow:**
-   - Provides drag-and-drop and file-picker targets supporting both direct folder upload (`webkitdirectory`) and compressed archives (`.zip`, `.tar.gz`).
-   - Streams files via `POST /api/sources/upload`, receiving the assigned `source_id` and detection results from the backend.
+2. **Local Computer Flow (`Import from Computer`):**
+   - Features a clean sub-mode selector between **`[ Existing Directory ]`** (Primary Workflow) and **`[ Upload Archive ]`** (Fallback Workflow):
+   - **Mode A: Existing Directory (`localMode: 'directory'`):**
+     - Primary, high-performance workflow for local development.
+     - User specifies a directory path accessible to the ForgeLAB backend (e.g. `C:\Users\...\Projects\my-app` or `/host-projects/my-app`).
+     - Triggers fast metadata validation via `POST /api/sources/local/validate`.
+     - Displays explicit, real-time states:
+       - *Path Required:* Prompts user for a valid host directory path.
+       - *Validating Directory:* Visual progress indicator while the backend validates canonical boundaries and parses manifests.
+       - *Directory Found & Validated:* Rich status card displaying canonical path, project name, detected framework, runtime, build strategy (Dockerfile detected or Auto), build context, suggested port, total file count, and uncompressed size.
+       - *Security / Validation Error:* Actionable error explanation if the directory does not exist, is outside `FORGELAB_ALLOWED_SOURCE_ROOTS`, or is unmounted in Docker.
+     - Zero browser file enumeration, zero `FormData` construction, and zero source network upload.
+   - **Mode B: Upload Archive (`localMode: 'archive'`):**
+     - Fallback workflow when direct filesystem access is unavailable.
+     - Accepts `.zip`, `.tar.gz`, or `.tgz` archive files (enforcing the 100MB limit).
+     - Operates an explicit `ImportPhase` lifecycle state machine:
+       - `idle`: Initial dropzone state.
+       - `preparing`: Archive validation and packaging.
+       - `uploading`: Honest network transfer progress (0–100%, transfer speed, ETA) with user-triggered cancellation (`AbortController`).
+       - `processing`: Server-side ingestion and runtime detection monitoring with authentic status display.
+       - `ready`: Summary badge displaying detected framework, runtime, and port before advancing to configuration.
+       - `failed` / `cancelled`: Actionable error classification and state reset.
+     - Uploads via streaming `POST /api/sources/upload` and polls `GET /api/sources/{id}` until status transitions to `ready` or `failed`.
 
 ### Step 2: Configuration & Runtime Review
-- Summarizes the imported source and detected runtime framework with a badge.
+- Summarizes the imported source:
+  - For GitHub: repository name and branch.
+  - For Direct Local Directory: host path, file count, and `Direct Build` badge.
+  - For Local Archive: archive name and file count.
 - Allows user to choose between:
   - **Automatic Build Strategy:** Generates a tailored multi-stage container build without requiring a Dockerfile.
   - **Dockerfile Strategy:** Uses the existing Dockerfile in the project.

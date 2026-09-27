@@ -52,10 +52,12 @@ redis healthy ──────► backend healthy (control plane + worker + do
 ```
 
 ### Local Repository Deployment & Container Filesystem Boundary
-When deploying local repositories (`source_type: "local"`):
+When deploying local repositories (`source_type: "local_directory"`):
 - The backend's `PathValidator` checks directory paths on the filesystem visible to the backend process.
-- Inside the backend container, the container filesystem is isolated; arbitrary host paths (such as `C:\dev\my-app`) are not mounted unless explicitly specified in `docker-compose.yml` volumes.
-- For host repository path testing, developers can bind-mount their source projects into the backend container or test via git/archive sources once repository integration is enabled.
+- **Docker Compose Read-Only Host Mount:** In `docker-compose.yml`, the backend container mounts `${FORGELAB_HOST_SOURCE_ROOT:-./}:/host-projects:ro`.
+- **Path Translation:** When the frontend provides a host directory path beneath `FORGELAB_HOST_SOURCE_ROOT`, `PathValidator` automatically and securely translates it to `/host-projects/...` inside the container.
+- **Security Boundary:** ForgeLAB strictly verifies that the translated directory is inside configured `FORGELAB_ALLOWED_SOURCE_ROOTS` and is not a restricted system directory.
+- **Direct Build Streaming:** Build context is streamed concurrently into Docker with early `.dockerignore` directory pruning. Files are never duplicated to `data/builds/<deployment-id>`.
 
 ---
 
@@ -85,9 +87,12 @@ Configuration is managed via `.env` with fallback defaults in `.env.example`:
 | `JWT_ACCESS_TOKEN_EXPIRY` | `15` | Access token lifespan in minutes |
 | `JWT_REFRESH_TOKEN_EXPIRY`| `7` | Refresh token lifespan in days |
 | `FORGELAB_ENCRYPTION_KEY` | `dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=` | 32-byte Base64 key for AES-256-GCM secret encryption |
-| `FORGELAB_WORK_DIR` | `/app/data/builds` | Working directory where source snapshots are staged |
+| `FORGELAB_WORK_DIR` | `/app/data/builds` | Working directory where source snapshots are staged (for snapshot build mode) |
 | `FORGELAB_SOURCES_DIR` | `/app/data/sources` | Working directory where uploaded source archives are extracted |
 | `FORGELAB_ALLOWED_SOURCE_ROOTS` | `""` | Comma-separated allowed host roots for repository imports |
+| `FORGELAB_HOST_SOURCE_ROOT` | `""` | Host projects directory mounted into backend container |
+| `FORGELAB_CONTAINER_SOURCE_ROOT` | `/host-projects` | Read-only container mount point for host projects |
+| `FORGELAB_LOCAL_BUILD_MODE` | `direct` | Build mode for local directories (`direct` or `snapshot`) |
 | `FRONTEND_URL` | `http://localhost:3000` | Frontend public URL for OAuth redirect landing |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:3000` | Permitted browser origins for CORS headers |
 | `COOKIE_SECURE` | `false` | Set to `true` in production to enforce HTTPS cookies |

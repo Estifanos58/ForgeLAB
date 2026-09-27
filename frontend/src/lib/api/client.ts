@@ -8,6 +8,7 @@ import {
   GitHubBranch,
   GitHubRepo,
   GitHubStatus,
+  LocalPathValidationResult,
   Project,
   SetEnvInput,
   SourceUploadResult,
@@ -32,6 +33,8 @@ export interface UploadProgress {
   loaded: number;
   total: number;
   percent: number;
+  speed?: number;
+  etaSeconds?: number;
 }
 
 let isRefreshing = false;
@@ -296,27 +299,58 @@ export const api = {
     async upload(
       formData: FormData,
       onProgress?: (progress: UploadProgress) => void,
-      isRetry = false
+      signal?: AbortSignal
     ): Promise<SourceUploadResult> {
       return new Promise<SourceUploadResult>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/sources/upload');
         xhr.withCredentials = true;
+        // 10 minutes timeout for the network transfer phase
+        xhr.timeout = 10 * 60 * 1000;
+
+        let lastLoaded = 0;
+        let lastTime = performance.now();
+        let smoothedSpeed = 0;
+
+        if (signal) {
+          if (signal.aborted) {
+            reject(new ApiClientError('Import cancelled', 0));
+            return;
+          }
+          signal.addEventListener('abort', () => {
+            xhr.abort();
+            reject(new ApiClientError('Import cancelled', 0));
+          });
+        }
 
         if (xhr.upload && onProgress) {
           xhr.upload.onprogress = (event) => {
             if (event.lengthComputable && event.total > 0) {
+              const now = performance.now();
+              const elapsedSec = (now - lastTime) / 1000;
+              if (elapsedSec > 0.2) {
+                const instantSpeed = (event.loaded - lastLoaded) / elapsedSec;
+                smoothedSpeed = smoothedSpeed === 0 ? instantSpeed : smoothedSpeed * 0.7 + instantSpeed * 0.3;
+                lastLoaded = event.loaded;
+                lastTime = now;
+              }
+
               const percent = Math.min(100, Math.round((event.loaded / event.total) * 100));
+              const remainingBytes = Math.max(0, event.total - event.loaded);
+              const etaSeconds = smoothedSpeed > 0 ? Math.ceil(remainingBytes / smoothedSpeed) : 0;
+
               onProgress({
                 loaded: event.loaded,
                 total: event.total,
                 percent,
+                speed: smoothedSpeed > 0 ? smoothedSpeed : undefined,
+                etaSeconds: etaSeconds > 0 ? etaSeconds : undefined,
               });
             }
           };
         }
 
-        xhr.onload = async () => {
+        xhr.onload = () => {
           if (xhr.status >= 200 && xhr.status < 300) {
             try {
               const res = JSON.parse(xhr.responseText);
@@ -324,14 +358,11 @@ export const api = {
             } catch {
               reject(new ApiClientError('Invalid JSON response from server', xhr.status));
             }
-          } else if (xhr.status === 401 && !isRetry) {
-            try {
-              await executeRefresh();
-              const retryRes = await api.sources.upload(formData, onProgress, true);
-              resolve(retryRes);
-            } catch {
-              reject(new ApiClientError('Session expired. Please log in again.', 401));
-            }
+          } else if (xhr.status === 401) {
+            // Do NOT blindly auto-retry large source uploads after 401 to prevent duplicate uploads
+            reject(new ApiClientError('Authentication expired. Please log in again.', 401));
+          } else if (xhr.status === 413) {
+            reject(new ApiClientError('Source files exceed the maximum allowed size limit of 100 MB.', 413));
           } else {
             let errorMsg = `Upload failed with status ${xhr.status}`;
             try {
@@ -345,15 +376,40 @@ export const api = {
         };
 
         xhr.onerror = () => {
-          reject(new ApiClientError('Network error: upload connection failed or was reset', 0));
+          reject(
+            new ApiClientError(
+              'The connection was interrupted while uploading your project. Your incomplete import was cleaned up. Please try again.',
+              0
+            )
+          );
+        };
+
+        xhr.onabort = () => {
+          reject(new ApiClientError('Import cancelled', 0));
         };
 
         xhr.ontimeout = () => {
-          reject(new ApiClientError('Upload request timed out', 408));
+          reject(
+            new ApiClientError(
+              'Upload request timed out. The network transfer took longer than expected. Please check your connection and try again.',
+              408
+            )
+          );
         };
 
         xhr.send(formData);
       });
+    },
+
+    async validateLocalPath(repositoryPath: string): Promise<LocalPathValidationResult> {
+      return apiFetch<LocalPathValidationResult>('/api/sources/local/validate', {
+        method: 'POST',
+        body: JSON.stringify({ repository_path: repositoryPath }),
+      });
+    },
+
+    async get(sourceId: string): Promise<SourceUploadResult> {
+      return apiFetch<SourceUploadResult>(`/api/sources/${encodeURIComponent(sourceId)}`);
     },
 
     async delete(sourceId: string): Promise<{ message: string }> {

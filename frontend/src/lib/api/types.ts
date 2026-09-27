@@ -24,7 +24,7 @@ export interface Project {
   owner_id: string;
   name: string;
   slug: string;
-  source_type: 'local' | 'github';
+  source_type: 'local' | 'local_directory' | 'local_upload' | 'github';
   source_reference?: string;
   repository_path: string;
   branch: string;
@@ -95,7 +95,7 @@ export interface EnvVar {
 
 export interface CreateProjectInput {
   name: string;
-  source_type?: 'local' | 'github';
+  source_type?: 'local' | 'local_directory' | 'local_upload' | 'github';
   source_reference?: string;
   repository_path?: string;
   branch?: string;
@@ -173,9 +173,38 @@ export interface DetectionResult {
   detected_files: string[];
 }
 
+export type SourceProcessingStatus = 'uploading' | 'processing' | 'ready' | 'failed' | 'cancelled';
+export type SourceProcessingPhase = 'uploading' | 'finalizing' | 'detecting' | 'ready' | 'failed';
+
 export interface SourceUploadResult {
   source_id: string;
+  status?: SourceProcessingStatus;
+  phase?: SourceProcessingPhase;
+  files_count: number;
+  processed_files?: number;
+  total_bytes: number;
+  processed_bytes?: number;
+  runtime?: string;
+  framework?: string;
+  detection?: DetectionResult;
+  error?: string | null;
+}
+
+export interface LocalPathValidationResult {
+  valid: boolean;
+  repository_path: string;
+  project_name: string;
   files_count: number;
   total_bytes: number;
-  detection?: DetectionResult;
+  runtime: string;
+  framework: string;
+  build_strategy: 'auto' | 'dockerfile';
+  dockerfile_path: string;
+  build_context: string;
+  build_command: string;
+  start_command: string;
+  suggested_port: number;
+  health_strategy: 'auto' | 'http' | 'tcp' | 'none';
+  health_check_path: string;
+  error?: string;
 }

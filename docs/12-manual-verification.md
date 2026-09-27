@@ -207,22 +207,52 @@ Verify that users can import projects from both their local computer (direct fil
 - User 2 registered (`user2@example.com`) in an Incognito window.
 - GitHub OAuth application configured in backend environment with `repo,read:user` redirect URL.
 
-#### Test Procedure — Part A: Local Computer Source Upload
+#### Test Procedure — Part A: Direct Local-Directory Deployment (Primary Computer Workflow)
 1. As User 1 on `http://localhost:3000/dashboard`, click "+ Create Project".
-2. Select the **"Import from Computer"** tab.
-3. Click **"Choose Directory"** and select a local project directory on your machine (e.g. a Node.js or Python app), or click **"Upload .zip / .tar.gz"** and select a compressed project archive.
-4. Observe upload progress:
-   - Files stream to `/api/sources/upload` and are unpacked into an isolated workspace directory (`data/sources/<source_id>`).
-   - Directories such as `node_modules`, `.git`, and `.next` are automatically excluded.
-   - Heuristic detection inspects the source and automatically advances to Step 2 ("Configure Application").
-5. Verify detected values:
-   - Detection badge shows detected framework (e.g. "Nextjs (Nodejs)" or "Fastapi (Python)").
-   - Internal Application Port is pre-filled with the framework default (e.g. 3000, 8000, or 8080).
-   - Build strategy defaults to "Automatic" (or "Dockerfile" if a Dockerfile was present).
-6. Provide a Project Name (e.g. `local-demo-app`) and click **"Create & Deploy Project"**.
-7. Verify redirection to `/projects/<project-id>`.
+2. Select the **"Import from Computer"** tab. Verify the sub-tabs display:
+   `[ Existing Directory ]` (selected by default) and `[ Upload Archive ]`.
+3. In the **"Local Directory Path"** input, enter an existing directory on your host machine (e.g. `C:\Users\username\Projects\my-app` or `/host-projects/my-app` if running in Docker with mount configured).
+4. Click **"Validate Directory"** (or press Enter):
+   - Verify network tab shows a single fast `POST /api/sources/local/validate` request.
+   - Verify NO large file transfers occur and NO `FormData` of files is created.
+   - Verify UI displays the "Validating directory..." progress state.
+5. Verify validated state card:
+   - Green badge displays "Directory Validated" with "Direct Build" badge.
+   - Card displays canonical repository path, project name, detected framework, runtime, suggested port, total files count, and size.
+   - Information callout confirms: "⚡ Direct local deployment active: Docker build context will be streamed directly from disk with .dockerignore filtering. No intermediate copies or in-memory tar buffers."
+6. Click **"Continue to Configuration"** to enter Step 2 ("Configure Application").
+7. Verify configuration fields:
+   - Top banner displays host path and file count with "Direct Build" indicator.
+   - Project name is pre-populated.
+   - Application Port, build command, and start command are pre-populated.
+8. Click **"Create & Deploy Project"**:
+   - Verify project is created in PostgreSQL with `source_type: "local_directory"` and `repository_path` holding the host path.
+   - Verify deployment engine logs in terminal viewer show:
+     ```text
+     SOURCE Using local directory: <path>
+     SOURCE Validated local source directory.
+     SOURCE Using direct filesystem build mode.
+     BUILD Applying .dockerignore...
+     BUILD Streaming Docker build context...
+     BUILD Docker build started.
+     ```
+   - Verify NO complete copy was created in `data/builds/<deployment-id>`.
+   - Verify container builds, starts, passes health check, and enters `RUNNING`.
 
-#### Test Procedure — Part B: Zip Slip / Path Traversal Guard Verification
+#### Test Procedure — Part B: Local Archive Upload Fallback
+1. In "+ Create Project" → "Import from Computer", switch to **"[ Upload Archive ]"**.
+2. Click **"Choose Archive File"** and select a `.zip`, `.tar.gz`, or `.tgz` file.
+3. Observe honest upload progress:
+   - Network progress bar moves from 0% to 100% displaying transferred bytes, speed, and ETA.
+   - Server extracts archive into isolated source workspace (`data/sources/<source-id>`) and polls `GET /api/sources/{id}`.
+4. Verify transition to "Archive Imported Successfully" with detected framework and port.
+5. Create project and verify it deploys from the uploaded source workspace with `source_type: "local_upload"`.
+
+#### Test Procedure — Part C: Path Boundary & Security Rejection
+1. In "Existing Directory" mode, enter a path outside `FORGELAB_ALLOWED_SOURCE_ROOTS` (or a restricted system path such as `C:\Windows` or `/etc`).
+2. Click "Validate Directory".
+3. Verify an error alert is displayed explaining that the path is restricted or outside configured roots.
+4. Verify project creation is blocked.
 1. Prepare a test zip archive containing an entry with relative traversal (e.g. `../../etc/evil.txt`).
 2. Make a direct API upload request:
    ```bash

@@ -293,13 +293,15 @@ Common status codes:
   ```
 - **Validation & Business Rules:**
   - `name`: Required, non-empty. Unique per-user slug is generated.
-  - `source_type`: `"local"` or `"github"`. Defaults to `"local"`.
+  - `source_type`: `"local_directory"`, `"local_upload"`, `"github"`, or legacy `"local"`.
+  - For `source_type: "local_directory"`:
+    - `repository_path`: Required absolute host directory path situated within configured `FORGELAB_ALLOWED_SOURCE_ROOTS`. Validated via `PathValidator`.
+  - For `source_type: "local_upload"`:
+    - `source_reference`: Required UUID of uploaded source workspace from `/api/sources/upload`.
   - For `source_type: "github"`:
-    - `source_reference`: Required (`owner/repo`).
-    - Verifies user has active GitHub repository integration with encrypted token. If missing, returns `403 Forbidden`.
-  - For `source_type: "local"`:
-    - `source_reference`: UUID of uploaded source from `/api/sources/upload`. Verifies source directory exists and is valid. If invalid/expired, returns `422 Unprocessable Entity`.
-    - `repository_path`: Optional legacy host path validated with `PathValidator` if provided directly on host.
+    - `source_reference`: Required (`owner/repo`). Verifies active GitHub integration with encrypted token.
+  - For legacy `source_type: "local"`:
+    - Automatically mapped to `local_directory` if `repository_path` is specified, or `local_upload` if `source_reference` is specified.
   - `build_strategy`: `"auto"` (multi-stage Docker build generation) or `"dockerfile"` (explicit Dockerfile). Defaults to `"auto"`.
   - `internal_port`: Application container listening port (e.g. 3000, 8000, 8080). Defaults to 8080 if not specified.
   - `health_strategy`: `"auto"`, `"http"`, `"tcp"`, or `"none"`. Defaults to `"auto"`.
@@ -631,8 +633,44 @@ Common status codes:
   ```json
   {
     "source_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "status": "processing",
+    "phase": "finalizing",
     "files_count": 42,
+    "processed_files": 0,
     "total_bytes": 1420500,
+    "processed_bytes": 0,
+    "detection": null
+  }
+  ```
+- **Streaming & Lifecycle Architecture:**
+  - Directory uploads use Go's sequential `r.MultipartReader()` API directly into `.uploads/<source_id>/` without buffering or writing temporary files to disk.
+  - Enforces `http.MaxBytesReader` 105MB request limit and 100MB uncompressed source limit.
+  - Upload atomically moves from `.uploads/<source_id>/` to `data/sources/<source_id>/` upon successful stream completion.
+  - The endpoint returns `201 Created` immediately after atomic persistence, decoupling network transfer from heuristic detection.
+  - Background processing analyzes source runtime/framework and transitions status to `ready` or `failed`.
+- **Error Responses:**
+  - `400 Bad Request`: Empty upload or invalid archive.
+  - `413 Payload Too Large`: Source exceeds 100MB uncompressed limit.
+  - `422 Unprocessable Entity`: Path traversal or corrupt archive.
+
+---
+
+### `GET /api/sources/{id}`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Parameters:** `id` (UUID of source workspace)
+- **Ownership:** Strictly restricted to the authenticated user that uploaded the source workspace.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "source_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "status": "ready",
+    "phase": "ready",
+    "files_count": 42,
+    "processed_files": 42,
+    "total_bytes": 1420500,
+    "processed_bytes": 1420500,
+    "runtime": "nodejs",
+    "framework": "nextjs",
     "detection": {
       "runtime": "nodejs",
       "framework": "nextjs",
@@ -643,13 +681,18 @@ Common status codes:
       "health_check_path": "/",
       "health_strategy": "auto",
       "detected_files": ["package.json", "next.config.js"]
-    }
+    },
+    "error": null
   }
   ```
+- **Lifecycle Status Values:**
+  - `status`: `uploading` | `processing` | `ready` | `failed` | `cancelled`
+  - `phase`: `uploading` | `finalizing` | `detecting` | `ready` | `failed` | `cancelled`
 - **Error Responses:**
-  - `400 Bad Request`: Empty upload or invalid archive.
-  - `413 Payload Too Large`: Source exceeds 100MB uncompressed limit.
-  - `422 Unprocessable Entity`: Path traversal or corrupt archive.
+  - `400 Bad Request`: Invalid source UUID format.
+  - `401 Unauthorized`: Unauthenticated.
+  - `403 Forbidden`: Authenticated user does not own this source workspace.
+  - `404 Not Found`: Source workspace not found.
 
 ---
 
@@ -809,6 +852,108 @@ Common status codes:
    { "type": "ping" }
    ```
 
+---
+
+## 8. Source Management Endpoints (`/api/sources`)
+
+### `POST /api/sources/local/validate`
+- **Authentication:** Required (Bearer JWT)
+- **Purpose:** Fast directory validation and heuristic runtime inspection for direct local-directory deployments. Does NOT transfer project files over HTTP.
+- **Request Body:**
+  ```json
+  {
+    "repository_path": "C:\\Users\\username\\Projects\\my-app"
+  }
+  ```
+- **Validation Rules:**
+  - `repository_path`: Required non-empty string.
+  - Path must exist and resolve to a directory (not a regular file).
+  - Must reside under configured `FORGELAB_ALLOWED_SOURCE_ROOTS`.
+  - Evaluates canonical symlinks and rejects restricted system directories (`/etc`, `C:\Windows`, etc.).
+  - In Docker Compose, translates host path beneath `FORGELAB_HOST_SOURCE_ROOT` to `/host-projects`.
+  - Prunes ignored directories (`node_modules`, `.git`, `.next`, cache dirs) during structure scanning.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "valid": true,
+    "repository_path": "C:\\Users\\username\\Projects\\my-app",
+    "project_name": "my-app",
+    "files_count": 42,
+    "total_bytes": 1048576,
+    "runtime": "node",
+    "framework": "nextjs",
+    "build_strategy": "dockerfile",
+    "dockerfile_path": "Dockerfile",
+    "build_context": ".",
+    "build_command": "npm run build",
+    "start_command": "npm start",
+    "suggested_port": 3000,
+    "health_strategy": "http",
+    "health_check_path": "/"
+  }
+  ```
+- **Error Responses:**
+  - `400 Bad Request`: Path is empty, not a directory, or system restricted directory.
+  - `403 Forbidden`: Path is outside configured `FORGELAB_ALLOWED_SOURCE_ROOTS`.
+  - `404 Not Found`: Path does not exist on the filesystem.
+
+---
+
+### `POST /api/sources/upload`
+- **Authentication:** Required (Bearer JWT)
+- **Purpose:** Optional fallback archive ingestion (.zip, .tar.gz, .tgz) when direct filesystem access is unavailable.
+- **Request Format:** `multipart/form-data` with `archive` file field.
+- **Constraints:** Maximum 100 MB uncompressed size limit.
+- **Success Response:** `201 Created`
+  ```json
+  {
+    "source_id": "b2c3d4e5-f6a7-8b9c-0d1e-2f3a4b5c6d7e",
+    "status": "processing",
+    "phase": "finalizing",
+    "files_count": 120,
+    "total_bytes": 4500000
+  }
+  ```
+
+---
+
+### `GET /api/sources/{id}`
+- **Authentication:** Required (Bearer JWT)
+- **Parameters:** `id` (Source workspace UUID).
+- **Purpose:** Check processing status and detection results for an uploaded archive source workspace.
+- **Success Response:** `200 OK`
+
+---
+
+### `DELETE /api/sources/{id}`
+- **Authentication:** Required (Bearer JWT)
+- **Parameters:** `id` (Source workspace UUID).
+- **Purpose:** Delete an uploaded source workspace from disk and the `source_workspaces` database table.
+- **Success Response:** `200 OK`
+
+---
+
+## 9. Realtime WebSocket Protocol (`/api/ws`)
+
+### Connection Establishment:
+- **Endpoint:** `GET /api/ws?token=<jwt_access_token>`
+- **Upgrade Header:** `Upgrade: websocket`, `Connection: Upgrade`
+- **Security:** Verifies JWT signature and claims before socket upgrade.
+
+### Client Messages:
+1. **Subscribe:**
+   ```json
+   { "type": "subscribe", "channel": "deployment:<uuid>" }
+   ```
+2. **Unsubscribe:**
+   ```json
+   { "type": "unsubscribe", "channel": "deployment:<uuid>" }
+   ```
+3. **Keepalive:**
+   ```json
+   { "type": "ping" }
+   ```
+
 ### Server Messages:
 1. **Subscription Confirmation:**
    ```json
@@ -852,11 +997,12 @@ Common status codes:
 
 ---
 
-## 9. Future / Planned Endpoints (Not Implemented in MVP)
+## 10. Future / Planned Endpoints (Not Implemented in MVP)
 
 The following endpoints were discussed in design architecture but are **not present** in the current codebase:
 
 - `POST /api/webhooks/github` — Automated push deployment receiver.
 - `GET /api/metrics` — OpenTelemetry / Prometheus platform metrics.
 - `GET /api/projects/{id}/deployments/{deploymentId}/events` — Event-replay log stream.
+
 

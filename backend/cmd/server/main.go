@@ -94,7 +94,11 @@ func main() {
 	if cfg.Docker.AllowedSourceRoots != "" {
 		allowedRoots = strings.Split(cfg.Docker.AllowedSourceRoots, ",")
 	}
-	pathValidator := security.NewPathValidator(allowedRoots)
+	pathValidator := security.NewPathValidatorWithMapping(
+		allowedRoots,
+		cfg.Docker.HostSourceRoot,
+		cfg.Docker.ContainerSourceRoot,
+	)
 	portManager := network.NewPortManager(10000, 60000)
 
 	encryptor, err := crypto.NewEncryptor(cfg.Encryption.Key)
@@ -133,6 +137,7 @@ func main() {
 		wsHub,
 		cfg.Docker.WorkDir,
 	)
+	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
 
 	// Initialize Redis deployment queue & worker
 	var deployQueue *queue.DeploymentQueue
@@ -148,7 +153,7 @@ func main() {
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
 	envHandler := handlers.NewEnvHandler(secretService)
 	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL)
-	sourceHandler := handlers.NewSourceHandler(sourceService)
+	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
 
 	// Setup router
 	r := chi.NewRouter()
@@ -203,6 +208,8 @@ func main() {
 			// Source Management & Uploads
 			r.Route("/sources", func(r chi.Router) {
 				r.Post("/upload", sourceHandler.Upload)
+				r.Post("/local/validate", sourceHandler.ValidateLocalPath)
+				r.Get("/{id}", sourceHandler.GetStatus)
 				r.Delete("/{id}", sourceHandler.Delete)
 			})
 

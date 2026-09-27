@@ -299,19 +299,28 @@ ULID migration is explicitly deferred and must not be initiated without an appro
 
 ---
 
-## Local Repository Import Mechanism
+## Local Source Ingestion & Deployment Architecture
 
-For the MVP, local repository import works as follows:
+ForgeLAB supports three distinct source ingestion models:
 
-1. User specifies a **path on the host machine** where the project source lives
-2. When a deployment is triggered, ForgeLab **copies** the source to a working directory
-3. The working directory is used as the Docker build context
-4. This avoids bind-mount complications and ensures the build is reproducible from a snapshot
+### 1. Direct Local Directory Deployment (`source_type: "local_directory"`) — Primary Computer Workflow
+- **No Browser Source Upload:** Files are never transferred across the network or enumerated as browser File objects.
+- **Backend Host Visibility:** The backend accesses the project directly from disk under configured `FORGELAB_ALLOWED_SOURCE_ROOTS`. In Docker Compose, the backend mounts `${FORGELAB_HOST_SOURCE_ROOT:-./}:/host-projects:ro` as a read-only volume, and the application safely translates host paths to container paths.
+- **Fast Metadata Inspection:** `POST /api/sources/local/validate` inspects project manifests and directory structure directly, pruning ignored directories without full-tree walking.
+- **Direct Filesystem Build:** The deployment engine builds directly from the validated directory without duplicating tens of thousands of files into `data/builds/<deployment-id>`.
+- **Streaming Build Context:** Concurrently streams the Docker build context using `io.Pipe()` and `tar.Writer`, eliminating in-memory `bytes.Buffer` allocation.
+- **.dockerignore Early Pruning:** Skips `node_modules`, `.git`, `.next`, cache dirs, etc. before descending into them.
+- **Virtual Dockerfiles:** Auto-detected build strategies stream generated Dockerfiles directly into the in-memory TAR stream, leaving the host filesystem pristine and supporting read-only source mounts.
 
-The copy approach means:
-- The build uses a snapshot of the source at deployment time
-- Subsequent source changes don't affect running deployments
-- Each deployment has an isolated build context
+### 2. Local Source Archive Upload (`source_type: "local_upload"`) — Fallback Computer Workflow
+- Used when direct filesystem access is unavailable.
+- Browser uploads a `.zip`, `.tar.gz`, or `.tgz` archive via `POST /api/sources/upload`.
+- Extracted into an isolated, random UUID source workspace (`data/sources/<source-id>`).
+- Built from the isolated source workspace.
+
+### 3. GitHub Repository Import (`source_type: "github"`)
+- Users authorize GitHub via OAuth.
+- Source tarball is fetched into an isolated source workspace.
 
 ---
 

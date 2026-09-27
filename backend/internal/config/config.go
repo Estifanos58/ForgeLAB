@@ -79,10 +79,13 @@ type EncryptionConfig struct {
 
 // DockerConfig holds Docker-related settings.
 type DockerConfig struct {
-	Host               string
-	WorkDir            string
-	SourcesDir         string
-	AllowedSourceRoots string
+	Host                string
+	WorkDir             string
+	SourcesDir          string
+	AllowedSourceRoots  string
+	HostSourceRoot      string
+	ContainerSourceRoot string
+	LocalBuildMode      string
 }
 
 // LogConfig holds logging settings.
@@ -133,10 +136,13 @@ func Load() (*Config, error) {
 			Key: getEnv("FORGELAB_ENCRYPTION_KEY", "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q="),
 		},
 		Docker: DockerConfig{
-			Host:               getEnv("DOCKER_HOST", ""),
-			WorkDir:            getEnv("FORGELAB_WORK_DIR", "./data/builds"),
-			SourcesDir:         getEnv("FORGELAB_SOURCES_DIR", "./data/sources"),
-			AllowedSourceRoots: getEnv("FORGELAB_ALLOWED_SOURCE_ROOTS", ""),
+			Host:                getEnv("DOCKER_HOST", ""),
+			WorkDir:             getEnv("FORGELAB_WORK_DIR", "./data/builds"),
+			SourcesDir:          getEnv("FORGELAB_SOURCES_DIR", "./data/sources"),
+			AllowedSourceRoots:  getEnv("FORGELAB_ALLOWED_SOURCE_ROOTS", ""),
+			HostSourceRoot:      getEnv("FORGELAB_HOST_SOURCE_ROOT", ""),
+			ContainerSourceRoot: getEnv("FORGELAB_CONTAINER_SOURCE_ROOT", "/host-projects"),
+			LocalBuildMode:      getEnv("FORGELAB_LOCAL_BUILD_MODE", "direct"),
 		},
 		Log: LogConfig{
 			Level:  getEnv("LOG_LEVEL", "debug"),

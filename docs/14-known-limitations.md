@@ -19,8 +19,11 @@
 
 These are deliberate scoping decisions for the current platform release. They are **not** accidental bugs.
 
-1. **Universal Source Ingestion (Resolved in v0.2.0):**
-   - ForgeLAB now supports browser-based computer uploads (directories and `.zip`/`.tar.gz` archives) and direct GitHub repository imports with encrypted OAuth tokens.
+1. **Universal Source Ingestion:**
+   - ForgeLAB supports direct local-directory ingestion (`local_directory`), browser-based computer archive uploads (`local_upload` via `.zip`/`.tar.gz`), and direct GitHub repository imports (`github`) with encrypted OAuth tokens.
+   - Direct local directory projects stream the Docker build context directly over an `io.Pipe()` with early `.dockerignore` pruning, eliminating browser uploads and disk duplication.
+   - Archive uploads use Go's streaming `MultipartReader` into staged workspaces (`.uploads/<source_id>`) with asynchronous status polling via `GET /api/sources/{id}`.
+   - Resumable/chunked multi-part upload protocols (such as tus.io) and multi-part pause/resume are explicitly deferred to post-MVP.
    - Arbitrary unauthenticated git clone URLs remain rejected for security reasons.
 2. **Dynamic Direct Host Port Mapping:**
    - Deployed containers are exposed directly on dynamically allocated host ports (`10000–60000`).
@@ -72,11 +75,10 @@ These are identified codebase behaviors that require investigation and resolutio
 
 The following issues affect the fully containerized Compose environment (`docker compose up --build`), which requires reconciliation before it can be treated as a verified end-to-end development environment:
 
-#### a. Host Repository Inaccessibility in Containerized Backend
+#### a. Host Repository Inaccessibility in Containerized Backend (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml) (`backend` service volumes)
-- **Behavior:** The backend service mounts only `/var/run/docker.sock` and `forgelab_builds:/app/data/builds`. It does **not** mount arbitrary host filesystem paths.
-- **Impact:** When a user enters a local host repository path (such as `C:\dev\my-app` or `/home/user/my-app`), the containerized Go backend's `PathValidator` and directory copy routines cannot access the directory because it exists only on the host filesystem outside the container. Local repository creation fails unless the backend runs directly on the host (**Environment A**) or an explicit bind mount is configured.
-- **Guidance:** See [docs/11-development-environment.md](11-development-environment.md) for environment separation. A future enhancement could introduce a configurable source volume mount or an archive upload mechanism.
+- **Behavior & Resolution:** The backend service mounts `${FORGELAB_HOST_SOURCE_ROOT:-./}:/host-projects:ro` as a read-only volume. `PathValidator` translates configured host roots (`FORGELAB_HOST_SOURCE_ROOT`) to container paths (`FORGELAB_CONTAINER_SOURCE_ROOT=/host-projects`). Direct local directory deployments read directly from this mount without copying.
+- **Guidance:** See [docs/11-development-environment.md](11-development-environment.md). Ensure `FORGELAB_HOST_SOURCE_ROOT` in `.env` is configured to the parent directory containing projects when running ForgeLAB via Docker Compose.
 
 #### b. Frontend/Backend Container Networking & Rewrite Mismatch
 - **Location:** [`frontend/next.config.js:L9-L14`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.js#L9-L14), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml) (`frontend` service)

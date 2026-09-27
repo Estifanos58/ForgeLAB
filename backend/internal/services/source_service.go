@@ -5,11 +5,14 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"mime/multipart"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,21 +32,62 @@ var (
 	ErrArchiveTooLarge       = errors.New("uncompressed source exceeds maximum allowed size (100MB)")
 	ErrSourceDirNotFound     = errors.New("source directory not found")
 	ErrUnauthorizedSource    = errors.New("unauthorized source workspace access")
+	ErrSourceNotReady        = errors.New("source workspace is still processing")
 )
 
 const MaxUncompressedBytes = 100 * 1024 * 1024 // 100MB
 
+const (
+	SourceStatusUploading  = "uploading"
+	SourceStatusProcessing = "processing"
+	SourceStatusReady      = "ready"
+	SourceStatusFailed     = "failed"
+	SourceStatusCancelled  = "cancelled"
+
+	SourcePhaseUploading  = "uploading"
+	SourcePhaseFinalizing = "finalizing"
+	SourcePhaseDetecting  = "detecting"
+	SourcePhaseReady      = "ready"
+	SourcePhaseFailed     = "failed"
+)
+
 type SourceUploadResult struct {
-	SourceID   uuid.UUID                `json:"source_id"`
-	FilesCount int                      `json:"files_count"`
-	TotalBytes int64                    `json:"total_bytes"`
-	Detection  *detector.DetectionResult `json:"detection"`
+	SourceID       uuid.UUID                 `json:"source_id"`
+	Status         string                    `json:"status"`
+	Phase          string                    `json:"phase"`
+	FilesCount     int                       `json:"files_count"`
+	ProcessedFiles int                       `json:"processed_files"`
+	TotalBytes     int64                     `json:"total_bytes"`
+	ProcessedBytes int64                     `json:"processed_bytes"`
+	Runtime        string                    `json:"runtime,omitempty"`
+	Framework      string                    `json:"framework,omitempty"`
+	Detection      *detector.DetectionResult `json:"detection,omitempty"`
+	Error          *string                   `json:"error"`
+}
+
+type SourceWorkspaceRecord struct {
+	ID             uuid.UUID
+	OwnerID        uuid.UUID
+	WorkspacePath  string
+	FilesCount     int
+	ProcessedFiles int
+	TotalBytes     int64
+	ProcessedBytes int64
+	Status         string
+	Phase          string
+	Runtime        string
+	Framework      string
+	Detection      *detector.DetectionResult
+	Error          *string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type SourceService struct {
-	db             *pgxpool.Pool
-	sourcesDir     string
-	fallbackOwners sync.Map
+	db              *pgxpool.Pool
+	sourcesDir      string
+	fallbackOwners  sync.Map
+	fallbackSources sync.Map
 }
 
 func NewSourceService(db *pgxpool.Pool, sourcesDir string) *SourceService {
@@ -51,6 +95,7 @@ func NewSourceService(db *pgxpool.Pool, sourcesDir string) *SourceService {
 		sourcesDir = "./data/sources"
 	}
 	_ = os.MkdirAll(sourcesDir, 0755)
+	_ = os.MkdirAll(filepath.Join(sourcesDir, ".uploads"), 0755)
 	return &SourceService{
 		db:         db,
 		sourcesDir: sourcesDir,
@@ -58,7 +103,7 @@ func NewSourceService(db *pgxpool.Pool, sourcesDir string) *SourceService {
 }
 
 // GetSourcePath returns the isolated filesystem path for a previously uploaded source,
-// verifying that ownerID owns the source workspace.
+// verifying that ownerID owns the source workspace and that it is ready.
 func (s *SourceService) GetSourcePath(ctx context.Context, ownerID, sourceID uuid.UUID) (string, error) {
 	if sourceID == uuid.Nil {
 		return "", ErrSourceDirNotFound
@@ -67,10 +112,11 @@ func (s *SourceService) GetSourcePath(ctx context.Context, ownerID, sourceID uui
 	if s.db != nil {
 		var realOwner uuid.UUID
 		var workspacePath string
+		var status string
 		err := s.db.QueryRow(ctx,
-			`SELECT owner_id, workspace_path FROM source_workspaces WHERE id = $1`,
+			`SELECT owner_id, workspace_path, status FROM source_workspaces WHERE id = $1`,
 			sourceID,
-		).Scan(&realOwner, &workspacePath)
+		).Scan(&realOwner, &workspacePath, &status)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return "", ErrSourceDirNotFound
@@ -80,6 +126,9 @@ func (s *SourceService) GetSourcePath(ctx context.Context, ownerID, sourceID uui
 		if realOwner != ownerID {
 			return "", ErrUnauthorizedSource
 		}
+		if status == SourceStatusFailed || status == SourceStatusCancelled {
+			return "", ErrSourceDirNotFound
+		}
 		info, err := os.Stat(workspacePath)
 		if err != nil || !info.IsDir() {
 			return "", ErrSourceDirNotFound
@@ -87,7 +136,22 @@ func (s *SourceService) GetSourcePath(ctx context.Context, ownerID, sourceID uui
 		return workspacePath, nil
 	}
 
-	// Fallback for tests running without database connection: verify in-memory ownership
+	// Fallback for tests running without database connection
+	if val, ok := s.fallbackSources.Load(sourceID); ok {
+		rec := val.(*SourceWorkspaceRecord)
+		if rec.OwnerID != ownerID {
+			return "", ErrUnauthorizedSource
+		}
+		if rec.Status == SourceStatusFailed || rec.Status == SourceStatusCancelled {
+			return "", ErrSourceDirNotFound
+		}
+		info, err := os.Stat(rec.WorkspacePath)
+		if err != nil || !info.IsDir() {
+			return "", ErrSourceDirNotFound
+		}
+		return rec.WorkspacePath, nil
+	}
+
 	if val, ok := s.fallbackOwners.Load(sourceID); ok {
 		if val.(uuid.UUID) != ownerID {
 			return "", ErrUnauthorizedSource
@@ -100,6 +164,106 @@ func (s *SourceService) GetSourcePath(ctx context.Context, ownerID, sourceID uui
 		return "", ErrSourceDirNotFound
 	}
 	return dir, nil
+}
+
+// GetSourceStatus retrieves the status and detection metadata of an uploaded source workspace.
+func (s *SourceService) GetSourceStatus(ctx context.Context, ownerID, sourceID uuid.UUID) (*SourceUploadResult, error) {
+	if sourceID == uuid.Nil {
+		return nil, ErrSourceDirNotFound
+	}
+
+	if s.db != nil {
+		var realOwner uuid.UUID
+		var res SourceUploadResult
+		var detectionJSON []byte
+		var runtime, framework, dbError *string
+
+		err := s.db.QueryRow(ctx,
+			`SELECT id, owner_id, status, phase, files_count, processed_files, total_bytes, processed_bytes, runtime, framework, detection_result, error
+			 FROM source_workspaces WHERE id = $1`,
+			sourceID,
+		).Scan(
+			&res.SourceID,
+			&realOwner,
+			&res.Status,
+			&res.Phase,
+			&res.FilesCount,
+			&res.ProcessedFiles,
+			&res.TotalBytes,
+			&res.ProcessedBytes,
+			&runtime,
+			&framework,
+			&detectionJSON,
+			&dbError,
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrSourceDirNotFound
+			}
+			return nil, fmt.Errorf("failed to query source status: %w", err)
+		}
+		if realOwner != ownerID {
+			return nil, ErrUnauthorizedSource
+		}
+
+		if runtime != nil {
+			res.Runtime = *runtime
+		}
+		if framework != nil {
+			res.Framework = *framework
+		}
+		res.Error = dbError
+		if len(detectionJSON) > 0 {
+			var det detector.DetectionResult
+			if err := json.Unmarshal(detectionJSON, &det); err == nil {
+				res.Detection = &det
+			}
+		}
+
+		return &res, nil
+	}
+
+	// Fallback for tests running without database connection
+	if val, ok := s.fallbackSources.Load(sourceID); ok {
+		rec := val.(*SourceWorkspaceRecord)
+		if rec.OwnerID != ownerID {
+			return nil, ErrUnauthorizedSource
+		}
+		return &SourceUploadResult{
+			SourceID:       rec.ID,
+			Status:         rec.Status,
+			Phase:          rec.Phase,
+			FilesCount:     rec.FilesCount,
+			ProcessedFiles: rec.ProcessedFiles,
+			TotalBytes:     rec.TotalBytes,
+			ProcessedBytes: rec.ProcessedBytes,
+			Runtime:        rec.Runtime,
+			Framework:      rec.Framework,
+			Detection:      rec.Detection,
+			Error:          rec.Error,
+		}, nil
+	}
+
+	if val, ok := s.fallbackOwners.Load(sourceID); ok {
+		if val.(uuid.UUID) != ownerID {
+			return nil, ErrUnauthorizedSource
+		}
+		dir := filepath.Join(s.sourcesDir, sourceID.String())
+		if _, err := os.Stat(dir); err != nil {
+			return nil, ErrSourceDirNotFound
+		}
+		return &SourceUploadResult{
+			SourceID:       sourceID,
+			Status:         SourceStatusReady,
+			Phase:          SourcePhaseReady,
+			FilesCount:     1,
+			ProcessedFiles: 1,
+			TotalBytes:     0,
+			ProcessedBytes: 0,
+		}, nil
+	}
+
+	return nil, ErrSourceDirNotFound
 }
 
 // DeleteSource cleans up an uploaded source workspace after verifying ownership.
@@ -131,24 +295,526 @@ func (s *SourceService) DeleteSource(ctx context.Context, ownerID, sourceID uuid
 		}
 	} else {
 		// Fallback for tests running without database connection: verify in-memory ownership
-		if val, ok := s.fallbackOwners.Load(sourceID); ok {
+		if val, ok := s.fallbackSources.Load(sourceID); ok {
+			rec := val.(*SourceWorkspaceRecord)
+			if rec.OwnerID != ownerID {
+				return ErrUnauthorizedSource
+			}
+			dir = rec.WorkspacePath
+			s.fallbackSources.Delete(sourceID)
+			s.fallbackOwners.Delete(sourceID)
+		} else if val, ok := s.fallbackOwners.Load(sourceID); ok {
 			if val.(uuid.UUID) != ownerID {
 				return ErrUnauthorizedSource
 			}
 			s.fallbackOwners.Delete(sourceID)
+			dir = filepath.Join(s.sourcesDir, sourceID.String())
+		} else {
+			dir = filepath.Join(s.sourcesDir, sourceID.String())
 		}
 
-		dir = filepath.Join(s.sourcesDir, sourceID.String())
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
 			return ErrSourceDirNotFound
 		}
 	}
 
-	return os.RemoveAll(dir)
+	// Clean up both finalized workspace and any temporary upload staging directory
+	uploadStaging := filepath.Join(s.sourcesDir, ".uploads", sourceID.String())
+	_ = removeAllWithRetry(uploadStaging)
+	return removeAllWithRetry(dir)
 }
 
-// IngestZip extracts an uploaded zip archive into an isolated source directory.
+func removeAllWithRetry(path string) error {
+	var err error
+	for i := 0; i < 8; i++ {
+		err = os.RemoveAll(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	return err
+}
+
+func renameWithRetry(oldPath, newPath string) error {
+	var err error
+	for i := 0; i < 8; i++ {
+		err = os.Rename(oldPath, newPath)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	return err
+}
+
+// IngestMultipartStream processes multipart parts sequentially via Go's streaming API,
+// writing file bytes directly to a temporary staging workspace (.uploads/<sourceID>),
+// normalizing wrapper paths, atomically moving to final storage, and initiating async detection.
+func (s *SourceService) IngestMultipartStream(ctx context.Context, ownerID uuid.UUID, reader *multipart.Reader) (*SourceUploadResult, error) {
+	sourceID := uuid.New()
+	uploadDir := filepath.Join(s.sourcesDir, ".uploads", sourceID.String())
+	targetDir := filepath.Join(s.sourcesDir, sourceID.String())
+
+	if err := os.MkdirAll(uploadDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create upload staging directory: %w", err)
+	}
+
+	cleanUploadDir := filepath.Clean(uploadDir)
+	var totalBytes int64
+	var filesCount int
+	var finalized bool
+
+	// Cleanup guard: if upload fails, is cancelled, or errors before finalization, remove staging and target dirs
+	defer func() {
+		if !finalized {
+			_ = os.RemoveAll(uploadDir)
+			_ = os.RemoveAll(targetDir)
+		}
+	}()
+
+	// Watch for context cancellation asynchronously to purge immediately
+	cleanupDone := make(chan struct{})
+	defer close(cleanupDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = os.RemoveAll(uploadDir)
+			_ = os.RemoveAll(targetDir)
+			if s.db != nil {
+				_, _ = s.db.Exec(context.Background(), `DELETE FROM source_workspaces WHERE id = $1`, sourceID)
+			} else {
+				s.fallbackSources.Delete(sourceID)
+				s.fallbackOwners.Delete(sourceID)
+			}
+		case <-cleanupDone:
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		fieldName := part.FormName()
+		fileName := part.FileName()
+		if fileName == "" {
+			_ = part.Close()
+			continue
+		}
+
+		lowerName := strings.ToLower(fileName)
+
+		// 1. Archive stream handling (.zip, .tar.gz, .tgz)
+		if (fieldName == "archive" || fieldName == "file") && filesCount == 0 &&
+			(strings.HasSuffix(lowerName, ".zip") || strings.HasSuffix(lowerName, ".tar.gz") || strings.HasSuffix(lowerName, ".tgz")) {
+			return s.ingestArchivePart(ctx, ownerID, sourceID, uploadDir, targetDir, part, lowerName, &finalized)
+		}
+
+		// 2. Browser directory file streaming
+		relPath := getRelativePathFromHeader(part.Header, fileName)
+		if shouldIgnorePath(relPath) {
+			_, _ = io.Copy(io.Discard, part)
+			_ = part.Close()
+			continue
+		}
+
+		normRel := filepath.ToSlash(filepath.Clean(relPath))
+		if strings.HasPrefix(normRel, "../") || normRel == ".." || filepath.IsAbs(normRel) || strings.HasPrefix(normRel, "/") || strings.Contains(normRel, "\x00") {
+			_ = part.Close()
+			return nil, ErrPathTraversalDetected
+		}
+
+		cleanRel := filepath.FromSlash(normRel)
+		if cleanRel == "" || cleanRel == "." {
+			_ = part.Close()
+			continue
+		}
+
+		destPath := filepath.Join(cleanUploadDir, cleanRel)
+		if !strings.HasPrefix(filepath.Clean(destPath), cleanUploadDir+string(filepath.Separator)) {
+			_ = part.Close()
+			return nil, ErrPathTraversalDetected
+		}
+
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			_ = part.Close()
+			return nil, err
+		}
+
+		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			_ = part.Close()
+			return nil, err
+		}
+
+		remaining := MaxUncompressedBytes - totalBytes
+		written, copyErr := copyWithLimit(outFile, part, remaining)
+		outFile.Close()
+		part.Close()
+
+		if copyErr != nil {
+			return nil, copyErr
+		}
+
+		totalBytes += written
+		if totalBytes > MaxUncompressedBytes {
+			return nil, ErrArchiveTooLarge
+		}
+		filesCount++
+	}
+
+	if filesCount == 0 {
+		return nil, errors.New("no files or source archive provided in upload")
+	}
+
+	// Normalize root structure (lift single wrapper directory if browser sent folder prefix)
+	if err := normalizeSourceWorkspace(uploadDir); err != nil {
+		return nil, fmt.Errorf("failed to normalize upload workspace: %w", err)
+	}
+
+	// Atomically move from .uploads/<sourceID> to data/sources/<sourceID>
+	if err := renameWithRetry(uploadDir, targetDir); err != nil {
+		return nil, fmt.Errorf("failed to finalize upload workspace: %w", err)
+	}
+	finalized = true
+
+	// Persist initial source status in database
+	status := SourceStatusProcessing
+	phase := SourcePhaseDetecting
+
+	if s.db != nil {
+		_, err := s.db.Exec(ctx,
+			`INSERT INTO source_workspaces (id, owner_id, workspace_path, files_count, total_bytes, status, phase, processed_files, processed_bytes, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`,
+			sourceID, ownerID, targetDir, filesCount, totalBytes, status, phase, filesCount, totalBytes,
+		)
+		if err != nil {
+			_ = os.RemoveAll(targetDir)
+			return nil, fmt.Errorf("failed to record source workspace: %w", err)
+		}
+	}
+
+	rec := &SourceWorkspaceRecord{
+		ID:             sourceID,
+		OwnerID:        ownerID,
+		WorkspacePath:  targetDir,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+		Status:         status,
+		Phase:          phase,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	s.fallbackSources.Store(sourceID, rec)
+	s.fallbackOwners.Store(sourceID, ownerID)
+
+	// Kick off asynchronous detection without blocking HTTP upload response
+	go s.processSourceBackground(sourceID, ownerID, targetDir)
+
+	return &SourceUploadResult{
+		SourceID:       sourceID,
+		Status:         status,
+		Phase:          phase,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+	}, nil
+}
+
+// ingestArchivePart handles streaming extraction for compressed archives (.zip, .tar.gz, .tgz).
+func (s *SourceService) ingestArchivePart(
+	ctx context.Context,
+	ownerID, sourceID uuid.UUID,
+	uploadDir, targetDir string,
+	part *multipart.Part,
+	filename string,
+	finalized *bool,
+) (*SourceUploadResult, error) {
+	defer part.Close()
+
+	var filesCount int
+	var totalBytes int64
+
+	if strings.HasSuffix(filename, ".zip") {
+		// Zip format requires random access reader (central directory is at end of archive).
+		// Buffer part to a temporary archive file inside staging uploadDir.
+		tempZip := filepath.Join(uploadDir, "__archive__.zip")
+		outFile, err := os.OpenFile(tempZip, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return nil, err
+		}
+		archiveBytes, copyErr := copyWithLimit(outFile, part, MaxUncompressedBytes)
+		outFile.Close()
+		if copyErr != nil {
+			return nil, copyErr
+		}
+
+		zipFile, err := os.Open(tempZip)
+		if err != nil {
+			_ = os.Remove(tempZip)
+			return nil, fmt.Errorf("%w: failed to open archive: %v", ErrInvalidSourceArchive, err)
+		}
+
+		zipReader, err := zip.NewReader(zipFile, archiveBytes)
+		if err != nil {
+			zipFile.Close()
+			_ = os.Remove(tempZip)
+			return nil, fmt.Errorf("%w: %v", ErrInvalidSourceArchive, err)
+		}
+
+		cleanUpload := filepath.Clean(uploadDir)
+		for _, f := range zipReader.File {
+			if shouldIgnorePath(f.Name) {
+				continue
+			}
+			normRel := filepath.ToSlash(filepath.Clean(f.Name))
+			if strings.HasPrefix(normRel, "../") || normRel == ".." || filepath.IsAbs(normRel) || strings.HasPrefix(normRel, "/") || strings.Contains(normRel, "\x00") {
+				zipFile.Close()
+				_ = os.Remove(tempZip)
+				return nil, ErrPathTraversalDetected
+			}
+			cleanRel := filepath.FromSlash(normRel)
+			if cleanRel == "" || cleanRel == "." {
+				continue
+			}
+			destPath := filepath.Join(cleanUpload, cleanRel)
+			if !strings.HasPrefix(filepath.Clean(destPath), cleanUpload+string(filepath.Separator)) {
+				zipFile.Close()
+				_ = os.Remove(tempZip)
+				return nil, ErrPathTraversalDetected
+			}
+
+			if f.FileInfo().IsDir() {
+				_ = os.MkdirAll(destPath, 0755)
+				continue
+			}
+
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				zipFile.Close()
+				_ = os.Remove(tempZip)
+				return nil, err
+			}
+
+			rc, err := f.Open()
+			if err != nil {
+				zipFile.Close()
+				_ = os.Remove(tempZip)
+				return nil, err
+			}
+			outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+			if err != nil {
+				rc.Close()
+				zipFile.Close()
+				_ = os.Remove(tempZip)
+				return nil, err
+			}
+			remaining := MaxUncompressedBytes - totalBytes
+			written, copyErr := copyWithLimit(outFile, rc, remaining)
+			outFile.Close()
+			rc.Close()
+			if copyErr != nil {
+				zipFile.Close()
+				_ = os.Remove(tempZip)
+				return nil, copyErr
+			}
+			totalBytes += written
+			if totalBytes > MaxUncompressedBytes {
+				zipFile.Close()
+				_ = os.Remove(tempZip)
+				return nil, ErrArchiveTooLarge
+			}
+			filesCount++
+		}
+		zipFile.Close()
+		_ = os.Remove(tempZip)
+	} else {
+		// tar.gz or tgz: stream extract sequentially directly from part
+		gzReader, err := gzip.NewReader(part)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidSourceArchive, err)
+		}
+		defer gzReader.Close()
+
+		tarReader := tar.NewReader(gzReader)
+		cleanUpload := filepath.Clean(uploadDir)
+
+		for {
+			header, err := tarReader.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrInvalidSourceArchive, err)
+			}
+			if shouldIgnorePath(header.Name) {
+				continue
+			}
+			normRel := filepath.ToSlash(filepath.Clean(header.Name))
+			if strings.HasPrefix(normRel, "../") || normRel == ".." || filepath.IsAbs(normRel) || strings.HasPrefix(normRel, "/") || strings.Contains(normRel, "\x00") {
+				return nil, ErrPathTraversalDetected
+			}
+			cleanRel := filepath.FromSlash(normRel)
+			if cleanRel == "" || cleanRel == "." {
+				continue
+			}
+			destPath := filepath.Join(cleanUpload, cleanRel)
+			if !strings.HasPrefix(filepath.Clean(destPath), cleanUpload+string(filepath.Separator)) {
+				return nil, ErrPathTraversalDetected
+			}
+
+			switch header.Typeflag {
+			case tar.TypeDir:
+				_ = os.MkdirAll(destPath, 0755)
+			case tar.TypeReg:
+				if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+					return nil, err
+				}
+				outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, header.FileInfo().Mode())
+				if err != nil {
+					return nil, err
+				}
+				remaining := MaxUncompressedBytes - totalBytes
+				written, copyErr := copyWithLimit(outFile, tarReader, remaining)
+				outFile.Close()
+				if copyErr != nil {
+					return nil, copyErr
+				}
+				totalBytes += written
+				if totalBytes > MaxUncompressedBytes {
+					return nil, ErrArchiveTooLarge
+				}
+				filesCount++
+			}
+		}
+	}
+
+	if filesCount == 0 {
+		return nil, errors.New("no files found in source archive")
+	}
+
+	if err := normalizeSourceWorkspace(uploadDir); err != nil {
+		return nil, err
+	}
+
+	if err := renameWithRetry(uploadDir, targetDir); err != nil {
+		return nil, err
+	}
+	*finalized = true
+
+	status := SourceStatusProcessing
+	phase := SourcePhaseDetecting
+
+	if s.db != nil {
+		_, err := s.db.Exec(ctx,
+			`INSERT INTO source_workspaces (id, owner_id, workspace_path, files_count, total_bytes, status, phase, processed_files, processed_bytes, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`,
+			sourceID, ownerID, targetDir, filesCount, totalBytes, status, phase, filesCount, totalBytes,
+		)
+		if err != nil {
+			_ = os.RemoveAll(targetDir)
+			return nil, fmt.Errorf("failed to record source workspace: %w", err)
+		}
+	}
+
+	rec := &SourceWorkspaceRecord{
+		ID:             sourceID,
+		OwnerID:        ownerID,
+		WorkspacePath:  targetDir,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+		Status:         status,
+		Phase:          phase,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	s.fallbackSources.Store(sourceID, rec)
+	s.fallbackOwners.Store(sourceID, ownerID)
+
+	go s.processSourceBackground(sourceID, ownerID, targetDir)
+
+	return &SourceUploadResult{
+		SourceID:       sourceID,
+		Status:         status,
+		Phase:          phase,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+	}, nil
+}
+
+// processSourceBackground inspects unpacked files to detect runtime/framework and transitions state to ready or failed.
+func (s *SourceService) processSourceBackground(sourceID, ownerID uuid.UUID, targetDir string) {
+	detection, err := detector.Detect(targetDir)
+	if err != nil {
+		slog.Warn("source detection failed",
+			"source_id", sourceID.String(),
+			"owner_id", ownerID.String(),
+			"error", err.Error(),
+		)
+		errMsg := err.Error()
+		s.updateSourceState(context.Background(), sourceID, SourceStatusFailed, SourcePhaseFailed, nil, &errMsg)
+		return
+	}
+
+	s.updateSourceState(context.Background(), sourceID, SourceStatusReady, SourcePhaseReady, detection, nil)
+}
+
+func (s *SourceService) updateSourceState(ctx context.Context, sourceID uuid.UUID, status, phase string, detection *detector.DetectionResult, errMsg *string) {
+	var runtime, framework string
+	var detBytes []byte
+	if detection != nil {
+		runtime = detection.Runtime
+		framework = detection.Framework
+		detBytes, _ = json.Marshal(detection)
+	}
+
+	if s.db != nil {
+		_, err := s.db.Exec(ctx,
+			`UPDATE source_workspaces
+			 SET status = $2, phase = $3, runtime = $4, framework = $5, detection_result = $6, error = $7, updated_at = NOW()
+			 WHERE id = $1`,
+			sourceID, status, phase, runtime, framework, detBytes, errMsg,
+		)
+		if err != nil {
+			slog.Error("failed to update source workspace status in database",
+				"source_id", sourceID.String(),
+				"error", err.Error(),
+			)
+		}
+	}
+
+	if val, ok := s.fallbackSources.Load(sourceID); ok {
+		rec := val.(*SourceWorkspaceRecord)
+		rec.Status = status
+		rec.Phase = phase
+		rec.Runtime = runtime
+		rec.Framework = framework
+		rec.Detection = detection
+		rec.Error = errMsg
+		rec.UpdatedAt = time.Now()
+		s.fallbackSources.Store(sourceID, rec)
+	}
+}
+
+// IngestZip extracts an uploaded zip archive into an isolated source directory (synchronous compatibility).
 func (s *SourceService) IngestZip(ctx context.Context, ownerID uuid.UUID, r io.ReaderAt, size int64) (*SourceUploadResult, error) {
 	zipReader, err := zip.NewReader(r, size)
 	if err != nil {
@@ -246,11 +912,19 @@ func (s *SourceService) IngestZip(ctx context.Context, ownerID uuid.UUID, r io.R
 		return nil, err
 	}
 
+	detection, _ := detector.Detect(targetDir)
+	detBytes, _ := json.Marshal(detection)
+	var runtime, framework string
+	if detection != nil {
+		runtime = detection.Runtime
+		framework = detection.Framework
+	}
+
 	if s.db != nil {
 		_, err = s.db.Exec(ctx,
-			`INSERT INTO source_workspaces (id, owner_id, workspace_path, files_count, total_bytes, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
-			sourceID, ownerID, targetDir, filesCount, totalBytes, time.Now(),
+			`INSERT INTO source_workspaces (id, owner_id, workspace_path, files_count, total_bytes, status, phase, processed_files, processed_bytes, runtime, framework, detection_result, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, 'ready', 'ready', $4, $5, $6, $7, $8, NOW(), NOW())`,
+			sourceID, ownerID, targetDir, filesCount, totalBytes, runtime, framework, detBytes,
 		)
 		if err != nil {
 			_ = os.RemoveAll(targetDir)
@@ -258,18 +932,40 @@ func (s *SourceService) IngestZip(ctx context.Context, ownerID uuid.UUID, r io.R
 		}
 	}
 
+	rec := &SourceWorkspaceRecord{
+		ID:             sourceID,
+		OwnerID:        ownerID,
+		WorkspacePath:  targetDir,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+		Status:         SourceStatusReady,
+		Phase:          SourcePhaseReady,
+		Runtime:        runtime,
+		Framework:      framework,
+		Detection:      detection,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	s.fallbackSources.Store(sourceID, rec)
 	s.fallbackOwners.Store(sourceID, ownerID)
-	detection, _ := detector.Detect(targetDir)
 
 	return &SourceUploadResult{
-		SourceID:   sourceID,
-		FilesCount: filesCount,
-		TotalBytes: totalBytes,
-		Detection:  detection,
+		SourceID:       sourceID,
+		Status:         SourceStatusReady,
+		Phase:          SourcePhaseReady,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+		Runtime:        runtime,
+		Framework:      framework,
+		Detection:      detection,
 	}, nil
 }
 
-// IngestTarGz extracts an uploaded tar.gz archive into an isolated source directory.
+// IngestTarGz extracts an uploaded tar.gz archive into an isolated source directory (synchronous compatibility).
 func (s *SourceService) IngestTarGz(ctx context.Context, ownerID uuid.UUID, r io.Reader) (*SourceUploadResult, error) {
 	gzReader, err := gzip.NewReader(r)
 	if err != nil {
@@ -320,10 +1016,13 @@ func (s *SourceService) IngestTarGz(ctx context.Context, ownerID uuid.UUID, r io
 		}
 
 		switch header.Typeflag {
-		case tar.TypeDir:
+			case tar.TypeDir:
 			_ = os.MkdirAll(destPath, 0755)
 		case tar.TypeReg:
-			_ = os.MkdirAll(filepath.Dir(destPath), 0755)
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				_ = os.RemoveAll(targetDir)
+				return nil, err
+			}
 			outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, header.FileInfo().Mode())
 			if err != nil {
 				_ = os.RemoveAll(targetDir)
@@ -353,11 +1052,19 @@ func (s *SourceService) IngestTarGz(ctx context.Context, ownerID uuid.UUID, r io
 		return nil, err
 	}
 
+	detection, _ := detector.Detect(targetDir)
+	detBytes, _ := json.Marshal(detection)
+	var runtime, framework string
+	if detection != nil {
+		runtime = detection.Runtime
+		framework = detection.Framework
+	}
+
 	if s.db != nil {
 		_, err = s.db.Exec(ctx,
-			`INSERT INTO source_workspaces (id, owner_id, workspace_path, files_count, total_bytes, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
-			sourceID, ownerID, targetDir, filesCount, totalBytes, time.Now(),
+			`INSERT INTO source_workspaces (id, owner_id, workspace_path, files_count, total_bytes, status, phase, processed_files, processed_bytes, runtime, framework, detection_result, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, 'ready', 'ready', $4, $5, $6, $7, $8, NOW(), NOW())`,
+			sourceID, ownerID, targetDir, filesCount, totalBytes, runtime, framework, detBytes,
 		)
 		if err != nil {
 			_ = os.RemoveAll(targetDir)
@@ -365,18 +1072,40 @@ func (s *SourceService) IngestTarGz(ctx context.Context, ownerID uuid.UUID, r io
 		}
 	}
 
+	rec := &SourceWorkspaceRecord{
+		ID:             sourceID,
+		OwnerID:        ownerID,
+		WorkspacePath:  targetDir,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+		Status:         SourceStatusReady,
+		Phase:          SourcePhaseReady,
+		Runtime:        runtime,
+		Framework:      framework,
+		Detection:      detection,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	s.fallbackSources.Store(sourceID, rec)
 	s.fallbackOwners.Store(sourceID, ownerID)
-	detection, _ := detector.Detect(targetDir)
 
 	return &SourceUploadResult{
-		SourceID:   sourceID,
-		FilesCount: filesCount,
-		TotalBytes: totalBytes,
-		Detection:  detection,
+		SourceID:       sourceID,
+		Status:         SourceStatusReady,
+		Phase:          SourcePhaseReady,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+		Runtime:        runtime,
+		Framework:      framework,
+		Detection:      detection,
 	}, nil
 }
 
-// IngestMultipartFiles writes multiple files uploaded via HTML5 directory selection.
+// IngestMultipartFiles writes multiple files uploaded via HTML5 directory selection (synchronous compatibility).
 func (s *SourceService) IngestMultipartFiles(ctx context.Context, ownerID uuid.UUID, files []*multipart.FileHeader) (*SourceUploadResult, error) {
 	if len(files) == 0 {
 		return nil, errors.New("no files provided in upload")
@@ -471,11 +1200,19 @@ func (s *SourceService) IngestMultipartFiles(ctx context.Context, ownerID uuid.U
 		return nil, err
 	}
 
+	detection, _ := detector.Detect(targetDir)
+	detBytes, _ := json.Marshal(detection)
+	var runtime, framework string
+	if detection != nil {
+		runtime = detection.Runtime
+		framework = detection.Framework
+	}
+
 	if s.db != nil {
 		_, err = s.db.Exec(ctx,
-			`INSERT INTO source_workspaces (id, owner_id, workspace_path, files_count, total_bytes, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
-			sourceID, ownerID, targetDir, filesCount, totalBytes, time.Now(),
+			`INSERT INTO source_workspaces (id, owner_id, workspace_path, files_count, total_bytes, status, phase, processed_files, processed_bytes, runtime, framework, detection_result, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, 'ready', 'ready', $4, $5, $6, $7, $8, NOW(), NOW())`,
+			sourceID, ownerID, targetDir, filesCount, totalBytes, runtime, framework, detBytes,
 		)
 		if err != nil {
 			_ = os.RemoveAll(targetDir)
@@ -483,14 +1220,36 @@ func (s *SourceService) IngestMultipartFiles(ctx context.Context, ownerID uuid.U
 		}
 	}
 
+	rec := &SourceWorkspaceRecord{
+		ID:             sourceID,
+		OwnerID:        ownerID,
+		WorkspacePath:  targetDir,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+		Status:         SourceStatusReady,
+		Phase:          SourcePhaseReady,
+		Runtime:        runtime,
+		Framework:      framework,
+		Detection:      detection,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	s.fallbackSources.Store(sourceID, rec)
 	s.fallbackOwners.Store(sourceID, ownerID)
-	detection, _ := detector.Detect(targetDir)
 
 	return &SourceUploadResult{
-		SourceID:   sourceID,
-		FilesCount: filesCount,
-		TotalBytes: totalBytes,
-		Detection:  detection,
+		SourceID:       sourceID,
+		Status:         SourceStatusReady,
+		Phase:          SourcePhaseReady,
+		FilesCount:     filesCount,
+		ProcessedFiles: filesCount,
+		TotalBytes:     totalBytes,
+		ProcessedBytes: totalBytes,
+		Runtime:        runtime,
+		Framework:      framework,
+		Detection:      detection,
 	}, nil
 }
 
@@ -538,7 +1297,6 @@ func detectCommonWrapperDir(paths []string) (string, error) {
 	for i, norm := range validPaths {
 		parts := strings.Split(norm, "/")
 		if len(parts) <= 1 {
-			// Found a file at root level (e.g. "package.json")
 			return "", nil
 		}
 		top := parts[0]
@@ -553,38 +1311,42 @@ func detectCommonWrapperDir(paths []string) (string, error) {
 }
 
 // normalizeSourceWorkspace checks if all extracted files ended up inside a single subfolder
-// and lifts them to the workspace root if so.
+// and lifts them to the workspace root if so (handles single or multi-tier wrapper directories).
 func normalizeSourceWorkspace(targetDir string) error {
-	entries, err := os.ReadDir(targetDir)
-	if err != nil {
-		return err
-	}
-
-	var validEntries []os.DirEntry
-	for _, e := range entries {
-		if !shouldIgnorePath(e.Name()) {
-			validEntries = append(validEntries, e)
-		}
-	}
-
-	if len(validEntries) == 1 && validEntries[0].IsDir() {
-		wrapperName := validEntries[0].Name()
-		wrapperPath := filepath.Join(targetDir, wrapperName)
-
-		subEntries, err := os.ReadDir(wrapperPath)
+	for {
+		entries, err := os.ReadDir(targetDir)
 		if err != nil {
 			return err
 		}
 
-		for _, sub := range subEntries {
-			oldPath := filepath.Join(wrapperPath, sub.Name())
-			newPath := filepath.Join(targetDir, sub.Name())
-			if err := os.Rename(oldPath, newPath); err != nil {
-				return err
+		var validEntries []os.DirEntry
+		for _, e := range entries {
+			if !shouldIgnorePath(e.Name()) {
+				validEntries = append(validEntries, e)
 			}
 		}
 
-		_ = os.Remove(wrapperPath)
+		if len(validEntries) == 1 && validEntries[0].IsDir() {
+			wrapperName := validEntries[0].Name()
+			wrapperPath := filepath.Join(targetDir, wrapperName)
+
+			subEntries, err := os.ReadDir(wrapperPath)
+			if err != nil {
+				return err
+			}
+
+			for _, sub := range subEntries {
+				oldPath := filepath.Join(wrapperPath, sub.Name())
+				newPath := filepath.Join(targetDir, sub.Name())
+				if err := os.Rename(oldPath, newPath); err != nil {
+					return err
+				}
+			}
+
+			_ = os.Remove(wrapperPath)
+		} else {
+			break
+		}
 	}
 
 	return nil
@@ -618,4 +1380,19 @@ func getRelativePath(fh *multipart.FileHeader) string {
 		}
 	}
 	return fh.Filename
+}
+
+func getRelativePathFromHeader(header textproto.MIMEHeader, defaultName string) string {
+	if header != nil {
+		cd := header.Get("Content-Disposition")
+		if cd != "" {
+			_, params, err := mime.ParseMediaType(cd)
+			if err == nil {
+				if fn, ok := params["filename"]; ok && fn != "" {
+					return fn
+				}
+			}
+		}
+	}
+	return defaultName
 }

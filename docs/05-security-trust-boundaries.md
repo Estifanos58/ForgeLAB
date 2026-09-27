@@ -114,26 +114,27 @@ ForgeLAB implements backend-owned, cookie-based session management:
 
 ---
 
-## 3. Source Workspace Security & Ingestion Protection
+## 3. Source Ingestion Security & Path Boundaries
 
-ForgeLAB ingests application source through two primary channels, treating all source code as untrusted input:
+ForgeLAB treats all source code and filesystem paths as untrusted input across all three ingestion modes:
 
-### 1. Browser-Based Computer Uploads (`/api/sources/upload`)
-- **Zip Slip & Path Traversal Prevention:** Archive extraction and multipart file ingestion evaluate every relative path with `filepath.Clean`. Any entry attempting to traverse outside the allocated directory (e.g. `../`, absolute paths, or symlink escapes) is immediately rejected with `ErrPathTraversalDetected` and the directory is purged.
+### 1. Direct Local-Directory Ingestion (`source_type: "local_directory"`)
+- **`PathValidator` Security Boundary:** Validates directory existence, verifies that the target is a directory (not a regular file or device), and canonicalizes paths with full symlink resolution (`filepath.EvalSymlinks`).
+- **Configured Allowed Roots (`FORGELAB_ALLOWED_SOURCE_ROOTS`):** Only paths situated beneath explicitly configured root directories are permitted. All attempts to navigate outside (e.g. traversal via `..` or symlink escape) are rejected with `ErrPathNotAllowed`.
+- **System Directory Rejection:** System directories (`/etc`, `/var`, `/usr`, `C:\Windows`, `C:\Program Files`, etc.) are unconditionally rejected with `ErrRestrictedSystemPath`.
+- **Docker Compose Host-to-Container Translation:** In containerized setups, the backend mounts `${FORGELAB_HOST_SOURCE_ROOT}:/host-projects:ro` as a read-only volume. The backend safely translates host paths beneath `FORGELAB_HOST_SOURCE_ROOT` to `/host-projects/...` preventing arbitrary host container path spoofing.
+- **Cross-User Project Path Authorization:** Project creation and deployments verify that the authenticated user owns the project record. A user cannot hijack or redeploy another user's project path.
+- **Direct Build Security:** Build context is streamed concurrently into Docker with early `.dockerignore` pruning. In-memory `bytes.Buffer` buffering is completely eliminated, and virtual files (such as auto-generated `Dockerfile.forgelab`) are injected into the TAR stream without requiring write access to the source filesystem.
+
+### 2. Browser-Based Archive Uploads (`source_type: "local_upload"`)
+- **Zip Slip & Path Traversal Prevention:** Archive extraction via sequential `r.MultipartReader()` evaluates every relative path with `filepath.Clean`. Any entry attempting to traverse outside the allocated directory (e.g. `../`, absolute paths, or symlink escapes) is immediately rejected with `ErrPathTraversalDetected` and the directory is purged.
 - **Decompression Bomb Protection:** Imposes a strict `MaxUncompressedBytes` limit (100MB). Exceeding this limit halts decompression and wipes the target folder.
-- **Ignore Filtering:** Automatically rejects or skips build artifacts, dependencies, and version control metadata (`node_modules`, `.git`, `.next`, `dist`, `__pycache__`, etc.) during extraction.
 - **Workspace Isolation:** Each upload is stored in a dedicated, random UUID workspace (`data/sources/<source_id>`) isolated from other projects and host system directories.
 
-### 2. GitHub Repository Tarball Ingestion
+### 3. GitHub Repository Tarball Ingestion (`source_type: "github"`)
 - **Server-Side Token Verification:** Only repositories accessible via the authenticated user's encrypted OAuth token are cloned/fetched.
 - **Encrypted Token Handling:** Tokens are decrypted in-memory only when communicating with `api.github.com` and are never logged or exposed to the client.
 - **Tarball Extraction Isolation:** Remote tarballs are unpacked using the same path-traversal safeguards and size limits into isolated source directories.
-
-### 3. Snapshot Isolation
-Before the Docker build engine starts, ForgeLAB snapshots the source files into `data/builds/<deployment-id>`:
-- Prevents concurrent edits from corrupting active builds.
-- Isolates build context and prevents path traversal escapes during `docker build`.
-- Snapshot directory is automatically wiped after the image build finishes.
 
 ---
 

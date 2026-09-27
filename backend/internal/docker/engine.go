@@ -1,7 +1,6 @@
 package docker
 
 import (
-	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -42,6 +41,7 @@ type Engine struct {
 	pathValidator     *security.PathValidator
 	wsHub             *ws.Hub
 	workDir           string
+	localBuildMode    string
 }
 
 func NewEngine(
@@ -72,6 +72,14 @@ func NewEngine(
 		pathValidator:     pathValidator,
 		wsHub:             wsHub,
 		workDir:           workDir,
+		localBuildMode:    "direct",
+	}
+}
+
+// SetLocalBuildMode sets the local directory deployment mode ("direct" or "snapshot").
+func (e *Engine) SetLocalBuildMode(mode string) {
+	if mode != "" {
+		e.localBuildMode = mode
 	}
 }
 
@@ -136,13 +144,25 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		redactor.SetSecrets(secrets)
 	}
 
-	// 1. CLONING / SOURCE ACQUISITION
+	// 1. SOURCE ACQUISITION & RESOLUTION
 	updateStatus(models.DeployStatusCloning, nil)
-	snapshotDir := filepath.Join(e.workDir, deployment.ID.String())
-	_ = os.MkdirAll(snapshotDir, 0755)
-	defer os.RemoveAll(snapshotDir) // Clean up snapshot dir after build completes
+
+	var (
+		buildSourceDir string
+		cleanupDir     string
+	)
+	defer func() {
+		if cleanupDir != "" {
+			_ = os.RemoveAll(cleanupDir)
+		}
+	}()
 
 	if project.SourceType == models.SourceTypeGitHub {
+		snapshotDir := filepath.Join(e.workDir, deployment.ID.String())
+		_ = os.MkdirAll(snapshotDir, 0755)
+		cleanupDir = snapshotDir
+		buildSourceDir = snapshotDir
+
 		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (branch: %s)...", project.SourceReference, project.Branch))
 		parts := strings.Split(project.SourceReference, "/")
 		if len(parts) != 2 {
@@ -163,66 +183,75 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 			updateStatus(models.DeployStatusFailed, &reason)
 			return errors.New(reason)
 		}
-	} else {
-		// Local Source
-		var sourceDir string
-		if project.SourceReference != "" {
-			sourceUUID, err := uuid.Parse(project.SourceReference)
-			if err != nil {
-				reason := fmt.Sprintf("Invalid local source upload ID '%s': %v", project.SourceReference, err)
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, "GitHub repository archive acquired successfully.")
+
+	} else if project.SourceType == models.SourceTypeLocalUpload || (project.SourceType == models.SourceTypeLocal && project.SourceReference != "") {
+		sourceUUID, err := uuid.Parse(project.SourceReference)
+		if err != nil {
+			reason := fmt.Sprintf("Invalid local source upload ID '%s': %v", project.SourceReference, err)
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+		if e.sourceService == nil {
+			reason := "Local source upload service is not available"
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+		p, err := e.sourceService.GetSourcePath(ctx, project.OwnerID, sourceUUID)
+		if err != nil {
+			reason := fmt.Sprintf("Failed to locate uploaded source files: %v", err)
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+		buildSourceDir = p
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using isolated uploaded source workspace.")
+
+	} else if project.SourceType == models.SourceTypeLocalDirectory || project.RepositoryPath != "" {
+		canonicalSource, err := e.pathValidator.ValidateSourcePath(project.RepositoryPath)
+		if err != nil {
+			reason := fmt.Sprintf("Source path validation failed: %v", err)
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Using local directory: %s", project.RepositoryPath))
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, "Validated local source directory.")
+
+		if e.localBuildMode == "snapshot" {
+			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using snapshot filesystem build mode.")
+			snapshotDir := filepath.Join(e.workDir, deployment.ID.String())
+			_ = os.MkdirAll(snapshotDir, 0755)
+			cleanupDir = snapshotDir
+			if err := copyDirectory(canonicalSource, snapshotDir); err != nil {
+				reason := fmt.Sprintf("Failed to snapshot source files: %v", err)
 				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
 				updateStatus(models.DeployStatusFailed, &reason)
 				return errors.New(reason)
 			}
-			if e.sourceService == nil {
-				reason := "Local source upload service is not available"
-				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-				updateStatus(models.DeployStatusFailed, &reason)
-				return errors.New(reason)
-			}
-			p, err := e.sourceService.GetSourcePath(ctx, project.OwnerID, sourceUUID)
-			if err != nil {
-				reason := fmt.Sprintf("Failed to locate uploaded source files: %v", err)
-				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-				updateStatus(models.DeployStatusFailed, &reason)
-				return errors.New(reason)
-			}
-			sourceDir = p
-			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using isolated uploaded source workspace.")
-		} else if project.RepositoryPath != "" {
-			canonicalSource, err := e.pathValidator.ValidateSourcePath(project.RepositoryPath)
-			if err != nil {
-				reason := fmt.Sprintf("Source path validation failed: %v", err)
-				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-				updateStatus(models.DeployStatusFailed, &reason)
-				return errors.New(reason)
-			}
-			sourceDir = canonicalSource
-			emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring source snapshot from host path '%s'...", project.RepositoryPath))
+			buildSourceDir = snapshotDir
 		} else {
-			reason := "No valid local source reference or repository path configured"
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
+			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using direct filesystem build mode.")
+			buildSourceDir = canonicalSource
 		}
 
-		if err := copyDirectory(sourceDir, snapshotDir); err != nil {
-			reason := fmt.Sprintf("Failed to snapshot source files: %v", err)
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
+	} else {
+		reason := "No valid local directory, uploaded source, or repository configured"
+		emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+		updateStatus(models.DeployStatusFailed, &reason)
+		return errors.New(reason)
 	}
-
-	emitLog(models.LogPhaseSource, models.LogStreamSystem, "Source snapshot acquired successfully.")
 
 	// 2. BUILDING DOCKER IMAGE
 	updateStatus(models.DeployStatusBuilding, nil)
 	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Preparing build for image '%s'...", *deployment.ImageTag))
 
-	buildContextDir := filepath.Join(snapshotDir, project.BuildContext)
+	buildContextDir := filepath.Join(buildSourceDir, project.BuildContext)
 	if _, err := os.Stat(buildContextDir); err != nil {
-		reason := fmt.Sprintf("Build context directory '%s' does not exist in source snapshot", project.BuildContext)
+		reason := fmt.Sprintf("Build context directory '%s' does not exist in source", project.BuildContext)
 		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
 		return errors.New(reason)
@@ -248,6 +277,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	}
 
 	relDockerPath := dockerfilePath
+	var virtualFiles map[string][]byte
 
 	if buildStrategy == models.BuildStrategyDockerfile || (buildStrategy == models.BuildStrategyAuto && hasExistingDockerfile) {
 		if !hasExistingDockerfile {
@@ -258,7 +288,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		}
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Using Dockerfile build strategy with '%s'...", dockerfilePath))
 	} else {
-		// Automatic Build Strategy: generate container image specification
+		// Automatic Build Strategy: generate container image specification in memory (no disk modification)
 		runtimeType := deployment.RuntimeType
 		if runtimeType == "" {
 			runtimeType = project.RuntimeType
@@ -277,23 +307,34 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Generating automatic build recipe for runtime: %s (internal port: %d)...", runtimeType, intPort))
 		generatedContent := detector.GenerateDockerfile(runtimeType, intPort, startCmd)
-		genPath := filepath.Join(buildContextDir, "Dockerfile.forgelab")
-		if err := os.WriteFile(genPath, []byte(generatedContent), 0644); err != nil {
-			reason := fmt.Sprintf("Failed to write generated Dockerfile: %v", err)
-			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
 		relDockerPath = "Dockerfile.forgelab"
+		virtualFiles = map[string][]byte{
+			"Dockerfile.forgelab": []byte(generatedContent),
+		}
 	}
 
-	tarArchive, err := createTarArchive(buildContextDir)
+	// Load and apply .dockerignore
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Applying .dockerignore...")
+	matcher, err := LoadDockerignore(buildContextDir)
 	if err != nil {
-		reason := fmt.Sprintf("Failed to pack build context: %v", err)
-		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
+		emitLog(models.LogPhaseBuild, models.LogStreamStderr, fmt.Sprintf("Warning reading .dockerignore: %v. Using default filters.", err))
+		matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 	}
+
+	// Stream build context concurrently without materializing tar in RAM
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Streaming Docker build context...")
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker build started.")
+
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	tarArchive := StreamBuildContext(streamCtx, TarStreamerOptions{
+		BuildContextDir: buildContextDir,
+		Matcher:         matcher,
+		VirtualFiles:    virtualFiles,
+		EmitLog:         emitLog,
+	})
+	defer tarArchive.Close()
 
 	buildResponse, err := e.dockerClient.ImageBuild(ctx, tarArchive, types.ImageBuildOptions{
 		Tags:       []string{*deployment.ImageTag},
@@ -318,7 +359,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		return errors.New(reason)
 	}
 
-	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker image build completed successfully.")
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker build completed.")
 
 	// 3. STARTING CONTAINER
 	updateStatus(models.DeployStatusStarting, nil)
@@ -729,52 +770,4 @@ func copyDirectory(src, dst string) error {
 		_, err = io.Copy(dstFile, srcFile)
 		return err
 	})
-}
-
-func createTarArchive(srcDir string) (io.Reader, error) {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-
-	err := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		relPath, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return err
-		}
-		if relPath == "." {
-			return nil
-		}
-
-		header, err := tar.FileInfoHeader(info, info.Name())
-		if err != nil {
-			return err
-		}
-		header.Name = filepath.ToSlash(relPath)
-
-		if err := tw.WriteHeader(header); err != nil {
-			return err
-		}
-
-		if info.Mode().IsRegular() {
-			file, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-			_, err = io.Copy(tw, file)
-			return err
-		}
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-	if err := tw.Close(); err != nil {
-		return nil, err
-	}
-
-	return &buf, nil
 }
