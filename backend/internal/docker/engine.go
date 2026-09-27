@@ -180,7 +180,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 				updateStatus(models.DeployStatusFailed, &reason)
 				return errors.New(reason)
 			}
-			p, err := e.sourceService.GetSourcePath(sourceUUID)
+			p, err := e.sourceService.GetSourcePath(ctx, project.OwnerID, sourceUUID)
 			if err != nil {
 				reason := fmt.Sprintf("Failed to locate uploaded source files: %v", err)
 				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
@@ -463,11 +463,20 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 						healthy = true
 						emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Health check passed (HTTP %d) on attempt %d.", res.StatusCode, attempt))
 						break
-					} else if healthStrategy == models.HealthStrategyAuto && res.StatusCode > 0 {
-						healthy = true
-						emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Health check auto-detected responsive server (HTTP %d) on attempt %d.", res.StatusCode, attempt))
-						break
+					} else if res.StatusCode >= 500 {
+						// 5xx server error is never healthy under any strategy
+						emitLog(models.LogPhaseHealth, models.LogStreamStderr, fmt.Sprintf("Health check attempt %d returned HTTP %d server error", attempt, res.StatusCode))
 					} else {
+						// 4xx client status codes (e.g. 404 Not Found on unmapped path or 401 Unauthorized)
+						if healthStrategy == models.HealthStrategyAuto {
+							conn, tcpErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", allocatedPort), 1*time.Second)
+							if tcpErr == nil {
+								conn.Close()
+								healthy = true
+								emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Health check auto-detected active server (HTTP %d) on attempt %d.", res.StatusCode, attempt))
+								break
+							}
+						}
 						emitLog(models.LogPhaseHealth, models.LogStreamStderr, fmt.Sprintf("Health check attempt %d returned HTTP %d", attempt, res.StatusCode))
 					}
 				} else {

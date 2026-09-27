@@ -110,7 +110,7 @@ func main() {
 		cfg.JWT.RefreshTokenExpiry,
 	)
 
-	sourceService := services.NewSourceService(cfg.Docker.SourcesDir)
+	sourceService := services.NewSourceService(pool, cfg.Docker.SourcesDir)
 	githubService := services.NewGitHubService(pool, encryptor, cfg.GitHub, redisClient)
 	userService := services.NewUserService(pool, jwtManager)
 	projectService := services.NewProjectService(pool, pathValidator, sourceService, githubService)
@@ -203,6 +203,7 @@ func main() {
 			// Source Management & Uploads
 			r.Route("/sources", func(r chi.Router) {
 				r.Post("/upload", sourceHandler.Upload)
+				r.Delete("/{id}", sourceHandler.Delete)
 			})
 
 			// Integrations (GitHub Repository Access)
@@ -214,6 +215,7 @@ func main() {
 					r.Post("/disconnect", integrationHandler.DisconnectGitHub)
 					r.Get("/repositories", integrationHandler.ListRepositories)
 					r.Get("/repositories/{owner}/{repo}/branches", integrationHandler.ListBranches)
+					r.Get("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
 					r.Post("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
 				})
 			})

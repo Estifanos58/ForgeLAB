@@ -19,7 +19,7 @@ func TestProjectService_CreateProject_Validation(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tempDir)
 
-	sourceSvc := services.NewSourceService(tempDir)
+	sourceSvc := services.NewSourceService(nil, tempDir)
 	// ProjectService without db (for validation checks before DB interaction)
 	projectSvc := services.NewProjectService(nil, nil, sourceSvc, nil)
 
@@ -76,7 +76,7 @@ func TestProjectService_CreateProject_Validation(t *testing.T) {
 		})
 		require.Error(t, err)
 		assert.ErrorIs(t, err, services.ErrInvalidSource)
-		assert.Contains(t, err.Error(), "source files not found or expired")
+		assert.Contains(t, err.Error(), "source files not found")
 	})
 
 	t.Run("local source without reference and without repository path", func(t *testing.T) {
@@ -99,7 +99,7 @@ func TestProjectService_CreateProject_LocalSource_ValidFiles(t *testing.T) {
 	sourceDir := filepath.Join(tempDir, sourceID.String())
 	require.NoError(t, os.MkdirAll(sourceDir, 0755))
 
-	sourceSvc := services.NewSourceService(tempDir)
+	sourceSvc := services.NewSourceService(nil, tempDir)
 	projectSvc := services.NewProjectService(nil, nil, sourceSvc, nil)
 
 	ctx := context.Background()

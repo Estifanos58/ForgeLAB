@@ -177,7 +177,7 @@ func (h *IntegrationHandler) ListBranches(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, branches)
 }
 
-// DetectRepository handles POST /api/integrations/github/repositories/{owner}/{repo}/detect
+// DetectRepository handles GET /api/integrations/github/repositories/{owner}/{repo}/detect
 func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Request) {
 	userID, ok := getUserIDFromContext(r)
 	if !ok {
@@ -192,20 +192,25 @@ func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	var req struct {
-		Branch  string `json:"branch"`
-		RootDir string `json:"root_dir"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	branch := r.URL.Query().Get("branch")
+	rootDir := r.URL.Query().Get("root_dir")
 
-	if req.Branch == "" {
-		req.Branch = r.URL.Query().Get("branch")
-	}
-	if req.RootDir == "" {
-		req.RootDir = r.URL.Query().Get("root_dir")
+	// Fallback to JSON body if sent via POST
+	if r.Method == http.MethodPost && r.Body != nil {
+		var req struct {
+			Branch  string `json:"branch"`
+			RootDir string `json:"root_dir"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Branch != "" {
+			branch = req.Branch
+		}
+		if req.RootDir != "" {
+			rootDir = req.RootDir
+		}
 	}
 
-	detection, err := h.githubService.DetectRepo(r.Context(), userID, owner, repo, req.Branch, req.RootDir)
+	detection, err := h.githubService.DetectRepo(r.Context(), userID, owner, repo, branch, rootDir)
 	if err != nil {
 		if errors.Is(err, services.ErrGitHubNotConnected) {
 			writeError(w, http.StatusForbidden, "github repository access has not been granted")

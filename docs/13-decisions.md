@@ -186,3 +186,23 @@
 - **Current Implementation:** `backend/internal/detector/`, `backend/internal/services/source_service.go`, `backend/internal/services/github_service.go`, `backend/internal/docker/engine.go`, `backend/migrations/000004_source_and_build_abstractions.up.sql`, `frontend/src/components/dashboard/create-project-modal.tsx`.
 - **Rule for Future Agents:** Do not revert to requiring host filesystem paths or mandatory Dockerfiles. Maintain source isolation and AES-256-GCM token encryption.
 
+---
+
+## DEC-012: Authentication Boundary Proxy, Source Workspace Ownership, and Detector Hardening
+
+- **Date:** 2026-09-27
+- **Status:** **ACTIVE**
+- **Decision:** Addressed live authentication and local-upload failure modes without altering the core Go/PostgreSQL/Redis/Docker architecture:
+  1. **Next.js App Router Reverse Proxy:** Implemented `frontend/src/app/api/[[...path]]/route.ts` as a reliable same-origin reverse proxy. Explicitly preserves incoming `Cookie`, `Authorization`, method, query string, request body (`duplex: 'half'`), backend `Set-Cookie` headers (via `response.headers.getSetCookie()`), `Location` redirects (`redirect: 'manual'`), and backend status codes. Client JavaScript never touches raw JWTs.
+  2. **Session Verification & Controlled Refresh:** Frontend `login` and `register` verify session validity by calling `GET /api/auth/me` before updating auth state. `apiClient` implements a single controlled 401 refresh-and-retry mechanism using the refresh-token cookie, preventing infinite loops.
+  3. **Persistent Source Workspace Ownership:** Created `source_workspaces` table (`migrations/000005_add_source_workspaces.up.sql`) recording `id`, `owner_id`, `workspace_path`, `files_count`, `total_bytes`, and `created_at`. Every source lookup, deletion, and project creation verifies ownership against the authenticated user.
+  4. **Registered Source Deletion Route:** Registered `DELETE /api/sources/{id}` in Chi router with `AuthMiddleware` and `SourceService.DeleteSource()`. Unauthorized users receive `403 Forbidden`.
+  5. **Deterministic Source Ingestion:** Strips outer browser-selected directory wrappers (e.g. `MyProject/package.json` $\to$ `package.json`) while preserving internal nested directories. Uses `io.LimitedReader(src, remaining + 1)` to prevent silent file truncation and strictly enforce the 100MB uncompressed limit. Parses raw `Content-Disposition` header to circumvent Go's `filepath.Base` stripping of relative paths.
+  6. **Docker Compose Volume Persistence:** Added `forgelab_sources:/app/data/sources` named volume and `FORGELAB_SOURCES_DIR=/app/data/sources` to persist uploaded sources across container restarts, isolated from build workspaces.
+  7. **Deterministic Dockerfile Generation:** Hardened automatic Dockerfiles across Node.js, Next.js, Vite/static, FastAPI, Flask, Django, Go, Maven, Gradle, and Rust. Multi-stage Java builds copy artifacts to `/app/app.jar` and Rust builds copy binaries to `/app/server`, eliminating shell glob expansion failures in exec-form `CMD`.
+  8. **Readiness Semantics Hardening:** `health_strategy: "auto"` treats HTTP 2xx/3xx as healthy, explicitly rejects HTTP 5xx server errors as healthy, and falls back to TCP connectivity. Preserves the deployment safety invariant.
+  9. **Consistent GitHub Detection Endpoint:** Standardized read-only repository inspection as `GET /api/integrations/github/repositories/{owner}/{repo}/detect` with `branch` and `root_dir` query parameters across backend, frontend client, and documentation.
+- **Current Implementation:** `frontend/src/app/api/[[...path]]/route.ts`, `frontend/src/lib/api/client.ts`, `frontend/src/features/auth/auth-context.tsx`, `backend/internal/services/source_service.go`, `backend/internal/handlers/source_handler.go`, `backend/internal/detector/detector.go`, `backend/internal/docker/engine.go`, `docker-compose.yml`.
+- **Rule for Future Agents:** Do not remove the Next.js API route proxy in favor of config rewrites. Maintain `source_workspaces` ownership checks and ensure Dockerfile `CMD` statements remain valid in exec form without shell globs.
+
+

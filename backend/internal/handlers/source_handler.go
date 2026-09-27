@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+
 	"github.com/forgelab/backend/internal/services"
 )
 
@@ -18,7 +21,7 @@ func NewSourceHandler(sourceService *services.SourceService) *SourceHandler {
 
 // Upload handles POST /api/sources/upload
 func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
-	_, ok := getUserIDFromContext(r)
+	userID, ok := getUserIDFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -56,9 +59,9 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 		var res *services.SourceUploadResult
 		if strings.HasSuffix(strings.ToLower(fh.Filename), ".zip") {
-			res, err = h.sourceService.IngestZip(r.Context(), f, fh.Size)
+			res, err = h.sourceService.IngestZip(r.Context(), userID, f, fh.Size)
 		} else {
-			res, err = h.sourceService.IngestTarGz(r.Context(), f)
+			res, err = h.sourceService.IngestTarGz(r.Context(), userID, f)
 		}
 
 		if err != nil {
@@ -89,7 +92,7 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.sourceService.IngestMultipartFiles(r.Context(), allFiles)
+	res, err := h.sourceService.IngestMultipartFiles(r.Context(), userID, allFiles)
 	if err != nil {
 		if errors.Is(err, services.ErrPathTraversalDetected) {
 			writeError(w, http.StatusBadRequest, "security violation: path traversal detected in uploaded files")
@@ -104,4 +107,35 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, res)
+}
+
+// Delete handles DELETE /api/sources/{id}
+func (h *SourceHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	sourceID, err := uuid.Parse(idStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid source ID format")
+		return
+	}
+
+	if err := h.sourceService.DeleteSource(r.Context(), userID, sourceID); err != nil {
+		if errors.Is(err, services.ErrUnauthorizedSource) {
+			writeError(w, http.StatusForbidden, "unauthorized: you do not own this source workspace")
+			return
+		}
+		if errors.Is(err, services.ErrSourceDirNotFound) {
+			writeError(w, http.StatusNotFound, "source workspace not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to delete source workspace: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "source workspace deleted successfully"})
 }

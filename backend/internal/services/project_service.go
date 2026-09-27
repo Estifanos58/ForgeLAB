@@ -120,8 +120,8 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				return nil, fmt.Errorf("%w: invalid source upload ID", ErrInvalidSource)
 			}
 			if s.sourceService != nil {
-				if _, err := s.sourceService.GetSourcePath(sourceUUID); err != nil {
-					return nil, fmt.Errorf("%w: source files not found or expired", ErrInvalidSource)
+				if _, err := s.sourceService.GetSourcePath(ctx, ownerID, sourceUUID); err != nil {
+					return nil, fmt.Errorf("%w: source files not found, expired, or access denied", ErrInvalidSource)
 				}
 			}
 		} else if repoPath != "" {
@@ -291,7 +291,19 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 		project.Slug = generateSlug(*input.Name)
 	}
 	if input.SourceReference != nil {
-		project.SourceReference = *input.SourceReference
+		newRef := strings.TrimSpace(*input.SourceReference)
+		if newRef != "" && project.SourceType == models.SourceTypeLocal {
+			sourceUUID, err := uuid.Parse(newRef)
+			if err != nil {
+				return nil, fmt.Errorf("%w: invalid source upload ID", ErrInvalidSource)
+			}
+			if s.sourceService != nil {
+				if _, err := s.sourceService.GetSourcePath(ctx, ownerID, sourceUUID); err != nil {
+					return nil, fmt.Errorf("%w: source files not found, expired, or access denied", ErrInvalidSource)
+				}
+			}
+		}
+		project.SourceReference = newRef
 	}
 	if input.RepositoryPath != nil {
 		project.RepositoryPath = *input.RepositoryPath

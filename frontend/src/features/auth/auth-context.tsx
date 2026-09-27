@@ -45,8 +45,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = async (email: string, password: string) => {
     setError(null);
     try {
-      const res = await api.auth.login({ email, password });
-      setUser(res.user);
+      await api.auth.login({ email, password });
+      // Explicitly verify the authenticated session through /api/auth/me
+      const verifiedUser = await api.auth.me();
+      setUser(verifiedUser);
       router.push('/dashboard');
     } catch (err: any) {
       const message = err.message || 'Failed to sign in. Please verify your credentials.';
@@ -58,8 +60,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const register = async (email: string, password: string, displayName?: string) => {
     setError(null);
     try {
-      const res = await api.auth.register({ email, password, display_name: displayName });
-      setUser(res.user);
+      await api.auth.register({ email, password, display_name: displayName });
+      // Explicitly verify the authenticated session through /api/auth/me
+      const verifiedUser = await api.auth.me();
+      setUser(verifiedUser);
       router.push('/dashboard');
     } catch (err: any) {
       const message = err.message || 'Failed to create account.';

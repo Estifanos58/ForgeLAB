@@ -296,7 +296,7 @@ func DetectFromFiles(files map[string][]byte) *DetectionResult {
 			BuildStrategy:   "auto",
 			SuggestedPort:   8080,
 			BuildCommand:    "mvn clean package -DskipTests",
-			StartCommand:    "java -jar target/*.jar",
+			StartCommand:    "java -jar /app/app.jar",
 			HealthCheckPath: "/health",
 			HealthStrategy:  "http",
 			DetectedFiles:   detectedFiles,
@@ -309,7 +309,7 @@ func DetectFromFiles(files map[string][]byte) *DetectionResult {
 			BuildStrategy:   "auto",
 			SuggestedPort:   8080,
 			BuildCommand:    "./gradlew build -x test",
-			StartCommand:    "java -jar build/libs/*.jar",
+			StartCommand:    "java -jar /app/app.jar",
 			HealthCheckPath: "/health",
 			HealthStrategy:  "http",
 			DetectedFiles:   detectedFiles,
@@ -414,8 +414,9 @@ EXPOSE %d
 	case "python-fastapi":
 		return fmt.Sprintf(`FROM python:3.11-slim
 WORKDIR /app
-COPY requirements*.txt pyproject.toml* ./
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
+COPY requirements*.txt pyproject.toml* Pipfile* ./
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi && \
+    pip install --no-cache-dir uvicorn fastapi
 COPY . .
 ENV PORT=%d
 EXPOSE %d
@@ -425,23 +426,34 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "%d"]
 	case "python-flask":
 		return fmt.Sprintf(`FROM python:3.11-slim
 WORKDIR /app
-COPY requirements*.txt ./
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+COPY requirements*.txt pyproject.toml* Pipfile* ./
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
 COPY . .
 ENV PORT=%d
 EXPOSE %d
 CMD ["python", "app.py"]
 `, port, port)
 
-	case "python", "python-django":
+	case "python-django":
+		return fmt.Sprintf(`FROM python:3.11-slim
+WORKDIR /app
+COPY requirements*.txt pyproject.toml* Pipfile* ./
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
+COPY . .
+ENV PORT=%d
+EXPOSE %d
+CMD ["python", "manage.py", "runserver", "0.0.0.0:%d"]
+`, port, port, port)
+
+	case "python":
 		cmd := `CMD ["python", "main.py"]`
 		if startCmd != "" {
 			cmd = fmt.Sprintf(`CMD %s`, formatCommand(startCmd))
 		}
 		return fmt.Sprintf(`FROM python:3.11-slim
 WORKDIR /app
-COPY requirements*.txt ./
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+COPY requirements*.txt pyproject.toml* Pipfile* ./
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
 COPY . .
 ENV PORT=%d
 EXPOSE %d
@@ -454,7 +466,7 @@ WORKDIR /app
 COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /app/server .
+RUN CGO_ENABLED=0 go build -o /app/server . || CGO_ENABLED=0 go build -o /app/server ./cmd/... || CGO_ENABLED=0 go build -o /app/server ./...
 
 FROM alpine:latest
 WORKDIR /app
@@ -464,17 +476,52 @@ EXPOSE %d
 CMD ["/app/server"]
 `, port, port)
 
+	case "java", "java-maven":
+		return fmt.Sprintf(`FROM maven:3.9-eclipse-temurin-17-alpine AS builder
+WORKDIR /app
+COPY pom.xml ./
+RUN mvn dependency:go-offline -B || true
+COPY src ./src
+RUN mvn clean package -DskipTests && \
+    find target -maxdepth 1 -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" -exec cp {} /app/app.jar \;
+
+FROM eclipse-temurin:17-jre-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/app.jar /app/app.jar
+ENV PORT=%d
+EXPOSE %d
+CMD ["java", "-jar", "/app/app.jar"]
+`, port, port)
+
+	case "java-gradle":
+		return fmt.Sprintf(`FROM gradle:8.5-jdk17-alpine AS builder
+WORKDIR /app
+COPY build.gradle* settings.gradle* gradlew* ./
+COPY gradle ./gradle
+COPY src ./src
+RUN if [ -f ./gradlew ]; then chmod +x ./gradlew && ./gradlew build -x test; else gradle build -x test; fi && \
+    find build/libs -name "*.jar" ! -name "*-plain.jar" -exec cp {} /app/app.jar \;
+
+FROM eclipse-temurin:17-jre-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/app.jar /app/app.jar
+ENV PORT=%d
+EXPOSE %d
+CMD ["java", "-jar", "/app/app.jar"]
+`, port, port)
+
 	case "rust":
 		return fmt.Sprintf(`FROM rust:1.75-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
-RUN cargo build --release
+RUN cargo build --release && \
+    find target/release -maxdepth 1 -type f -perm /111 ! -name "*.d" -exec cp {} /app/server \;
 
 FROM alpine:latest
 WORKDIR /app
-COPY --from=builder /app/target/release/* /app/server
+COPY --from=builder /app/server /app/server
 ENV PORT=%d
 EXPOSE %d
 CMD ["/app/server"]

@@ -24,7 +24,38 @@ class ApiClientError extends Error {
   }
 }
 
-async function apiFetch<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+interface ApiFetchOptions extends RequestInit {
+  _retry?: boolean;
+}
+
+let isRefreshing = false;
+let refreshPromise: Promise<void> | null = null;
+
+async function executeRefresh(): Promise<void> {
+  if (isRefreshing && refreshPromise) {
+    return refreshPromise;
+  }
+  isRefreshing = true;
+  refreshPromise = (async () => {
+    try {
+      const res = await fetch('/api/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) {
+        throw new Error('Session refresh failed');
+      }
+    } finally {
+      isRefreshing = false;
+      refreshPromise = null;
+    }
+  })();
+  return refreshPromise;
+}
+
+async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {}): Promise<T> {
   const url = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
 
   const headers: Record<string, string> = {
@@ -40,6 +71,26 @@ async function apiFetch<T>(endpoint: string, options: RequestInit = {}): Promise
     headers,
     credentials: 'include',
   });
+
+  // Handle 401 with a single controlled refresh and retry
+  const isAuthEndpoint =
+    url.includes('/api/auth/login') ||
+    url.includes('/api/auth/register') ||
+    url.includes('/api/auth/refresh') ||
+    url.includes('/api/auth/logout');
+
+  if (response.status === 401 && !options._retry && !isAuthEndpoint) {
+    try {
+      await executeRefresh();
+      // Retry original request exactly once
+      return await apiFetch<T>(endpoint, {
+        ...options,
+        _retry: true,
+      });
+    } catch {
+      // Refresh failed; proceed with original 401 error handling
+    }
+  }
 
   if (response.status === 204) {
     return {} as T;

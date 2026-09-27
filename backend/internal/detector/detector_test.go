@@ -41,6 +41,20 @@ func TestDetectFromFiles_NextJS(t *testing.T) {
 	}
 }
 
+func TestDetectFromFiles_Vite(t *testing.T) {
+	files := map[string][]byte{
+		"package.json":   []byte(`{"dependencies": {"react": "^18.2.0"}, "devDependencies": {"vite": "^5.0.0"}}`),
+		"vite.config.ts": []byte("export default {};"),
+	}
+	res := DetectFromFiles(files)
+	if res.Runtime != "react-vite" {
+		t.Fatalf("expected react-vite, got %s", res.Runtime)
+	}
+	if res.SuggestedPort != 3000 {
+		t.Fatalf("expected port 3000, got %d", res.SuggestedPort)
+	}
+}
+
 func TestDetectFromFiles_PythonFastAPI(t *testing.T) {
 	files := map[string][]byte{
 		"requirements.txt": []byte("fastapi==0.110.0\nuvicorn==0.28.0"),
@@ -55,6 +69,37 @@ func TestDetectFromFiles_PythonFastAPI(t *testing.T) {
 	}
 	if !strings.Contains(res.StartCommand, "uvicorn") {
 		t.Fatalf("expected uvicorn in start command, got %s", res.StartCommand)
+	}
+}
+
+func TestDetectFromFiles_PythonFlask(t *testing.T) {
+	files := map[string][]byte{
+		"requirements.txt": []byte("flask==3.0.0\ngunicorn==21.2.0"),
+		"app.py":           []byte("from flask import Flask\napp = Flask(__name__)"),
+	}
+	res := DetectFromFiles(files)
+	if res.Runtime != "python-flask" {
+		t.Fatalf("expected python-flask, got %s", res.Runtime)
+	}
+	if res.SuggestedPort != 5000 {
+		t.Fatalf("expected port 5000, got %d", res.SuggestedPort)
+	}
+}
+
+func TestDetectFromFiles_PythonDjango(t *testing.T) {
+	files := map[string][]byte{
+		"requirements.txt": []byte("django==5.0.2"),
+		"manage.py":        []byte("#!/usr/bin/env python"),
+	}
+	res := DetectFromFiles(files)
+	if res.Runtime != "python-django" {
+		t.Fatalf("expected python-django, got %s", res.Runtime)
+	}
+	if res.SuggestedPort != 8000 {
+		t.Fatalf("expected port 8000, got %d", res.SuggestedPort)
+	}
+	if !strings.Contains(res.StartCommand, "manage.py") {
+		t.Fatalf("expected manage.py in start command, got %s", res.StartCommand)
 	}
 }
 
@@ -75,19 +120,111 @@ func TestDetectFromFiles_Go(t *testing.T) {
 	}
 }
 
+func TestDetectFromFiles_Java_Maven(t *testing.T) {
+	files := map[string][]byte{
+		"pom.xml": []byte(`<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId><artifactId>demo</artifactId></project>`),
+	}
+	res := DetectFromFiles(files)
+	if res.Runtime != "java" {
+		t.Fatalf("expected java, got %s", res.Runtime)
+	}
+	// Verify no shell glob in StartCommand
+	if strings.Contains(res.StartCommand, "*") {
+		t.Fatalf("StartCommand must not contain wildcard globs: %s", res.StartCommand)
+	}
+	if res.StartCommand != "java -jar /app/app.jar" {
+		t.Fatalf("expected java -jar /app/app.jar, got %s", res.StartCommand)
+	}
+}
+
+func TestDetectFromFiles_Java_Gradle(t *testing.T) {
+	files := map[string][]byte{
+		"build.gradle": []byte(`plugins { id 'org.springframework.boot' version '3.2.0' }`),
+	}
+	res := DetectFromFiles(files)
+	if res.Runtime != "java" {
+		t.Fatalf("expected java, got %s", res.Runtime)
+	}
+	// Verify no shell glob in StartCommand
+	if strings.Contains(res.StartCommand, "*") {
+		t.Fatalf("StartCommand must not contain wildcard globs: %s", res.StartCommand)
+	}
+	if res.StartCommand != "java -jar /app/app.jar" {
+		t.Fatalf("expected java -jar /app/app.jar, got %s", res.StartCommand)
+	}
+}
+
+func TestDetectFromFiles_Rust(t *testing.T) {
+	files := map[string][]byte{
+		"Cargo.toml": []byte(`[package]
+name = "my-service"
+version = "0.1.0"
+edition = "2021"
+`),
+	}
+	res := DetectFromFiles(files)
+	if res.Runtime != "rust" {
+		t.Fatalf("expected rust, got %s", res.Runtime)
+	}
+}
+
 func TestGenerateDockerfile(t *testing.T) {
-	dfNext := GenerateDockerfile("nextjs", 3000, "npm start")
-	if !strings.Contains(dfNext, "EXPOSE 3000") || !strings.Contains(dfNext, "npm run build") {
-		t.Fatalf("unexpected Dockerfile for Next.js: %s", dfNext)
+	runtimes := []string{
+		"nextjs",
+		"react-vite",
+		"nodejs",
+		"python-fastapi",
+		"python-flask",
+		"python-django",
+		"python",
+		"go",
+		"java",
+		"java-maven",
+		"java-gradle",
+		"rust",
 	}
 
-	dfGo := GenerateDockerfile("go", 8080, "/app/server")
-	if !strings.Contains(dfGo, "go build") || !strings.Contains(dfGo, "EXPOSE 8080") {
-		t.Fatalf("unexpected Dockerfile for Go: %s", dfGo)
-	}
+	for _, rt := range runtimes {
+		df := GenerateDockerfile(rt, 8080, "")
+		if df == "" {
+			t.Fatalf("GenerateDockerfile returned empty for %s", rt)
+		}
+		if !strings.Contains(df, "EXPOSE 8080") {
+			t.Fatalf("GenerateDockerfile(%s) missing EXPOSE 8080", rt)
+		}
 
-	dfPy := GenerateDockerfile("python-fastapi", 8000, "")
-	if !strings.Contains(dfPy, "uvicorn") || !strings.Contains(dfPy, "EXPOSE 8000") {
-		t.Fatalf("unexpected Dockerfile for FastAPI: %s", dfPy)
+		// Security & correctness check: No exec-form CMD should contain a raw shell glob '*'
+		for _, line := range strings.Split(df, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "CMD [") {
+				if strings.Contains(trimmed, "*") {
+					t.Fatalf("Runtime %s has shell glob in exec-form CMD: %s", rt, trimmed)
+				}
+			}
+		}
+	}
+}
+
+func TestGenerateDockerfile_JavaMaven_Valid(t *testing.T) {
+	df := GenerateDockerfile("java", 8080, "")
+	if !strings.Contains(df, "maven") || !strings.Contains(df, "app.jar") {
+		t.Fatalf("expected maven and app.jar in Dockerfile, got: %s", df)
+	}
+	if strings.Contains(df, "target/*.jar") && strings.Contains(df, "CMD [") {
+		t.Fatalf("found unexpanded glob in exec CMD: %s", df)
+	}
+}
+
+func TestGenerateDockerfile_Rust_Valid(t *testing.T) {
+	df := GenerateDockerfile("rust", 8080, "")
+	if !strings.Contains(df, "cargo build --release") {
+		t.Fatalf("expected cargo build in Rust Dockerfile: %s", df)
+	}
+	// Must not have COPY --from=builder /app/target/release/* /app/server
+	if strings.Contains(df, "COPY --from=builder /app/target/release/* /app/server") {
+		t.Fatalf("Rust Dockerfile has unsafe wildcard directory copy: %s", df)
+	}
+	if !strings.Contains(df, `CMD ["/app/server"]`) {
+		t.Fatalf("expected CMD [/app/server] in Rust Dockerfile: %s", df)
 	}
 }

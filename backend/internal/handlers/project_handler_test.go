@@ -27,7 +27,7 @@ func TestProjectHandler_Create_ErrorMappings(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tempDir)
 
-	sourceSvc := services.NewSourceService(tempDir)
+	sourceSvc := services.NewSourceService(nil, tempDir)
 	projectSvc := services.NewProjectService(nil, nil, sourceSvc, nil)
 	handler := handlers.NewProjectHandler(projectSvc, nil, nil, nil)
 

@@ -297,6 +297,9 @@ func (s *GitHubService) Disconnect(ctx context.Context, userID uuid.UUID) error 
 
 // getDecryptedToken retrieves and decrypts the GitHub access token for a user.
 func (s *GitHubService) getDecryptedToken(ctx context.Context, userID uuid.UUID) (string, error) {
+	if s.db == nil {
+		return "", ErrGitHubNotConnected
+	}
 	var encryptedToken []byte
 	err := s.db.QueryRow(ctx, "SELECT encrypted_access_token FROM github_integrations WHERE user_id = $1", userID).Scan(&encryptedToken)
 	if err != nil {
