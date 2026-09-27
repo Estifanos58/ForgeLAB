@@ -249,12 +249,16 @@ func main() {
 	})
 
 	// Start server
+	// Start server with safe timeouts:
+	// - ReadHeaderTimeout prevents Slowloris attacks by requiring request headers within 15 seconds.
+	// - Global ReadTimeout and WriteTimeout are omitted to allow large authenticated source uploads
+	//   and persistent WebSocket connections to stream without mid-stream socket termination.
+	// - Upload body sizes are strictly guarded at the HTTP boundary via http.MaxBytesReader in SourceHandler.
 	server := &http.Server{
-		Addr:         cfg.Server.Addr(),
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              cfg.Server.Addr(),
+		Handler:           r,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown

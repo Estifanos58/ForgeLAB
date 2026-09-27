@@ -167,3 +167,49 @@ func TestSourceHandler_Delete_Authenticated_OtherUserForbidden(t *testing.T) {
 	assert.DirExists(t, sourceDir)
 }
 
+func TestSourceHandler_Upload_ContentLength_TooLarge(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-sh-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	sourceSvc := services.NewSourceService(nil, tempDir)
+	handler := handlers.NewSourceHandler(sourceSvc)
+	ownerID := uuid.New()
+
+	body, contentType := createMultipartFormData("files", "package.json", []byte(`{"name":"test"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/sources/upload", body)
+	req.Header.Set("Content-Type", contentType)
+	req.ContentLength = handlers.MaxUploadBytes + 1024
+	req = req.WithContext(withTestUser(req.Context(), ownerID))
+	rec := httptest.NewRecorder()
+
+	handler.Upload(rec, req)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	assert.Contains(t, rec.Body.String(), "upload size exceeds")
+}
+
+func TestSourceHandler_Upload_Stream_TooLarge(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-sh-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	sourceSvc := services.NewSourceService(nil, tempDir)
+	handler := handlers.NewSourceHandler(sourceSvc)
+	ownerID := uuid.New()
+
+	// 106MB content streamed
+	overflow := make([]byte, handlers.MaxUploadBytes+1024)
+	body, contentType := createMultipartFormData("files", "large.bin", overflow)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sources/upload", body)
+	req.Header.Set("Content-Type", contentType)
+	req.ContentLength = -1 // Chunked / unknown length so it tests MaxBytesReader
+	req = req.WithContext(withTestUser(req.Context(), ownerID))
+	rec := httptest.NewRecorder()
+
+	handler.Upload(rec, req)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	assert.Contains(t, rec.Body.String(), "upload size exceeds")
+}
+
+

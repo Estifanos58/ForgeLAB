@@ -2,7 +2,12 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { api } from '@/lib/api/client';
+import { api, UploadProgress } from '@/lib/api/client';
+import {
+  filterDirectoryFiles,
+  formatBytes,
+  MAX_SOURCE_SIZE_BYTES,
+} from '@/lib/source-utils';
 import {
   Project,
   GitHubRepo,
@@ -68,6 +73,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   // Local upload state
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
+  const [uploadPercent, setUploadPercent] = useState<number | null>(null);
+  const [uploadStats, setUploadStats] = useState<string | null>(null);
   const [localSourceId, setLocalSourceId] = useState<string | null>(null);
   const [localFilesCount, setLocalFilesCount] = useState<number>(0);
   const [localFolderName, setLocalFolderName] = useState<string>('');
@@ -196,37 +203,73 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   };
 
   const handleFolderUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
+    const rawFiles = e.target.files;
+    if (!rawFiles || rawFiles.length === 0) return;
+
+    setError(null);
+
+    // 1. Efficient client-side filtering and size calculation (no file reading)
+    const {
+      acceptedFiles,
+      totalSelectedCount,
+      excludedCount,
+      totalSizeBytes,
+      detectedRootFolder,
+    } = filterDirectoryFiles(rawFiles);
+
+    if (acceptedFiles.length === 0) {
+      setError(
+        `All ${totalSelectedCount.toLocaleString()} selected files were excluded as non-essential build/cache artifacts (.git, node_modules, dist, etc.). Please select a valid project directory.`
+      );
+      if (e.target) e.target.value = '';
+      return;
+    }
+
+    if (totalSizeBytes > MAX_SOURCE_SIZE_BYTES) {
+      setError(
+        `Source directory size (${formatBytes(totalSizeBytes)}) exceeds the maximum allowed limit of 100 MB. Please remove large build caches or dependencies.`
+      );
+      if (e.target) e.target.value = '';
+      return;
+    }
 
     setUploading(true);
-    setError(null);
-    setUploadProgress(`Preparing ${files.length} files...`);
+    setUploadPercent(0);
+    setLocalFolderName(detectedRootFolder);
 
+    const statsText = `${acceptedFiles.length.toLocaleString()} files selected · ${excludedCount.toLocaleString()} files excluded · ${formatBytes(totalSizeBytes)} to upload`;
+    setUploadStats(statsText);
+    setUploadProgress(`Preparing upload for ${acceptedFiles.length.toLocaleString()} files (${formatBytes(totalSizeBytes)})...`);
+
+    // 2. Build FormData with only accepted files
     const formData = new FormData();
-    let folder = '';
-
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    for (let i = 0; i < acceptedFiles.length; i++) {
+      const file = acceptedFiles[i];
       const relPath = file.webkitRelativePath || file.name;
-      if (!folder && relPath.includes('/')) {
-        folder = relPath.split('/')[0];
-      }
       formData.append('files', file, relPath);
     }
 
-    setLocalFolderName(folder || 'local-app');
-    setUploadProgress(`Uploading ${files.length} files to isolated workspace...`);
-
     try {
-      const res = await api.sources.upload(formData);
+      const res = await api.sources.upload(formData, (progress: UploadProgress) => {
+        setUploadPercent(progress.percent);
+        if (progress.percent < 100) {
+          setUploadProgress(
+            `Uploading ${acceptedFiles.length.toLocaleString()} files — ${progress.percent}% (${formatBytes(progress.loaded)} / ${formatBytes(progress.total)})`
+          );
+        } else {
+          setUploadProgress(
+            `Upload complete. Server is extracting files, normalizing structure, and detecting runtime...`
+          );
+        }
+      });
+
       setLocalSourceId(res.source_id);
       setLocalFilesCount(res.files_count);
 
       if (res.detection) {
-        applyDetection(res.detection, folder || 'local-app');
+        applyDetection(res.detection, detectedRootFolder);
       } else {
-        setProjectName(folder || 'local-app');
+        setProjectName(detectedRootFolder);
       }
 
       setStep('config');
@@ -235,6 +278,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     } finally {
       setUploading(false);
       setUploadProgress(null);
+      setUploadPercent(null);
+      setUploadStats(null);
       if (e.target) e.target.value = '';
     }
   };
@@ -243,18 +288,37 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     const file = e.target.files?.[0];
     if (!file) return;
 
+    if (file.size > MAX_SOURCE_SIZE_BYTES) {
+      setError(`Archive size (${formatBytes(file.size)}) exceeds the maximum allowed limit of 100 MB.`);
+      if (e.target) e.target.value = '';
+      return;
+    }
+
     setUploading(true);
     setError(null);
-    setUploadProgress(`Uploading ${file.name}...`);
+    setUploadPercent(0);
+    const baseName = file.name.replace(/\.(zip|tar\.gz|tgz)$/i, '') || 'local-app';
+    setLocalFolderName(baseName);
+    setUploadStats(`1 archive selected · ${formatBytes(file.size)} to upload`);
+    setUploadProgress(`Uploading ${file.name} (${formatBytes(file.size)})...`);
 
     const formData = new FormData();
     formData.append('archive', file, file.name);
 
-    const baseName = file.name.replace(/\.(zip|tar\.gz|tgz)$/i, '');
-    setLocalFolderName(baseName);
-
     try {
-      const res = await api.sources.upload(formData);
+      const res = await api.sources.upload(formData, (progress: UploadProgress) => {
+        setUploadPercent(progress.percent);
+        if (progress.percent < 100) {
+          setUploadProgress(
+            `Uploading ${file.name} — ${progress.percent}% (${formatBytes(progress.loaded)} / ${formatBytes(progress.total)})`
+          );
+        } else {
+          setUploadProgress(
+            `Upload complete. Server is unpacking archive and analyzing source...`
+          );
+        }
+      });
+
       setLocalSourceId(res.source_id);
       setLocalFilesCount(res.files_count);
 
@@ -266,10 +330,12 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
       setStep('config');
     } catch (err: any) {
-      setError(err.message || 'Failed to upload archive');
+      setError(err.message || 'Failed to upload source archive');
     } finally {
       setUploading(false);
       setUploadProgress(null);
+      setUploadPercent(null);
+      setUploadStats(null);
       if (e.target) e.target.value = '';
     }
   };
@@ -593,12 +659,36 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
               />
 
               {uploading ? (
-                <div className="rounded-lg border border-dashed border-primary/50 bg-primary/5 p-8 text-center space-y-3">
-                  <RefreshCw className="w-6 h-6 animate-spin mx-auto text-primary" />
-                  <div>
-                    <h4 className="text-sm font-semibold text-white">Importing Source</h4>
-                    <p className="text-xs text-neutral-400 mt-1">{uploadProgress}</p>
+                <div className="rounded-lg border border-primary/40 bg-surface-elevated/40 p-6 text-center space-y-4">
+                  <div className="flex items-center justify-center gap-2 text-primary font-medium text-sm">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>Importing Source Workspace</span>
                   </div>
+
+                  {uploadStats && (
+                    <div className="inline-block px-3 py-1 rounded-full bg-surface border border-surface-border text-xs font-mono text-neutral-300">
+                      {uploadStats}
+                    </div>
+                  )}
+
+                  {uploadPercent !== null && (
+                    <div className="w-full max-w-md mx-auto space-y-1.5">
+                      <div className="w-full bg-surface-elevated rounded-full h-2 overflow-hidden border border-surface-border">
+                        <div
+                          className="bg-primary h-full transition-all duration-150 ease-out"
+                          style={{ width: `${Math.max(4, uploadPercent)}%` }}
+                        />
+                      </div>
+                      <div className="flex justify-between text-[11px] font-mono text-neutral-400">
+                        <span>{uploadPercent}% uploaded</span>
+                        <span>{uploadProgress?.includes('Server') || uploadProgress?.includes('unpacking') ? 'Processing' : 'Streaming'}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  <p className="text-xs text-neutral-400 max-w-md mx-auto leading-relaxed">
+                    {uploadProgress}
+                  </p>
                 </div>
               ) : (
                 <div className="rounded-lg border-2 border-dashed border-surface-border bg-surface-elevated/20 p-8 text-center space-y-4 hover:border-neutral-600 transition-colors">

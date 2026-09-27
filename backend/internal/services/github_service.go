@@ -153,7 +153,7 @@ func (s *GitHubService) GetConnectURL(ctx context.Context, userID uuid.UUID) (st
 	params.Set("client_id", s.githubCfg.ClientID)
 	redirectURL := s.githubCfg.RepoRedirectURL
 	if redirectURL == "" {
-		redirectURL = s.githubCfg.RedirectURL
+		redirectURL = "http://localhost:3000/api/integrations/github/callback"
 	}
 	params.Set("redirect_uri", redirectURL)
 	params.Set("scope", "repo,read:user")
@@ -195,12 +195,17 @@ func (s *GitHubService) HandleCallback(ctx context.Context, code, state string) 
 		return uuid.Nil, fmt.Errorf("invalid user id in state: %w", err)
 	}
 
+	redirectURL := s.githubCfg.RepoRedirectURL
+	if redirectURL == "" {
+		redirectURL = "http://localhost:3000/api/integrations/github/callback"
+	}
+
 	// 1. Exchange code for access token
 	tokenBody, _ := json.Marshal(map[string]string{
 		"client_id":     s.githubCfg.ClientID,
 		"client_secret": s.githubCfg.ClientSecret,
 		"code":          code,
-		"redirect_uri":  s.githubCfg.RepoRedirectURL,
+		"redirect_uri":  redirectURL,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://github.com/login/oauth/access_token", strings.NewReader(string(tokenBody)))

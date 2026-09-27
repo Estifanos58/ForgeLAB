@@ -2,14 +2,23 @@ package handlers
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/services"
 )
+
+// MaxUncompressedSourceBytes is the maximum allowed uncompressed source code size (100MB).
+const MaxUncompressedSourceBytes = 100 * 1024 * 1024 // 100MB
+
+// MaxUploadBytes is the maximum allowed HTTP request body size for POST /api/sources/upload (105MB).
+// Provides 5MB headroom for multipart form-data boundary framing and MIME headers.
+const MaxUploadBytes = 105 * 1024 * 1024 // 105MB
 
 type SourceHandler struct {
 	sourceService *services.SourceService
@@ -21,15 +30,53 @@ func NewSourceHandler(sourceService *services.SourceService) *SourceHandler {
 
 // Upload handles POST /api/sources/upload
 func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
 	userID, ok := getUserIDFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	// 100MB max memory buffer for parsing multipart
-	err := r.ParseMultipartForm(100 * 1024 * 1024)
+	slog.Info("source upload initiated",
+		"user_id", userID.String(),
+		"content_length", r.ContentLength,
+		"content_type", r.Header.Get("Content-Type"),
+	)
+
+	// Early HTTP boundary check: reject if declared Content-Length exceeds MaxUploadBytes
+	if r.ContentLength > MaxUploadBytes {
+		slog.Warn("source upload rejected: content-length exceeds maximum limit",
+			"user_id", userID.String(),
+			"content_length", r.ContentLength,
+			"limit", MaxUploadBytes,
+			"duration_ms", time.Since(startTime).Milliseconds(),
+		)
+		writeError(w, http.StatusRequestEntityTooLarge, "upload size exceeds the maximum allowed limit of 100MB")
+		return
+	}
+
+	// Protect server by limiting the streaming request body at HTTP boundary
+	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadBytes)
+
+	parseStart := time.Now()
+	// Buffer up to 32MB in RAM, spill excess to temp files on disk (cleaned up by RemoveAll)
+	err := r.ParseMultipartForm(32 * 1024 * 1024)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) || strings.Contains(strings.ToLower(err.Error()), "request body too large") {
+			slog.Warn("source upload rejected: body stream exceeded limit",
+				"user_id", userID.String(),
+				"limit", MaxUploadBytes,
+				"duration_ms", time.Since(startTime).Milliseconds(),
+			)
+			writeError(w, http.StatusRequestEntityTooLarge, "upload size exceeds the maximum allowed limit of 100MB")
+			return
+		}
+		slog.Warn("source upload rejected: multipart parsing failed",
+			"user_id", userID.String(),
+			"error", err.Error(),
+			"duration_ms", time.Since(startTime).Milliseconds(),
+		)
 		writeError(w, http.StatusBadRequest, "failed to parse multipart form: "+err.Error())
 		return
 	}
@@ -38,6 +85,11 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 			_ = r.MultipartForm.RemoveAll()
 		}
 	}()
+
+	slog.Debug("source upload multipart parsed",
+		"user_id", userID.String(),
+		"parse_duration_ms", time.Since(parseStart).Milliseconds(),
+	)
 
 	// 1. Check if archive was uploaded (zip / tar.gz)
 	fileHeaders := r.MultipartForm.File["archive"]
@@ -52,6 +104,11 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		fh := fileHeaders[0]
 		f, err := fh.Open()
 		if err != nil {
+			slog.Warn("source upload archive open failed",
+				"user_id", userID.String(),
+				"error", err.Error(),
+				"duration_ms", time.Since(startTime).Milliseconds(),
+			)
 			writeError(w, http.StatusBadRequest, "failed to open archive: "+err.Error())
 			return
 		}
@@ -65,6 +122,11 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err != nil {
+			slog.Warn("source upload archive extraction failed",
+				"user_id", userID.String(),
+				"reason", err.Error(),
+				"duration_ms", time.Since(startTime).Milliseconds(),
+			)
 			if errors.Is(err, services.ErrPathTraversalDetected) {
 				writeError(w, http.StatusBadRequest, "security violation: path traversal detected in archive")
 				return
@@ -77,6 +139,13 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		slog.Info("source upload completed successfully (archive)",
+			"user_id", userID.String(),
+			"source_id", res.SourceID.String(),
+			"accepted_files", res.FilesCount,
+			"total_bytes", res.TotalBytes,
+			"duration_ms", time.Since(startTime).Milliseconds(),
+		)
 		writeJSON(w, http.StatusCreated, res)
 		return
 	}
@@ -88,12 +157,28 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(allFiles) == 0 {
+		slog.Warn("source upload rejected: no files in multipart payload",
+			"user_id", userID.String(),
+			"duration_ms", time.Since(startTime).Milliseconds(),
+		)
 		writeError(w, http.StatusBadRequest, "no files or source archive provided in upload")
 		return
 	}
 
+	receivedFiles := len(allFiles)
+	slog.Debug("processing uploaded directory files",
+		"user_id", userID.String(),
+		"received_files", receivedFiles,
+	)
+
 	res, err := h.sourceService.IngestMultipartFiles(r.Context(), userID, allFiles)
 	if err != nil {
+		slog.Warn("source upload directory ingestion failed",
+			"user_id", userID.String(),
+			"received_files", receivedFiles,
+			"reason", err.Error(),
+			"duration_ms", time.Since(startTime).Milliseconds(),
+		)
 		if errors.Is(err, services.ErrPathTraversalDetected) {
 			writeError(w, http.StatusBadRequest, "security violation: path traversal detected in uploaded files")
 			return
@@ -106,6 +191,14 @@ func (h *SourceHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	slog.Info("source upload completed successfully (directory)",
+		"user_id", userID.String(),
+		"source_id", res.SourceID.String(),
+		"received_files", receivedFiles,
+		"accepted_files", res.FilesCount,
+		"total_bytes", res.TotalBytes,
+		"duration_ms", time.Since(startTime).Milliseconds(),
+	)
 	writeJSON(w, http.StatusCreated, res)
 }
 

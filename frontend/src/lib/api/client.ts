@@ -28,6 +28,12 @@ interface ApiFetchOptions extends RequestInit {
   _retry?: boolean;
 }
 
+export interface UploadProgress {
+  loaded: number;
+  total: number;
+  percent: number;
+}
+
 let isRefreshing = false;
 let refreshPromise: Promise<void> | null = null;
 
@@ -287,10 +293,66 @@ export const api = {
   },
 
   sources: {
-    async upload(formData: FormData): Promise<SourceUploadResult> {
-      return apiFetch<SourceUploadResult>('/api/sources/upload', {
-        method: 'POST',
-        body: formData,
+    async upload(
+      formData: FormData,
+      onProgress?: (progress: UploadProgress) => void,
+      isRetry = false
+    ): Promise<SourceUploadResult> {
+      return new Promise<SourceUploadResult>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/sources/upload');
+        xhr.withCredentials = true;
+
+        if (xhr.upload && onProgress) {
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable && event.total > 0) {
+              const percent = Math.min(100, Math.round((event.loaded / event.total) * 100));
+              onProgress({
+                loaded: event.loaded,
+                total: event.total,
+                percent,
+              });
+            }
+          };
+        }
+
+        xhr.onload = async () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              const res = JSON.parse(xhr.responseText);
+              resolve(res);
+            } catch {
+              reject(new ApiClientError('Invalid JSON response from server', xhr.status));
+            }
+          } else if (xhr.status === 401 && !isRetry) {
+            try {
+              await executeRefresh();
+              const retryRes = await api.sources.upload(formData, onProgress, true);
+              resolve(retryRes);
+            } catch {
+              reject(new ApiClientError('Session expired. Please log in again.', 401));
+            }
+          } else {
+            let errorMsg = `Upload failed with status ${xhr.status}`;
+            try {
+              const errJson = JSON.parse(xhr.responseText);
+              if (errJson.error) errorMsg = errJson.error;
+            } catch {
+              if (xhr.responseText) errorMsg = xhr.responseText;
+            }
+            reject(new ApiClientError(errorMsg, xhr.status));
+          }
+        };
+
+        xhr.onerror = () => {
+          reject(new ApiClientError('Network error: upload connection failed or was reset', 0));
+        };
+
+        xhr.ontimeout = () => {
+          reject(new ApiClientError('Upload request timed out', 408));
+        };
+
+        xhr.send(formData);
       });
     },
 

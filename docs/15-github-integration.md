@@ -94,8 +94,22 @@ The agreed user workflow mirrors developer platforms such as Vercel, Railway, Re
 ## 3. Core Functional Requirements for Implementation
 
 ### 1. Explicit User Authorization (OAuth 2.0)
-- The integration will use a dedicated **GitHub App** (preferred for granular repository permissions) or **GitHub OAuth App**.
-- The OAuth callback handler (`/api/auth/github/callback`) receives the temporary code, exchanges it with GitHub's token endpoint, and records the access token.
+- **Sign-In OAuth Flow:**
+  - Scopes: `read:user user:email`
+  - Callback: `http://localhost:3000/api/auth/github/callback`
+  - Config: `GITHUB_REDIRECT_URL`
+- **Repository Integration OAuth Flow:**
+  - Scopes: `repo,read:user`
+  - Callback: `http://localhost:3000/api/integrations/github/callback`
+  - Config: `GITHUB_REPO_REDIRECT_URL`
+  - Encrypted at rest via AES-256-GCM in `github_integrations`.
+
+> [!IMPORTANT]
+> **GitHub Developer Settings Configuration Rule:**  
+> GitHub OAuth Apps validate that the incoming `redirect_uri` matches the configured **"Authorization callback URL"**.  
+> If using a **single GitHub OAuth App** for both Sign-In and Repository Import in development, set the Authorization callback URL in GitHub Developer Settings to:  
+> `http://localhost:3000/api/integrations/github/callback`  
+> Alternatively, create two dedicated OAuth Apps in GitHub Developer Settings (one for sign-in and one for repository access) to keep client credentials isolated.
 
 ### 2. Encryption at Rest
 - GitHub personal access tokens or OAuth installation tokens are classified as high-risk platform secrets.
@@ -103,14 +117,14 @@ The agreed user workflow mirrors developer platforms such as Vercel, Railway, Re
 - Tokens must be encrypted using ForgeLAB's existing encryption service (`FORGELAB_ENCRYPTION_KEY` using AES-256-GCM with unique nonces) and stored in a dedicated `github_integrations` database table.
 
 ### 3. Repository & Branch Selection
-- Before creating a project, the frontend queries `/api/auth/github/repositories` to display a searchable list of repositories permitted by the user's GitHub grant.
+- Before creating a project, the frontend queries `/api/integrations/github/repositories` to display a searchable list of repositories permitted by the user's GitHub grant.
 - The user explicitly chooses:
   - Repository full name (`owner/repo`)
   - Target deployment branch (e.g. `main` or `release`)
   - Build context & Dockerfile path within that repository.
 
 ### 4. Disconnect & Revocation Semantics
-- Users must be able to disconnect GitHub at any time (`POST /api/auth/github/disconnect`).
+- Users must be able to disconnect GitHub at any time (`POST /api/integrations/github/disconnect`).
 - Disconnecting must:
   - Securely delete the encrypted access token from PostgreSQL.
   - Invalidate active webhook registrations on GitHub.
@@ -124,11 +138,3 @@ Once the GitHub App/OAuth authorization foundation is established:
 1. **Webhook Registration:** When a project is imported, ForgeLAB registers a webhook endpoint (`/api/webhooks/github`) on the target repository with a cryptographically signed HMAC secret.
 2. **Push Event Delivery:** On `git push` to the configured branch, GitHub delivers an event payload containing the new commit SHA.
 3. **Automated Deployment:** ForgeLAB verifies the webhook signature, fetches the commit archive, creates a deployment record (`QUEUED`), and pushes the deployment job to the Redis queue.
-
----
-
-## 5. Explicit Current Limitation
-
-> **CRITICAL REMINDER FOR CODING AGENTS:**  
-> **Do NOT implement GitHub OAuth or webhooks at this time.**  
-> Existing local-path deployment functionality must undergo physical manual verification by the project owner before any work begins on GitHub integration.

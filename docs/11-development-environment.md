@@ -100,6 +100,9 @@ Configuration is managed via `.env` with fallback defaults in `.env.example`:
 | `GITHUB_REPO_REDIRECT_URL`| `http://localhost:3000/api/integrations/github/callback` | Callback URL registered with GitHub Developer Settings (Repository Import) |
 | `LOG_LEVEL` | `debug` | Logging level (`debug`, `info`, `warn`, `error`) |
 
+> [!NOTE]
+> **GitHub Developer Settings Callback URL:** In GitHub OAuth Apps, GitHub validates that `redirect_uri` matches the configured Authorization callback URL. When using a single OAuth App for local development, register `http://localhost:3000/api/integrations/github/callback` in GitHub Developer Settings (or use two separate apps for sign-in and repository import).
+
 ---
 
 ## 5. Database Initialization & Automatic Migrations

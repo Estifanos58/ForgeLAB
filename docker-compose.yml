@@ -73,6 +73,7 @@ services:
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
       GITHUB_REDIRECT_URL: ${GITHUB_REDIRECT_URL:-http://localhost:3000/api/auth/github/callback}
+      GITHUB_REPO_REDIRECT_URL: ${GITHUB_REPO_REDIRECT_URL:-http://localhost:3000/api/integrations/github/callback}
       LOG_LEVEL: ${LOG_LEVEL:-debug}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
