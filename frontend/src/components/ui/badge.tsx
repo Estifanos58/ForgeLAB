@@ -20,6 +20,9 @@ export function Badge({ status, variant, className, children, showDot = true }: 
       case 'running':
         computedVariant = 'success';
         break;
+      case 'partially_running':
+        computedVariant = 'warning';
+        break;
       case 'deploying':
       case 'building':
       case 'starting':

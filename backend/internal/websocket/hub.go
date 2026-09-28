@@ -440,19 +440,49 @@ func (c *Client) handleSubscribe(channel string) {
 		return
 	}
 
-	parts := strings.SplitN(channel, ":", 2)
-	if len(parts) != 2 {
-		slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "invalid channel format")
-		c.sendError("INVALID_CHANNEL", "invalid channel format. Expected project:<uuid> or deployment:<uuid>")
-		return
-	}
+	var (
+		channelType string
+		resourceID  uuid.UUID
+	)
 
-	channelType, resourceIDStr := parts[0], parts[1]
-	resourceID, err := uuid.Parse(resourceIDStr)
-	if err != nil {
-		slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "invalid resource UUID")
-		c.sendError("INVALID_CHANNEL", "invalid resource UUID")
-		return
+	if strings.HasPrefix(channel, "deployment:") && strings.Contains(channel, ":service:") {
+		// Scoped service deployment channel: deployment:<uuid>:service:<uuid>
+		subParts := strings.Split(channel, ":")
+		if len(subParts) != 4 || subParts[0] != "deployment" || subParts[2] != "service" {
+			slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "invalid service deployment channel format")
+			c.sendError("INVALID_CHANNEL", "invalid channel format. Expected deployment:<uuid>:service:<uuid>")
+			return
+		}
+		deployUUID, err := uuid.Parse(subParts[1])
+		if err != nil {
+			slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "invalid deployment UUID")
+			c.sendError("INVALID_CHANNEL", "invalid deployment UUID")
+			return
+		}
+		_, err = uuid.Parse(subParts[3])
+		if err != nil {
+			slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "invalid service UUID")
+			c.sendError("INVALID_CHANNEL", "invalid service UUID")
+			return
+		}
+		channelType = "deployment"
+		resourceID = deployUUID
+	} else {
+		parts := strings.SplitN(channel, ":", 2)
+		if len(parts) != 2 {
+			slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "invalid channel format")
+			c.sendError("INVALID_CHANNEL", "invalid channel format. Expected project:<uuid> or deployment:<uuid>")
+			return
+		}
+
+		channelType = parts[0]
+		parsedID, err := uuid.Parse(parts[1])
+		if err != nil {
+			slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "invalid resource UUID")
+			c.sendError("INVALID_CHANNEL", "invalid resource UUID")
+			return
+		}
+		resourceID = parsedID
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -487,7 +517,7 @@ func (c *Client) handleSubscribe(channel string) {
 		c.sendError("SERVICE_UNAVAILABLE", "project service unavailable")
 		return
 	}
-	_, err = c.hub.projectService.GetProject(ctx, projectID, c.userID)
+	_, err := c.hub.projectService.GetProject(ctx, projectID, c.userID)
 	if err != nil {
 		slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "project access denied")
 		c.sendError("UNAUTHORIZED", "access denied to this resource")

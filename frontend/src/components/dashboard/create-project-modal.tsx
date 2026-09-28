@@ -13,13 +13,16 @@ import {
   GitHubBranch,
   GitHubStatus,
   DetectionResult,
-  LocalPathValidationResult,
+  AgentStatus,
+  AgentSourceSession,
+  ServiceDefinition,
+  BuildCandidate,
+  ServiceRole,
 } from '@/lib/api/types';
 import { Modal } from '@/components/ui/modal';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Alert } from '@/components/ui/alert';
-import { Badge } from '@/components/ui/badge';
 import {
   Github,
   Upload,
@@ -29,20 +32,23 @@ import {
   Search,
   CheckCircle2,
   RefreshCw,
-  ExternalLink,
-  Layers,
   Sparkles,
   Lock,
   Globe,
   FileCode,
-  Sliders,
   Server,
   Activity,
   HardDrive,
   FileArchive,
   AlertCircle,
   FolderCheck,
-  Check,
+  ChevronDown,
+  ChevronUp,
+  Cpu,
+  ShieldCheck,
+  Plus,
+  Trash2,
+  Layers,
 } from 'lucide-react';
 
 interface CreateProjectModalProps {
@@ -53,7 +59,7 @@ interface CreateProjectModalProps {
 
 type Step = 'source' | 'config';
 type SourceTab = 'github' | 'local';
-type LocalMode = 'directory' | 'archive';
+type LocalMode = 'agent' | 'archive';
 
 export type ImportPhase =
   | 'idle'
@@ -64,12 +70,57 @@ export type ImportPhase =
   | 'failed'
   | 'cancelled';
 
+export interface ConfigurableService {
+  id: string;
+  name: string;
+  role: ServiceRole;
+  source_path: string;
+  runtime: string;
+  framework: string;
+  package_manager: string;
+  build_strategy: 'auto' | 'dockerfile' | 'custom';
+  selected_candidate_id?: string;
+  build_candidates: BuildCandidate[];
+  build_command: string;
+  start_command: string;
+  internal_port: number;
+  dockerfile_path: string;
+  health_strategy: 'auto' | 'http' | 'tcp' | 'none';
+  health_check_path: string;
+  expanded?: boolean;
+}
+
+function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): ConfigurableService {
+  const candidates = def.build_candidates || [];
+  const defaultCandidate = candidates.length > 0 ? candidates[0] : null;
+
+  return {
+    id: def.id || `svc-${idx}-${Date.now()}`,
+    name: def.name || (def.role === 'frontend' ? 'frontend' : def.role === 'backend' ? 'backend' : `service-${idx + 1}`),
+    role: def.role || 'other',
+    source_path: def.source_path || '.',
+    runtime: def.language || 'generic',
+    framework: def.framework || 'generic',
+    package_manager: def.build_system || 'generic',
+    build_strategy: (def.selected_build_strategy as any) || (defaultCandidate?.strategy === 'dockerfile' ? 'dockerfile' : 'auto'),
+    selected_candidate_id: defaultCandidate?.id || '',
+    build_candidates: candidates,
+    build_command: def.build_command || defaultCandidate?.build_command || '',
+    start_command: def.start_command || defaultCandidate?.start_command || '',
+    internal_port: def.internal_port || defaultCandidate?.suggested_port || 8080,
+    dockerfile_path: defaultCandidate?.dockerfile_path || 'Dockerfile',
+    health_strategy: (def.health_strategy as any) || 'auto',
+    health_check_path: def.health_check_path || '/health',
+    expanded: idx === 0,
+  };
+}
+
 export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProjectModalProps) {
   const router = useRouter();
 
   // Step state
   const [step, setStep] = useState<Step>('source');
-  const [sourceTab, setSourceTab] = useState<SourceTab>('github');
+  const [sourceTab, setSourceTab] = useState<SourceTab>('local');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -85,14 +136,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   const [selectedBranch, setSelectedBranch] = useState('main');
   const [rootDir, setRootDir] = useState('.');
 
-  // Local directory direct mode state
-  const [localMode, setLocalMode] = useState<LocalMode>('directory');
-  const [localPathInput, setLocalPathInput] = useState<string>('');
-  const [validatingPath, setValidatingPath] = useState<boolean>(false);
-  const [pathValidationResult, setPathValidationResult] = useState<LocalPathValidationResult | null>(null);
-  const [pathValidationError, setPathValidationError] = useState<string | null>(null);
+  // Local Agent State
+  const [localMode, setLocalMode] = useState<LocalMode>('agent');
+  const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
+  const [checkingAgent, setCheckingAgent] = useState<boolean>(false);
+  const [agentSelectingFolder, setAgentSelectingFolder] = useState<boolean>(false);
+  const [agentSession, setAgentSession] = useState<AgentSourceSession | null>(null);
+  const [configuredServices, setConfiguredServices] = useState<ConfigurableService[]>([]);
+  const [manualPathInput, setManualPathInput] = useState<string>('');
+  const [showManualPath, setShowManualPath] = useState<boolean>(false);
 
-  // Local archive upload explicit state machine
+  // Archive upload fallback state
   const [importPhase, setImportPhase] = useState<ImportPhase>('idle');
   const [uploadPercent, setUploadPercent] = useState<number>(0);
   const [uploadLoadedBytes, setUploadLoadedBytes] = useState<number>(0);
@@ -110,7 +164,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   const abortControllerRef = useRef<AbortController | null>(null);
   const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Configuration state
+  // Project configuration state
   const [projectName, setProjectName] = useState('');
   const [buildStrategy, setBuildStrategy] = useState<'auto' | 'dockerfile'>('auto');
   const [dockerfilePath, setDockerfilePath] = useState('Dockerfile');
@@ -126,14 +180,18 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   // File input ref for archive upload
   const zipInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Load GitHub status when modal opens or tab switches
+  // Load GitHub status or agent status when modal opens or tab changes
   useEffect(() => {
-    if (isOpen && sourceTab === 'github') {
-      checkGitHubStatus();
+    if (isOpen) {
+      if (sourceTab === 'github') {
+        checkGitHubStatus();
+      } else if (sourceTab === 'local' && localMode === 'agent') {
+        checkAgentStatus();
+      }
     }
-  }, [isOpen, sourceTab]);
+  }, [isOpen, sourceTab, localMode]);
 
-  // Cancel in-flight upload and clear polling when modal closes or unmounts
+  // Cancel in-flight upload and clear polling when modal closes
   useEffect(() => {
     if (!isOpen) {
       handleCancelUpload();
@@ -150,6 +208,157 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     };
   }, [isOpen]);
 
+  const checkAgentStatus = async () => {
+    setCheckingAgent(true);
+    try {
+      const status = await api.agent.getStatus();
+      setAgentStatus(status);
+    } catch {
+      setAgentStatus({
+        status: 'offline',
+        agent_id: '',
+        version: '',
+        os: '',
+        arch: '',
+        docker_available: false,
+        active_sessions: 0,
+      });
+    } finally {
+      setCheckingAgent(false);
+    }
+  };
+
+  const handleSelectLocalFolder = async () => {
+    setAgentSelectingFolder(true);
+    setError(null);
+    try {
+      const res = await api.agent.selectFolder('Select Project Folder for ForgeLAB');
+      if ('cancelled' in res && res.cancelled) {
+        return;
+      }
+      const session = res as AgentSourceSession;
+      handleApplyAgentSession(session);
+    } catch (err: any) {
+      setError(err.message || 'Failed to select and analyze directory via ForgeLAB Agent');
+    } finally {
+      setAgentSelectingFolder(false);
+    }
+  };
+
+  const handleManualPathSelect = async () => {
+    const p = manualPathInput.trim();
+    if (!p) {
+      setError('Please enter a directory path');
+      return;
+    }
+    setAgentSelectingFolder(true);
+    setError(null);
+    try {
+      const session = await api.agent.selectPath(p);
+      handleApplyAgentSession(session);
+    } catch (err: any) {
+      setError(err.message || 'Failed to validate and inspect path via ForgeLAB Agent');
+    } finally {
+      setAgentSelectingFolder(false);
+    }
+  };
+
+  const handleApplyAgentSession = (session: AgentSourceSession) => {
+    setAgentSession(session);
+    setProjectName(session.folder_name);
+    setLocalFolderName(session.folder_name);
+    setLocalFilesCount(session.total_files);
+
+    const services = (session.services || []).map((s, idx) => mapDefinitionToConfigurable(s, idx));
+    if (services.length === 0) {
+      // Monolith / generic fallback
+      services.push({
+        id: `svc-0-${Date.now()}`,
+        name: session.folder_name || 'app',
+        role: 'other',
+        source_path: '.',
+        runtime: 'generic',
+        framework: 'generic',
+        package_manager: 'generic',
+        build_strategy: 'auto',
+        build_candidates: [],
+        build_command: '',
+        start_command: '',
+        internal_port: 8080,
+        dockerfile_path: 'Dockerfile',
+        health_strategy: 'auto',
+        health_check_path: '/health',
+        expanded: true,
+      });
+    }
+    setConfiguredServices(services);
+  };
+
+  const handleResetAgentSession = () => {
+    setAgentSession(null);
+    setConfiguredServices([]);
+    setManualPathInput('');
+  };
+
+  const handleCandidateChange = (svcIndex: number, candidateId: string) => {
+    setConfiguredServices((prev) => {
+      const next = [...prev];
+      const svc = { ...next[svcIndex] };
+      const candidate = svc.build_candidates.find((c) => c.id === candidateId);
+      if (candidate) {
+        svc.selected_candidate_id = candidate.id;
+        svc.build_strategy = candidate.strategy as any;
+        svc.build_command = candidate.build_command || '';
+        svc.start_command = candidate.start_command || '';
+        if (candidate.suggested_port) svc.internal_port = candidate.suggested_port;
+        if (candidate.dockerfile_path) svc.dockerfile_path = candidate.dockerfile_path;
+        if (candidate.package_manager) svc.package_manager = candidate.package_manager;
+      }
+      next[svcIndex] = svc;
+      return next;
+    });
+  };
+
+  const handleUpdateService = (svcIndex: number, field: keyof ConfigurableService, value: any) => {
+    setConfiguredServices((prev) => {
+      const next = [...prev];
+      next[svcIndex] = { ...next[svcIndex], [field]: value };
+      return next;
+    });
+  };
+
+  const handleRemoveService = (svcIndex: number) => {
+    if (configuredServices.length <= 1) {
+      setError('A project must have at least one service');
+      return;
+    }
+    setConfiguredServices((prev) => prev.filter((_, idx) => idx !== svcIndex));
+  };
+
+  const handleAddCustomService = () => {
+    const idx = configuredServices.length;
+    const newSvc: ConfigurableService = {
+      id: `svc-custom-${Date.now()}`,
+      name: `service-${idx + 1}`,
+      role: 'backend',
+      source_path: '.',
+      runtime: 'generic',
+      framework: 'generic',
+      package_manager: 'generic',
+      build_strategy: 'auto',
+      build_candidates: [],
+      build_command: '',
+      start_command: '',
+      internal_port: 8080 + idx,
+      dockerfile_path: 'Dockerfile',
+      health_strategy: 'auto',
+      health_check_path: '/health',
+      expanded: true,
+    };
+    setConfiguredServices((prev) => [...prev, newSvc]);
+  };
+
+  // GitHub integration handlers
   const checkGitHubStatus = async () => {
     setLoadingGhStatus(true);
     setError(null);
@@ -199,7 +408,6 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       const bRes = await api.integrations.github.listBranches(owner, name);
       setBranches(bRes.branches || []);
     } catch {
-      // Default to the repo default_branch if branches fail to fetch
       setBranches([{ name: repo.default_branch || 'main', commit_sha: '' }]);
     } finally {
       setLoadingBranches(false);
@@ -241,6 +449,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     }
   };
 
+  // Archive upload handlers
   const handleCancelUpload = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -283,6 +492,12 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             pollingTimerRef.current = null;
           }
           setImportPhase('ready');
+
+          if (status.analysis && status.analysis.services && status.analysis.services.length > 0) {
+            const mapped = status.analysis.services.map((s, idx) => mapDefinitionToConfigurable(s, idx));
+            setConfiguredServices(mapped);
+          }
+
           if (status.detection) {
             applyDetection(status.detection, folderName);
           } else {
@@ -301,63 +516,12 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           return;
         }
       } catch {
-        // Polling will retry until timeout or status resolves
+        // Polling will retry
       }
     };
 
     pollingTimerRef.current = setInterval(poll, 700);
     poll();
-  };
-
-  const handleValidateLocalPath = async (overridePath?: string) => {
-    const targetPath = (overridePath !== undefined ? overridePath : localPathInput).trim();
-    if (!targetPath) {
-      setPathValidationError('Path required: Please enter an absolute local directory path.');
-      setPathValidationResult(null);
-      return;
-    }
-
-    setValidatingPath(true);
-    setPathValidationError(null);
-    setError(null);
-
-    try {
-      const res = await api.sources.validateLocalPath(targetPath);
-      if (!res.valid) {
-        setPathValidationError(res.error || 'The selected directory is invalid or inaccessible from ForgeLAB.');
-        setPathValidationResult(null);
-        return;
-      }
-
-      setPathValidationResult(res);
-      setProjectName(res.project_name);
-      setRuntimeType(res.runtime || 'generic');
-      setDetectedFramework(res.framework || res.runtime || 'generic');
-      setInternalPort(res.suggested_port || 8080);
-      setBuildCommand(res.build_command || '');
-      setStartCommand(res.start_command || '');
-      setDockerfilePath(res.dockerfile_path || 'Dockerfile');
-      setHealthCheckPath(res.health_check_path || '/health');
-      setHealthStrategy((res.health_strategy as any) || 'auto');
-      if (res.build_strategy === 'dockerfile') {
-        setBuildStrategy('dockerfile');
-      } else {
-        setBuildStrategy('auto');
-      }
-    } catch (err: any) {
-      setPathValidationResult(null);
-      setPathValidationError(
-        err.message ||
-          'ForgeLAB cannot access this directory. Ensure the path exists, is within configured source roots, and is mounted if running in Docker.'
-      );
-    } finally {
-      setValidatingPath(false);
-    }
-  };
-
-  const handleResetLocalPath = () => {
-    setPathValidationResult(null);
-    setPathValidationError(null);
   };
 
   const handleZipUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -431,16 +595,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     setError(null);
 
     try {
-      const payload: any = {
-        name: projectName.trim(),
-        build_strategy: buildStrategy,
-        runtime_type: runtimeType,
-        internal_port: Number(internalPort) || 8080,
-        build_command: buildCommand,
-        start_command: startCommand,
-        health_strategy: healthStrategy,
-        health_check_path: healthStrategy === 'http' || healthStrategy === 'auto' ? healthCheckPath : undefined,
-      };
+      let payload: any;
 
       if (sourceTab === 'github') {
         if (!selectedRepo) {
@@ -448,34 +603,105 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           setLoading(false);
           return;
         }
-        payload.source_type = 'github';
-        payload.source_reference = selectedRepo.full_name;
-        payload.branch = selectedBranch;
-        payload.build_context = rootDir;
-        payload.dockerfile_path = dockerfilePath;
-      } else if (localMode === 'directory') {
-        if (!pathValidationResult) {
-          setError('Please validate a local directory path first');
+        payload = {
+          name: projectName.trim(),
+          source_type: 'github',
+          source_reference: selectedRepo.full_name,
+          branch: selectedBranch,
+          build_context: rootDir,
+          dockerfile_path: dockerfilePath,
+          build_strategy: buildStrategy,
+          runtime_type: runtimeType,
+          internal_port: Number(internalPort) || 8080,
+          build_command: buildCommand,
+          start_command: startCommand,
+          health_strategy: healthStrategy,
+          health_check_path: healthStrategy === 'http' || healthStrategy === 'auto' ? healthCheckPath : undefined,
+        };
+      } else if (localMode === 'agent') {
+        if (!agentSession) {
+          setError('Please select a local folder using ForgeLAB Agent first');
           setLoading(false);
           return;
         }
-        payload.source_type = 'local_directory';
-        payload.repository_path = pathValidationResult.repository_path;
-        payload.source_reference = '';
-        payload.branch = 'main';
-        payload.build_context = pathValidationResult.build_context || '.';
-        payload.dockerfile_path = dockerfilePath || pathValidationResult.dockerfile_path || 'Dockerfile';
+
+        // Register agent source in ForgeLAB backend
+        try {
+          await api.sources.registerAgentSource({
+            source_id: agentSession.source_id,
+            agent_id: agentSession.agent_id,
+            folder_name: agentSession.folder_name,
+            metadata: {
+              total_files: agentSession.total_files,
+              total_bytes: agentSession.total_bytes,
+            },
+          });
+        } catch (err) {
+          console.warn('Agent source register status notice:', err);
+        }
+
+        payload = {
+          name: projectName.trim(),
+          source_type: 'local_agent',
+          source_reference: agentSession.source_id,
+          agent_id: agentSession.agent_id,
+          branch: 'main',
+          build_context: '.',
+          services: configuredServices.map((svc) => ({
+            name: svc.name.trim(),
+            role: svc.role,
+            source_path: svc.source_path,
+            runtime_type: svc.runtime,
+            framework: svc.framework,
+            package_manager: svc.package_manager,
+            build_strategy: svc.build_strategy,
+            build_candidates: svc.build_candidates,
+            build_command: svc.build_command,
+            start_command: svc.start_command,
+            dockerfile_path: svc.dockerfile_path,
+            internal_port: Number(svc.internal_port) || 8080,
+            health_strategy: svc.health_strategy,
+            health_check_path: svc.health_check_path,
+          })),
+        };
       } else {
+        // Archive upload fallback
         if (!localSourceId) {
           setError('Please upload an archive file first');
           setLoading(false);
           return;
         }
-        payload.source_type = 'local_upload';
-        payload.source_reference = localSourceId;
-        payload.branch = 'main';
-        payload.build_context = '.';
-        payload.dockerfile_path = dockerfilePath;
+
+        payload = {
+          name: projectName.trim(),
+          source_type: 'local_upload',
+          source_reference: localSourceId,
+          branch: 'main',
+          build_context: '.',
+          build_strategy: buildStrategy,
+          runtime_type: runtimeType,
+          internal_port: Number(internalPort) || 8080,
+          build_command: buildCommand,
+          start_command: startCommand,
+          health_strategy: healthStrategy,
+          health_check_path: healthStrategy === 'http' || healthStrategy === 'auto' ? healthCheckPath : undefined,
+          services: configuredServices.length > 0 ? configuredServices.map((svc) => ({
+            name: svc.name.trim(),
+            role: svc.role,
+            source_path: svc.source_path,
+            runtime_type: svc.runtime,
+            framework: svc.framework,
+            package_manager: svc.package_manager,
+            build_strategy: svc.build_strategy,
+            build_candidates: svc.build_candidates,
+            build_command: svc.build_command,
+            start_command: svc.start_command,
+            dockerfile_path: svc.dockerfile_path,
+            internal_port: Number(svc.internal_port) || 8080,
+            health_strategy: svc.health_strategy,
+            health_check_path: svc.health_check_path,
+          })) : undefined,
+        };
       }
 
       const project = await api.projects.create(payload);
@@ -498,6 +724,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       (r.description && r.description.toLowerCase().includes(repoSearch.toLowerCase()))
   );
 
+  const isLocalAgentOnline = agentStatus?.status === 'online';
+
   return (
     <Modal
       isOpen={isOpen}
@@ -505,8 +733,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       title={step === 'source' ? 'Import Project' : 'Configure Application'}
       description={
         step === 'source'
-          ? 'Select a GitHub repository or import directly from your local machine.'
-          : 'Review detected runtime configurations and customize build or port settings.'
+          ? 'Select a project from your local computer or import from a GitHub repository.'
+          : 'Review detected service architecture, configure build strategies and ports.'
       }
       maxWidth="xl"
     >
@@ -525,6 +753,22 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             <button
               type="button"
               onClick={() => {
+                setSourceTab('local');
+                setError(null);
+              }}
+              className={`flex items-center justify-center gap-2 py-2 font-medium rounded transition-colors ${
+                sourceTab === 'local'
+                  ? 'bg-surface text-white shadow-sm border border-surface-border'
+                  : 'text-neutral-400 hover:text-white'
+              }`}
+            >
+              <Folder className="w-4 h-4 text-emerald-400" />
+              <span>Import from Computer</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
                 if (importPhase === 'uploading' || importPhase === 'processing') {
                   handleCancelUpload();
                 }
@@ -540,402 +784,525 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
               <Github className="w-4 h-4" />
               <span>Import from GitHub</span>
             </button>
-            <button
-              type="button"
-              onClick={() => {
-                setSourceTab('local');
-                setError(null);
-              }}
-              className={`flex items-center justify-center gap-2 py-2 font-medium rounded transition-colors ${
-                sourceTab === 'local'
-                  ? 'bg-surface text-white shadow-sm border border-surface-border'
-                  : 'text-neutral-400 hover:text-white'
-              }`}
-            >
-              <Folder className="w-4 h-4" />
-              <span>Import from Computer</span>
-            </button>
           </div>
 
-          {/* Tab 1: GitHub Repositories */}
-          {sourceTab === 'github' && (
-            <div className="space-y-3.5">
-              {loadingGhStatus ? (
-                <div className="flex items-center justify-center py-10 text-xs text-neutral-400">
-                  <RefreshCw className="w-4 h-4 animate-spin mr-2" />
-                  Checking GitHub permissions...
-                </div>
-              ) : !ghStatus?.connected ? (
-                /* Unconnected / Permission Missing State */
-                <div className="rounded-lg border border-surface-border bg-surface-elevated/40 p-6 text-center space-y-3">
-                  <div className="w-10 h-10 mx-auto rounded-full bg-surface-elevated border border-surface-border flex items-center justify-center text-white">
-                    <Github className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <h4 className="text-sm font-semibold text-white">GitHub Repository Access Required</h4>
-                    <p className="text-xs text-neutral-400 max-w-sm mx-auto mt-1 leading-relaxed">
-                      Authorize ForgeLAB with read-only repository permissions to discover and import your
-                      public and private repositories. Tokens are encrypted at rest using AES-256-GCM.
-                    </p>
-                  </div>
-                  <div className="pt-2">
-                    <Button
-                      type="button"
-                      variant="primary"
-                      size="sm"
-                      onClick={handleConnectGitHub}
-                      icon={<Github className="w-4 h-4" />}
-                    >
-                      Authorize GitHub Repositories
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                /* Connected State - Repository Picker */
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-neutral-400 flex items-center gap-1.5 font-mono">
-                      <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />
-                      Connected as <strong className="text-white">@{ghStatus.username}</strong>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={loadRepositories}
-                      disabled={loadingRepos}
-                      className="text-neutral-400 hover:text-white flex items-center gap-1 transition-colors text-[11px]"
-                    >
-                      <RefreshCw className={`w-3 h-3 ${loadingRepos ? 'animate-spin' : ''}`} />
-                      Refresh
-                    </button>
-                  </div>
-
-                  {/* Search Repositories */}
-                  <div className="relative">
-                    <Search className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      placeholder="Search repositories..."
-                      value={repoSearch}
-                      onChange={(e) => setRepoSearch(e.target.value)}
-                      className="w-full h-8 pl-8 pr-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-neutral-500 transition-colors"
-                    />
-                  </div>
-
-                  {/* Repositories List */}
-                  <div className="rounded border border-surface-border bg-surface divide-y divide-surface-border max-h-56 overflow-y-auto font-sans">
-                    {loadingRepos ? (
-                      <div className="p-8 text-center text-xs text-neutral-400 flex items-center justify-center">
-                        <RefreshCw className="w-4 h-4 animate-spin mr-2" />
-                        Loading repositories...
-                      </div>
-                    ) : filteredRepos.length === 0 ? (
-                      <div className="p-8 text-center text-xs text-neutral-500">
-                        No repositories found matching your search.
-                      </div>
-                    ) : (
-                      filteredRepos.map((repo) => {
-                        const isSelected = selectedRepo?.id === repo.id;
-                        return (
-                          <div
-                            key={repo.id}
-                            onClick={() => handleSelectRepo(repo)}
-                            className={`p-2.5 flex items-center justify-between gap-3 text-xs cursor-pointer transition-colors ${
-                              isSelected
-                                ? 'bg-surface-elevated border-l-2 border-primary text-white'
-                                : 'hover:bg-surface-elevated/50 text-neutral-300'
-                            }`}
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
-                                <span className="font-medium text-white truncate">{repo.full_name}</span>
-                                {repo.private ? (
-                                  <span className="flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-neutral-800 text-neutral-400 border border-neutral-700">
-                                    <Lock className="w-2.5 h-2.5" /> Private
-                                  </span>
-                                ) : (
-                                  <span className="flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-neutral-900 text-neutral-400 border border-neutral-800">
-                                    <Globe className="w-2.5 h-2.5" /> Public
-                                  </span>
-                                )}
-                              </div>
-                              {repo.description && (
-                                <p className="text-[11px] text-neutral-400 truncate mt-0.5">
-                                  {repo.description}
-                                </p>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-2 flex-shrink-0">
-                              <span className="font-mono text-[10px] text-neutral-500">
-                                {repo.default_branch}
-                              </span>
-                              {isSelected ? (
-                                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                              ) : (
-                                <Button size="sm" variant="ghost" className="h-6 text-[11px] px-2">
-                                  Select
-                                </Button>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-
-                  {/* Selected Repository Options */}
-                  {selectedRepo && (
-                    <div className="p-3 rounded-md bg-surface-elevated/40 border border-surface-border space-y-3 animate-in fade-in duration-100">
-                      <div className="grid grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                            Branch
-                          </label>
-                          <select
-                            value={selectedBranch}
-                            onChange={(e) => setSelectedBranch(e.target.value)}
-                            disabled={loadingBranches}
-                            className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                          >
-                            {branches.map((b) => (
-                              <option key={b.name} value={b.name}>
-                                {b.name}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                        <div>
-                          <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                            Root Directory
-                          </label>
-                          <input
-                            type="text"
-                            value={rootDir}
-                            onChange={(e) => setRootDir(e.target.value)}
-                            placeholder="."
-                            className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                          />
-                        </div>
-                      </div>
-
-                      <div className="flex justify-end pt-1">
-                        <Button
-                          type="button"
-                          variant="primary"
-                          size="sm"
-                          onClick={handleAnalyzeGitHub}
-                          loading={loading}
-                          icon={<ArrowRight className="w-3.5 h-3.5" />}
-                        >
-                          Analyze & Configure
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Tab 2: Computer / Local Ingestion */}
+          {/* TAB 1: COMPUTER / LOCAL AGENT IMPORT */}
           {sourceTab === 'local' && (
             <div className="space-y-4">
               {/* Local Mode Sub-Selector */}
-              <div className="grid grid-cols-2 p-1 rounded-md bg-surface-elevated/70 border border-surface-border text-xs">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (importPhase === 'uploading' || importPhase === 'processing') {
-                      handleCancelUpload();
-                    }
-                    setLocalMode('directory');
-                    setError(null);
-                  }}
-                  className={`flex items-center justify-center gap-2 py-1.5 font-medium rounded transition-colors ${
-                    localMode === 'directory'
-                      ? 'bg-surface text-white shadow-sm border border-surface-border'
-                      : 'text-neutral-400 hover:text-white'
-                  }`}
-                >
-                  <HardDrive className="w-3.5 h-3.5 text-primary" />
-                  <span>Existing Directory</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLocalMode('archive');
-                    setError(null);
-                  }}
-                  className={`flex items-center justify-center gap-2 py-1.5 font-medium rounded transition-colors ${
-                    localMode === 'archive'
-                      ? 'bg-surface text-white shadow-sm border border-surface-border'
-                      : 'text-neutral-400 hover:text-white'
-                  }`}
-                >
-                  <FileArchive className="w-3.5 h-3.5 text-neutral-400" />
-                  <span>Upload Archive</span>
-                </button>
+              <div className="flex items-center justify-between">
+                <div className="grid grid-cols-2 p-1 rounded-md bg-surface-elevated/70 border border-surface-border text-xs w-72">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (importPhase === 'uploading' || importPhase === 'processing') {
+                        handleCancelUpload();
+                      }
+                      setLocalMode('agent');
+                      setError(null);
+                    }}
+                    className={`flex items-center justify-center gap-2 py-1.5 font-medium rounded transition-colors ${
+                      localMode === 'agent'
+                        ? 'bg-surface text-white shadow-sm border border-surface-border'
+                        : 'text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    <HardDrive className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Local Agent</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLocalMode('archive');
+                      setError(null);
+                    }}
+                    className={`flex items-center justify-center gap-2 py-1.5 font-medium rounded transition-colors ${
+                      localMode === 'archive'
+                        ? 'bg-surface text-white shadow-sm border border-surface-border'
+                        : 'text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    <FileArchive className="w-3.5 h-3.5 text-neutral-400" />
+                    <span>Archive Upload</span>
+                  </button>
+                </div>
+
+                {localMode === 'agent' && (
+                  <div className="flex items-center gap-2 text-xs">
+                    {checkingAgent ? (
+                      <span className="flex items-center gap-1.5 text-neutral-400 font-mono text-[11px]">
+                        <RefreshCw className="w-3 h-3 animate-spin" /> Checking agent...
+                      </span>
+                    ) : isLocalAgentOnline ? (
+                      <span className="flex items-center gap-1.5 text-emerald-400 font-mono text-[11px] bg-emerald-500/10 px-2 py-1 rounded border border-emerald-500/20">
+                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                        Agent Online (v{agentStatus?.version})
+                      </span>
+                    ) : (
+                      <span className="flex items-center gap-1.5 text-amber-400 font-mono text-[11px] bg-amber-500/10 px-2 py-1 rounded border border-amber-500/20">
+                        <span className="w-2 h-2 rounded-full bg-amber-500" />
+                        Agent Offline
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={checkAgentStatus}
+                      className="text-neutral-400 hover:text-white transition-colors p-1"
+                      title="Refresh Agent Status"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
               </div>
 
-              {/* MODE 1: Existing Directory (Primary Direct Local Workflow) */}
-              {localMode === 'directory' && (
-                <div className="space-y-3.5">
-                  {!pathValidationResult ? (
-                    <div className="rounded-lg border border-surface-border bg-surface-elevated/30 p-5 space-y-4">
+              {/* LOCAL AGENT WORKFLOW */}
+              {localMode === 'agent' && (
+                <div className="space-y-4">
+                  {/* Case 1: Agent Offline Banner */}
+                  {!checkingAgent && !isLocalAgentOnline && !agentSession && (
+                    <div className="rounded-lg border border-amber-500/30 bg-surface-elevated/40 p-5 space-y-4">
                       <div className="flex items-start gap-3">
-                        <div className="w-9 h-9 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center text-primary flex-shrink-0 mt-0.5">
+                        <div className="w-9 h-9 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400 flex-shrink-0 mt-0.5">
                           <HardDrive className="w-5 h-5" />
                         </div>
-                        <div>
-                          <h4 className="text-sm font-semibold text-white">Direct Local-Directory Deployment</h4>
-                          <p className="text-xs text-neutral-400 mt-0.5 leading-relaxed">
-                            ForgeLAB builds and deploys directly from your existing directory. Your files are not uploaded through the browser or copied to intermediate workspaces.
+                        <div className="space-y-1">
+                          <h4 className="text-sm font-semibold text-white">ForgeLAB Local Agent Not Detected</h4>
+                          <p className="text-xs text-neutral-400 leading-relaxed">
+                            The local agent provides a native OS folder dialog, analyzes full-stack projects in-place, and builds directly with your local Docker Engine without uploading files through the browser.
                           </p>
                         </div>
                       </div>
 
-                      <div className="space-y-2">
-                        <label className="block text-xs font-medium text-neutral-300">
-                          Local Directory Path <span className="text-rose-400">*</span>
-                        </label>
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            placeholder="e.g. C:\Users\name\Projects\my-app or /host-projects/my-app"
-                            value={localPathInput}
-                            onChange={(e) => {
-                              setLocalPathInput(e.target.value);
-                              setPathValidationError(null);
-                            }}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault();
-                                handleValidateLocalPath();
-                              }
-                            }}
-                            disabled={validatingPath}
-                            className="flex-1 h-9 px-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-primary transition-colors"
-                          />
-                          <Button
-                            type="button"
-                            variant="primary"
-                            size="sm"
-                            onClick={() => handleValidateLocalPath()}
-                            loading={validatingPath}
-                            disabled={validatingPath || !localPathInput.trim()}
-                            icon={<Search className="w-3.5 h-3.5" />}
-                          >
-                            Validate Directory
-                          </Button>
+                      <div className="p-3 rounded bg-surface border border-surface-border text-xs font-mono text-neutral-300 space-y-1.5">
+                        <div className="text-[11px] text-neutral-500">Run the agent binary on your computer:</div>
+                        <div className="flex items-center justify-between bg-black/40 px-3 py-1.5 rounded border border-surface-border text-emerald-400">
+                          <code>./forgelab-agent</code>
+                          <span className="text-[10px] text-neutral-500 font-sans">Port 4142</span>
                         </div>
-                        <p className="text-[11px] text-neutral-500 font-mono">
-                          Path must be an existing directory accessible to the ForgeLAB backend (under configured FORGELAB_ALLOWED_SOURCE_ROOTS).
+                      </div>
+
+                      <div className="flex items-center justify-between pt-1">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setLocalMode('archive')}
+                          icon={<FileArchive className="w-3.5 h-3.5" />}
+                        >
+                          Use Archive Upload Fallback
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="primary"
+                          size="sm"
+                          onClick={checkAgentStatus}
+                          loading={checkingAgent}
+                          icon={<RefreshCw className="w-3.5 h-3.5" />}
+                        >
+                          Check Again
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Case 2: Agent Online - Folder Selection */}
+                  {isLocalAgentOnline && !agentSession && (
+                    <div className="rounded-lg border border-surface-border bg-surface-elevated/30 p-6 text-center space-y-4">
+                      <div className="w-12 h-12 mx-auto rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+                        <FolderCheck className="w-6 h-6" />
+                      </div>
+
+                      <div className="space-y-1">
+                        <h4 className="text-sm font-semibold text-white">Select Project Folder on Your Computer</h4>
+                        <p className="text-xs text-neutral-400 max-w-md mx-auto leading-relaxed">
+                          Click below to open the native operating-system folder picker. ForgeLAB will automatically analyze monorepos, full-stack apps (frontend + backend), and independent services.
                         </p>
                       </div>
 
-                      {validatingPath && (
-                        <div className="p-3.5 rounded-md bg-surface border border-surface-border flex items-center gap-3 text-xs text-neutral-300">
-                          <RefreshCw className="w-4 h-4 animate-spin text-primary flex-shrink-0" />
-                          <div>
-                            <div className="font-medium text-white">Validating directory & detecting runtime...</div>
-                            <div className="text-[11px] text-neutral-400 mt-0.5">
-                              Inspecting configuration and manifests directly without transferring files.
-                            </div>
-                          </div>
-                        </div>
-                      )}
+                      <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
+                        <Button
+                          type="button"
+                          variant="primary"
+                          size="lg"
+                          onClick={handleSelectLocalFolder}
+                          loading={agentSelectingFolder}
+                          icon={<Folder className="w-4 h-4" />}
+                          className="px-6 py-2.5 text-sm font-medium shadow-md shadow-emerald-500/10"
+                        >
+                          {agentSelectingFolder ? 'Waiting for Folder Selection...' : 'Select Folder'}
+                        </Button>
+                      </div>
 
-                      {pathValidationError && (
-                        <Alert variant="error" onClose={() => setPathValidationError(null)}>
-                          <div className="space-y-1">
-                            <div className="font-medium">{pathValidationError}</div>
-                            <div className="text-[11px] opacity-90">
-                              Ensure the path exists, is a directory, and is accessible from the backend environment. If running ForgeLAB in Docker, mount the host project directory into the container.
-                            </div>
+                      <div className="pt-3 border-t border-surface-border/60">
+                        <button
+                          type="button"
+                          onClick={() => setShowManualPath(!showManualPath)}
+                          className="text-[11px] text-neutral-500 hover:text-neutral-300 font-mono transition-colors"
+                        >
+                          {showManualPath ? '▲ Hide manual path input' : '▼ Or enter directory path directly'}
+                        </button>
+
+                        {showManualPath && (
+                          <div className="mt-3 flex gap-2 max-w-lg mx-auto">
+                            <input
+                              type="text"
+                              placeholder="e.g. C:\Users\name\Projects\my-app or /home/user/my-app"
+                              value={manualPathInput}
+                              onChange={(e) => setManualPathInput(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  handleManualPathSelect();
+                                }
+                              }}
+                              className="flex-1 h-8 px-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-neutral-500"
+                            />
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={handleManualPathSelect}
+                              loading={agentSelectingFolder}
+                              disabled={!manualPathInput.trim()}
+                              className="h-8 text-xs"
+                            >
+                              Analyze
+                            </Button>
                           </div>
-                        </Alert>
-                      )}
+                        )}
+                      </div>
                     </div>
-                  ) : (
-                    /* Directory Validated State */
-                    <div className="rounded-lg border border-emerald-500/40 bg-surface-elevated/40 p-5 space-y-4 animate-in fade-in duration-150">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <div className="w-7 h-7 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 flex-shrink-0">
-                            <CheckCircle2 className="w-4 h-4" />
+                  )}
+
+                  {/* Case 3: Folder Selected & Analyzed */}
+                  {agentSession && (
+                    <div className="space-y-4 animate-in fade-in duration-150">
+                      {/* Repository Summary Banner */}
+                      <div className="rounded-lg border border-emerald-500/40 bg-surface-elevated/40 p-4 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-9 h-9 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 flex-shrink-0">
+                            <Layers className="w-5 h-5" />
                           </div>
-                          <div className="min-w-0">
+                          <div>
                             <div className="flex items-center gap-2">
-                              <h4 className="text-sm font-semibold text-white">Directory Validated</h4>
+                              <h4 className="text-sm font-semibold text-white">{agentSession.folder_name}</h4>
                               <span className="px-1.5 py-0.5 text-[10px] rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
-                                Direct Build
+                                In-Place Local Direct
                               </span>
                             </div>
-                            <p className="text-xs text-neutral-400 font-mono truncate max-w-md mt-0.5">
-                              {pathValidationResult.repository_path}
+                            <p className="text-xs text-neutral-400 font-mono mt-0.5">
+                              {agentSession.total_files.toLocaleString()} files ({formatBytes(agentSession.total_bytes)}) · {configuredServices.length} {configuredServices.length === 1 ? 'service' : 'services'} discovered
                             </p>
                           </div>
                         </div>
+
                         <Button
                           type="button"
                           variant="ghost"
                           size="sm"
-                          onClick={handleResetLocalPath}
-                          className="text-xs text-neutral-400 hover:text-white flex-shrink-0"
+                          onClick={handleResetAgentSession}
+                          className="text-xs text-neutral-400 hover:text-white"
                         >
-                          Change Directory
+                          Change Folder
                         </Button>
                       </div>
 
-                      <div className="grid grid-cols-3 gap-2.5 p-3 rounded bg-surface border border-surface-border text-xs font-mono">
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Framework</span>
-                          <span className="text-neutral-200 font-medium capitalize flex items-center gap-1 mt-0.5">
-                            <Sparkles className="w-3 h-3 text-amber-400" />
-                            {pathValidationResult.framework || 'Generic'}
+                      {/* Detected Services List */}
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between text-xs font-medium text-neutral-300">
+                          <span className="flex items-center gap-1.5">
+                            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                            Discovered Services ({configuredServices.length})
                           </span>
+                          <button
+                            type="button"
+                            onClick={handleAddCustomService}
+                            className="text-[11px] text-primary hover:text-primary-hover flex items-center gap-1 font-mono transition-colors"
+                          >
+                            <Plus className="w-3 h-3" /> Add Service
+                          </button>
                         </div>
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Runtime</span>
-                          <span className="text-neutral-200 font-medium capitalize block mt-0.5">
-                            {pathValidationResult.runtime}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Build Strategy</span>
-                          <span className="text-neutral-200 font-medium capitalize block mt-0.5">
-                            {pathValidationResult.build_strategy === 'dockerfile'
-                              ? `Dockerfile (${pathValidationResult.dockerfile_path})`
-                              : 'Auto (Buildpack)'}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Suggested Port</span>
-                          <span className="text-neutral-200 font-medium block mt-0.5">
-                            {pathValidationResult.suggested_port}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Build Context</span>
-                          <span className="text-neutral-200 font-medium block mt-0.5">
-                            {pathValidationResult.build_context}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Files & Size</span>
-                          <span className="text-neutral-200 font-medium block mt-0.5">
-                            {pathValidationResult.files_count.toLocaleString()} files ({formatBytes(pathValidationResult.total_bytes)})
-                          </span>
-                        </div>
+
+                        {configuredServices.map((svc, idx) => {
+                          const isFrontend = svc.role === 'frontend';
+                          const isBackend = svc.role === 'backend';
+
+                          return (
+                            <div
+                              key={svc.id}
+                              className="rounded-lg border border-surface-border bg-surface-elevated/20 p-4 space-y-3 transition-colors hover:border-surface-border/90"
+                            >
+                              {/* Service Card Top Header */}
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2.5">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[11px] font-mono font-medium uppercase tracking-wider border ${
+                                      isFrontend
+                                        ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+                                        : isBackend
+                                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                                        : 'bg-purple-500/10 text-purple-400 border-purple-500/20'
+                                    }`}
+                                  >
+                                    {svc.role}
+                                  </span>
+
+                                  <span className="text-sm font-semibold text-white">{svc.name}</span>
+                                  <span className="text-xs text-neutral-400 font-mono">
+                                    ({svc.source_path})
+                                  </span>
+                                </div>
+
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs font-mono text-neutral-400 bg-surface px-2 py-0.5 rounded border border-surface-border">
+                                    Port {svc.internal_port}
+                                  </span>
+                                  {configuredServices.length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveService(idx)}
+                                      className="text-neutral-500 hover:text-rose-400 p-1 transition-colors"
+                                      title="Remove Service"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => handleUpdateService(idx, 'expanded', !svc.expanded)}
+                                    className="text-neutral-400 hover:text-white p-1 transition-colors"
+                                  >
+                                    {svc.expanded ? (
+                                      <ChevronUp className="w-4 h-4" />
+                                    ) : (
+                                      <ChevronDown className="w-4 h-4" />
+                                    )}
+                                  </button>
+                                </div>
+                              </div>
+
+                              {/* Framework & Runtime Badges */}
+                              <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                                <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-surface border border-surface-border text-neutral-300">
+                                  <Sparkles className="w-3 h-3 text-amber-400" />
+                                  {svc.framework !== 'generic' ? svc.framework : svc.runtime}
+                                </span>
+                                {svc.package_manager && svc.package_manager !== 'generic' && (
+                                  <span className="px-2 py-0.5 rounded bg-surface border border-surface-border text-neutral-400">
+                                    {svc.package_manager}
+                                  </span>
+                                )}
+                                <span className="px-2 py-0.5 rounded bg-surface border border-surface-border text-neutral-400">
+                                  Strategy: {svc.build_strategy}
+                                </span>
+                              </div>
+
+                              {/* Build Candidates Selection if multiple exist */}
+                              {svc.build_candidates && svc.build_candidates.length > 1 && (
+                                <div className="space-y-1.5 pt-1">
+                                  <label className="block text-[11px] font-mono text-neutral-400">
+                                    Build Strategy & Candidates:
+                                  </label>
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                                    {svc.build_candidates.map((cand) => {
+                                      const isSelected = svc.selected_candidate_id === cand.id;
+                                      return (
+                                        <div
+                                          key={cand.id}
+                                          onClick={() => handleCandidateChange(idx, cand.id)}
+                                          className={`p-2.5 rounded border cursor-pointer transition-colors ${
+                                            isSelected
+                                              ? 'bg-primary/10 border-primary text-white'
+                                              : 'bg-surface border-surface-border text-neutral-400 hover:bg-surface-elevated'
+                                          }`}
+                                        >
+                                          <div className="flex items-center justify-between font-medium">
+                                            <span className="flex items-center gap-1.5 truncate">
+                                              {cand.strategy === 'dockerfile' ? (
+                                                <FileCode className="w-3.5 h-3.5 text-blue-400" />
+                                              ) : (
+                                                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                                              )}
+                                              {cand.name}
+                                            </span>
+                                            {cand.is_default && (
+                                              <span className="text-[9px] px-1 rounded bg-neutral-800 text-neutral-400 uppercase font-mono">
+                                                Default
+                                              </span>
+                                            )}
+                                          </div>
+                                          {cand.description && (
+                                            <p className="text-[10px] text-neutral-400 mt-1 line-clamp-1">
+                                              {cand.description}
+                                            </p>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Expanded Customizable Settings */}
+                              {svc.expanded && (
+                                <div className="p-3 rounded-md bg-surface/60 border border-surface-border space-y-3 pt-3 animate-in fade-in duration-100">
+                                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Service Name
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={svc.name}
+                                        onChange={(e) => handleUpdateService(idx, 'name', e.target.value)}
+                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      />
+                                    </div>
+
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Service Role
+                                      </label>
+                                      <select
+                                        value={svc.role}
+                                        onChange={(e) => handleUpdateService(idx, 'role', e.target.value)}
+                                        className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      >
+                                        <option value="frontend">Frontend</option>
+                                        <option value="backend">Backend</option>
+                                        <option value="worker">Worker</option>
+                                        <option value="other">Other / Service</option>
+                                      </select>
+                                    </div>
+
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Internal Port
+                                      </label>
+                                      <input
+                                        type="number"
+                                        value={svc.internal_port}
+                                        onChange={(e) =>
+                                          handleUpdateService(idx, 'internal_port', parseInt(e.target.value, 10) || 8080)
+                                        }
+                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Relative Source Path
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={svc.source_path}
+                                        onChange={(e) => handleUpdateService(idx, 'source_path', e.target.value)}
+                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      />
+                                    </div>
+
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Build Strategy
+                                      </label>
+                                      <select
+                                        value={svc.build_strategy}
+                                        onChange={(e) => handleUpdateService(idx, 'build_strategy', e.target.value)}
+                                        className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      >
+                                        <option value="auto">ForgeLAB Generated (Auto)</option>
+                                        <option value="dockerfile">Existing Dockerfile</option>
+                                        <option value="custom">Custom Commands</option>
+                                      </select>
+                                    </div>
+                                  </div>
+
+                                  {svc.build_strategy === 'dockerfile' && (
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Dockerfile Path
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={svc.dockerfile_path}
+                                        onChange={(e) => handleUpdateService(idx, 'dockerfile_path', e.target.value)}
+                                        placeholder="Dockerfile"
+                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      />
+                                    </div>
+                                  )}
+
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Build Command (Optional)
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={svc.build_command}
+                                        onChange={(e) => handleUpdateService(idx, 'build_command', e.target.value)}
+                                        placeholder="e.g. npm run build"
+                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      />
+                                    </div>
+
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Start Command (Optional)
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={svc.start_command}
+                                        onChange={(e) => handleUpdateService(idx, 'start_command', e.target.value)}
+                                        placeholder="e.g. npm start"
+                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                                    <div>
+                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                        Health Strategy
+                                      </label>
+                                      <select
+                                        value={svc.health_strategy}
+                                        onChange={(e) => handleUpdateService(idx, 'health_strategy', e.target.value)}
+                                        className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                      >
+                                        <option value="auto">Automatic</option>
+                                        <option value="http">HTTP Endpoint</option>
+                                        <option value="tcp">TCP Socket</option>
+                                        <option value="none">None</option>
+                                      </select>
+                                    </div>
+
+                                    {svc.health_strategy !== 'none' && svc.health_strategy !== 'tcp' && (
+                                      <div>
+                                        <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                                          Health Path
+                                        </label>
+                                        <input
+                                          type="text"
+                                          value={svc.health_check_path}
+                                          onChange={(e) => handleUpdateService(idx, 'health_check_path', e.target.value)}
+                                          placeholder="/health"
+                                          className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                                        />
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
 
-                      <div className="p-3 rounded-md bg-surface/60 border border-surface-border text-[11px] text-neutral-400 flex items-center gap-2">
-                        <Sparkles className="w-3.5 h-3.5 text-primary flex-shrink-0" />
-                        <span>
-                          ⚡ <strong>Direct local deployment active:</strong> Docker build context will be streamed directly from disk with .dockerignore filtering. No intermediate copies or in-memory tar buffers.
-                        </span>
-                      </div>
-
-                      <div className="flex justify-end pt-1">
+                      <div className="flex justify-end pt-2">
                         <Button
                           type="button"
                           variant="primary"
@@ -943,7 +1310,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                           onClick={() => setStep('config')}
                           icon={<ArrowRight className="w-3.5 h-3.5" />}
                         >
-                          Continue to Configuration
+                          Continue to Project Setup
                         </Button>
                       </div>
                     </div>
@@ -951,7 +1318,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 </div>
               )}
 
-              {/* MODE 2: Upload Archive (Fallback Workflow) */}
+              {/* ARCHIVE UPLOAD FALLBACK WORKFLOW */}
               {localMode === 'archive' && (
                 <div className="space-y-4">
                   <input
@@ -1061,7 +1428,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                           <span className="text-neutral-300 font-medium flex items-center gap-2">
                             <Sparkles className="w-3.5 h-3.5 text-amber-400" />
                             {serverPhase === 'detecting'
-                              ? 'Detecting project framework & runtime...'
+                              ? 'Detecting project framework & services...'
                               : 'Extracting and finalizing source workspace...'}
                           </span>
                           <span className="font-mono text-neutral-400 text-[11px]">
@@ -1071,9 +1438,6 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                         <div className="w-full bg-surface-elevated rounded-full h-1.5 overflow-hidden">
                           <div className="bg-primary/80 h-full w-full animate-pulse" />
                         </div>
-                        <p className="text-[11px] text-neutral-400 leading-relaxed">
-                          The server is inspecting source structure, framework manifests, and port configurations.
-                        </p>
                       </div>
                     </div>
                   )}
@@ -1087,7 +1451,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                             <CheckCircle2 className="w-4 h-4" />
                           </div>
                           <div>
-                            <h4 className="text-sm font-semibold text-white">Archive Imported Successfully</h4>
+                            <h4 className="text-sm font-semibold text-white">Archive Ready</h4>
                             <p className="text-xs text-neutral-400">
                               {localFolderName} ({localFilesCount.toLocaleString()} files)
                             </p>
@@ -1100,30 +1464,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                           onClick={handleCancelUpload}
                           className="text-xs text-neutral-400 hover:text-white"
                         >
-                          Change Source
+                          Change Archive
                         </Button>
-                      </div>
-
-                      <div className="grid grid-cols-3 gap-2.5 p-3 rounded bg-surface border border-surface-border text-xs font-mono">
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Framework</span>
-                          <span className="text-neutral-200 font-medium capitalize flex items-center gap-1 mt-0.5">
-                            <Sparkles className="w-3 h-3 text-amber-400" />
-                            {detectedFramework || 'Generic'}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Runtime</span>
-                          <span className="text-neutral-200 font-medium capitalize block mt-0.5">
-                            {runtimeType}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Suggested Port</span>
-                          <span className="text-neutral-200 font-medium block mt-0.5">
-                            {internalPort}
-                          </span>
-                        </div>
                       </div>
 
                       <div className="flex justify-end pt-1">
@@ -1140,7 +1482,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                     </div>
                   )}
 
-                  {/* State: Idle / Failed / Cancelled (Dropzone File Picker) */}
+                  {/* State: Idle / Dropzone */}
                   {(importPhase === 'idle' || importPhase === 'failed' || importPhase === 'cancelled') && (
                     <div className="rounded-lg border-2 border-dashed border-surface-border bg-surface-elevated/20 p-8 text-center space-y-4 hover:border-neutral-600 transition-colors">
                       <div className="w-10 h-10 mx-auto rounded-full bg-surface-elevated border border-surface-border flex items-center justify-center text-neutral-300">
@@ -1149,7 +1491,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                       <div>
                         <h4 className="text-sm font-semibold text-white">Upload Archive Fallback</h4>
                         <p className="text-xs text-neutral-400 max-w-sm mx-auto mt-1 leading-relaxed">
-                          Upload a compressed archive (.zip, .tar.gz, .tgz) when direct local filesystem access is unavailable. The server extracts and isolates it in a secure source workspace.
+                          Upload a compressed archive (.zip, .tar.gz, .tgz) when the ForgeLAB agent is unavailable. The server extracts and isolates it in a secure source workspace.
                         </p>
                       </div>
 
@@ -1165,8 +1507,182 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                         </Button>
                       </div>
                       <p className="text-[11px] text-neutral-500 font-mono">
-                        Maximum archive size: 100 MB. Common build caches are skipped.
+                        Maximum archive size: 100 MB. Common build caches are pruned.
                       </p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TAB 2: GITHUB REPOSITORIES (PRESERVED) */}
+          {sourceTab === 'github' && (
+            <div className="space-y-3.5">
+              {loadingGhStatus ? (
+                <div className="flex items-center justify-center py-10 text-xs text-neutral-400">
+                  <RefreshCw className="w-4 h-4 animate-spin mr-2" />
+                  Checking GitHub permissions...
+                </div>
+              ) : !ghStatus?.connected ? (
+                <div className="rounded-lg border border-surface-border bg-surface-elevated/40 p-6 text-center space-y-3">
+                  <div className="w-10 h-10 mx-auto rounded-full bg-surface-elevated border border-surface-border flex items-center justify-center text-white">
+                    <Github className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-semibold text-white">GitHub Repository Access Required</h4>
+                    <p className="text-xs text-neutral-400 max-w-sm mx-auto mt-1 leading-relaxed">
+                      Authorize ForgeLAB with read-only repository permissions to discover and import your
+                      public and private repositories.
+                    </p>
+                  </div>
+                  <div className="pt-2">
+                    <Button
+                      type="button"
+                      variant="primary"
+                      size="sm"
+                      onClick={handleConnectGitHub}
+                      icon={<Github className="w-4 h-4" />}
+                    >
+                      Authorize GitHub Repositories
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-neutral-400 flex items-center gap-1.5 font-mono">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />
+                      Connected as <strong className="text-white">@{ghStatus.username}</strong>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={loadRepositories}
+                      disabled={loadingRepos}
+                      className="text-neutral-400 hover:text-white flex items-center gap-1 transition-colors text-[11px]"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${loadingRepos ? 'animate-spin' : ''}`} />
+                      Refresh
+                    </button>
+                  </div>
+
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      placeholder="Search repositories..."
+                      value={repoSearch}
+                      onChange={(e) => setRepoSearch(e.target.value)}
+                      className="w-full h-8 pl-8 pr-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-neutral-500 transition-colors"
+                    />
+                  </div>
+
+                  <div className="rounded border border-surface-border bg-surface divide-y divide-surface-border max-h-56 overflow-y-auto font-sans">
+                    {loadingRepos ? (
+                      <div className="p-8 text-center text-xs text-neutral-400 flex items-center justify-center">
+                        <RefreshCw className="w-4 h-4 animate-spin mr-2" />
+                        Loading repositories...
+                      </div>
+                    ) : filteredRepos.length === 0 ? (
+                      <div className="p-8 text-center text-xs text-neutral-500">
+                        No repositories found matching your search.
+                      </div>
+                    ) : (
+                      filteredRepos.map((repo) => {
+                        const isSelected = selectedRepo?.id === repo.id;
+                        return (
+                          <div
+                            key={repo.id}
+                            onClick={() => handleSelectRepo(repo)}
+                            className={`p-2.5 flex items-center justify-between gap-3 text-xs cursor-pointer transition-colors ${
+                              isSelected
+                                ? 'bg-surface-elevated border-l-2 border-primary text-white'
+                                : 'hover:bg-surface-elevated/50 text-neutral-300'
+                            }`}
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className="font-medium text-white truncate">{repo.full_name}</span>
+                                {repo.private ? (
+                                  <span className="flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-neutral-800 text-neutral-400 border border-neutral-700">
+                                    <Lock className="w-2.5 h-2.5" /> Private
+                                  </span>
+                                ) : (
+                                  <span className="flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-neutral-900 text-neutral-400 border border-neutral-800">
+                                    <Globe className="w-2.5 h-2.5" /> Public
+                                  </span>
+                                )}
+                              </div>
+                              {repo.description && (
+                                <p className="text-[11px] text-neutral-400 truncate mt-0.5">
+                                  {repo.description}
+                                </p>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                              <span className="font-mono text-[10px] text-neutral-500">
+                                {repo.default_branch}
+                              </span>
+                              {isSelected ? (
+                                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                              ) : (
+                                <Button size="sm" variant="ghost" className="h-6 text-[11px] px-2">
+                                  Select
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  {selectedRepo && (
+                    <div className="p-3 rounded-md bg-surface-elevated/40 border border-surface-border space-y-3 animate-in fade-in duration-100">
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                            Branch
+                          </label>
+                          <select
+                            value={selectedBranch}
+                            onChange={(e) => setSelectedBranch(e.target.value)}
+                            disabled={loadingBranches}
+                            className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                          >
+                            {branches.map((b) => (
+                              <option key={b.name} value={b.name}>
+                                {b.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-mono text-neutral-400 mb-1">
+                            Root Directory
+                          </label>
+                          <input
+                            type="text"
+                            value={rootDir}
+                            onChange={(e) => setRootDir(e.target.value)}
+                            placeholder="."
+                            className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex justify-end pt-1">
+                        <Button
+                          type="button"
+                          variant="primary"
+                          size="sm"
+                          onClick={handleAnalyzeGitHub}
+                          loading={loading}
+                          icon={<ArrowRight className="w-3.5 h-3.5" />}
+                        >
+                          Analyze & Configure
+                        </Button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -1188,7 +1704,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             >
               Cancel
             </Button>
-            {sourceTab === 'local' && localMode === 'directory' && pathValidationResult && (
+
+            {sourceTab === 'local' && localMode === 'agent' && agentSession && (
               <Button
                 type="button"
                 variant="primary"
@@ -1199,6 +1716,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 Continue to Configuration
               </Button>
             )}
+
             {sourceTab === 'local' && localMode === 'archive' && importPhase === 'ready' && (
               <Button
                 type="button"
@@ -1214,33 +1732,34 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         </div>
       )}
 
-      {/* Step 2: Configuration & Review */}
+      {/* STEP 2: CONFIGURATION & REVIEW */}
       {step === 'config' && (
         <form onSubmit={handleCreateProject} className="space-y-4">
-          {/* Source & Detection Banner */}
+          {/* Source Banner */}
           <div className="p-3 rounded-md bg-surface-elevated border border-surface-border flex items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-2.5 min-w-0">
               {sourceTab === 'github' ? (
                 <Github className="w-4 h-4 text-neutral-400 flex-shrink-0" />
-              ) : localMode === 'directory' ? (
-                <HardDrive className="w-4 h-4 text-emerald-400 flex-shrink-0" />
               ) : (
-                <FileArchive className="w-4 h-4 text-neutral-400 flex-shrink-0" />
+                <HardDrive className="w-4 h-4 text-emerald-400 flex-shrink-0" />
               )}
               <div className="truncate">
                 <span className="font-mono font-medium text-white truncate block">
                   {sourceTab === 'github'
                     ? `${selectedRepo?.full_name} (${selectedBranch})`
-                    : localMode === 'directory'
-                    ? `${pathValidationResult?.repository_path} (${pathValidationResult?.files_count} files · Direct Build)`
+                    : localMode === 'agent'
+                    ? `${agentSession?.folder_name} (${agentSession?.total_files} files · Local Agent In-Place)`
                     : `${localFolderName} (${localFilesCount} files · Archive)`}
                 </span>
                 <span className="text-[11px] text-neutral-400 flex items-center gap-1.5 mt-0.5">
                   <Sparkles className="w-3 h-3 text-amber-400" />
-                  Detected: <strong className="text-neutral-200 capitalize">{detectedFramework}</strong>
-                  {localMode === 'directory' && (
-                    <span className="ml-1 text-[10px] text-emerald-400 bg-emerald-500/10 px-1 py-0.2 rounded border border-emerald-500/20 font-mono">
-                      No Upload
+                  {configuredServices.length > 1 ? (
+                    <span>
+                      Multi-Service Repository: <strong className="text-white">{configuredServices.length} independent services</strong>
+                    </span>
+                  ) : (
+                    <span>
+                      Detected: <strong className="text-neutral-200 capitalize">{detectedFramework || configuredServices[0]?.framework || 'Generic'}</strong>
                     </span>
                   )}
                 </span>
@@ -1264,123 +1783,173 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             placeholder="e.g. my-app"
             value={projectName}
             onChange={(e) => setProjectName(e.target.value)}
-            helperText="Unique identifier for your service on ForgeLAB."
+            helperText="Unique parent identifier for your application and services."
           />
 
-          {/* Build Strategy */}
-          <div className="space-y-1.5">
-            <label className="block text-xs font-medium text-neutral-300">Build Strategy</label>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <button
-                type="button"
-                onClick={() => setBuildStrategy('auto')}
-                className={`p-2.5 rounded border text-left transition-colors ${
-                  buildStrategy === 'auto'
-                    ? 'border-primary bg-primary/10 text-white'
-                    : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-400'
-                }`}
-              >
-                <div className="font-medium flex items-center gap-1.5">
-                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                  Automatic
+          {/* If Multi-Service (from Local Agent or Archive Analysis) */}
+          {configuredServices.length > 0 ? (
+            <div className="space-y-3">
+              {/* Isolated Project Network Callout */}
+              <div className="p-3 rounded-md bg-surface border border-surface-border text-xs space-y-1.5">
+                <div className="font-semibold text-white flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                  <span>Isolated Project Network & Internal DNS</span>
                 </div>
-                <div className="text-[11px] text-neutral-400 mt-1">
-                  Builds using detected {detectedFramework} runtime without requiring a Dockerfile.
-                </div>
-              </button>
+                <p className="text-[11px] text-neutral-400 leading-relaxed font-mono">
+                  Services are deployed onto an isolated Docker bridge network. Services can reach each other directly via their service names (e.g. <span className="text-emerald-400">http://backend:{configuredServices.find(s => s.role === 'backend')?.internal_port || 8080}</span>) without public internet round-trips.
+                </p>
+              </div>
 
-              <button
-                type="button"
-                onClick={() => setBuildStrategy('dockerfile')}
-                className={`p-2.5 rounded border text-left transition-colors ${
-                  buildStrategy === 'dockerfile'
-                    ? 'border-primary bg-primary/10 text-white'
-                    : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-400'
-                }`}
-              >
-                <div className="font-medium flex items-center gap-1.5">
-                  <FileCode className="w-3.5 h-3.5 text-neutral-300" />
-                  Dockerfile
+              {/* Service Deployment List Review */}
+              <div className="space-y-2">
+                <label className="block text-xs font-medium text-neutral-300">
+                  Services to Deploy in Release #1 ({configuredServices.length})
+                </label>
+                <div className="divide-y divide-surface-border rounded border border-surface-border bg-surface">
+                  {configuredServices.map((svc) => (
+                    <div key={svc.id} className="p-3 flex items-center justify-between text-xs font-mono">
+                      <div className="flex items-center gap-2.5">
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold border ${
+                            svc.role === 'frontend'
+                              ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+                              : svc.role === 'backend'
+                              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                              : 'bg-purple-500/10 text-purple-400 border-purple-500/20'
+                          }`}
+                        >
+                          {svc.role}
+                        </span>
+                        <span className="font-semibold text-white">{svc.name}</span>
+                        <span className="text-neutral-500 text-[11px] font-sans">
+                          {svc.framework !== 'generic' ? svc.framework : svc.runtime} · {svc.source_path}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="text-neutral-400 text-[11px]">
+                          Strategy: <strong className="text-neutral-200">{svc.build_strategy}</strong>
+                        </span>
+                        <span className="text-neutral-400 text-[11px] bg-surface-elevated px-2 py-0.5 rounded">
+                          Port {svc.internal_port}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-                <div className="text-[11px] text-neutral-400 mt-1">
-                  Uses Dockerfile located inside your repository.
-                </div>
-              </button>
+              </div>
             </div>
-          </div>
+          ) : (
+            /* Single Service GitHub / Simple Fallback Configuration */
+            <div className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="block text-xs font-medium text-neutral-300">Build Strategy</label>
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setBuildStrategy('auto')}
+                    className={`p-2.5 rounded border text-left transition-colors ${
+                      buildStrategy === 'auto'
+                        ? 'border-primary bg-primary/10 text-white'
+                        : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-400'
+                    }`}
+                  >
+                    <div className="font-medium flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                      Automatic
+                    </div>
+                    <div className="text-[11px] text-neutral-400 mt-1">
+                      Builds using detected {detectedFramework} runtime without requiring a Dockerfile.
+                    </div>
+                  </button>
 
-          {/* Dockerfile input if Dockerfile strategy chosen */}
-          {buildStrategy === 'dockerfile' && (
-            <Input
-              label="Dockerfile Path"
-              placeholder="Dockerfile"
-              value={dockerfilePath}
-              onChange={(e) => setDockerfilePath(e.target.value)}
-              className="font-mono text-xs"
-            />
-          )}
+                  <button
+                    type="button"
+                    onClick={() => setBuildStrategy('dockerfile')}
+                    className={`p-2.5 rounded border text-left transition-colors ${
+                      buildStrategy === 'dockerfile'
+                        ? 'border-primary bg-primary/10 text-white'
+                        : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-400'
+                    }`}
+                  >
+                    <div className="font-medium flex items-center gap-1.5">
+                      <FileCode className="w-3.5 h-3.5 text-neutral-300" />
+                      Dockerfile
+                    </div>
+                    <div className="text-[11px] text-neutral-400 mt-1">
+                      Uses Dockerfile located inside your repository.
+                    </div>
+                  </button>
+                </div>
+              </div>
 
-          {/* Runtime Commands & Port */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <Input
-              label="Application Port"
-              type="number"
-              required
-              placeholder="e.g. 3000, 8000, 8080"
-              value={internalPort}
-              onChange={(e) => setInternalPort(parseInt(e.target.value, 10) || 8080)}
-              helperText="Internal port container listens on."
-              className="font-mono text-xs"
-            />
+              {buildStrategy === 'dockerfile' && (
+                <Input
+                  label="Dockerfile Path"
+                  placeholder="Dockerfile"
+                  value={dockerfilePath}
+                  onChange={(e) => setDockerfilePath(e.target.value)}
+                  className="font-mono text-xs"
+                />
+              )}
 
-            <div>
-              <label className="block text-xs font-medium text-neutral-300 mb-1">
-                Health Strategy
-              </label>
-              <select
-                value={healthStrategy}
-                onChange={(e) => setHealthStrategy(e.target.value as any)}
-                className="w-full h-9 px-3 rounded bg-surface border border-surface-border text-xs text-white focus:outline-none focus:border-neutral-500 font-mono"
-              >
-                <option value="auto">Automatic</option>
-                <option value="http">HTTP Endpoint</option>
-                <option value="tcp">TCP Socket</option>
-                <option value="none">None</option>
-              </select>
-              <p className="mt-1 text-[11px] text-neutral-500 font-mono">
-                Determines readiness before traffic promotion.
-              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <Input
+                  label="Application Port"
+                  type="number"
+                  required
+                  placeholder="e.g. 3000, 8000, 8080"
+                  value={internalPort}
+                  onChange={(e) => setInternalPort(parseInt(e.target.value, 10) || 8080)}
+                  helperText="Internal port container listens on."
+                  className="font-mono text-xs"
+                />
+
+                <div>
+                  <label className="block text-xs font-medium text-neutral-300 mb-1">
+                    Health Strategy
+                  </label>
+                  <select
+                    value={healthStrategy}
+                    onChange={(e) => setHealthStrategy(e.target.value as any)}
+                    className="w-full h-9 px-3 rounded bg-surface border border-surface-border text-xs text-white focus:outline-none focus:border-neutral-500 font-mono"
+                  >
+                    <option value="auto">Automatic</option>
+                    <option value="http">HTTP Endpoint</option>
+                    <option value="tcp">TCP Socket</option>
+                    <option value="none">None</option>
+                  </select>
+                </div>
+              </div>
+
+              {(healthStrategy === 'http' || healthStrategy === 'auto') && (
+                <Input
+                  label="Health Check Path"
+                  placeholder="/health or /"
+                  value={healthCheckPath}
+                  onChange={(e) => setHealthCheckPath(e.target.value)}
+                  className="font-mono text-xs"
+                />
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <Input
+                  label="Build Command (Optional)"
+                  placeholder="e.g. npm run build"
+                  value={buildCommand}
+                  onChange={(e) => setBuildCommand(e.target.value)}
+                  className="font-mono text-xs"
+                />
+
+                <Input
+                  label="Start Command (Optional)"
+                  placeholder="e.g. npm start"
+                  value={startCommand}
+                  onChange={(e) => setStartCommand(e.target.value)}
+                  className="font-mono text-xs"
+                />
+              </div>
             </div>
-          </div>
-
-          {(healthStrategy === 'http' || healthStrategy === 'auto') && (
-            <Input
-              label="Health Check Path"
-              placeholder="/health or /"
-              value={healthCheckPath}
-              onChange={(e) => setHealthCheckPath(e.target.value)}
-              helperText="Polled by the deployment engine to confirm container health."
-              className="font-mono text-xs"
-            />
           )}
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <Input
-              label="Build Command (Optional)"
-              placeholder="e.g. npm run build"
-              value={buildCommand}
-              onChange={(e) => setBuildCommand(e.target.value)}
-              className="font-mono text-xs"
-            />
-
-            <Input
-              label="Start Command (Optional)"
-              placeholder="e.g. npm start"
-              value={startCommand}
-              onChange={(e) => setStartCommand(e.target.value)}
-              className="font-mono text-xs"
-            />
-          </div>
 
           {/* Action Buttons */}
           <div className="pt-3 border-t border-surface-border flex items-center justify-between">

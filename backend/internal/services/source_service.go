@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgelab/backend/internal/analyzer"
 	"github.com/forgelab/backend/internal/detector"
 )
 
@@ -62,6 +63,7 @@ type SourceUploadResult struct {
 	Runtime        string                    `json:"runtime,omitempty"`
 	Framework      string                    `json:"framework,omitempty"`
 	Detection      *detector.DetectionResult `json:"detection,omitempty"`
+	Analysis       *analyzer.AnalysisResult  `json:"analysis,omitempty"`
 	Error          *string                   `json:"error"`
 }
 
@@ -78,6 +80,7 @@ type SourceWorkspaceRecord struct {
 	Runtime        string
 	Framework      string
 	Detection      *detector.DetectionResult
+	Analysis       *analyzer.AnalysisResult
 	Error          *string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
@@ -219,6 +222,11 @@ func (s *SourceService) GetSourceStatus(ctx context.Context, ownerID, sourceID u
 				res.Detection = &det
 			}
 		}
+		if _, err := os.Stat(filepath.Join(s.sourcesDir, sourceID.String())); err == nil {
+			if a, err := analyzer.AnalyzeRepository(filepath.Join(s.sourcesDir, sourceID.String())); err == nil {
+				res.Analysis = a
+			}
+		}
 
 		return &res, nil
 	}
@@ -240,6 +248,7 @@ func (s *SourceService) GetSourceStatus(ctx context.Context, ownerID, sourceID u
 			Runtime:        rec.Runtime,
 			Framework:      rec.Framework,
 			Detection:      rec.Detection,
+			Analysis:       rec.Analysis,
 			Error:          rec.Error,
 		}, nil
 	}
@@ -762,22 +771,23 @@ func (s *SourceService) ingestArchivePart(
 
 // processSourceBackground inspects unpacked files to detect runtime/framework and transitions state to ready or failed.
 func (s *SourceService) processSourceBackground(sourceID, ownerID uuid.UUID, targetDir string) {
+	analysis, _ := analyzer.AnalyzeRepository(targetDir)
 	detection, err := detector.Detect(targetDir)
-	if err != nil {
+	if err != nil && analysis == nil {
 		slog.Warn("source detection failed",
 			"source_id", sourceID.String(),
 			"owner_id", ownerID.String(),
 			"error", err.Error(),
 		)
 		errMsg := err.Error()
-		s.updateSourceState(context.Background(), sourceID, SourceStatusFailed, SourcePhaseFailed, nil, &errMsg)
+		s.updateSourceState(context.Background(), sourceID, SourceStatusFailed, SourcePhaseFailed, nil, analysis, &errMsg)
 		return
 	}
 
-	s.updateSourceState(context.Background(), sourceID, SourceStatusReady, SourcePhaseReady, detection, nil)
+	s.updateSourceState(context.Background(), sourceID, SourceStatusReady, SourcePhaseReady, detection, analysis, nil)
 }
 
-func (s *SourceService) updateSourceState(ctx context.Context, sourceID uuid.UUID, status, phase string, detection *detector.DetectionResult, errMsg *string) {
+func (s *SourceService) updateSourceState(ctx context.Context, sourceID uuid.UUID, status, phase string, detection *detector.DetectionResult, analysis *analyzer.AnalysisResult, errMsg *string) {
 	var runtime, framework string
 	var detBytes []byte
 	if detection != nil {
@@ -808,6 +818,7 @@ func (s *SourceService) updateSourceState(ctx context.Context, sourceID uuid.UUI
 		rec.Runtime = runtime
 		rec.Framework = framework
 		rec.Detection = detection
+		rec.Analysis = analysis
 		rec.Error = errMsg
 		rec.UpdatedAt = time.Now()
 		s.fallbackSources.Store(sourceID, rec)

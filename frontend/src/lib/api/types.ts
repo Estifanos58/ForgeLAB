@@ -17,14 +17,124 @@ export interface AuthResponse {
   tokens: AuthTokens;
 }
 
-export type ProjectStatus = 'inactive' | 'deploying' | 'running' | 'stopped' | 'failed';
+export type ProjectStatus = 'inactive' | 'deploying' | 'running' | 'partially_running' | 'stopped' | 'failed';
+
+export type ServiceRole = 'frontend' | 'backend' | 'worker' | 'other';
+
+export interface BuildCandidate {
+  id: string;
+  strategy: string;
+  name: string;
+  description: string;
+  confidence: number;
+  build_command: string;
+  start_command: string;
+  dockerfile_path?: string;
+  package_manager?: string;
+  suggested_port?: number;
+  internal_port?: number;
+  health_check_path?: string;
+  health_strategy?: string;
+  is_default?: boolean;
+}
+
+export interface Service {
+  id: string;
+  project_id: string;
+  source_id?: string | null;
+  name: string;
+  role: ServiceRole;
+  source_path: string;
+  runtime_type: string;
+  framework: string;
+  package_manager: string;
+  build_strategy: string;
+  build_candidates: BuildCandidate[];
+  build_command: string;
+  start_command: string;
+  dockerfile_path?: string;
+  build_context?: string;
+  internal_port: number;
+  host_port?: number | null;
+  public_exposed: boolean;
+  health_strategy: string;
+  health_check_path?: string | null;
+  health_check_enabled: boolean;
+  status: string;
+  container_id?: string | null;
+  image_tag?: string | null;
+  current_service_deployment_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ServiceDeployment {
+  id: string;
+  deployment_id: string;
+  service_id: string;
+  service_name: string;
+  status: DeploymentStatus;
+  image_tag?: string | null;
+  container_id?: string | null;
+  host_port?: number | null;
+  internal_port: number;
+  build_strategy: string;
+  build_command: string;
+  start_command: string;
+  runtime_type: string;
+  started_at?: string | null;
+  built_at?: string | null;
+  deployed_at?: string | null;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  failure_reason?: string | null;
+  created_at: string;
+}
+
+export interface AgentStatus {
+  status: 'online' | 'offline';
+  agent_id: string;
+  version: string;
+  os: string;
+  arch: string;
+  docker_available: boolean;
+  active_sessions: number;
+}
+
+export interface ServiceDefinition {
+  id: string;
+  name: string;
+  role: ServiceRole;
+  source_path: string;
+  language: string;
+  framework: string;
+  build_system: string;
+  selected_build_strategy: string;
+  build_candidates: BuildCandidate[];
+  build_command: string;
+  start_command: string;
+  internal_port: number;
+  health_strategy: string;
+  health_check_path: string;
+}
+
+export interface AgentSourceSession {
+  source_id: string;
+  agent_id: string;
+  folder_name: string;
+  total_files: number;
+  total_bytes: number;
+  services: ServiceDefinition[];
+  registered_at: string;
+}
 
 export interface Project {
   id: string;
   owner_id: string;
+  source_id?: string | null;
   name: string;
   slug: string;
-  source_type: 'local' | 'local_directory' | 'local_upload' | 'github';
+  source_type: 'local' | 'local_directory' | 'local_upload' | 'local_agent' | 'github';
   source_reference?: string;
   repository_path: string;
   branch: string;
@@ -41,6 +151,7 @@ export interface Project {
   status: ProjectStatus;
   current_deployment_id: string | null;
   port: number | null;
+  services?: Service[];
   created_at: string;
   updated_at: string;
 }
@@ -52,6 +163,7 @@ export type DeploymentStatus =
   | 'starting'
   | 'health_checking'
   | 'running'
+  | 'partially_running'
   | 'stopped'
   | 'crashed'
   | 'failed';
@@ -77,6 +189,7 @@ export interface Deployment {
 export interface DeploymentLog {
   id: number;
   deployment_id: string;
+  service_id?: string | null;
   timestamp: string;
   phase: 'source' | 'build' | 'startup' | 'health' | 'runtime';
   stream: 'stdout' | 'stderr' | 'system';
@@ -95,8 +208,9 @@ export interface EnvVar {
 
 export interface CreateProjectInput {
   name: string;
-  source_type?: 'local' | 'local_directory' | 'local_upload' | 'github';
+  source_type?: 'local' | 'local_directory' | 'local_upload' | 'local_agent' | 'github';
   source_reference?: string;
+  agent_id?: string;
   repository_path?: string;
   branch?: string;
   dockerfile_path?: string;
@@ -108,6 +222,7 @@ export interface CreateProjectInput {
   internal_port?: number;
   health_strategy?: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path?: string;
+  services?: Partial<Service>[];
 }
 
 export interface UpdateProjectInput {
@@ -187,6 +302,11 @@ export interface SourceUploadResult {
   runtime?: string;
   framework?: string;
   detection?: DetectionResult;
+  analysis?: {
+    total_files: number;
+    total_bytes: number;
+    services: ServiceDefinition[];
+  };
   error?: string | null;
 }
 

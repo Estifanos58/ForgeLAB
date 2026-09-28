@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/docker"
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/queue"
 	"github.com/forgelab/backend/internal/services"
 )
@@ -565,11 +566,66 @@ func (h *ProjectHandler) GetDeploymentLogs(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	logs, err := h.deploymentService.GetDeploymentLogs(r.Context(), deploymentID)
+	var logs []*models.DeploymentLog
+	serviceIDStr := r.URL.Query().Get("service_id")
+	if serviceIDStr != "" {
+		serviceUUID, parseErr := uuid.Parse(serviceIDStr)
+		if parseErr == nil {
+			logs, err = h.deploymentService.GetServiceLogs(r.Context(), deploymentID, serviceUUID)
+		} else {
+			logs, err = h.deploymentService.GetDeploymentLogs(r.Context(), deploymentID)
+		}
+	} else {
+		logs, err = h.deploymentService.GetDeploymentLogs(r.Context(), deploymentID)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to get deployment logs")
 		return
 	}
 
 	writeJSON(w, http.StatusOK, logs)
+}
+
+// ListServiceDeployments handles GET /api/projects/{id}/deployments/{deploymentId}/services
+func (h *ProjectHandler) ListServiceDeployments(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	deploymentID, err := uuid.Parse(chi.URLParam(r, "deploymentId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid deployment ID")
+		return
+	}
+
+	// Verify ownership
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify project access")
+		return
+	}
+
+	serviceDeploys, err := h.deploymentService.ListServiceDeployments(r.Context(), deploymentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list service deployments")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, serviceDeploys)
 }

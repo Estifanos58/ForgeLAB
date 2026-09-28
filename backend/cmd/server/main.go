@@ -117,7 +117,9 @@ func main() {
 	sourceService := services.NewSourceService(pool, cfg.Docker.SourcesDir)
 	githubService := services.NewGitHubService(pool, encryptor, cfg.GitHub, redisClient)
 	userService := services.NewUserService(pool, jwtManager)
+	serviceService := services.NewServiceService(pool)
 	projectService := services.NewProjectService(pool, pathValidator, sourceService, githubService)
+	projectService.SetServiceService(serviceService)
 	deploymentService := services.NewDeploymentService(pool)
 	secretService := services.NewSecretService(pool, encryptor, projectService)
 
@@ -137,6 +139,7 @@ func main() {
 		wsHub,
 		cfg.Docker.WorkDir,
 	)
+	dockerEngine.SetServiceService(serviceService)
 	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
 
 	// Initialize Redis deployment queue & worker
@@ -151,6 +154,7 @@ func main() {
 	oauthService := services.NewOAuthService(cfg.Google, cfg.GitHub, redisClient)
 	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
+	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, dockerEngine)
 	envHandler := handlers.NewEnvHandler(secretService)
 	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
@@ -208,6 +212,7 @@ func main() {
 			// Source Management & Uploads
 			r.Route("/sources", func(r chi.Router) {
 				r.Post("/upload", sourceHandler.Upload)
+				r.Post("/agent/register", sourceHandler.RegisterAgentSource)
 				r.Post("/local/validate", sourceHandler.ValidateLocalPath)
 				r.Get("/{id}", sourceHandler.GetStatus)
 				r.Delete("/{id}", sourceHandler.Delete)
@@ -235,6 +240,12 @@ func main() {
 				r.Patch("/{id}", projectHandler.Update)
 				r.Delete("/{id}", projectHandler.Delete)
 
+				// Service Lifecycle Controls & Listing
+				r.Get("/{id}/services", serviceHandler.List)
+				r.Post("/{id}/services/{serviceId}/stop", serviceHandler.Stop)
+				r.Post("/{id}/services/{serviceId}/start", serviceHandler.Start)
+				r.Post("/{id}/services/{serviceId}/restart", serviceHandler.Restart)
+
 				// Application Lifecycle Controls
 				r.Post("/{id}/stop", projectHandler.Stop)
 				r.Post("/{id}/start", projectHandler.Start)
@@ -250,6 +261,7 @@ func main() {
 				r.Post("/{id}/deployments", projectHandler.Deploy)
 				r.Get("/{id}/deployments", projectHandler.ListDeployments)
 				r.Get("/{id}/deployments/{deploymentId}", projectHandler.GetDeployment)
+				r.Get("/{id}/deployments/{deploymentId}/services", projectHandler.ListServiceDeployments)
 				r.Get("/{id}/deployments/{deploymentId}/logs", projectHandler.GetDeploymentLogs)
 			})
 		})

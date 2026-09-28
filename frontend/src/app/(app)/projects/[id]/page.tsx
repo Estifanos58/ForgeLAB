@@ -3,11 +3,12 @@
 import React, { useEffect, useState, useCallback, useRef, use } from 'react';
 import Link from 'next/link';
 import { api } from '@/lib/api/client';
-import { Project, Deployment, DeploymentLog } from '@/lib/api/types';
+import { Project, Deployment, DeploymentLog, Service } from '@/lib/api/types';
 import { AppHeader } from '@/components/layout/app-header';
 import { Badge } from '@/components/ui/badge';
 import { Alert } from '@/components/ui/alert';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Button } from '@/components/ui/button';
 import { LifecycleControls } from '@/features/deployments/lifecycle-controls';
 import { TerminalViewer } from '@/features/deployments/terminal-viewer';
 import { DeploymentHistory } from '@/features/deployments/deployment-history';
@@ -24,6 +25,14 @@ import {
   History,
   Lock,
   ArrowLeft,
+  Server,
+  Globe,
+  Cpu,
+  Layers,
+  Play,
+  Square,
+  RotateCcw,
+  Sparkles,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
@@ -40,12 +49,18 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   const [project, setProject] = useState<Project | null>(null);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [selectedDeployment, setSelectedDeployment] = useState<Deployment | null>(null);
+  const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
+  const [serviceActionLoading, setServiceActionLoading] = useState<{ [serviceId: string]: string | null }>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('overview');
 
-  // Active WebSocket channel
-  const wsChannel = selectedDeployment ? `deployment:${selectedDeployment.id}` : null;
+  // Service-scoped or Deployment-level WebSocket channel
+  const wsChannel = selectedDeployment
+    ? selectedServiceId
+      ? `deployment:${selectedDeployment.id}:service:${selectedServiceId}`
+      : `deployment:${selectedDeployment.id}`
+    : null;
 
   // Load project and deployments
   const loadData = useCallback(async () => {
@@ -81,19 +96,23 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   const addHistoricalLogsRef = useRef<(logs: DeploymentLog[]) => void>(() => {});
 
   // Callback invoked on every successful subscription acknowledgment
-  // (initial subscribe, channel switch, or reconnect)
+  // (initial subscribe, service tab switch, or reconnect)
   const handleWSSubscribed = useCallback((channel: string) => {
     if (!channel.startsWith('deployment:')) return;
-    const deploymentId = channel.replace('deployment:', '');
+    const parts = channel.split(':');
+    const deploymentId = parts[1];
+    const serviceId = parts.length >= 4 && parts[2] === 'service' ? parts[3] : undefined;
+
     if (process.env.NODE_ENV === 'development') {
-      console.log(`[ForgeLAB WS] resyncing historical logs for deployment: ${deploymentId}`);
+      console.log(`[ForgeLAB WS] resyncing historical logs for channel: ${channel}`);
     }
+
     api.projects
-      .getLogs(projectId, deploymentId)
+      .getLogs(projectId, deploymentId, serviceId)
       .then((historyLogs) => {
         addHistoricalLogsRef.current(historyLogs);
         if (process.env.NODE_ENV === 'development') {
-          console.log(`[ForgeLAB WS] merged ${historyLogs.length} historical logs for deployment: ${deploymentId}`);
+          console.log(`[ForgeLAB WS] merged ${historyLogs.length} historical logs for channel: ${channel}`);
         }
       })
       .catch((err) => {
@@ -113,15 +132,12 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
   // Handle immediate deployment creation from lifecycle controls
   const handleDeploymentCreated = useCallback((newDeployment: Deployment) => {
-    // 1. Immediately select the new deployment so WebSocket channel switches right away
     setSelectedDeployment(newDeployment);
-    // 2. Optimistically prepend new deployment to deployments list
     setDeployments((prev) => {
       const exists = prev.some((d) => d.id === newDeployment.id);
       if (exists) return prev.map((d) => (d.id === newDeployment.id ? newDeployment : d));
       return [newDeployment, ...prev];
     });
-    // 3. Switch to terminal logs tab so user immediately sees live build progress
     setActiveTab('logs');
   }, []);
 
@@ -131,7 +147,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     const timer = setTimeout(() => {
       if (connectionState === 'offline') {
         api.projects
-          .getLogs(projectId, selectedDeployment.id)
+          .getLogs(projectId, selectedDeployment.id, selectedServiceId || undefined)
           .then((historyLogs) => {
             addHistoricalLogs(historyLogs);
           })
@@ -139,7 +155,26 @@ export default function ProjectPage({ params }: ProjectPageProps) {
       }
     }, 3000);
     return () => clearTimeout(timer);
-  }, [projectId, selectedDeployment?.id, connectionState, addHistoricalLogs]);
+  }, [projectId, selectedDeployment?.id, selectedServiceId, connectionState, addHistoricalLogs]);
+
+  // Service-level lifecycle handler
+  const handleServiceAction = async (serviceId: string, action: 'start' | 'stop' | 'restart') => {
+    setServiceActionLoading((prev) => ({ ...prev, [serviceId]: action }));
+    try {
+      if (action === 'start') {
+        await api.services.start(projectId, serviceId);
+      } else if (action === 'stop') {
+        await api.services.stop(projectId, serviceId);
+      } else if (action === 'restart') {
+        await api.services.restart(projectId, serviceId);
+      }
+      await loadData();
+    } catch (err: any) {
+      setError(err.message || `Failed to ${action} service`);
+    } finally {
+      setServiceActionLoading((prev) => ({ ...prev, [serviceId]: null }));
+    }
+  };
 
   if (loading) {
     return (
@@ -178,6 +213,9 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     );
   }
 
+  const services = project.services || [];
+  const hasMultipleServices = services.length > 1;
+
   return (
     <div className="min-h-screen flex flex-col bg-background">
       <AppHeader breadcrumbs={[{ label: project.name }]} />
@@ -199,7 +237,8 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               </h1>
               <Badge status={project.status} />
 
-              {project.status === 'running' && project.port && (
+              {/* Display public port link if single service running */}
+              {project.status === 'running' && project.port && services.length <= 1 && (
                 <a
                   href={`http://localhost:${project.port}`}
                   target="_blank"
@@ -214,10 +253,20 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
             <div className="flex items-center gap-3 text-[11px] font-mono text-neutral-500">
               <span>slug: {project.slug}</span>
-              <span>•</span>
-              <span className="truncate max-w-xs" title={project.repository_path}>
-                {project.repository_path}
-              </span>
+              {services.length > 0 && (
+                <>
+                  <span>•</span>
+                  <span className="text-neutral-400">{services.length} services</span>
+                </>
+              )}
+              {project.repository_path && (
+                <>
+                  <span>•</span>
+                  <span className="truncate max-w-xs" title={project.repository_path}>
+                    {project.repository_path}
+                  </span>
+                </>
+              )}
             </div>
           </div>
 
@@ -296,60 +345,200 @@ export default function ProjectPage({ params }: ProjectPageProps) {
         {/* Tab 1: Overview */}
         {activeTab === 'overview' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Left: Configuration & Details (5 cols) */}
+            {/* Left Column: Services & Config (5 cols) */}
             <div className="lg:col-span-5 space-y-4">
-              <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-3">
-                <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-400 font-semibold flex items-center gap-1.5">
-                  <Sliders className="w-3.5 h-3.5" />
-                  <span>Build & Runtime Configuration</span>
+              {/* If Multi-Service Project: Render Dedicated Services Section */}
+              {services.length > 0 ? (
+                <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-3">
+                  <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-400 font-semibold flex items-center justify-between">
+                    <span className="flex items-center gap-1.5">
+                      <Layers className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Services ({services.length})</span>
+                    </span>
+                    <span className="text-[10px] text-neutral-500 font-sans normal-case">
+                      Isolated Network: forgelab-net-{project.id.slice(0, 8)}
+                    </span>
+                  </div>
+
+                  <div className="space-y-3 pt-1">
+                    {services.map((svc) => {
+                      const isFrontend = svc.role === 'frontend';
+                      const isBackend = svc.role === 'backend';
+                      const actionLoading = serviceActionLoading[svc.id];
+
+                      return (
+                        <div
+                          key={svc.id}
+                          className="rounded-lg border border-surface-border bg-surface-elevated/40 p-3.5 space-y-2.5 transition-colors hover:border-surface-border/90"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wider border ${
+                                  isFrontend
+                                    ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+                                    : isBackend
+                                    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                                    : 'bg-purple-500/10 text-purple-400 border-purple-500/20'
+                                }`}
+                              >
+                                {svc.role}
+                              </span>
+                              <span className="text-sm font-semibold text-white">{svc.name}</span>
+                            </div>
+                            <Badge status={svc.status} />
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2 text-xs font-mono text-neutral-400">
+                            <div>
+                              <span className="text-[10px] text-neutral-500 block uppercase">Runtime</span>
+                              <span className="text-neutral-200 capitalize">
+                                {svc.framework !== 'generic' ? svc.framework : svc.runtime_type}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-neutral-500 block uppercase">Path</span>
+                              <span className="text-neutral-200 truncate block" title={svc.source_path}>
+                                {svc.source_path}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-neutral-500 block uppercase">Container Port</span>
+                              <span className="text-neutral-200">:{svc.internal_port}</span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-neutral-500 block uppercase">Host Port</span>
+                              {svc.host_port ? (
+                                <a
+                                  href={`http://localhost:${svc.host_port}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 text-emerald-400 hover:text-emerald-300 font-semibold"
+                                >
+                                  <span>:{svc.host_port}</span>
+                                  <ExternalLink className="w-2.5 h-2.5" />
+                                </a>
+                              ) : (
+                                <span className="text-neutral-500">Unallocated</span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Service-level Controls */}
+                          <div className="flex items-center justify-between pt-2 border-t border-surface-border/60">
+                            <div className="flex items-center gap-1.5">
+                              {svc.status === 'running' ? (
+                                <>
+                                  <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    onClick={() => handleServiceAction(svc.id, 'stop')}
+                                    loading={actionLoading === 'stop'}
+                                    disabled={actionLoading !== null}
+                                    className="h-6 text-[11px] px-2"
+                                    icon={<Square className="w-2.5 h-2.5" />}
+                                  >
+                                    Stop
+                                  </Button>
+                                  <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    onClick={() => handleServiceAction(svc.id, 'restart')}
+                                    loading={actionLoading === 'restart'}
+                                    disabled={actionLoading !== null}
+                                    className="h-6 text-[11px] px-2"
+                                    icon={<RotateCcw className="w-2.5 h-2.5" />}
+                                  >
+                                    Restart
+                                  </Button>
+                                </>
+                              ) : (
+                                <Button
+                                  variant="secondary"
+                                  size="sm"
+                                  onClick={() => handleServiceAction(svc.id, 'start')}
+                                  loading={actionLoading === 'start'}
+                                  disabled={actionLoading !== null}
+                                  className="h-6 text-[11px] px-2"
+                                  icon={<Play className="w-2.5 h-2.5" />}
+                                >
+                                  Start
+                                </Button>
+                              )}
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedServiceId(svc.id);
+                                setActiveTab('logs');
+                              }}
+                              className="text-[11px] text-neutral-400 hover:text-white font-mono flex items-center gap-1 transition-colors"
+                            >
+                              <Terminal className="w-3 h-3 text-neutral-500" />
+                              View Logs →
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-
-                <div className="divide-y divide-surface-border font-mono text-xs">
-                  <div className="py-2 flex items-start justify-between gap-2">
-                    <span className="text-neutral-400 flex items-center gap-1 shrink-0">
-                      <FolderGit2 className="w-3 h-3 text-neutral-500" /> Source Path
-                    </span>
-                    <span className="text-neutral-200 truncate text-right" title={project.repository_path}>
-                      {project.repository_path}
-                    </span>
+              ) : (
+                /* Legacy Single-Service Configuration Panel */
+                <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-3">
+                  <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-400 font-semibold flex items-center gap-1.5">
+                    <Sliders className="w-3.5 h-3.5" />
+                    <span>Build & Runtime Configuration</span>
                   </div>
 
-                  <div className="py-2 flex items-center justify-between gap-2">
-                    <span className="text-neutral-400 flex items-center gap-1">
-                      <GitBranch className="w-3 h-3 text-neutral-500" /> Branch
-                    </span>
-                    <span className="text-neutral-200">{project.branch}</span>
-                  </div>
+                  <div className="divide-y divide-surface-border font-mono text-xs">
+                    <div className="py-2 flex items-start justify-between gap-2">
+                      <span className="text-neutral-400 flex items-center gap-1 shrink-0">
+                        <FolderGit2 className="w-3 h-3 text-neutral-500" /> Source Path
+                      </span>
+                      <span className="text-neutral-200 truncate text-right" title={project.repository_path}>
+                        {project.repository_path || 'Direct Workspace'}
+                      </span>
+                    </div>
 
-                  <div className="py-2 flex items-center justify-between gap-2">
-                    <span className="text-neutral-400 flex items-center gap-1">
-                      <FileCode className="w-3 h-3 text-neutral-500" /> Dockerfile
-                    </span>
-                    <span className="text-neutral-200">{project.dockerfile_path}</span>
-                  </div>
+                    <div className="py-2 flex items-center justify-between gap-2">
+                      <span className="text-neutral-400 flex items-center gap-1">
+                        <GitBranch className="w-3 h-3 text-neutral-500" /> Branch
+                      </span>
+                      <span className="text-neutral-200">{project.branch}</span>
+                    </div>
 
-                  <div className="py-2 flex items-center justify-between gap-2">
-                    <span className="text-neutral-400">Build Context</span>
-                    <span className="text-neutral-200">{project.build_context}</span>
-                  </div>
+                    <div className="py-2 flex items-center justify-between gap-2">
+                      <span className="text-neutral-400 flex items-center gap-1">
+                        <FileCode className="w-3 h-3 text-neutral-500" /> Dockerfile
+                      </span>
+                      <span className="text-neutral-200">{project.dockerfile_path}</span>
+                    </div>
 
-                  <div className="py-2 flex items-center justify-between gap-2">
-                    <span className="text-neutral-400 flex items-center gap-1">
-                      <HeartPulse className="w-3 h-3 text-neutral-500" /> Health Path
-                    </span>
-                    <span className="text-neutral-200">{project.health_check_path || 'None'}</span>
-                  </div>
+                    <div className="py-2 flex items-center justify-between gap-2">
+                      <span className="text-neutral-400">Build Context</span>
+                      <span className="text-neutral-200">{project.build_context}</span>
+                    </div>
 
-                  <div className="py-2 flex items-center justify-between gap-2">
-                    <span className="text-neutral-400">Allocated Host Port</span>
-                    <span className="text-neutral-200 font-semibold">
-                      {project.port ? `:${project.port}` : 'None (stopped)'}
-                    </span>
+                    <div className="py-2 flex items-center justify-between gap-2">
+                      <span className="text-neutral-400 flex items-center gap-1">
+                        <HeartPulse className="w-3 h-3 text-neutral-500" /> Health Path
+                      </span>
+                      <span className="text-neutral-200">{project.health_check_path || 'None'}</span>
+                    </div>
+
+                    <div className="py-2 flex items-center justify-between gap-2">
+                      <span className="text-neutral-400">Allocated Host Port</span>
+                      <span className="text-neutral-200 font-semibold">
+                        {project.port ? `:${project.port}` : 'None (stopped)'}
+                      </span>
+                    </div>
                   </div>
                 </div>
-              </div>
+              )}
 
-              {/* Release Card */}
+              {/* Releases Card */}
               <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-400 font-semibold">
@@ -374,8 +563,53 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               </div>
             </div>
 
-            {/* Right: Live Terminal Preview (7 cols) */}
-            <div className="lg:col-span-7 flex flex-col">
+            {/* Right Column: Live Terminal Preview (7 cols) */}
+            <div className="lg:col-span-7 flex flex-col space-y-2">
+              {/* Service Tab Switcher for Terminal */}
+              {services.length > 0 && (
+                <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono">
+                  <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold">Scope:</span>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedServiceId(null)}
+                    className={cn(
+                      'px-2.5 py-1 rounded transition-colors text-xs font-medium',
+                      selectedServiceId === null
+                        ? 'bg-white text-black font-semibold shadow-sm'
+                        : 'text-neutral-400 hover:text-white'
+                    )}
+                  >
+                    All Services
+                  </button>
+                  {services.map((svc) => (
+                    <button
+                      key={svc.id}
+                      type="button"
+                      onClick={() => setSelectedServiceId(svc.id)}
+                      className={cn(
+                        'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5',
+                        selectedServiceId === svc.id
+                          ? 'bg-white text-black font-semibold shadow-sm'
+                          : 'text-neutral-400 hover:text-white'
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          'w-1.5 h-1.5 rounded-full',
+                          svc.status === 'running'
+                            ? 'bg-emerald-500'
+                            : svc.status === 'failed'
+                            ? 'bg-rose-500'
+                            : 'bg-neutral-500'
+                        )}
+                      />
+                      <span>{svc.name}</span>
+                      <span className="text-[10px] opacity-70 uppercase font-sans">({svc.role})</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <TerminalViewer
                 logs={logs}
                 connected={connected}
@@ -403,7 +637,51 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               />
             </div>
 
-            <div className="lg:col-span-7 flex flex-col">
+            <div className="lg:col-span-7 flex flex-col space-y-2">
+              {services.length > 0 && (
+                <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono">
+                  <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold">Scope:</span>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedServiceId(null)}
+                    className={cn(
+                      'px-2.5 py-1 rounded transition-colors text-xs font-medium',
+                      selectedServiceId === null
+                        ? 'bg-white text-black font-semibold shadow-sm'
+                        : 'text-neutral-400 hover:text-white'
+                    )}
+                  >
+                    All Services
+                  </button>
+                  {services.map((svc) => (
+                    <button
+                      key={svc.id}
+                      type="button"
+                      onClick={() => setSelectedServiceId(svc.id)}
+                      className={cn(
+                        'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5',
+                        selectedServiceId === svc.id
+                          ? 'bg-white text-black font-semibold shadow-sm'
+                          : 'text-neutral-400 hover:text-white'
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          'w-1.5 h-1.5 rounded-full',
+                          svc.status === 'running'
+                            ? 'bg-emerald-500'
+                            : svc.status === 'failed'
+                            ? 'bg-rose-500'
+                            : 'bg-neutral-500'
+                        )}
+                      />
+                      <span>{svc.name}</span>
+                      <span className="text-[10px] opacity-70 uppercase font-sans">({svc.role})</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <TerminalViewer
                 logs={logs}
                 connected={connected}
@@ -419,26 +697,74 @@ export default function ProjectPage({ params }: ProjectPageProps) {
         {/* Tab 3: Logs */}
         {activeTab === 'logs' && (
           <div className="space-y-4">
-            {/* Release Selector Bar */}
-            {deployments.length > 1 && (
-              <div className="flex items-center gap-2 overflow-x-auto pb-1 text-xs font-mono">
-                <span className="text-neutral-500 shrink-0">Release:</span>
-                {deployments.map((d) => (
+            {/* Top Toolbar: Release Selector & Service Scope Tabs */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              {/* Release Selector Bar */}
+              {deployments.length > 1 && (
+                <div className="flex items-center gap-2 overflow-x-auto pb-1 text-xs font-mono">
+                  <span className="text-neutral-500 shrink-0">Release:</span>
+                  {deployments.map((d) => (
+                    <button
+                      key={d.id}
+                      onClick={() => setSelectedDeployment(d)}
+                      className={cn(
+                        'px-2.5 py-1 rounded border text-[11px] shrink-0 transition-colors',
+                        selectedDeployment?.id === d.id
+                          ? 'border-white bg-surface-elevated text-white font-semibold'
+                          : 'border-surface-border text-neutral-400 hover:text-white'
+                      )}
+                    >
+                      #{d.deploy_number} ({d.status})
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Service Tab Switcher */}
+              {services.length > 0 && (
+                <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono ml-auto">
+                  <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold">Service:</span>
                   <button
-                    key={d.id}
-                    onClick={() => setSelectedDeployment(d)}
+                    type="button"
+                    onClick={() => setSelectedServiceId(null)}
                     className={cn(
-                      'px-2.5 py-1 rounded border text-[11px] shrink-0 transition-colors',
-                      selectedDeployment?.id === d.id
-                        ? 'border-white bg-surface-elevated text-white font-semibold'
-                        : 'border-surface-border text-neutral-400 hover:text-white'
+                      'px-2.5 py-1 rounded transition-colors text-xs font-medium',
+                      selectedServiceId === null
+                        ? 'bg-white text-black font-semibold shadow-sm'
+                        : 'text-neutral-400 hover:text-white'
                     )}
                   >
-                    #{d.deploy_number} ({d.status})
+                    All Services
                   </button>
-                ))}
-              </div>
-            )}
+                  {services.map((svc) => (
+                    <button
+                      key={svc.id}
+                      type="button"
+                      onClick={() => setSelectedServiceId(svc.id)}
+                      className={cn(
+                        'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5',
+                        selectedServiceId === svc.id
+                          ? 'bg-white text-black font-semibold shadow-sm'
+                          : 'text-neutral-400 hover:text-white'
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          'w-1.5 h-1.5 rounded-full',
+                          svc.status === 'running'
+                            ? 'bg-emerald-500'
+                            : svc.status === 'failed'
+                            ? 'bg-rose-500'
+                            : 'bg-neutral-500'
+                        )}
+                      />
+                      <span>{svc.name}</span>
+                      <span className="text-[10px] opacity-70 uppercase font-sans">({svc.role})</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
 
             <TerminalViewer
               logs={logs}

@@ -120,6 +120,35 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		return nil, fmt.Errorf("failed to create deployment: %w", err)
 	}
 
+	// Create service deployments for all project services
+	rows, err := tx.Query(ctx,
+		`SELECT id, name, role, build_strategy, build_command, start_command, runtime_type, internal_port 
+		 FROM services WHERE project_id = $1`,
+		project.ID,
+	)
+	var svcList []models.Service
+	if err == nil {
+		for rows.Next() {
+			var s models.Service
+			if err := rows.Scan(&s.ID, &s.Name, &s.Role, &s.BuildStrategy, &s.BuildCommand, &s.StartCommand, &s.RuntimeType, &s.InternalPort); err == nil {
+				svcList = append(svcList, s)
+			}
+		}
+		rows.Close()
+	}
+
+	for _, s := range svcList {
+		svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, s.Name, deployNumber)
+		_, _ = tx.Exec(ctx,
+			`INSERT INTO service_deployments (
+				id, deployment_id, service_id, status, image_tag, build_strategy,
+				build_command, start_command, runtime_type, internal_port, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			uuid.New(), deployment.ID, s.ID, models.DeployStatusQueued, svcTag,
+			s.BuildStrategy, s.BuildCommand, s.StartCommand, s.RuntimeType, s.InternalPort, now,
+		)
+	}
+
 	// Update project status to deploying
 	_, err = tx.Exec(ctx,
 		"UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
@@ -263,6 +292,10 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, deploymentID uuid
 		}
 		return nil, fmt.Errorf("failed to get deployment: %w", err)
 	}
+
+	svcDeploys, _ := s.ListServiceDeployments(ctx, d.ID)
+	d.ServiceDeployments = svcDeploys
+
 	return d, nil
 }
 
@@ -336,17 +369,23 @@ func (s *DeploymentService) GetPreviousSuccessfulDeployment(ctx context.Context,
 
 // AddDeploymentLog adds a log entry for a deployment and returns the persisted record.
 func (s *DeploymentService) AddDeploymentLog(ctx context.Context, deploymentID uuid.UUID, phase, stream, message string) (*models.DeploymentLog, error) {
+	return s.AddDeploymentServiceLog(ctx, deploymentID, nil, phase, stream, message)
+}
+
+// AddDeploymentServiceLog adds a log entry scoped to a specific service.
+func (s *DeploymentService) AddDeploymentServiceLog(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, phase, stream, message string) (*models.DeploymentLog, error) {
 	log := &models.DeploymentLog{
 		DeploymentID: deploymentID,
+		ServiceID:    serviceID,
 		Phase:        phase,
 		Stream:       stream,
 		Message:      message,
 	}
 	err := s.db.QueryRow(ctx,
-		`INSERT INTO deployment_logs (deployment_id, timestamp, phase, stream, message)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO deployment_logs (deployment_id, service_id, timestamp, phase, stream, message)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 RETURNING id, timestamp`,
-		deploymentID, time.Now(), phase, stream, message,
+		deploymentID, serviceID, time.Now(), phase, stream, message,
 	).Scan(&log.ID, &log.Timestamp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to add deployment log: %w", err)
@@ -354,10 +393,10 @@ func (s *DeploymentService) AddDeploymentLog(ctx context.Context, deploymentID u
 	return log, nil
 }
 
-// GetDeploymentLogs retrieves logs for a deployment.
+// GetDeploymentLogs retrieves logs for a deployment (global or all services).
 func (s *DeploymentService) GetDeploymentLogs(ctx context.Context, deploymentID uuid.UUID) ([]*models.DeploymentLog, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT id, deployment_id, timestamp, phase, stream, message
+		`SELECT id, deployment_id, service_id, timestamp, phase, stream, message
 		 FROM deployment_logs WHERE deployment_id = $1 ORDER BY timestamp ASC, id ASC`,
 		deploymentID,
 	)
@@ -369,7 +408,7 @@ func (s *DeploymentService) GetDeploymentLogs(ctx context.Context, deploymentID 
 	var logs []*models.DeploymentLog
 	for rows.Next() {
 		l := &models.DeploymentLog{}
-		err := rows.Scan(&l.ID, &l.DeploymentID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message)
+		err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan deployment log: %w", err)
 		}
@@ -381,4 +420,110 @@ func (s *DeploymentService) GetDeploymentLogs(ctx context.Context, deploymentID 
 	}
 
 	return logs, nil
+}
+
+// GetServiceLogs retrieves logs scoped strictly to a specific service deployment.
+func (s *DeploymentService) GetServiceLogs(ctx context.Context, deploymentID, serviceID uuid.UUID) ([]*models.DeploymentLog, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT id, deployment_id, service_id, timestamp, phase, stream, message
+		 FROM deployment_logs 
+		 WHERE deployment_id = $1 AND (service_id = $2 OR service_id IS NULL)
+		 ORDER BY timestamp ASC, id ASC`,
+		deploymentID, serviceID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get service deployment logs: %w", err)
+	}
+	defer rows.Close()
+
+	var logs []*models.DeploymentLog
+	for rows.Next() {
+		l := &models.DeploymentLog{}
+		err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan service log: %w", err)
+		}
+		logs = append(logs, l)
+	}
+
+	if logs == nil {
+		logs = []*models.DeploymentLog{}
+	}
+
+	return logs, nil
+}
+
+// ListServiceDeployments retrieves all service deployment records for a release.
+func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deploymentID uuid.UUID) ([]*models.ServiceDeployment, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, sd.status, sd.image_tag, sd.container_id,
+		        sd.host_port, sd.internal_port, sd.build_strategy, sd.build_command, sd.start_command,
+		        sd.runtime_type, sd.started_at, sd.built_at, sd.deployed_at, sd.finished_at,
+		        sd.duration_ms, sd.failure_reason, sd.created_at
+		 FROM service_deployments sd
+		 JOIN services s ON s.id = sd.service_id
+		 WHERE sd.deployment_id = $1
+		 ORDER BY sd.created_at ASC`,
+		deploymentID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list service deployments: %w", err)
+	}
+	defer rows.Close()
+
+	var list []*models.ServiceDeployment
+	for rows.Next() {
+		sd := &models.ServiceDeployment{}
+		err := rows.Scan(
+			&sd.ID, &sd.DeploymentID, &sd.ServiceID, &sd.ServiceName, &sd.Status, &sd.ImageTag,
+			&sd.ContainerID, &sd.HostPort, &sd.InternalPort, &sd.BuildStrategy, &sd.BuildCommand,
+			&sd.StartCommand, &sd.RuntimeType, &sd.StartedAt, &sd.BuiltAt, &sd.DeployedAt,
+			&sd.FinishedAt, &sd.DurationMs, &sd.FailureReason, &sd.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan service deployment: %w", err)
+		}
+		list = append(list, sd)
+	}
+
+	if list == nil {
+		list = []*models.ServiceDeployment{}
+	}
+
+	return list, nil
+}
+
+// UpdateServiceDeploymentStatus updates status for an individual service deployment.
+func (s *DeploymentService) UpdateServiceDeploymentStatus(ctx context.Context, deploymentID, serviceID uuid.UUID, newStatus string, failureReason *string) error {
+	now := time.Now()
+	var deployedAt, finishedAt *time.Time
+	if newStatus == models.DeployStatusRunning {
+		deployedAt = &now
+	}
+	if newStatus == models.DeployStatusRunning || newStatus == models.DeployStatusFailed || newStatus == models.DeployStatusStopped {
+		finishedAt = &now
+	}
+
+	_, err := s.db.Exec(ctx,
+		`UPDATE service_deployments SET
+		 status = $3,
+		 deployed_at = COALESCE($4, deployed_at),
+		 finished_at = COALESCE($5, finished_at),
+		 failure_reason = COALESCE($6, failure_reason)
+		 WHERE deployment_id = $1 AND service_id = $2`,
+		deploymentID, serviceID, newStatus, deployedAt, finishedAt, failureReason,
+	)
+	return err
+}
+
+// UpdateServiceDeploymentContainer records container ID and allocated host port for a service deployment.
+func (s *DeploymentService) UpdateServiceDeploymentContainer(ctx context.Context, deploymentID, serviceID uuid.UUID, containerID string, hostPort *int) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE service_deployments SET
+		 container_id = $3,
+		 host_port = $4
+		 WHERE deployment_id = $1 AND service_id = $2`,
+		deploymentID, serviceID, containerID, hostPort,
+	)
+	return err
 }

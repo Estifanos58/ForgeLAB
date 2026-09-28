@@ -1,4 +1,6 @@
 import {
+  AgentSourceSession,
+  AgentStatus,
   AuthResponse,
   CreateProjectInput,
   Deployment,
@@ -10,6 +12,8 @@ import {
   GitHubStatus,
   LocalPathValidationResult,
   Project,
+  Service,
+  ServiceDeployment,
   SetEnvInput,
   SourceUploadResult,
   UpdateProjectInput,
@@ -122,6 +126,24 @@ async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {}): Pro
   return data as T;
 }
 
+const AGENT_URL = 'http://127.0.0.1:4142';
+
+async function agentFetch<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  const url = `${AGENT_URL}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers as Record<string, string>),
+    },
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new ApiClientError(errorText || `Agent request failed with status ${response.status}`, response.status);
+  }
+  return response.json();
+}
+
 export const api = {
   auth: {
     async register(data: { email: string; password: string; display_name?: string }): Promise<AuthResponse> {
@@ -224,8 +246,37 @@ export const api = {
       return apiFetch<Deployment>(`/api/projects/${projectId}/deployments/${deploymentId}`);
     },
 
-    async getLogs(projectId: string, deploymentId: string): Promise<DeploymentLog[]> {
-      return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/deployments/${deploymentId}/logs`);
+    async getLogs(projectId: string, deploymentId: string, serviceId?: string): Promise<DeploymentLog[]> {
+      const query = serviceId ? `?service_id=${encodeURIComponent(serviceId)}` : '';
+      return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/deployments/${deploymentId}/logs${query}`);
+    },
+  },
+
+  services: {
+    async list(projectId: string): Promise<Service[]> {
+      return apiFetch<Service[]>(`/api/projects/${projectId}/services`);
+    },
+
+    async stop(projectId: string, serviceId: string): Promise<{ message: string; status: string }> {
+      return apiFetch<{ message: string; status: string }>(`/api/projects/${projectId}/services/${serviceId}/stop`, {
+        method: 'POST',
+      });
+    },
+
+    async start(projectId: string, serviceId: string): Promise<{ message: string; status: string }> {
+      return apiFetch<{ message: string; status: string }>(`/api/projects/${projectId}/services/${serviceId}/start`, {
+        method: 'POST',
+      });
+    },
+
+    async restart(projectId: string, serviceId: string): Promise<{ message: string; status: string }> {
+      return apiFetch<{ message: string; status: string }>(`/api/projects/${projectId}/services/${serviceId}/restart`, {
+        method: 'POST',
+      });
+    },
+
+    async getServiceDeployments(projectId: string, deploymentId: string): Promise<ServiceDeployment[]> {
+      return apiFetch<ServiceDeployment[]>(`/api/projects/${projectId}/deployments/${deploymentId}/services`);
     },
   },
 
@@ -408,6 +459,25 @@ export const api = {
       });
     },
 
+    async registerAgentSource(data: {
+      source_id: string;
+      agent_id: string;
+      folder_name: string;
+      metadata?: Record<string, any>;
+    }): Promise<{
+      source_id: string;
+      owner_id: string;
+      agent_id: string;
+      type: string;
+      status: string;
+      folder_name: string;
+    }> {
+      return apiFetch('/api/sources/agent/register', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      });
+    },
+
     async get(sourceId: string): Promise<SourceUploadResult> {
       return apiFetch<SourceUploadResult>(`/api/sources/${encodeURIComponent(sourceId)}`);
     },
@@ -415,6 +485,42 @@ export const api = {
     async delete(sourceId: string): Promise<{ message: string }> {
       return apiFetch<{ message: string }>(`/api/sources/${encodeURIComponent(sourceId)}`, {
         method: 'DELETE',
+      });
+    },
+  },
+
+  agent: {
+    async getStatus(): Promise<AgentStatus> {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        const res = await agentFetch<AgentStatus>('/api/agent/status', { signal: controller.signal });
+        clearTimeout(timeoutId);
+        return res;
+      } catch {
+        return {
+          status: 'offline',
+          agent_id: '',
+          version: '',
+          os: '',
+          arch: '',
+          docker_available: false,
+          active_sessions: 0,
+        };
+      }
+    },
+
+    async selectFolder(title?: string): Promise<AgentSourceSession | { cancelled: true }> {
+      return agentFetch<AgentSourceSession | { cancelled: true }>('/api/agent/select-folder', {
+        method: 'POST',
+        body: JSON.stringify({ title: title || 'Select Project Folder' }),
+      });
+    },
+
+    async selectPath(path: string): Promise<AgentSourceSession> {
+      return agentFetch<AgentSourceSession>('/api/agent/select-path', {
+        method: 'POST',
+        body: JSON.stringify({ path }),
       });
     },
   },

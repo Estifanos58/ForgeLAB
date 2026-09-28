@@ -16,6 +16,7 @@ import (
 
 	"github.com/forgelab/backend/internal/detector"
 	"github.com/forgelab/backend/internal/docker"
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
 )
@@ -368,4 +369,50 @@ func (h *SourceHandler) ValidateLocalPath(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// RegisterAgentSourceRequest defines payload for POST /api/sources/agent/register
+type RegisterAgentSourceRequest struct {
+	SourceID   string                 `json:"source_id"`
+	AgentID    string                 `json:"agent_id"`
+	FolderName string                 `json:"folder_name"`
+	Metadata   map[string]interface{} `json:"metadata"`
+}
+
+// RegisterAgentSource handles POST /api/sources/agent/register
+func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req RegisterAgentSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request payload")
+		return
+	}
+
+	sourceUUID, err := uuid.Parse(req.SourceID)
+	if err != nil {
+		sourceUUID = uuid.New()
+	}
+
+	meta := req.Metadata
+	if meta == nil {
+		meta = make(map[string]interface{})
+	}
+	meta["folder_name"] = req.FolderName
+
+	res := map[string]interface{}{
+		"source_id":   sourceUUID.String(),
+		"owner_id":    userID.String(),
+		"agent_id":    req.AgentID,
+		"type":        models.SourceTypeLocalAgent,
+		"status":      "ready",
+		"folder_name": req.FolderName,
+		"metadata":    meta,
+	}
+
+	writeJSON(w, http.StatusCreated, res)
 }
