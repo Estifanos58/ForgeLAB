@@ -102,20 +102,25 @@ export interface AgentStatus {
 }
 
 export interface ServiceDefinition {
-  id: string;
+  id?: string;
   name: string;
   role: ServiceRole;
   source_path: string;
-  language: string;
-  framework: string;
-  build_system: string;
-  selected_build_strategy: string;
-  build_candidates: BuildCandidate[];
-  build_command: string;
-  start_command: string;
-  internal_port: number;
-  health_strategy: string;
-  health_check_path: string;
+  runtime?: string;
+  runtime_type?: string;
+  language?: string;
+  framework?: string;
+  package_manager?: string;
+  build_system?: string;
+  selected_build_strategy?: string;
+  build_strategy?: string;
+  build_candidates?: BuildCandidate[];
+  build_command?: string;
+  start_command?: string;
+  dockerfile_path?: string;
+  internal_port?: number;
+  health_strategy?: string;
+  health_check_path?: string;
 }
 
 export interface AgentSourceSession {
@@ -277,6 +282,14 @@ export interface GitHubBranch {
 }
 
 export interface DetectionResult {
+  source?: {
+    type: string;
+    owner?: string;
+    repo?: string;
+    branch?: string;
+    source_reference?: string;
+  };
+  services?: ServiceDefinition[];
   runtime: string;
   framework: string;
   build_strategy: string;
@@ -293,6 +306,8 @@ export type SourceProcessingPhase = 'uploading' | 'finalizing' | 'detecting' | '
 
 export interface SourceUploadResult {
   source_id: string;
+  source?: any;
+  services?: ServiceDefinition[];
   status?: SourceProcessingStatus;
   phase?: SourceProcessingPhase;
   files_count: number;

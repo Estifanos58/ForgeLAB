@@ -61,7 +61,7 @@ export function Badge({ status, variant, className, children, showDot = true }: 
     default: 'text-neutral-300',
   };
 
-  const displayText = children || (status ? status.replace(/_/g, ' ') : '');
+  const displayText = children || (status ? (normStatus === 'inactive' ? 'Not deployed' : status.replace(/_/g, ' ')) : '');
 
   return (
     <span

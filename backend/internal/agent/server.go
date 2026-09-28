@@ -226,12 +226,21 @@ func (s *AgentServer) registerDirectory(rawPath string) (*LocalSourceSession, er
 
 func (s *AgentServer) renderSessionResponse(w http.ResponseWriter, session *LocalSourceSession) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"source_id":    session.SourceID.String(),
-		"agent_id":     s.agentID,
-		"folder_name":  session.FolderName,
-		"total_files":  session.Analysis.TotalFiles,
-		"total_bytes":  session.Analysis.TotalBytes,
-		"services":     session.Analysis.Services,
+		"source": map[string]interface{}{
+			"id":               session.SourceID.String(),
+			"source_type":      "local_agent",
+			"source_reference": session.SourceID.String(),
+			"agent_id":         s.agentID,
+			"folder_name":      session.FolderName,
+			"total_files":      session.Analysis.TotalFiles,
+			"total_bytes":      session.Analysis.TotalBytes,
+		},
+		"source_id":     session.SourceID.String(),
+		"agent_id":      s.agentID,
+		"folder_name":   session.FolderName,
+		"total_files":   session.Analysis.TotalFiles,
+		"total_bytes":   session.Analysis.TotalBytes,
+		"services":      session.Analysis.Services,
 		"registered_at": session.CreatedAt.Format(time.RFC3339),
 	})
 }

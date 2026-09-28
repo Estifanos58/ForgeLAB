@@ -427,7 +427,7 @@ func (s *DeploymentService) GetServiceLogs(ctx context.Context, deploymentID, se
 	rows, err := s.db.Query(ctx,
 		`SELECT id, deployment_id, service_id, timestamp, phase, stream, message
 		 FROM deployment_logs 
-		 WHERE deployment_id = $1 AND (service_id = $2 OR service_id IS NULL)
+		 WHERE deployment_id = $1 AND service_id = $2
 		 ORDER BY timestamp ASC, id ASC`,
 		deploymentID, serviceID,
 	)

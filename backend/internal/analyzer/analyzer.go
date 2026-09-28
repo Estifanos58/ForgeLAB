@@ -17,6 +17,7 @@ type ServiceDefinition struct {
 	Name               string                  `json:"name"`
 	Role               string                  `json:"role"` // "frontend", "backend", "worker", "other"
 	SourcePath         string                  `json:"source_path"`
+	Runtime            string                  `json:"runtime"`
 	RuntimeType        string                  `json:"runtime_type"`
 	Framework          string                  `json:"framework"`
 	PackageManager     string                  `json:"package_manager"`
@@ -341,6 +342,7 @@ func inspectServiceDirectory(repoRoot, dirPath, relPath string) (*ServiceDefinit
 		Name:               name,
 		Role:               role,
 		SourcePath:         relPath,
+		Runtime:            runtime,
 		RuntimeType:        runtime,
 		Framework:          framework,
 		PackageManager:     pkgManager,
@@ -876,6 +878,7 @@ func createGenericService(name, relPath string) ServiceDefinition {
 		Name:           name,
 		Role:           models.RoleOther,
 		SourcePath:     relPath,
+		Runtime:        "generic",
 		RuntimeType:    "generic",
 		Framework:      "Generic Application",
 		PackageManager: "",

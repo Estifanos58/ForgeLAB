@@ -25,6 +25,7 @@ import (
 
 	"github.com/forgelab/backend/internal/analyzer"
 	"github.com/forgelab/backend/internal/detector"
+	"github.com/forgelab/backend/internal/models"
 )
 
 var (
@@ -53,18 +54,20 @@ const (
 )
 
 type SourceUploadResult struct {
-	SourceID       uuid.UUID                 `json:"source_id"`
-	Status         string                    `json:"status"`
-	Phase          string                    `json:"phase"`
-	FilesCount     int                       `json:"files_count"`
-	ProcessedFiles int                       `json:"processed_files"`
-	TotalBytes     int64                     `json:"total_bytes"`
-	ProcessedBytes int64                     `json:"processed_bytes"`
-	Runtime        string                    `json:"runtime,omitempty"`
-	Framework      string                    `json:"framework,omitempty"`
-	Detection      *detector.DetectionResult `json:"detection,omitempty"`
-	Analysis       *analyzer.AnalysisResult  `json:"analysis,omitempty"`
-	Error          *string                   `json:"error"`
+	SourceID       uuid.UUID                    `json:"source_id"`
+	Source         map[string]interface{}       `json:"source,omitempty"`
+	Services       []analyzer.ServiceDefinition `json:"services,omitempty"`
+	Status         string                       `json:"status"`
+	Phase          string                       `json:"phase"`
+	FilesCount     int                          `json:"files_count"`
+	ProcessedFiles int                          `json:"processed_files"`
+	TotalBytes     int64                        `json:"total_bytes"`
+	ProcessedBytes int64                        `json:"processed_bytes"`
+	Runtime        string                       `json:"runtime,omitempty"`
+	Framework      string                       `json:"framework,omitempty"`
+	Detection      *detector.DetectionResult    `json:"detection,omitempty"`
+	Analysis       *analyzer.AnalysisResult     `json:"analysis,omitempty"`
+	Error          *string                      `json:"error"`
 }
 
 type SourceWorkspaceRecord struct {
@@ -225,6 +228,15 @@ func (s *SourceService) GetSourceStatus(ctx context.Context, ownerID, sourceID u
 		if _, err := os.Stat(filepath.Join(s.sourcesDir, sourceID.String())); err == nil {
 			if a, err := analyzer.AnalyzeRepository(filepath.Join(s.sourcesDir, sourceID.String())); err == nil {
 				res.Analysis = a
+				res.Services = a.Services
+				res.Source = map[string]interface{}{
+					"id":               sourceID.String(),
+					"source_type":      "local_upload",
+					"source_reference": sourceID.String(),
+					"folder_name":      a.RepositoryName,
+					"total_files":      a.TotalFiles,
+					"total_bytes":      a.TotalBytes,
+				}
 			}
 		}
 
@@ -237,8 +249,23 @@ func (s *SourceService) GetSourceStatus(ctx context.Context, ownerID, sourceID u
 		if rec.OwnerID != ownerID {
 			return nil, ErrUnauthorizedSource
 		}
+		var svcs []analyzer.ServiceDefinition
+		var srcMap map[string]interface{}
+		if rec.Analysis != nil {
+			svcs = rec.Analysis.Services
+			srcMap = map[string]interface{}{
+				"id":               rec.ID.String(),
+				"source_type":      "local_upload",
+				"source_reference": rec.ID.String(),
+				"folder_name":      rec.Analysis.RepositoryName,
+				"total_files":      rec.Analysis.TotalFiles,
+				"total_bytes":      rec.Analysis.TotalBytes,
+			}
+		}
 		return &SourceUploadResult{
 			SourceID:       rec.ID,
+			Source:         srcMap,
+			Services:       svcs,
 			Status:         rec.Status,
 			Phase:          rec.Phase,
 			FilesCount:     rec.FilesCount,
@@ -1407,3 +1434,62 @@ func getRelativePathFromHeader(header textproto.MIMEHeader, defaultName string) 
 	}
 	return defaultName
 }
+
+// SaveSource inserts or updates a source record in the sources table.
+func (s *SourceService) SaveSource(ctx context.Context, src *models.Source) error {
+	if s.db == nil {
+		return nil
+	}
+	if src.ID == uuid.Nil {
+		src.ID = uuid.New()
+	}
+	now := time.Now()
+	if src.CreatedAt.IsZero() {
+		src.CreatedAt = now
+	}
+	src.UpdatedAt = now
+
+	metaJSON, _ := json.Marshal(src.Metadata)
+	if len(metaJSON) == 0 {
+		metaJSON = []byte("{}")
+	}
+
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO sources (id, owner_id, source_type, source_reference, agent_id, fingerprint, metadata, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		 ON CONFLICT (id) DO UPDATE SET
+		    source_type = EXCLUDED.source_type,
+		    source_reference = EXCLUDED.source_reference,
+		    agent_id = EXCLUDED.agent_id,
+		    fingerprint = EXCLUDED.fingerprint,
+		    metadata = EXCLUDED.metadata,
+		    updated_at = NOW()`,
+		src.ID, src.OwnerID, src.SourceType, src.SourceReference, src.AgentID, src.Fingerprint, metaJSON, src.CreatedAt, src.UpdatedAt,
+	)
+	return err
+}
+
+// GetSource retrieves a source record by ID and owner.
+func (s *SourceService) GetSource(ctx context.Context, id, ownerID uuid.UUID) (*models.Source, error) {
+	if s.db == nil {
+		return nil, ErrSourceDirNotFound
+	}
+	src := &models.Source{}
+	var metaJSON []byte
+	err := s.db.QueryRow(ctx,
+		`SELECT id, owner_id, source_type, source_reference, agent_id, fingerprint, metadata, created_at, updated_at
+		 FROM sources WHERE id = $1 AND owner_id = $2`,
+		id, ownerID,
+	).Scan(&src.ID, &src.OwnerID, &src.SourceType, &src.SourceReference, &src.AgentID, &src.Fingerprint, &metaJSON, &src.CreatedAt, &src.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrSourceDirNotFound
+		}
+		return nil, err
+	}
+	if len(metaJSON) > 0 {
+		_ = json.Unmarshal(metaJSON, &src.Metadata)
+	}
+	return src, nil
+}
+

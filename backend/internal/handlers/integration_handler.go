@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -210,7 +211,7 @@ func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	detection, err := h.githubService.DetectRepo(r.Context(), userID, owner, repo, branch, rootDir)
+	analysis, err := h.githubService.AnalyzeRepo(r.Context(), userID, owner, repo, branch, rootDir)
 	if err != nil {
 		if errors.Is(err, services.ErrGitHubNotConnected) {
 			writeError(w, http.StatusForbidden, "github repository access has not been granted")
@@ -220,5 +221,47 @@ func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	writeJSON(w, http.StatusOK, detection)
+	primaryRuntime := "generic"
+	primaryFramework := "generic"
+	primaryStrategy := "auto"
+	primaryPort := 8080
+	primaryHealthPath := "/health"
+	primaryHealthStrat := "auto"
+	primaryBuildCmd := ""
+	primaryStartCmd := ""
+
+	if len(analysis.Services) > 0 {
+		s0 := analysis.Services[0]
+		primaryRuntime = s0.RuntimeType
+		primaryFramework = s0.Framework
+		primaryStrategy = s0.BuildStrategy
+		primaryPort = s0.InternalPort
+		primaryHealthPath = s0.HealthCheckPath
+		primaryHealthStrat = s0.HealthStrategy
+		primaryBuildCmd = s0.BuildCommand
+		primaryStartCmd = s0.StartCommand
+	}
+
+	response := map[string]interface{}{
+		"source": map[string]interface{}{
+			"source_type":      "github",
+			"source_reference": fmt.Sprintf("%s/%s", owner, repo),
+			"branch":           branch,
+			"folder_name":      repo,
+			"root_dir":         rootDir,
+		},
+		"services":          analysis.Services,
+		"total_files":       analysis.TotalFiles,
+		"total_bytes":       analysis.TotalBytes,
+		"runtime":           primaryRuntime,
+		"framework":         primaryFramework,
+		"build_strategy":    primaryStrategy,
+		"suggested_port":    primaryPort,
+		"health_check_path": primaryHealthPath,
+		"health_strategy":   primaryHealthStrat,
+		"build_command":     primaryBuildCmd,
+		"start_command":     primaryStartCmd,
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }

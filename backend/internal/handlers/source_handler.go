@@ -404,7 +404,30 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 	}
 	meta["folder_name"] = req.FolderName
 
+	sourceRecord := &models.Source{
+		ID:              sourceUUID,
+		OwnerID:         userID,
+		SourceType:      models.SourceTypeLocalAgent,
+		SourceReference: sourceUUID.String(),
+		AgentID:         req.AgentID,
+		Metadata:        meta,
+	}
+
+	if h.sourceService != nil {
+		if err := h.sourceService.SaveSource(r.Context(), sourceRecord); err != nil {
+			slog.Error("failed to save agent source in database", "source_id", sourceUUID, "error", err)
+		}
+	}
+
 	res := map[string]interface{}{
+		"source": map[string]interface{}{
+			"id":               sourceUUID.String(),
+			"source_type":      models.SourceTypeLocalAgent,
+			"source_reference": sourceUUID.String(),
+			"agent_id":         req.AgentID,
+			"folder_name":      req.FolderName,
+			"metadata":         meta,
+		},
 		"source_id":   sourceUUID.String(),
 		"owner_id":    userID.String(),
 		"agent_id":    req.AgentID,

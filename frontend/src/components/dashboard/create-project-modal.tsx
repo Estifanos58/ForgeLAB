@@ -92,26 +92,31 @@ export interface ConfigurableService {
 
 function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): ConfigurableService {
   const candidates = def.build_candidates || [];
-  const defaultCandidate = candidates.length > 0 ? candidates[0] : null;
+  const defaultCandidate = candidates.length > 0 ? (candidates.find((c) => c.is_default) || candidates[0]) : null;
+
+  const runtime = def.runtime || def.runtime_type || def.language || 'generic';
+  const framework = def.framework || 'generic';
+  const pkgManager = def.package_manager || def.build_system || 'generic';
+  const strategy = (def.build_strategy as any) || (def.selected_build_strategy as any) || (defaultCandidate?.strategy === 'dockerfile' ? 'dockerfile' : 'auto');
 
   return {
     id: def.id || `svc-${idx}-${Date.now()}`,
     name: def.name || (def.role === 'frontend' ? 'frontend' : def.role === 'backend' ? 'backend' : `service-${idx + 1}`),
     role: def.role || 'other',
     source_path: def.source_path || '.',
-    runtime: def.language || 'generic',
-    framework: def.framework || 'generic',
-    package_manager: def.build_system || 'generic',
-    build_strategy: (def.selected_build_strategy as any) || (defaultCandidate?.strategy === 'dockerfile' ? 'dockerfile' : 'auto'),
+    runtime: runtime,
+    framework: framework,
+    package_manager: pkgManager,
+    build_strategy: strategy,
     selected_candidate_id: defaultCandidate?.id || '',
     build_candidates: candidates,
     build_command: def.build_command || defaultCandidate?.build_command || '',
     start_command: def.start_command || defaultCandidate?.start_command || '',
     internal_port: def.internal_port || defaultCandidate?.suggested_port || 8080,
-    dockerfile_path: defaultCandidate?.dockerfile_path || 'Dockerfile',
-    health_strategy: (def.health_strategy as any) || 'auto',
-    health_check_path: def.health_check_path || '/health',
-    expanded: idx === 0,
+    dockerfile_path: def.dockerfile_path || defaultCandidate?.dockerfile_path || 'Dockerfile',
+    health_strategy: (def.health_strategy as any) || (defaultCandidate?.health_strategy as any) || 'auto',
+    health_check_path: def.health_check_path || defaultCandidate?.health_check_path || '/health',
+    expanded: true,
   };
 }
 
@@ -292,6 +297,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       });
     }
     setConfiguredServices(services);
+    setStep('config');
   };
 
   const handleResetAgentSession = () => {
@@ -313,6 +319,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         if (candidate.suggested_port) svc.internal_port = candidate.suggested_port;
         if (candidate.dockerfile_path) svc.dockerfile_path = candidate.dockerfile_path;
         if (candidate.package_manager) svc.package_manager = candidate.package_manager;
+        if (candidate.health_strategy) svc.health_strategy = candidate.health_strategy as any;
+        if (candidate.health_check_path) svc.health_check_path = candidate.health_check_path;
       }
       next[svcIndex] = svc;
       return next;
@@ -422,7 +430,37 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     const [owner, name] = selectedRepo.full_name.split('/');
     try {
       const det = await api.integrations.github.detect(owner, name, selectedBranch, rootDir);
-      applyDetection(det, name);
+      setProjectName(name);
+
+      let svcs: ConfigurableService[] = [];
+      if (det.services && det.services.length > 0) {
+        svcs = det.services.map((s, idx) => mapDefinitionToConfigurable(s, idx));
+      } else {
+        svcs = [
+          mapDefinitionToConfigurable(
+            {
+              id: `svc-0-${Date.now()}`,
+              name: name,
+              role: 'other',
+              source_path: rootDir || '.',
+              runtime: det.runtime || 'generic',
+              runtime_type: det.runtime || 'generic',
+              framework: det.framework || 'generic',
+              package_manager: 'generic',
+              build_strategy: det.build_strategy || 'auto',
+              build_candidates: [],
+              build_command: det.build_command || '',
+              start_command: det.start_command || '',
+              internal_port: det.suggested_port || 8080,
+              dockerfile_path: 'Dockerfile',
+              health_strategy: det.health_strategy || 'auto',
+              health_check_path: det.health_check_path || '/health',
+            } as any,
+            0
+          ),
+        ];
+      }
+      setConfiguredServices(svcs);
       setStep('config');
     } catch (err: any) {
       setError(err.message || 'Failed to analyze repository');
@@ -493,16 +531,41 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           }
           setImportPhase('ready');
 
+          let svcs: ConfigurableService[] = [];
           if (status.analysis && status.analysis.services && status.analysis.services.length > 0) {
-            const mapped = status.analysis.services.map((s, idx) => mapDefinitionToConfigurable(s, idx));
-            setConfiguredServices(mapped);
+            svcs = status.analysis.services.map((s, idx) => mapDefinitionToConfigurable(s, idx));
+          } else if (status.services && status.services.length > 0) {
+            svcs = status.services.map((s, idx) => mapDefinitionToConfigurable(s, idx));
+          } else if (status.detection) {
+            svcs = [
+              mapDefinitionToConfigurable(
+                {
+                  id: `svc-0-${Date.now()}`,
+                  name: folderName,
+                  role: 'other',
+                  source_path: '.',
+                  runtime: status.detection.runtime || 'generic',
+                  runtime_type: status.detection.runtime || 'generic',
+                  framework: status.detection.framework || 'generic',
+                  package_manager: 'generic',
+                  build_strategy: status.detection.build_strategy || 'auto',
+                  build_candidates: [],
+                  build_command: status.detection.build_command || '',
+                  start_command: status.detection.start_command || '',
+                  internal_port: status.detection.suggested_port || 8080,
+                  dockerfile_path: 'Dockerfile',
+                  health_strategy: status.detection.health_strategy || 'auto',
+                  health_check_path: status.detection.health_check_path || '/health',
+                } as any,
+                0
+              ),
+            ];
           }
-
-          if (status.detection) {
-            applyDetection(status.detection, folderName);
-          } else {
-            setProjectName(folderName);
+          if (svcs.length > 0) {
+            setConfiguredServices(svcs);
           }
+          setProjectName(folderName);
+          setStep('config');
           return;
         }
 
@@ -597,6 +660,30 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     try {
       let payload: any;
 
+      if (configuredServices.length === 0) {
+        setError('At least one configured service is required');
+        setLoading(false);
+        return;
+      }
+
+      const servicesPayload = configuredServices.map((svc) => ({
+        name: svc.name.trim(),
+        role: svc.role,
+        source_path: svc.source_path,
+        runtime: svc.runtime,
+        runtime_type: svc.runtime,
+        framework: svc.framework,
+        package_manager: svc.package_manager,
+        build_strategy: svc.build_strategy,
+        build_candidates: svc.build_candidates,
+        build_command: svc.build_command,
+        start_command: svc.start_command,
+        dockerfile_path: svc.dockerfile_path,
+        internal_port: Number(svc.internal_port) || 8080,
+        health_strategy: svc.health_strategy,
+        health_check_path: svc.health_check_path,
+      }));
+
       if (sourceTab === 'github') {
         if (!selectedRepo) {
           setError('Please select a GitHub repository');
@@ -609,14 +696,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           source_reference: selectedRepo.full_name,
           branch: selectedBranch,
           build_context: rootDir,
-          dockerfile_path: dockerfilePath,
-          build_strategy: buildStrategy,
-          runtime_type: runtimeType,
-          internal_port: Number(internalPort) || 8080,
-          build_command: buildCommand,
-          start_command: startCommand,
-          health_strategy: healthStrategy,
-          health_check_path: healthStrategy === 'http' || healthStrategy === 'auto' ? healthCheckPath : undefined,
+          services: servicesPayload,
         };
       } else if (localMode === 'agent') {
         if (!agentSession) {
@@ -647,22 +727,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           agent_id: agentSession.agent_id,
           branch: 'main',
           build_context: '.',
-          services: configuredServices.map((svc) => ({
-            name: svc.name.trim(),
-            role: svc.role,
-            source_path: svc.source_path,
-            runtime_type: svc.runtime,
-            framework: svc.framework,
-            package_manager: svc.package_manager,
-            build_strategy: svc.build_strategy,
-            build_candidates: svc.build_candidates,
-            build_command: svc.build_command,
-            start_command: svc.start_command,
-            dockerfile_path: svc.dockerfile_path,
-            internal_port: Number(svc.internal_port) || 8080,
-            health_strategy: svc.health_strategy,
-            health_check_path: svc.health_check_path,
-          })),
+          services: servicesPayload,
         };
       } else {
         // Archive upload fallback
@@ -678,29 +743,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           source_reference: localSourceId,
           branch: 'main',
           build_context: '.',
-          build_strategy: buildStrategy,
-          runtime_type: runtimeType,
-          internal_port: Number(internalPort) || 8080,
-          build_command: buildCommand,
-          start_command: startCommand,
-          health_strategy: healthStrategy,
-          health_check_path: healthStrategy === 'http' || healthStrategy === 'auto' ? healthCheckPath : undefined,
-          services: configuredServices.length > 0 ? configuredServices.map((svc) => ({
-            name: svc.name.trim(),
-            role: svc.role,
-            source_path: svc.source_path,
-            runtime_type: svc.runtime,
-            framework: svc.framework,
-            package_manager: svc.package_manager,
-            build_strategy: svc.build_strategy,
-            build_candidates: svc.build_candidates,
-            build_command: svc.build_command,
-            start_command: svc.start_command,
-            dockerfile_path: svc.dockerfile_path,
-            internal_port: Number(svc.internal_port) || 8080,
-            health_strategy: svc.health_strategy,
-            health_check_path: svc.health_check_path,
-          })) : undefined,
+          services: servicesPayload,
         };
       }
 
@@ -997,321 +1040,26 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                           </div>
                         </div>
 
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          onClick={handleResetAgentSession}
-                          className="text-xs text-neutral-400 hover:text-white"
-                        >
-                          Change Folder
-                        </Button>
-                      </div>
-
-                      {/* Detected Services List */}
-                      <div className="space-y-3">
-                        <div className="flex items-center justify-between text-xs font-medium text-neutral-300">
-                          <span className="flex items-center gap-1.5">
-                            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                            Discovered Services ({configuredServices.length})
-                          </span>
-                          <button
+                        <div className="flex items-center gap-2">
+                          <Button
                             type="button"
-                            onClick={handleAddCustomService}
-                            className="text-[11px] text-primary hover:text-primary-hover flex items-center gap-1 font-mono transition-colors"
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleResetAgentSession}
+                            className="text-xs text-neutral-400 hover:text-white"
                           >
-                            <Plus className="w-3 h-3" /> Add Service
-                          </button>
+                            Change Folder
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="primary"
+                            size="sm"
+                            onClick={() => setStep('config')}
+                            icon={<ArrowRight className="w-3.5 h-3.5" />}
+                          >
+                            Continue to Configuration
+                          </Button>
                         </div>
-
-                        {configuredServices.map((svc, idx) => {
-                          const isFrontend = svc.role === 'frontend';
-                          const isBackend = svc.role === 'backend';
-
-                          return (
-                            <div
-                              key={svc.id}
-                              className="rounded-lg border border-surface-border bg-surface-elevated/20 p-4 space-y-3 transition-colors hover:border-surface-border/90"
-                            >
-                              {/* Service Card Top Header */}
-                              <div className="flex items-center justify-between">
-                                <div className="flex items-center gap-2.5">
-                                  <span
-                                    className={`px-2 py-0.5 rounded text-[11px] font-mono font-medium uppercase tracking-wider border ${
-                                      isFrontend
-                                        ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
-                                        : isBackend
-                                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                                        : 'bg-purple-500/10 text-purple-400 border-purple-500/20'
-                                    }`}
-                                  >
-                                    {svc.role}
-                                  </span>
-
-                                  <span className="text-sm font-semibold text-white">{svc.name}</span>
-                                  <span className="text-xs text-neutral-400 font-mono">
-                                    ({svc.source_path})
-                                  </span>
-                                </div>
-
-                                <div className="flex items-center gap-2">
-                                  <span className="text-xs font-mono text-neutral-400 bg-surface px-2 py-0.5 rounded border border-surface-border">
-                                    Port {svc.internal_port}
-                                  </span>
-                                  {configuredServices.length > 1 && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleRemoveService(idx)}
-                                      className="text-neutral-500 hover:text-rose-400 p-1 transition-colors"
-                                      title="Remove Service"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  )}
-                                  <button
-                                    type="button"
-                                    onClick={() => handleUpdateService(idx, 'expanded', !svc.expanded)}
-                                    className="text-neutral-400 hover:text-white p-1 transition-colors"
-                                  >
-                                    {svc.expanded ? (
-                                      <ChevronUp className="w-4 h-4" />
-                                    ) : (
-                                      <ChevronDown className="w-4 h-4" />
-                                    )}
-                                  </button>
-                                </div>
-                              </div>
-
-                              {/* Framework & Runtime Badges */}
-                              <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
-                                <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-surface border border-surface-border text-neutral-300">
-                                  <Sparkles className="w-3 h-3 text-amber-400" />
-                                  {svc.framework !== 'generic' ? svc.framework : svc.runtime}
-                                </span>
-                                {svc.package_manager && svc.package_manager !== 'generic' && (
-                                  <span className="px-2 py-0.5 rounded bg-surface border border-surface-border text-neutral-400">
-                                    {svc.package_manager}
-                                  </span>
-                                )}
-                                <span className="px-2 py-0.5 rounded bg-surface border border-surface-border text-neutral-400">
-                                  Strategy: {svc.build_strategy}
-                                </span>
-                              </div>
-
-                              {/* Build Candidates Selection if multiple exist */}
-                              {svc.build_candidates && svc.build_candidates.length > 1 && (
-                                <div className="space-y-1.5 pt-1">
-                                  <label className="block text-[11px] font-mono text-neutral-400">
-                                    Build Strategy & Candidates:
-                                  </label>
-                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
-                                    {svc.build_candidates.map((cand) => {
-                                      const isSelected = svc.selected_candidate_id === cand.id;
-                                      return (
-                                        <div
-                                          key={cand.id}
-                                          onClick={() => handleCandidateChange(idx, cand.id)}
-                                          className={`p-2.5 rounded border cursor-pointer transition-colors ${
-                                            isSelected
-                                              ? 'bg-primary/10 border-primary text-white'
-                                              : 'bg-surface border-surface-border text-neutral-400 hover:bg-surface-elevated'
-                                          }`}
-                                        >
-                                          <div className="flex items-center justify-between font-medium">
-                                            <span className="flex items-center gap-1.5 truncate">
-                                              {cand.strategy === 'dockerfile' ? (
-                                                <FileCode className="w-3.5 h-3.5 text-blue-400" />
-                                              ) : (
-                                                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                                              )}
-                                              {cand.name}
-                                            </span>
-                                            {cand.is_default && (
-                                              <span className="text-[9px] px-1 rounded bg-neutral-800 text-neutral-400 uppercase font-mono">
-                                                Default
-                                              </span>
-                                            )}
-                                          </div>
-                                          {cand.description && (
-                                            <p className="text-[10px] text-neutral-400 mt-1 line-clamp-1">
-                                              {cand.description}
-                                            </p>
-                                          )}
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              )}
-
-                              {/* Expanded Customizable Settings */}
-                              {svc.expanded && (
-                                <div className="p-3 rounded-md bg-surface/60 border border-surface-border space-y-3 pt-3 animate-in fade-in duration-100">
-                                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Service Name
-                                      </label>
-                                      <input
-                                        type="text"
-                                        value={svc.name}
-                                        onChange={(e) => handleUpdateService(idx, 'name', e.target.value)}
-                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      />
-                                    </div>
-
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Service Role
-                                      </label>
-                                      <select
-                                        value={svc.role}
-                                        onChange={(e) => handleUpdateService(idx, 'role', e.target.value)}
-                                        className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      >
-                                        <option value="frontend">Frontend</option>
-                                        <option value="backend">Backend</option>
-                                        <option value="worker">Worker</option>
-                                        <option value="other">Other / Service</option>
-                                      </select>
-                                    </div>
-
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Internal Port
-                                      </label>
-                                      <input
-                                        type="number"
-                                        value={svc.internal_port}
-                                        onChange={(e) =>
-                                          handleUpdateService(idx, 'internal_port', parseInt(e.target.value, 10) || 8080)
-                                        }
-                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      />
-                                    </div>
-                                  </div>
-
-                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Relative Source Path
-                                      </label>
-                                      <input
-                                        type="text"
-                                        value={svc.source_path}
-                                        onChange={(e) => handleUpdateService(idx, 'source_path', e.target.value)}
-                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      />
-                                    </div>
-
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Build Strategy
-                                      </label>
-                                      <select
-                                        value={svc.build_strategy}
-                                        onChange={(e) => handleUpdateService(idx, 'build_strategy', e.target.value)}
-                                        className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      >
-                                        <option value="auto">ForgeLAB Generated (Auto)</option>
-                                        <option value="dockerfile">Existing Dockerfile</option>
-                                        <option value="custom">Custom Commands</option>
-                                      </select>
-                                    </div>
-                                  </div>
-
-                                  {svc.build_strategy === 'dockerfile' && (
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Dockerfile Path
-                                      </label>
-                                      <input
-                                        type="text"
-                                        value={svc.dockerfile_path}
-                                        onChange={(e) => handleUpdateService(idx, 'dockerfile_path', e.target.value)}
-                                        placeholder="Dockerfile"
-                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      />
-                                    </div>
-                                  )}
-
-                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Build Command (Optional)
-                                      </label>
-                                      <input
-                                        type="text"
-                                        value={svc.build_command}
-                                        onChange={(e) => handleUpdateService(idx, 'build_command', e.target.value)}
-                                        placeholder="e.g. npm run build"
-                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      />
-                                    </div>
-
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Start Command (Optional)
-                                      </label>
-                                      <input
-                                        type="text"
-                                        value={svc.start_command}
-                                        onChange={(e) => handleUpdateService(idx, 'start_command', e.target.value)}
-                                        placeholder="e.g. npm start"
-                                        className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      />
-                                    </div>
-                                  </div>
-
-                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                                    <div>
-                                      <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                        Health Strategy
-                                      </label>
-                                      <select
-                                        value={svc.health_strategy}
-                                        onChange={(e) => handleUpdateService(idx, 'health_strategy', e.target.value)}
-                                        className="w-full h-8 px-2 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                      >
-                                        <option value="auto">Automatic</option>
-                                        <option value="http">HTTP Endpoint</option>
-                                        <option value="tcp">TCP Socket</option>
-                                        <option value="none">None</option>
-                                      </select>
-                                    </div>
-
-                                    {svc.health_strategy !== 'none' && svc.health_strategy !== 'tcp' && (
-                                      <div>
-                                        <label className="block text-[11px] font-mono text-neutral-400 mb-1">
-                                          Health Path
-                                        </label>
-                                        <input
-                                          type="text"
-                                          value={svc.health_check_path}
-                                          onChange={(e) => handleUpdateService(idx, 'health_check_path', e.target.value)}
-                                          placeholder="/health"
-                                          className="w-full h-8 px-2.5 rounded bg-surface border border-surface-border text-xs text-white font-mono focus:outline-none focus:border-neutral-500"
-                                        />
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      <div className="flex justify-end pt-2">
-                        <Button
-                          type="button"
-                          variant="primary"
-                          size="sm"
-                          onClick={() => setStep('config')}
-                          icon={<ArrowRight className="w-3.5 h-3.5" />}
-                        >
-                          Continue to Project Setup
-                        </Button>
                       </div>
                     </div>
                   )}
@@ -1786,170 +1534,336 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             helperText="Unique parent identifier for your application and services."
           />
 
-          {/* If Multi-Service (from Local Agent or Archive Analysis) */}
-          {configuredServices.length > 0 ? (
-            <div className="space-y-3">
-              {/* Isolated Project Network Callout */}
+          {/* Services Configuration List */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-primary" />
+                  Configured Services ({configuredServices.length})
+                </h3>
+                <p className="text-[11px] text-neutral-400">
+                  Review and customize runtime, build candidates, and ports for each detected service.
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="text-xs h-7"
+                onClick={handleAddCustomService}
+                icon={<Plus className="w-3.5 h-3.5" />}
+              >
+                Add Service
+              </Button>
+            </div>
+
+            {configuredServices.map((svc, svcIdx) => {
+              const isExpanded = svc.expanded ?? true;
+              return (
+                <div
+                  key={svc.id || svcIdx}
+                  className="rounded-lg border border-surface-border bg-surface overflow-hidden transition-colors"
+                >
+                  {/* Service Header */}
+                  <div
+                    className="p-3.5 flex items-center justify-between cursor-pointer hover:bg-surface-elevated/50 border-b border-surface-border/50"
+                    onClick={() => handleUpdateService(svcIdx, 'expanded', !isExpanded)}
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] uppercase font-bold tracking-wide border ${
+                          svc.role === 'frontend'
+                            ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+                            : svc.role === 'backend'
+                            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                            : 'bg-purple-500/10 text-purple-400 border-purple-500/20'
+                        }`}
+                      >
+                        {svc.role}
+                      </span>
+                      <span className="font-semibold text-white text-sm font-mono">{svc.name || 'unnamed-service'}</span>
+                      <span className="text-neutral-400 text-xs font-mono">({svc.source_path})</span>
+                      <span className="text-neutral-500 text-xs">
+                        · {svc.framework && svc.framework !== 'generic' ? svc.framework : svc.runtime}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-mono text-neutral-400 bg-surface-elevated px-2 py-0.5 rounded border border-surface-border">
+                        Port {svc.internal_port}
+                      </span>
+                      {configuredServices.length > 1 && (
+                        <button
+                          type="button"
+                          className="p-1 rounded text-neutral-400 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRemoveService(svcIdx);
+                          }}
+                          title="Remove service"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                      <button type="button" className="p-1 text-neutral-400 hover:text-white">
+                        {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Service Details (when expanded) */}
+                  {isExpanded && (
+                    <div className="p-4 space-y-4 bg-surface/50">
+                      {/* Service Identity & Path */}
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                        <Input
+                          label="Service Name"
+                          required
+                          placeholder="e.g. frontend"
+                          value={svc.name}
+                          onChange={(e) => handleUpdateService(svcIdx, 'name', e.target.value)}
+                          className="font-mono text-xs"
+                        />
+
+                        <div>
+                          <label className="block text-xs font-medium text-neutral-300 mb-1">
+                            Service Role
+                          </label>
+                          <select
+                            value={svc.role}
+                            onChange={(e) => handleUpdateService(svcIdx, 'role', e.target.value as ServiceRole)}
+                            className="w-full h-9 px-3 rounded bg-surface border border-surface-border text-xs text-white focus:outline-none focus:border-neutral-500 font-mono"
+                          >
+                            <option value="frontend">Frontend</option>
+                            <option value="backend">Backend</option>
+                            <option value="worker">Worker / Background Job</option>
+                            <option value="database">Database</option>
+                            <option value="other">Other</option>
+                          </select>
+                        </div>
+
+                        <Input
+                          label="Source Path"
+                          required
+                          placeholder="e.g. ./frontend or ."
+                          value={svc.source_path}
+                          onChange={(e) => handleUpdateService(svcIdx, 'source_path', e.target.value)}
+                          helperText="Relative path within repo/source"
+                          className="font-mono text-xs"
+                        />
+                      </div>
+
+                      {/* Runtime & Framework Info */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <Input
+                          label="Runtime / Language"
+                          placeholder="e.g. node, python, go, java"
+                          value={svc.runtime}
+                          onChange={(e) => handleUpdateService(svcIdx, 'runtime', e.target.value)}
+                          className="font-mono text-xs"
+                        />
+
+                        <Input
+                          label="Detected Framework"
+                          placeholder="e.g. Next.js, FastAPI, Spring Boot"
+                          value={svc.framework}
+                          onChange={(e) => handleUpdateService(svcIdx, 'framework', e.target.value)}
+                          className="font-mono text-xs"
+                        />
+                      </div>
+
+                      {/* Build Candidates Selection */}
+                      {svc.build_candidates && svc.build_candidates.length > 0 ? (
+                        <div className="space-y-1.5">
+                          <label className="block text-xs font-medium text-neutral-300">
+                            Build Candidates ({svc.build_candidates.length} detected)
+                          </label>
+                          <div className="grid grid-cols-1 gap-2">
+                            {svc.build_candidates.map((cand) => {
+                              const isSelected =
+                                svc.selected_candidate_id === cand.id ||
+                                (!svc.selected_candidate_id && cand.strategy === svc.build_strategy);
+                              return (
+                                <div
+                                  key={cand.id}
+                                  onClick={() => handleCandidateChange(svcIdx, cand.id)}
+                                  className={`p-3 rounded-lg border text-left cursor-pointer transition-all ${
+                                    isSelected
+                                      ? 'border-primary bg-primary/10 shadow-sm ring-1 ring-primary/30'
+                                      : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-300'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <div className="flex items-center gap-2">
+                                      <input
+                                        type="radio"
+                                        name={`candidate-${svc.id}`}
+                                        checked={isSelected}
+                                        onChange={() => handleCandidateChange(svcIdx, cand.id)}
+                                        className="text-primary focus:ring-0"
+                                      />
+                                      <span className="font-semibold text-xs text-white">
+                                        {cand.name}
+                                      </span>
+                                      {cand.is_default && (
+                                        <span className="text-[10px] bg-primary/20 text-primary-light px-1.5 py-0.5 rounded font-mono font-medium">
+                                          Recommended
+                                        </span>
+                                      )}
+                                    </div>
+                                    <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-surface-elevated text-neutral-300 border border-surface-border">
+                                      {cand.strategy}
+                                    </span>
+                                  </div>
+                                  {cand.description && (
+                                    <p className="text-[11px] text-neutral-400 mt-1 pl-5">
+                                      {cand.description}
+                                    </p>
+                                  )}
+                                  <div className="flex items-center gap-3 mt-2 pl-5 text-[10px] text-neutral-400 font-mono">
+                                    {cand.dockerfile_path && <span>Dockerfile: {cand.dockerfile_path}</span>}
+                                    {cand.build_command && <span>Build: {cand.build_command}</span>}
+                                    {cand.start_command && <span>Start: {cand.start_command}</span>}
+                                    {cand.suggested_port && <span>Port: {cand.suggested_port}</span>}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : (
+                        /* Fallback Strategy Switcher if no candidates array */
+                        <div className="space-y-1.5">
+                          <label className="block text-xs font-medium text-neutral-300">Build Strategy</label>
+                          <div className="grid grid-cols-2 gap-2 text-xs">
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateService(svcIdx, 'build_strategy', 'auto')}
+                              className={`p-2.5 rounded border text-left transition-colors ${
+                                svc.build_strategy === 'auto'
+                                  ? 'border-primary bg-primary/10 text-white'
+                                  : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-400'
+                              }`}
+                            >
+                              <div className="font-medium flex items-center gap-1.5">
+                                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                                Automatic (ForgeLAB)
+                              </div>
+                              <div className="text-[11px] text-neutral-400 mt-1">
+                                Builds using detected runtime without requiring a Dockerfile.
+                              </div>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateService(svcIdx, 'build_strategy', 'dockerfile')}
+                              className={`p-2.5 rounded border text-left transition-colors ${
+                                svc.build_strategy === 'dockerfile'
+                                  ? 'border-primary bg-primary/10 text-white'
+                                  : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-400'
+                              }`}
+                            >
+                              <div className="font-medium flex items-center gap-1.5">
+                                <FileCode className="w-3.5 h-3.5 text-neutral-300" />
+                                Dockerfile
+                              </div>
+                              <div className="text-[11px] text-neutral-400 mt-1">
+                                Uses Dockerfile located inside your source path.
+                              </div>
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Dockerfile Path (if strategy is dockerfile) */}
+                      {svc.build_strategy === 'dockerfile' && (
+                        <Input
+                          label="Dockerfile Path"
+                          placeholder="Dockerfile"
+                          value={svc.dockerfile_path}
+                          onChange={(e) => handleUpdateService(svcIdx, 'dockerfile_path', e.target.value)}
+                          className="font-mono text-xs"
+                        />
+                      )}
+
+                      {/* Ports & Health Strategy */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <Input
+                          label="Internal Port"
+                          type="number"
+                          required
+                          placeholder="e.g. 3000, 8000, 8080"
+                          value={svc.internal_port}
+                          onChange={(e) => handleUpdateService(svcIdx, 'internal_port', parseInt(e.target.value, 10) || 8080)}
+                          helperText="Internal port the service listens on inside its container."
+                          className="font-mono text-xs"
+                        />
+
+                        <div>
+                          <label className="block text-xs font-medium text-neutral-300 mb-1">
+                            Health Check Strategy
+                          </label>
+                          <select
+                            value={svc.health_strategy}
+                            onChange={(e) => handleUpdateService(svcIdx, 'health_strategy', e.target.value as any)}
+                            className="w-full h-9 px-3 rounded bg-surface border border-surface-border text-xs text-white focus:outline-none focus:border-neutral-500 font-mono"
+                          >
+                            <option value="auto">Automatic</option>
+                            <option value="http">HTTP Endpoint</option>
+                            <option value="tcp">TCP Socket</option>
+                            <option value="none">None</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      {(svc.health_strategy === 'http' || svc.health_strategy === 'auto') && (
+                        <Input
+                          label="Health Check Path"
+                          placeholder="/health or /"
+                          value={svc.health_check_path}
+                          onChange={(e) => handleUpdateService(svcIdx, 'health_check_path', e.target.value)}
+                          className="font-mono text-xs"
+                        />
+                      )}
+
+                      {/* Build & Start Commands */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <Input
+                          label="Build Command (Optional)"
+                          placeholder="e.g. npm run build"
+                          value={svc.build_command}
+                          onChange={(e) => handleUpdateService(svcIdx, 'build_command', e.target.value)}
+                          className="font-mono text-xs"
+                        />
+
+                        <Input
+                          label="Start Command (Optional)"
+                          placeholder="e.g. npm start"
+                          value={svc.start_command}
+                          onChange={(e) => handleUpdateService(svcIdx, 'start_command', e.target.value)}
+                          className="font-mono text-xs"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Isolated Project Network Callout if multiple services */}
+            {configuredServices.length > 1 && (
               <div className="p-3 rounded-md bg-surface border border-surface-border text-xs space-y-1.5">
                 <div className="font-semibold text-white flex items-center gap-2">
                   <ShieldCheck className="w-4 h-4 text-emerald-400" />
                   <span>Isolated Project Network & Internal DNS</span>
                 </div>
                 <p className="text-[11px] text-neutral-400 leading-relaxed font-mono">
-                  Services are deployed onto an isolated Docker bridge network. Services can reach each other directly via their service names (e.g. <span className="text-emerald-400">http://backend:{configuredServices.find(s => s.role === 'backend')?.internal_port || 8080}</span>) without public internet round-trips.
+                  Services are deployed onto an isolated Docker bridge network. Services can reach each other directly via their service names (e.g. <span className="text-emerald-400">http://{configuredServices.find((s) => s.role === 'backend')?.name || 'backend'}:{configuredServices.find((s) => s.role === 'backend')?.internal_port || 8080}</span>) without public internet round-trips.
                 </p>
               </div>
-
-              {/* Service Deployment List Review */}
-              <div className="space-y-2">
-                <label className="block text-xs font-medium text-neutral-300">
-                  Services to Deploy in Release #1 ({configuredServices.length})
-                </label>
-                <div className="divide-y divide-surface-border rounded border border-surface-border bg-surface">
-                  {configuredServices.map((svc) => (
-                    <div key={svc.id} className="p-3 flex items-center justify-between text-xs font-mono">
-                      <div className="flex items-center gap-2.5">
-                        <span
-                          className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold border ${
-                            svc.role === 'frontend'
-                              ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
-                              : svc.role === 'backend'
-                              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                              : 'bg-purple-500/10 text-purple-400 border-purple-500/20'
-                          }`}
-                        >
-                          {svc.role}
-                        </span>
-                        <span className="font-semibold text-white">{svc.name}</span>
-                        <span className="text-neutral-500 text-[11px] font-sans">
-                          {svc.framework !== 'generic' ? svc.framework : svc.runtime} · {svc.source_path}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-3">
-                        <span className="text-neutral-400 text-[11px]">
-                          Strategy: <strong className="text-neutral-200">{svc.build_strategy}</strong>
-                        </span>
-                        <span className="text-neutral-400 text-[11px] bg-surface-elevated px-2 py-0.5 rounded">
-                          Port {svc.internal_port}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          ) : (
-            /* Single Service GitHub / Simple Fallback Configuration */
-            <div className="space-y-4">
-              <div className="space-y-1.5">
-                <label className="block text-xs font-medium text-neutral-300">Build Strategy</label>
-                <div className="grid grid-cols-2 gap-2 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => setBuildStrategy('auto')}
-                    className={`p-2.5 rounded border text-left transition-colors ${
-                      buildStrategy === 'auto'
-                        ? 'border-primary bg-primary/10 text-white'
-                        : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-400'
-                    }`}
-                  >
-                    <div className="font-medium flex items-center gap-1.5">
-                      <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                      Automatic
-                    </div>
-                    <div className="text-[11px] text-neutral-400 mt-1">
-                      Builds using detected {detectedFramework} runtime without requiring a Dockerfile.
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setBuildStrategy('dockerfile')}
-                    className={`p-2.5 rounded border text-left transition-colors ${
-                      buildStrategy === 'dockerfile'
-                        ? 'border-primary bg-primary/10 text-white'
-                        : 'border-surface-border bg-surface hover:bg-surface-elevated text-neutral-400'
-                    }`}
-                  >
-                    <div className="font-medium flex items-center gap-1.5">
-                      <FileCode className="w-3.5 h-3.5 text-neutral-300" />
-                      Dockerfile
-                    </div>
-                    <div className="text-[11px] text-neutral-400 mt-1">
-                      Uses Dockerfile located inside your repository.
-                    </div>
-                  </button>
-                </div>
-              </div>
-
-              {buildStrategy === 'dockerfile' && (
-                <Input
-                  label="Dockerfile Path"
-                  placeholder="Dockerfile"
-                  value={dockerfilePath}
-                  onChange={(e) => setDockerfilePath(e.target.value)}
-                  className="font-mono text-xs"
-                />
-              )}
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Input
-                  label="Application Port"
-                  type="number"
-                  required
-                  placeholder="e.g. 3000, 8000, 8080"
-                  value={internalPort}
-                  onChange={(e) => setInternalPort(parseInt(e.target.value, 10) || 8080)}
-                  helperText="Internal port container listens on."
-                  className="font-mono text-xs"
-                />
-
-                <div>
-                  <label className="block text-xs font-medium text-neutral-300 mb-1">
-                    Health Strategy
-                  </label>
-                  <select
-                    value={healthStrategy}
-                    onChange={(e) => setHealthStrategy(e.target.value as any)}
-                    className="w-full h-9 px-3 rounded bg-surface border border-surface-border text-xs text-white focus:outline-none focus:border-neutral-500 font-mono"
-                  >
-                    <option value="auto">Automatic</option>
-                    <option value="http">HTTP Endpoint</option>
-                    <option value="tcp">TCP Socket</option>
-                    <option value="none">None</option>
-                  </select>
-                </div>
-              </div>
-
-              {(healthStrategy === 'http' || healthStrategy === 'auto') && (
-                <Input
-                  label="Health Check Path"
-                  placeholder="/health or /"
-                  value={healthCheckPath}
-                  onChange={(e) => setHealthCheckPath(e.target.value)}
-                  className="font-mono text-xs"
-                />
-              )}
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Input
-                  label="Build Command (Optional)"
-                  placeholder="e.g. npm run build"
-                  value={buildCommand}
-                  onChange={(e) => setBuildCommand(e.target.value)}
-                  className="font-mono text-xs"
-                />
-
-                <Input
-                  label="Start Command (Optional)"
-                  placeholder="e.g. npm start"
-                  value={startCommand}
-                  onChange={(e) => setStartCommand(e.target.value)}
-                  className="font-mono text-xs"
-                />
-              </div>
-            </div>
-          )}
+            )}
+          </div>
 
           {/* Action Buttons */}
           <div className="pt-3 border-t border-surface-border flex items-center justify-between">
@@ -1967,7 +1881,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 Cancel
               </Button>
               <Button type="submit" variant="primary" size="sm" loading={loading}>
-                Create & Deploy Project
+                Create Project
               </Button>
             </div>
           </div>

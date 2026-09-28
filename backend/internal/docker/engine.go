@@ -367,13 +367,8 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					svcContextDir = buildSourceDir
 				}
 
-				hasExistingDF := false
-				if _, err := os.Stat(filepath.Join(svcContextDir, "Dockerfile")); err == nil {
-					hasExistingDF = true
-				}
-
 				var virtualFiles map[string][]byte
-				if svc.BuildStrategy == models.BuildStrategyAuto && !hasExistingDF {
+				if svc.BuildStrategy == models.BuildStrategyAuto {
 					intPort := svc.InternalPort
 					if intPort <= 0 {
 						intPort = 8080
@@ -382,6 +377,12 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					relDockerPath = "Dockerfile.forgelab"
 					virtualFiles = map[string][]byte{
 						"Dockerfile.forgelab": []byte(generatedContent),
+					}
+				} else {
+					if svc.DockerfilePath != "" {
+						relDockerPath = svc.DockerfilePath
+					} else {
+						relDockerPath = "Dockerfile"
 					}
 				}
 

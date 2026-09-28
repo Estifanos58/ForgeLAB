@@ -66,6 +66,7 @@ type CreateServiceInput struct {
 	Name            string                   `json:"name"`
 	Role            string                   `json:"role"`
 	SourcePath      string                   `json:"source_path"`
+	Runtime         string                   `json:"runtime"`
 	RuntimeType     string                   `json:"runtime_type"`
 	Framework       string                   `json:"framework"`
 	PackageManager  string                   `json:"package_manager"`
@@ -245,6 +246,22 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		runtimeType = "generic"
 	}
 
+	// If services provided, sync primary project metadata from first service
+	if len(input.Services) > 0 {
+		firstSvc := input.Services[0]
+		if strings.TrimSpace(firstSvc.RuntimeType) != "" {
+			runtimeType = strings.TrimSpace(firstSvc.RuntimeType)
+		} else if strings.TrimSpace(firstSvc.Runtime) != "" {
+			runtimeType = strings.TrimSpace(firstSvc.Runtime)
+		}
+		if firstSvc.InternalPort > 0 {
+			internalPort = firstSvc.InternalPort
+		}
+		if strings.TrimSpace(firstSvc.BuildStrategy) != "" {
+			buildStrategy = strings.TrimSpace(firstSvc.BuildStrategy)
+		}
+	}
+
 	healthCheckPath := "/health"
 	if input.HealthCheckPath != nil {
 		healthCheckPath = *input.HealthCheckPath
@@ -258,17 +275,24 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 	if parsedUUID, err := uuid.Parse(sourceRef); err == nil {
 		sourceUUID = parsedUUID
 	}
-	var agentIDPtr *string
-	if strings.TrimSpace(input.AgentID) != "" {
-		agentTrim := strings.TrimSpace(input.AgentID)
-		agentIDPtr = &agentTrim
+	agentIDStr := strings.TrimSpace(input.AgentID)
+	if s.sourceService != nil {
+		_ = s.sourceService.SaveSource(ctx, &models.Source{
+			ID:              sourceUUID,
+			OwnerID:         ownerID,
+			SourceType:      sourceType,
+			SourceReference: sourceRef,
+			AgentID:         agentIDStr,
+			Metadata:        map[string]interface{}{},
+		})
+	} else if s.db != nil {
+		_, _ = s.db.Exec(ctx,
+			`INSERT INTO sources (id, owner_id, source_type, source_reference, agent_id, metadata, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, '{}', NOW(), NOW())
+			 ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
+			sourceUUID, ownerID, sourceType, sourceRef, agentIDStr,
+		)
 	}
-	_, _ = s.db.Exec(ctx,
-		`INSERT INTO sources (id, owner_id, agent_id, type, reference, status, metadata)
-		 VALUES ($1, $2, $3, $4, $5, 'ready', '{}')
-		 ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
-		sourceUUID, ownerID, agentIDPtr, sourceType, sourceRef,
-	)
 	sourceIDPtr = &sourceUUID
 
 	project := &models.Project{
@@ -354,6 +378,23 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 					svcHealthPath = *svcIn.HealthCheckPath
 				}
 
+				rt := strings.TrimSpace(svcIn.RuntimeType)
+				if rt == "" {
+					rt = strings.TrimSpace(svcIn.Runtime)
+				}
+				if rt == "" {
+					rt = "generic"
+				}
+
+				dfPath := strings.TrimSpace(svcIn.DockerfilePath)
+				if dfPath == "" {
+					dfPath = "Dockerfile"
+				}
+				bCtx := strings.TrimSpace(svcIn.BuildContext)
+				if bCtx == "" {
+					bCtx = svcSourcePath
+				}
+
 				svc := &models.Service{
 					ID:                  uuid.New(),
 					ProjectID:           project.ID,
@@ -361,15 +402,15 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 					Name:                svcName,
 					Role:                svcRole,
 					SourcePath:          svcSourcePath,
-					RuntimeType:         svcIn.RuntimeType,
+					RuntimeType:         rt,
 					Framework:           svcIn.Framework,
 					PackageManager:      svcIn.PackageManager,
 					BuildStrategy:       svcStrat,
 					BuildCandidates:     svcIn.BuildCandidates,
 					BuildCommand:        strings.TrimSpace(svcIn.BuildCommand),
 					StartCommand:        strings.TrimSpace(svcIn.StartCommand),
-					DockerfilePath:      svcIn.DockerfilePath,
-					BuildContext:        svcIn.BuildContext,
+					DockerfilePath:      dfPath,
+					BuildContext:        bCtx,
 					InternalPort:        svcPort,
 					HostPort:            svcIn.HostPort,
 					PublicExposed:       svcIn.PublicExposed,
@@ -455,6 +496,31 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID) ([
 		}
 		if s.db != nil {
 			svcs, _ := s.getServiceService().ListServices(ctx, p.ID)
+			if len(svcs) == 0 {
+				svcs = []*models.Service{
+					{
+						ID:                 p.ID,
+						ProjectID:          p.ID,
+						SourceID:           p.SourceID,
+						Name:               p.Name,
+						Role:               models.RoleOther,
+						SourcePath:         p.BuildContext,
+						RuntimeType:        p.RuntimeType,
+						BuildStrategy:      p.BuildStrategy,
+						BuildCommand:       p.BuildCommand,
+						StartCommand:       p.StartCommand,
+						DockerfilePath:     p.DockerfilePath,
+						BuildContext:       p.BuildContext,
+						InternalPort:       p.InternalPort,
+						HostPort:           p.Port,
+						PublicExposed:      true,
+						HealthStrategy:     p.HealthStrategy,
+						HealthCheckPath:    p.HealthCheckPath,
+						HealthCheckEnabled: p.HealthCheckEnabled,
+						Status:             p.Status,
+					},
+				}
+			}
 			p.Services = svcs
 		}
 		projects = append(projects, p)
@@ -610,6 +676,31 @@ func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, pro
 	}
 	if s.db != nil {
 		svcs, _ := s.getServiceService().ListServices(ctx, p.ID)
+		if len(svcs) == 0 {
+			svcs = []*models.Service{
+				{
+					ID:                 p.ID,
+					ProjectID:          p.ID,
+					SourceID:           p.SourceID,
+					Name:               p.Name,
+					Role:               models.RoleOther,
+					SourcePath:         p.BuildContext,
+					RuntimeType:        p.RuntimeType,
+					BuildStrategy:      p.BuildStrategy,
+					BuildCommand:       p.BuildCommand,
+					StartCommand:       p.StartCommand,
+					DockerfilePath:     p.DockerfilePath,
+					BuildContext:       p.BuildContext,
+					InternalPort:       p.InternalPort,
+					HostPort:           p.Port,
+					PublicExposed:      true,
+					HealthStrategy:     p.HealthStrategy,
+					HealthCheckPath:    p.HealthCheckPath,
+					HealthCheckEnabled: p.HealthCheckEnabled,
+					Status:             p.Status,
+				},
+			}
+		}
 		p.Services = svcs
 	}
 	return p, nil

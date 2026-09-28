@@ -88,7 +88,7 @@ export function LifecycleControls({ project, onActionComplete, onError, onDeploy
         onClick={handleDeploy}
         icon={<Rocket className="w-3.5 h-3.5" />}
       >
-        {isDeploying ? 'Deploying...' : 'Deploy'}
+        {isDeploying ? 'Deploying...' : 'Deploy Project'}
       </Button>
 
       {/* Conditional Lifecycle Controls */}

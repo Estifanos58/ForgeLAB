@@ -24,9 +24,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/forgelab/backend/internal/analyzer"
 	"github.com/forgelab/backend/internal/config"
 	"github.com/forgelab/backend/internal/crypto"
 	"github.com/forgelab/backend/internal/detector"
+	"github.com/forgelab/backend/internal/models"
 )
 
 var (
@@ -529,6 +531,114 @@ func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner,
 	}
 
 	return detector.DetectFromFiles(filesMap), nil
+}
+
+// AnalyzeRepo acquires the repository archive and runs analyzer.AnalyzeRepository to produce normalized services
+func (s *GitHubService) AnalyzeRepo(ctx context.Context, userID uuid.UUID, owner, repo, branch, rootDir string) (*analyzer.AnalysisResult, error) {
+	if branch == "" {
+		branch = "main"
+	}
+
+	targetDir := filepath.Join(os.TempDir(), fmt.Sprintf("forgelab-gh-%s-%s-%s", owner, repo, branch))
+	_ = os.RemoveAll(targetDir)
+	_ = os.MkdirAll(targetDir, 0755)
+
+	err := s.AcquireRepoTarball(ctx, userID, owner, repo, branch, targetDir)
+	if err == nil {
+		analysisDir := targetDir
+		if rootDir != "" && rootDir != "." {
+			analysisDir = filepath.Join(targetDir, rootDir)
+		}
+		res, aErr := analyzer.AnalyzeRepository(analysisDir)
+		if aErr == nil && res != nil && len(res.Services) > 0 {
+			res.RepositoryName = repo
+			return res, nil
+		}
+	}
+
+	// Fallback to lightweight file-based detection if tarball download fails
+	det, detErr := s.DetectRepo(ctx, userID, owner, repo, branch, rootDir)
+	if detErr != nil {
+		if err != nil {
+			return nil, fmt.Errorf("failed to analyze repository: %w (fallback: %v)", err, detErr)
+		}
+		return nil, detErr
+	}
+
+	// Convert single detection result into normalized AnalysisResult with build candidates
+	candidates := []models.BuildCandidate{
+		{
+			ID:              "auto",
+			Strategy:        "auto",
+			Name:            fmt.Sprintf("ForgeLAB %s Build", det.Framework),
+			Description:     fmt.Sprintf("ForgeLAB optimized multi-stage build for %s", det.Framework),
+			Confidence:      0.85,
+			BuildCommand:    det.BuildCommand,
+			StartCommand:    det.StartCommand,
+			SuggestedPort:   det.SuggestedPort,
+			HealthCheckPath: det.HealthCheckPath,
+			HealthStrategy:  det.HealthStrategy,
+		},
+		{
+			ID:              "dockerfile",
+			Strategy:        "dockerfile",
+			Name:            "Existing Dockerfile",
+			Description:     "Build using the repository Dockerfile",
+			Confidence:      0.80,
+			DockerfilePath:  "Dockerfile",
+			SuggestedPort:   det.SuggestedPort,
+			HealthCheckPath: det.HealthCheckPath,
+			HealthStrategy:  det.HealthStrategy,
+		},
+		{
+			ID:              "custom",
+			Strategy:        "custom",
+			Name:            "Custom Build",
+			Description:     "Specify custom build and startup commands",
+			Confidence:      0.50,
+			BuildCommand:    det.BuildCommand,
+			StartCommand:    det.StartCommand,
+			SuggestedPort:   det.SuggestedPort,
+			HealthCheckPath: det.HealthCheckPath,
+			HealthStrategy:  det.HealthStrategy,
+		},
+	}
+
+	strat := det.BuildStrategy
+	if strat == "" {
+		strat = "auto"
+	}
+
+	sourcePath := rootDir
+	if sourcePath == "" {
+		sourcePath = "."
+	}
+
+	return &analyzer.AnalysisResult{
+		RepositoryName: repo,
+		TotalFiles:     1,
+		TotalBytes:     1024,
+		Services: []analyzer.ServiceDefinition{
+			{
+				Name:               repo,
+				Role:               models.RoleOther,
+				SourcePath:         sourcePath,
+				Runtime:            det.Runtime,
+				RuntimeType:        det.Runtime,
+				Framework:          det.Framework,
+				BuildStrategy:      strat,
+				BuildCandidates:    candidates,
+				BuildCommand:       det.BuildCommand,
+				StartCommand:       det.StartCommand,
+				DockerfilePath:     "Dockerfile",
+				BuildContext:       sourcePath,
+				InternalPort:       det.SuggestedPort,
+				HealthStrategy:     det.HealthStrategy,
+				HealthCheckPath:    det.HealthCheckPath,
+				HealthCheckEnabled: true,
+			},
+		},
+	}, nil
 }
 
 // AcquireRepoTarball downloads and safely extracts an authorized GitHub repository tarball.
