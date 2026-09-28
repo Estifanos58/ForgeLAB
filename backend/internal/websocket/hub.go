@@ -49,6 +49,12 @@ type EventMessage struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
+type RedisEnvelope struct {
+	NodeID  string        `json:"node_id"`
+	Channel string        `json:"channel"`
+	Event   *EventMessage `json:"event"`
+}
+
 // ProjectAuthorizer defines the interface required by the Hub for verifying project ownership.
 type ProjectAuthorizer interface {
 	GetProject(ctx context.Context, id, ownerID uuid.UUID) (*models.Project, error)
@@ -60,6 +66,7 @@ type DeploymentResolver interface {
 }
 
 type Hub struct {
+	nodeID            string
 	clients           map[*Client]bool
 	channels          map[string]map[*Client]bool
 	register          chan *Client
@@ -76,6 +83,7 @@ type Hub struct {
 func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deploymentService DeploymentResolver, redisClient *redis.Client) *Hub {
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
+		nodeID:            uuid.New().String(),
 		clients:           make(map[*Client]bool),
 		channels:          make(map[string]map[*Client]bool),
 		register:          make(chan *Client),
@@ -93,6 +101,16 @@ func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deplo
 		go h.listenRedisPubSub()
 	}
 	return h
+}
+
+// NodeID returns the unique runtime identifier of this backend instance.
+func (h *Hub) NodeID() string {
+	return h.nodeID
+}
+
+// Close stops the Hub and background goroutines.
+func (h *Hub) Close() {
+	h.cancel()
 }
 
 func (h *Hub) run() {
@@ -132,79 +150,131 @@ func (h *Hub) run() {
 // broadcastLocally sends an event payload to all local connected clients subscribed to the channel.
 func (h *Hub) broadcastLocally(channel string, payload []byte) {
 	h.mu.RLock()
+	defer h.mu.RUnlock()
 	subscribers, exists := h.channels[channel]
 	if exists {
 		for client := range subscribers {
 			select {
 			case client.send <- payload:
-				slog.Debug("ws event delivered", "user_id", client.userID, "channel", channel)
+				slog.Debug("ws event delivered to local subscriber", "user_id", client.userID, "channel", channel)
 			default:
 				slog.Warn("ws client send buffer full, dropping event", "user_id", client.userID, "channel", channel)
 			}
 		}
 	}
-	h.mu.RUnlock()
 }
 
-// PublishEvent publishes a realtime event. In single- or multi-instance setups with Redis,
-// Redis acts as the event distribution layer. When Redis is enabled, PublishEvent publishes
-// to Redis and the Redis pub/sub listener delivers the event to local subscribers exactly once.
-// If Redis is not configured, direct local delivery is used.
+// PublishEvent publishes a realtime event. Local WebSocket subscribers receive the event immediately
+// without waiting for a Redis round trip. If Redis is configured, an envelope tagged with this node's
+// nodeID is published to Redis for multi-instance distribution. Receiving nodes inspect nodeID and
+// suppress duplicates originating from themselves.
 func (h *Hub) PublishEvent(channel string, event *EventMessage) error {
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("failed to marshal event payload: %w", err)
 	}
 
-	slog.Info("ws event published", "channel", channel, "event_type", event.Type)
+	// 1. Immediately deliver to local subscribers on this node
+	h.broadcastLocally(channel, payload)
+	slog.Info("ws event published locally", "channel", channel, "event_type", event.Type, "node_id", h.nodeID)
 
-	// 1. If Redis is configured, use it as the distribution layer
+	// 2. If Redis is configured, forward to other backend nodes via Redis Pub/Sub
 	if h.redisClient != nil {
+		envelope := RedisEnvelope{
+			NodeID:  h.nodeID,
+			Channel: channel,
+			Event:   event,
+		}
+		envPayload, err := json.Marshal(envelope)
+		if err != nil {
+			slog.Error("failed to marshal redis envelope", "channel", channel, "error", err)
+			return fmt.Errorf("failed to marshal redis envelope: %w", err)
+		}
+
 		redisChan := "forgelab:pubsub:" + channel
-		if err := h.redisClient.Publish(h.ctx, redisChan, payload).Err(); err != nil {
-			slog.Error("redis publish error, falling back to direct local delivery", "channel", redisChan, "error", err)
-			h.broadcastLocally(channel, payload)
+		if err := h.redisClient.Publish(h.ctx, redisChan, envPayload).Err(); err != nil {
+			slog.Error("redis publish error", "channel", redisChan, "error", err)
+			// Return error so caller is informed, but local clients have already received the event
 			return fmt.Errorf("failed to publish event to redis: %w", err)
 		}
-		// Redis listener delivers to local subscribers — do NOT broadcast here to prevent double delivery
-		return nil
 	}
 
-	// 2. Standalone / test fallback when Redis is nil: deliver directly to local subscribers
-	h.broadcastLocally(channel, payload)
 	return nil
 }
 
 func (h *Hub) listenRedisPubSub() {
+	backoff := 1 * time.Second
 	for {
 		if h.ctx.Err() != nil {
 			return
 		}
 
 		pubsub := h.redisClient.PSubscribe(h.ctx, "forgelab:pubsub:*")
+
+		// Verify subscription readiness
+		_, err := pubsub.Receive(h.ctx)
+		if err != nil {
+			if h.ctx.Err() != nil {
+				_ = pubsub.Close()
+				return
+			}
+			slog.Error("failed to establish redis pubsub subscription", "error", err, "node_id", h.nodeID)
+			_ = pubsub.Close()
+			select {
+			case <-h.ctx.Done():
+				return
+			case <-time.After(backoff):
+				if backoff < 15*time.Second {
+					backoff *= 2
+				}
+				continue
+			}
+		}
+
+		backoff = 1 * time.Second
+		slog.Info("ws redis pubsub listener connected successfully", "pattern", "forgelab:pubsub:*", "node_id", h.nodeID)
 		ch := pubsub.Channel()
-		slog.Info("ws redis pubsub listener connected")
 
 	readLoop:
 		for {
 			select {
 			case <-h.ctx.Done():
-				pubsub.Close()
+				_ = pubsub.Close()
 				return
 			case msg, ok := <-ch:
 				if !ok {
+					slog.Warn("ws redis pubsub channel closed by server", "node_id", h.nodeID)
 					break readLoop
 				}
-				channel := strings.TrimPrefix(msg.Channel, "forgelab:pubsub:")
-				h.broadcastLocally(channel, []byte(msg.Payload))
+
+				// Unmarshal envelope
+				var env RedisEnvelope
+				if err := json.Unmarshal([]byte(msg.Payload), &env); err == nil && env.NodeID != "" {
+					// Origin-node suppression: ignore copy published by this same node
+					if env.NodeID == h.nodeID {
+						slog.Debug("redis pubsub ignored event from self", "node_id", env.NodeID, "channel", env.Channel)
+						continue
+					}
+
+					// Event originated from a remote node: broadcast to local subscribers
+					eventPayload, err := json.Marshal(env.Event)
+					if err == nil {
+						h.broadcastLocally(env.Channel, eventPayload)
+						slog.Debug("redis pubsub delivered event from remote node", "remote_node_id", env.NodeID, "channel", env.Channel)
+					}
+				} else {
+					// Backward compatibility: raw EventMessage fallback
+					channel := strings.TrimPrefix(msg.Channel, "forgelab:pubsub:")
+					h.broadcastLocally(channel, []byte(msg.Payload))
+				}
 			}
 		}
 
-		pubsub.Close()
+		_ = pubsub.Close()
 		if h.ctx.Err() != nil {
 			return
 		}
-		slog.Warn("ws redis pubsub channel closed, reconnecting in 1s...")
+		slog.Warn("ws redis pubsub disconnected, reconnecting in 1s...", "node_id", h.nodeID)
 		select {
 		case <-h.ctx.Done():
 			return

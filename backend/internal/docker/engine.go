@@ -109,10 +109,12 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 			slog.Error("failed to persist deployment log", "deployment_id", deployment.ID, "phase", phase, "error", err)
 			return
 		}
+		slog.Debug("deployment log persisted", "deployment_id", deployment.ID, "log_id", persistedLog.ID, "phase", phase)
 		if e.wsHub != nil {
-			_ = e.wsHub.PublishEvent("deployment:"+deployment.ID.String(), &ws.EventMessage{
+			channel := "deployment:" + deployment.ID.String()
+			err := e.wsHub.PublishEvent(channel, &ws.EventMessage{
 				Type:    "log",
-				Channel: "deployment:" + deployment.ID.String(),
+				Channel: channel,
 				Data: map[string]interface{}{
 					"id":            persistedLog.ID,
 					"deployment_id": deployment.ID.String(),
@@ -122,17 +124,25 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					"message":       persistedLog.Message,
 				},
 			})
+			if err != nil {
+				slog.Error("failed to publish deployment log event", "deployment_id", deployment.ID, "channel", channel, "event_type", "log", "error", err)
+			} else {
+				slog.Debug("deployment log event published", "deployment_id", deployment.ID, "channel", channel, "log_id", persistedLog.ID)
+			}
 		}
 	}
 
 	updateStatus := func(newStatus string, failureReason *string) {
 		prevStatus := deployment.Status
-		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason)
+		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason); err != nil {
+			slog.Error("failed to update deployment status", "deployment_id", deployment.ID, "status", newStatus, "error", err)
+		}
 		deployment.Status = newStatus
 		if e.wsHub != nil {
-			_ = e.wsHub.PublishEvent("deployment:"+deployment.ID.String(), &ws.EventMessage{
+			channel := "deployment:" + deployment.ID.String()
+			err := e.wsHub.PublishEvent(channel, &ws.EventMessage{
 				Type:    "status_change",
-				Channel: "deployment:" + deployment.ID.String(),
+				Channel: channel,
 				Data: map[string]interface{}{
 					"deployment_id":   deployment.ID.String(),
 					"project_id":      project.ID.String(),
@@ -141,6 +151,9 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					"timestamp":       time.Now().Format(time.RFC3339),
 				},
 			})
+			if err != nil {
+				slog.Error("failed to publish deployment status event", "deployment_id", deployment.ID, "channel", channel, "event_type", "status_change", "error", err)
+			}
 		}
 	}
 

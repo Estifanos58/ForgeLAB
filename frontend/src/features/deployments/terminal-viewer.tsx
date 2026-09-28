@@ -13,9 +13,10 @@ interface TerminalViewerProps {
   connectionState?: WSConnectionState;
   onClear?: () => void;
   deploymentNumber?: number;
+  deploymentId?: string;
 }
 
-export function TerminalViewer({ logs, connected, connectionState, onClear, deploymentNumber }: TerminalViewerProps) {
+export function TerminalViewer({ logs, connected, connectionState, onClear, deploymentNumber, deploymentId }: TerminalViewerProps) {
   const terminalEndRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -26,6 +27,16 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
       terminalEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [logs, autoScroll]);
+
+  const effectiveState = connectionState || (connected ? 'subscribed' : 'offline');
+
+  useEffect(() => {
+    if (process.env.NODE_ENV === 'development') {
+      console.log(
+        `[ForgeLAB Terminal] count=${logs.length} dep=${deploymentId || deploymentNumber || 'none'} state=${effectiveState}`
+      );
+    }
+  }, [logs.length, deploymentId, deploymentNumber, effectiveState]);
 
   const handleCopyLogs = () => {
     const text = logs
@@ -62,8 +73,6 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
         return 'text-neutral-500 border-neutral-800';
     }
   };
-
-  const effectiveState = connectionState || (connected ? 'subscribed' : 'offline');
 
   const getConnectionBadge = () => {
     switch (effectiveState) {
@@ -105,6 +114,11 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
               {statusBadge.text}
             </span>
           </div>
+          {process.env.NODE_ENV === 'development' && (
+            <span className="hidden sm:inline-block text-[10px] text-neutral-500 font-mono ml-1">
+              ({logs.length} logs)
+            </span>
+          )}
         </div>
 
         {/* Toolbar Controls */}

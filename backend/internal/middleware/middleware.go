@@ -1,8 +1,11 @@
 package middleware
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -157,4 +160,24 @@ type statusResponseWriter struct {
 func (w *statusResponseWriter) WriteHeader(code int) {
 	w.statusCode = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack implements http.Hijacker to allow WebSocket connection upgrades
+func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, errors.New("underlying ResponseWriter does not implement http.Hijacker")
+}
+
+// Flush implements http.Flusher to support streaming HTTP responses
+func (w *statusResponseWriter) Flush() {
+	if fl, ok := w.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+// Unwrap returns the underlying ResponseWriter
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

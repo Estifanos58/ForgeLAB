@@ -1,9 +1,9 @@
 'use client';
 
-import React, { useEffect, useState, useCallback, use } from 'react';
+import React, { useEffect, useState, useCallback, useRef, use } from 'react';
 import Link from 'next/link';
 import { api } from '@/lib/api/client';
-import { Project, Deployment } from '@/lib/api/types';
+import { Project, Deployment, DeploymentLog } from '@/lib/api/types';
 import { AppHeader } from '@/components/layout/app-header';
 import { Badge } from '@/components/ui/badge';
 import { Alert } from '@/components/ui/alert';
@@ -78,13 +78,38 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     loadData();
   }, [loadData]);
 
+  const addHistoricalLogsRef = useRef<(logs: DeploymentLog[]) => void>(() => {});
+
+  // Callback invoked on every successful subscription acknowledgment
+  // (initial subscribe, channel switch, or reconnect)
+  const handleWSSubscribed = useCallback((channel: string) => {
+    if (!channel.startsWith('deployment:')) return;
+    const deploymentId = channel.replace('deployment:', '');
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`[ForgeLAB WS] resyncing historical logs for deployment: ${deploymentId}`);
+    }
+    api.projects
+      .getLogs(projectId, deploymentId)
+      .then((historyLogs) => {
+        addHistoricalLogsRef.current(historyLogs);
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`[ForgeLAB WS] merged ${historyLogs.length} historical logs for deployment: ${deploymentId}`);
+        }
+      })
+      .catch((err) => {
+        console.warn('[ForgeLAB WS] Failed to resync historical logs:', err);
+      });
+  }, [projectId]);
+
   // WebSocket hook for live logs and status transitions
   const { logs, connectionState, connected, clearLogs, addHistoricalLogs } = useDeploymentWS({
     channel: wsChannel,
+    onSubscribed: handleWSSubscribed,
     onStatusChange: (_data) => {
       loadData();
     },
   });
+  addHistoricalLogsRef.current = addHistoricalLogs;
 
   // Handle immediate deployment creation from lifecycle controls
   const handleDeploymentCreated = useCallback((newDeployment: Deployment) => {
@@ -100,27 +125,21 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     setActiveTab('logs');
   }, []);
 
-  // Load historical logs when switching deployment
+  // Fallback: If offline or WebSocket fails to connect within 3s, load historical logs directly via REST
   useEffect(() => {
-    if (!selectedDeployment) return;
-
-    let isMounted = true;
-    api.projects
-      .getLogs(projectId, selectedDeployment.id)
-      .then((historyLogs) => {
-        if (isMounted) {
-          // Merge historical REST logs with any live logs already received over WebSocket
-          addHistoricalLogs(historyLogs);
-        }
-      })
-      .catch((err) => {
-        console.warn('Failed to load historical logs:', err);
-      });
-
-    return () => {
-      isMounted = false;
-    };
-  }, [projectId, selectedDeployment?.id, addHistoricalLogs]);
+    if (!selectedDeployment || connectionState === 'subscribed') return;
+    const timer = setTimeout(() => {
+      if (connectionState === 'offline') {
+        api.projects
+          .getLogs(projectId, selectedDeployment.id)
+          .then((historyLogs) => {
+            addHistoricalLogs(historyLogs);
+          })
+          .catch(() => {});
+      }
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [projectId, selectedDeployment?.id, connectionState, addHistoricalLogs]);
 
   if (loading) {
     return (
@@ -363,6 +382,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
                 connectionState={connectionState}
                 onClear={clearLogs}
                 deploymentNumber={selectedDeployment?.deploy_number}
+                deploymentId={selectedDeployment?.id}
               />
             </div>
           </div>
@@ -390,6 +410,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
                 connectionState={connectionState}
                 onClear={clearLogs}
                 deploymentNumber={selectedDeployment?.deploy_number}
+                deploymentId={selectedDeployment?.id}
               />
             </div>
           </div>
@@ -425,6 +446,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               connectionState={connectionState}
               onClear={clearLogs}
               deploymentNumber={selectedDeployment?.deploy_number}
+              deploymentId={selectedDeployment?.id}
             />
           </div>
         )}

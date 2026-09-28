@@ -14,6 +14,7 @@ export type WSConnectionState =
 
 export interface UseDeploymentWSOptions {
   channel: string | null;
+  onSubscribed?: (channel: string) => void;
   onStatusChange?: (data: any) => void;
   onLog?: (log: DeploymentLog) => void;
   onError?: (err: any) => void;
@@ -21,6 +22,7 @@ export interface UseDeploymentWSOptions {
 
 export function useDeploymentWS({
   channel,
+  onSubscribed,
   onStatusChange,
   onLog,
   onError,
@@ -30,6 +32,9 @@ export function useDeploymentWS({
   const [statusChange, setStatusChange] = useState<any>(null);
 
   // Keep stable callback references to avoid recreating sockets on normal component re-renders
+  const onSubscribedRef = useRef(onSubscribed);
+  onSubscribedRef.current = onSubscribed;
+
   const onStatusChangeRef = useRef(onStatusChange);
   onStatusChangeRef.current = onStatusChange;
 
@@ -53,17 +58,17 @@ export function useDeploymentWS({
   // deduplicates by persistent database ID, and sorts chronologically.
   const addHistoricalLogs = useCallback((historical: DeploymentLog[]) => {
     setLogs((prev) => {
-      const map = new Map<number | string, DeploymentLog>();
+      const map = new Map<string, DeploymentLog>();
 
       // 1. Index historical logs
       for (const log of historical) {
-        const key = log.id !== undefined && log.id !== null ? log.id : `${log.timestamp}-${log.message}`;
+        const key = log.id !== undefined && log.id !== null ? `id:${log.id}` : `ts:${log.timestamp}:${log.message}`;
         map.set(key, log);
       }
 
       // 2. Index existing live logs (retains newer live logs that arrived while REST request was in flight)
       for (const log of prev) {
-        const key = log.id !== undefined && log.id !== null ? log.id : `${log.timestamp}-${log.message}`;
+        const key = log.id !== undefined && log.id !== null ? `id:${log.id}` : `ts:${log.timestamp}:${log.message}`;
         map.set(key, log);
       }
 
@@ -136,6 +141,9 @@ export function useDeploymentWS({
       setConnectionState((prev) => (prev === 'offline' ? 'connecting' : 'reconnecting'));
 
       const wsUrl = getWebSocketUrl();
+      if (process.env.NODE_ENV === 'development') {
+        console.log(`[ForgeLAB WS] connecting to ${wsUrl}`);
+      }
       let ws: WebSocket;
 
       try {
@@ -152,6 +160,11 @@ export function useDeploymentWS({
         if (isDisposed || wsRef.current !== ws) {
           ws.close();
           return;
+        }
+
+        if (process.env.NODE_ENV === 'development') {
+          console.log('[ForgeLAB WS] connected');
+          console.log(`[ForgeLAB WS] subscribing ${channel}`);
         }
 
         // Socket is open at the transport layer; now subscribe to the channel
@@ -185,9 +198,13 @@ export function useDeploymentWS({
           switch (msg.type) {
             case 'subscribed':
               if (msg.channel === channel) {
+                if (process.env.NODE_ENV === 'development') {
+                  console.log(`[ForgeLAB WS] subscription acknowledged ${channel}`);
+                }
                 // Subscription acknowledged by backend: the stream is now fully live!
                 setConnectionState('subscribed');
                 backoffDelayRef.current = 1000; // Reset backoff on successful subscription
+                onSubscribedRef.current?.(msg.channel);
               }
               break;
 
@@ -207,12 +224,19 @@ export function useDeploymentWS({
                   message: msg.data.message || '',
                 };
 
+                if (process.env.NODE_ENV === 'development') {
+                  console.log(`[ForgeLAB WS] received log ${logEntry.id ?? 'noid'}`);
+                }
+
                 setLogs((prev) => {
                   // Deduplicate: if log ID is already present, do not add duplicate
                   if (logEntry.id !== undefined && logEntry.id !== null) {
-                    if (prev.some((existing) => existing.id === logEntry.id)) {
+                    if (prev.some((existing) => String(existing.id) === String(logEntry.id))) {
                       return prev;
                     }
+                  }
+                  if (process.env.NODE_ENV === 'development') {
+                    console.log(`[ForgeLAB WS] merged log ${logEntry.id ?? 'noid'}`);
                   }
                   return [...prev, logEntry];
                 });
@@ -266,6 +290,9 @@ export function useDeploymentWS({
     function scheduleReconnect() {
       if (isDisposed || isIntentionalCloseRef.current) return;
 
+      if (process.env.NODE_ENV === 'development') {
+        console.log('[ForgeLAB WS] reconnecting');
+      }
       setConnectionState('reconnecting');
       const delay = backoffDelayRef.current;
       // Exponential backoff up to 30 seconds

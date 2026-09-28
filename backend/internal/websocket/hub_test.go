@@ -10,10 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/forgelab/backend/internal/auth"
+	"github.com/forgelab/backend/internal/middleware"
 	"github.com/forgelab/backend/internal/models"
 )
 
@@ -546,5 +549,233 @@ func TestWebSocketEventContainsPersistedDeploymentLogID(t *testing.T) {
 	}
 	if depID, exists := data["deployment_id"]; !exists || depID.(string) != deploymentID.String() {
 		t.Fatalf("expected deployment_id %s, got %v", deploymentID.String(), depID)
+	}
+}
+
+// 10. Real Redis Pub/Sub integration test with miniredis
+func TestRedisPubSubIntegration(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close()
+
+	hub := NewHub(nil, nil, nil, rdb)
+	defer hub.Close()
+
+	// Wait for Redis pubsub listener to connect
+	time.Sleep(100 * time.Millisecond)
+
+	userID := uuid.New()
+	client := &Client{
+		hub:           hub,
+		userID:        userID,
+		subscriptions: make(map[string]bool),
+		send:          make(chan []byte, 10),
+	}
+
+	channel := "deployment:" + uuid.New().String()
+
+	hub.mu.Lock()
+	hub.clients[client] = true
+	hub.channels[channel] = map[*Client]bool{client: true}
+	hub.mu.Unlock()
+
+	// Case 1: Remote node publishes an event to Redis
+	remoteNodeID := uuid.New().String()
+	remoteEnvelope := RedisEnvelope{
+		NodeID:  remoteNodeID,
+		Channel: channel,
+		Event: &EventMessage{
+			Type:    "log",
+			Channel: channel,
+			Data: map[string]interface{}{
+				"id":      int64(999),
+				"message": "event from remote node",
+			},
+		},
+	}
+	envBytes, err := json.Marshal(remoteEnvelope)
+	if err != nil {
+		t.Fatalf("failed to marshal remote envelope: %v", err)
+	}
+
+	// Publish directly to Redis topic as if another node sent it
+	if err := rdb.Publish(context.Background(), "forgelab:pubsub:"+channel, envBytes).Err(); err != nil {
+		t.Fatalf("failed to publish to miniredis: %v", err)
+	}
+
+	// Local subscriber on this hub should receive the remote event via Redis pub/sub
+	select {
+	case msg := <-client.send:
+		var rec EventMessage
+		if err := json.Unmarshal(msg, &rec); err != nil {
+			t.Fatalf("failed to parse message: %v", err)
+		}
+		if rec.Type != "log" {
+			t.Fatalf("expected type 'log', got %s", rec.Type)
+		}
+		data := rec.Data.(map[string]interface{})
+		if data["id"].(float64) != 999 {
+			t.Fatalf("expected id 999, got %v", data["id"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for event from remote node via Redis pub/sub")
+	}
+
+	// Case 2: Origin node publishes via hub.PublishEvent()
+	// Origin node should deliver immediately to local subscriber,
+	// and the Redis copy originating from this same node should be suppressed (no duplicate delivery).
+	localEvent := &EventMessage{
+		Type:    "log",
+		Channel: channel,
+		Data: map[string]interface{}{
+			"id":      int64(1001),
+			"message": "event from origin node",
+		},
+	}
+	if err := hub.PublishEvent(channel, localEvent); err != nil {
+		t.Fatalf("failed to publish local event: %v", err)
+	}
+
+	// Immediate local delivery
+	select {
+	case msg := <-client.send:
+		var rec EventMessage
+		if err := json.Unmarshal(msg, &rec); err != nil {
+			t.Fatalf("failed to parse: %v", err)
+		}
+		data := rec.Data.(map[string]interface{})
+		if data["id"].(float64) != 1001 {
+			t.Fatalf("expected id 1001, got %v", data["id"])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for direct local event delivery")
+	}
+
+	// Give Redis loop time to receive the published message
+	time.Sleep(150 * time.Millisecond)
+
+	// Ensure no duplicate event arrived from Redis
+	select {
+	case msg := <-client.send:
+		t.Fatalf("received duplicate event from Redis for origin node: %s", string(msg))
+	default:
+		// Success! Exactly one event delivered, duplicate suppressed.
+	}
+}
+
+// 11. Full End-to-End WebSocket Test with RequestLogger middleware, Cookie Auth, and Sequential Logs
+func TestWebSocketEndToEndWithRequestLoggerAndCookie(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-secret-key-at-least-32-bytes-long!", 15*time.Minute, 7*24*time.Hour)
+	userID := uuid.New()
+	projectID := uuid.New()
+	deploymentID := uuid.New()
+
+	token, err := jwtManager.GenerateAccessToken(userID, "test@example.com")
+	if err != nil {
+		t.Fatalf("failed to generate access token: %v", err)
+	}
+
+	mockProjectSvc := &mockProjectAuthorizer{
+		getProjectFn: func(ctx context.Context, id, ownerID uuid.UUID) (*models.Project, error) {
+			if id == projectID && ownerID == userID {
+				return &models.Project{ID: projectID, OwnerID: userID}, nil
+			}
+			return nil, errors.New("access denied")
+		},
+	}
+
+	mockDeploySvc := &mockDeploymentResolver{
+		getDeploymentFn: func(ctx context.Context, id uuid.UUID) (*models.Deployment, error) {
+			if id == deploymentID {
+				return &models.Deployment{ID: deploymentID, ProjectID: projectID}, nil
+			}
+			return nil, errors.New("deployment not found")
+		},
+	}
+
+	hub := NewHub(jwtManager, mockProjectSvc, mockDeploySvc, nil)
+	defer hub.Close()
+
+	// Wrap handler in middleware.RequestLogger to verify statusResponseWriter.Hijack() works end-to-end!
+	handler := middleware.RequestLogger(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hub.ServeWS(w, r)
+	}))
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/ws"
+
+	// Authenticate via HttpOnly Cookie (forgelab_access_token)
+	header := http.Header{}
+	header.Add("Cookie", "forgelab_access_token="+token)
+
+	// Connect WebSocket
+	wsConn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v (response status: %v)", err, resp)
+	}
+	defer wsConn.Close()
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("expected status 101 Switching Protocols, got %d", resp.StatusCode)
+	}
+
+	// 1. Send subscription request
+	channel := "deployment:" + deploymentID.String()
+	subMsg := ClientMessage{
+		Type:    "subscribe",
+		Channel: channel,
+	}
+	if err := wsConn.WriteJSON(subMsg); err != nil {
+		t.Fatalf("failed to send subscribe message: %v", err)
+	}
+
+	// 2. Receive subscription acknowledgment frame
+	var ack EventMessage
+	if err := wsConn.ReadJSON(&ack); err != nil {
+		t.Fatalf("failed to read subscription ack: %v", err)
+	}
+	if ack.Type != "subscribed" || ack.Channel != channel {
+		t.Fatalf("expected subscribed event for %s, got %+v", channel, ack)
+	}
+
+	// 3. Publish multiple sequential log events from backend
+	for i := 1; i <= 5; i++ {
+		logEvent := &EventMessage{
+			Type:    "log",
+			Channel: channel,
+			Data: map[string]interface{}{
+				"id":            int64(100 + i),
+				"deployment_id": deploymentID.String(),
+				"phase":         "build",
+				"stream":        "stdout",
+				"message":       "Building step " + string(rune('0'+i)),
+			},
+		}
+		if err := hub.PublishEvent(channel, logEvent); err != nil {
+			t.Fatalf("failed to publish log event %d: %v", i, err)
+		}
+
+		// Read frame from WebSocket client
+		var received EventMessage
+		if err := wsConn.ReadJSON(&received); err != nil {
+			t.Fatalf("failed to read log event %d: %v", i, err)
+		}
+		if received.Type != "log" {
+			t.Fatalf("expected event type 'log', got %s", received.Type)
+		}
+		data, ok := received.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected data map, got %T", received.Data)
+		}
+		if data["id"].(float64) != float64(100+i) {
+			t.Fatalf("expected log id %d, got %v", 100+i, data["id"])
+		}
+		if data["deployment_id"].(string) != deploymentID.String() {
+			t.Fatalf("expected deployment_id %s, got %v", deploymentID.String(), data["deployment_id"])
+		}
 	}
 }
