@@ -149,8 +149,12 @@ When running in Docker Compose:
 
 ## 5. State Synchronization & Realtime Pipeline
 
-- **REST is Authoritative:** PostgreSQL via REST endpoints (`/api/projects`, `/api/deployments`) is the authoritative source for project state, deployment state machine transitions, and persistent build logs.
-- **WebSocket is Ephemeral:** Realtime log lines and state-change notifications stream over WebSocket channel `deployment:<uuid>`.
+- **REST is Authoritative for History:** PostgreSQL via REST endpoints (`/api/projects`, `/api/deployments/:id/logs`) is the authoritative source for project state, deployment state machine transitions, and persistent build logs.
+- **WebSocket Streams Live Events with Persistent IDs:** Realtime log lines and state-change notifications stream over WebSocket channel `deployment:<uuid>`. Each log event contains the persisted database ID (`id`), enabling reliable client-side deduplication.
+- **Immediate Deployment Selection:** When a new deployment is triggered via `LifecycleControls`, the returned `Deployment` object is immediately set as the active deployment (`setSelectedDeployment(newDeployment)`). The WebSocket subscription switches to `deployment:<newDeployment.id>` without waiting for a later list reload.
+- **Unified Log Merge Strategy:** Rather than blindly clearing logs upon REST response completion, `useDeploymentWS` safely merges historical REST logs and live WebSocket logs, deduplicating records by stable database ID and sorting chronologically.
+- **Stable Socket Lifecycle & Explicit Connection States:** Callbacks (`onStatusChange`, `onLog`, `onError`) are preserved across renders using React refs. The WebSocket lifecycle depends only on the active channel. Connection state transitions through `connecting` → `connected` → `subscribing` → `subscribed` (or `reconnecting` / `offline`).
+- **Resilient Reconnection:** Sockets automatically reconnect with exponential backoff (1s, 2s, 4s, 8s, 16s, max 30s) upon unexpected disconnection, re-subscribing to the active deployment channel.
 - **Event-Driven Refresh:** When a `status_change` frame arrives via WebSocket, the console automatically re-syncs project configuration, container state, and deployment history via REST.
 
 ---
@@ -161,6 +165,9 @@ With this release:
 1. **Eliminated `localStorage` Token Risk:** Raw JWTs are no longer stored in client storage. Sessions rely entirely on HttpOnly cookies.
 2. **Containerized Multi-Stage Production Build:** Upgraded from `next dev` to a production multi-stage Alpine build with `next build` and `next start`.
 3. **Docker Networking Alignment:** Internal Docker communication now points to `http://backend:8080` instead of loopback `http://localhost:8080`.
+4. **Resolved WebSocket Batching & Framing Bug:** Replaced newline batching with single-event framing where 1 application event equals 1 WebSocket text message frame.
+5. **Eliminated Redis Duplicate Event Delivery:** Replaced dual local+Redis broadcasting with a clean single-delivery architecture mediated by Redis pub/sub.
+6. **Eliminated Frontend Deployment Selection & Historical Log Races:** Wired immediate deployment selection on creation and safe chronological log merging without erasing in-flight streaming logs.
 
 ---
 

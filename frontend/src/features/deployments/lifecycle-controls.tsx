@@ -3,7 +3,7 @@
 import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api/client';
-import { Project } from '@/lib/api/types';
+import { Project, Deployment } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
 import { Play, RotateCcw, Square, History, Trash2, Rocket } from 'lucide-react';
 
@@ -11,9 +11,10 @@ interface LifecycleControlsProps {
   project: Project;
   onActionComplete: () => void;
   onError: (msg: string) => void;
+  onDeploymentCreated?: (deployment: Deployment) => void;
 }
 
-export function LifecycleControls({ project, onActionComplete, onError }: LifecycleControlsProps) {
+export function LifecycleControls({ project, onActionComplete, onError, onDeploymentCreated }: LifecycleControlsProps) {
   const router = useRouter();
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
 
@@ -30,7 +31,13 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
   };
 
   const handleDeploy = () => {
-    handleAction('deploy', () => api.projects.deploy(project.id));
+    handleAction('deploy', async () => {
+      const newDeployment = await api.projects.deploy(project.id);
+      if (onDeploymentCreated && newDeployment?.id) {
+        onDeploymentCreated(newDeployment);
+      }
+      return newDeployment;
+    });
   };
 
   const handleStop = () => {
@@ -47,7 +54,13 @@ export function LifecycleControls({ project, onActionComplete, onError }: Lifecy
 
   const handleRollback = () => {
     if (window.confirm('Roll back to the previous successful release? A new release will be queued.')) {
-      handleAction('rollback', () => api.projects.rollback(project.id));
+      handleAction('rollback', async () => {
+        const newDeployment = await api.projects.rollback(project.id);
+        if (onDeploymentCreated && newDeployment?.id) {
+          onDeploymentCreated(newDeployment);
+        }
+        return newDeployment;
+      });
     }
   };
 

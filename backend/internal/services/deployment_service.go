@@ -334,17 +334,24 @@ func (s *DeploymentService) GetPreviousSuccessfulDeployment(ctx context.Context,
 	return d, nil
 }
 
-// AddDeploymentLog adds a log entry for a deployment.
-func (s *DeploymentService) AddDeploymentLog(ctx context.Context, deploymentID uuid.UUID, phase, stream, message string) error {
-	_, err := s.db.Exec(ctx,
-		`INSERT INTO deployment_logs (deployment_id, timestamp, phase, stream, message)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		deploymentID, time.Now(), phase, stream, message,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to add deployment log: %w", err)
+// AddDeploymentLog adds a log entry for a deployment and returns the persisted record.
+func (s *DeploymentService) AddDeploymentLog(ctx context.Context, deploymentID uuid.UUID, phase, stream, message string) (*models.DeploymentLog, error) {
+	log := &models.DeploymentLog{
+		DeploymentID: deploymentID,
+		Phase:        phase,
+		Stream:       stream,
+		Message:      message,
 	}
-	return nil
+	err := s.db.QueryRow(ctx,
+		`INSERT INTO deployment_logs (deployment_id, timestamp, phase, stream, message)
+		 VALUES ($1, $2, $3, $4, $5)
+		 RETURNING id, timestamp`,
+		deploymentID, time.Now(), phase, stream, message,
+	).Scan(&log.ID, &log.Timestamp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add deployment log: %w", err)
+	}
+	return log, nil
 }
 
 // GetDeploymentLogs retrieves logs for a deployment.

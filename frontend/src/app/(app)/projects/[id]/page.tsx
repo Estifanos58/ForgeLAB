@@ -79,12 +79,26 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   }, [loadData]);
 
   // WebSocket hook for live logs and status transitions
-  const { logs, connected, clearLogs, addHistoricalLogs } = useDeploymentWS({
+  const { logs, connectionState, connected, clearLogs, addHistoricalLogs } = useDeploymentWS({
     channel: wsChannel,
     onStatusChange: (_data) => {
       loadData();
     },
   });
+
+  // Handle immediate deployment creation from lifecycle controls
+  const handleDeploymentCreated = useCallback((newDeployment: Deployment) => {
+    // 1. Immediately select the new deployment so WebSocket channel switches right away
+    setSelectedDeployment(newDeployment);
+    // 2. Optimistically prepend new deployment to deployments list
+    setDeployments((prev) => {
+      const exists = prev.some((d) => d.id === newDeployment.id);
+      if (exists) return prev.map((d) => (d.id === newDeployment.id ? newDeployment : d));
+      return [newDeployment, ...prev];
+    });
+    // 3. Switch to terminal logs tab so user immediately sees live build progress
+    setActiveTab('logs');
+  }, []);
 
   // Load historical logs when switching deployment
   useEffect(() => {
@@ -95,7 +109,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
       .getLogs(projectId, selectedDeployment.id)
       .then((historyLogs) => {
         if (isMounted) {
-          clearLogs();
+          // Merge historical REST logs with any live logs already received over WebSocket
           addHistoricalLogs(historyLogs);
         }
       })
@@ -106,7 +120,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     return () => {
       isMounted = false;
     };
-  }, [projectId, selectedDeployment?.id, clearLogs, addHistoricalLogs]);
+  }, [projectId, selectedDeployment?.id, addHistoricalLogs]);
 
   if (loading) {
     return (
@@ -193,6 +207,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
             project={project}
             onActionComplete={loadData}
             onError={(msg) => setError(msg)}
+            onDeploymentCreated={handleDeploymentCreated}
           />
         </div>
 
@@ -345,6 +360,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               <TerminalViewer
                 logs={logs}
                 connected={connected}
+                connectionState={connectionState}
                 onClear={clearLogs}
                 deploymentNumber={selectedDeployment?.deploy_number}
               />
@@ -371,6 +387,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               <TerminalViewer
                 logs={logs}
                 connected={connected}
+                connectionState={connectionState}
                 onClear={clearLogs}
                 deploymentNumber={selectedDeployment?.deploy_number}
               />
@@ -405,6 +422,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
             <TerminalViewer
               logs={logs}
               connected={connected}
+              connectionState={connectionState}
               onClear={clearLogs}
               deploymentNumber={selectedDeployment?.deploy_number}
             />

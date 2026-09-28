@@ -50,14 +50,10 @@ These are deliberate scoping decisions for the current platform release. They ar
 
 These are identified codebase behaviors that require investigation and resolution by future agents:
 
-### 1. WebSocket Duplicate Event Delivery
-- **Location:** `backend/internal/websocket/hub.go:L123-L184`
-- **Behavior:** `PublishEvent(channel, event)` performs two actions:
-  1. Sends the JSON payload directly to all local clients in `h.channels[channel]`.
-  2. Publishes the same JSON payload to Redis (`forgelab:pubsub:<channel>`).
-  3. The same backend instance's `listenRedisPubSub()` receives the message from Redis and delivers it a **second time** to the same local subscribers in `h.channels[channel]`.
-- **Impact:** Connected clients receive duplicate log lines and duplicate `status_change` frames.
-- **Guidance:** In single-node deployments, either distribute exclusively via Redis Pub/Sub, or attach an instance identifier (`sender_id`) to Redis messages so the local node ignores messages it generated.
+### 1. WebSocket Duplicate Event Delivery (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/websocket/hub.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/websocket/hub.go)
+- **Resolution:** Resolved by making Redis the authoritative event distribution bus. When Redis is configured, `PublishEvent()` publishes exclusively to Redis (`forgelab:pubsub:<channel>`), and the Redis pub/sub listener (`listenRedisPubSub()`) delivers to local connected subscribers via `broadcastLocally()`. This ensures each subscriber receives events exactly once without duplicate delivery. If Redis is unconfigured or in tests, direct local delivery is used as a fallback.
+- **Single-Event Framing & Persistent IDs:** Additionally resolved WebSocket batching issues by framing each queued event as an individual WebSocket TextMessage frame, and persisting database log IDs before emitting log events.
 
 ### 2. Project-Level Channel Has No Active Producers
 - **Location:** `backend/internal/websocket/hub.go:L347-L349`

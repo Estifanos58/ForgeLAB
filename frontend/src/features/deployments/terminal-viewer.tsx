@@ -5,14 +5,17 @@ import { DeploymentLog } from '@/lib/api/types';
 import { Terminal, Copy, Trash2, ArrowDown, Check } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
+import { WSConnectionState } from '@/lib/websocket/use-deployment-ws';
+
 interface TerminalViewerProps {
   logs: DeploymentLog[];
   connected: boolean;
+  connectionState?: WSConnectionState;
   onClear?: () => void;
   deploymentNumber?: number;
 }
 
-export function TerminalViewer({ logs, connected, onClear, deploymentNumber }: TerminalViewerProps) {
+export function TerminalViewer({ logs, connected, connectionState, onClear, deploymentNumber }: TerminalViewerProps) {
   const terminalEndRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -60,6 +63,28 @@ export function TerminalViewer({ logs, connected, onClear, deploymentNumber }: T
     }
   };
 
+  const effectiveState = connectionState || (connected ? 'subscribed' : 'offline');
+
+  const getConnectionBadge = () => {
+    switch (effectiveState) {
+      case 'subscribed':
+        return { dot: 'bg-emerald-500', text: 'live' };
+      case 'subscribing':
+        return { dot: 'bg-blue-400 animate-pulse', text: 'subscribing' };
+      case 'connected':
+        return { dot: 'bg-amber-400', text: 'connected' };
+      case 'connecting':
+        return { dot: 'bg-amber-400 animate-pulse', text: 'connecting' };
+      case 'reconnecting':
+        return { dot: 'bg-amber-500 animate-pulse', text: 'reconnecting' };
+      case 'offline':
+      default:
+        return { dot: 'bg-neutral-600', text: 'offline' };
+    }
+  };
+
+  const statusBadge = getConnectionBadge();
+
   return (
     <div className="flex flex-col h-full rounded-md border border-surface-border bg-[#09090b] shadow-subtle overflow-hidden font-mono text-xs">
       {/* Terminal Toolbar */}
@@ -73,11 +98,11 @@ export function TerminalViewer({ logs, connected, onClear, deploymentNumber }: T
             <span
               className={cn(
                 'w-1.5 h-1.5 rounded-full',
-                connected ? 'bg-emerald-500' : 'bg-neutral-600'
+                statusBadge.dot
               )}
             />
             <span className="text-neutral-400 font-mono">
-              {connected ? 'live' : 'offline'}
+              {statusBadge.text}
             </span>
           </div>
         </div>

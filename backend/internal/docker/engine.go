@@ -104,16 +104,22 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	// Helper to log and publish status/log events
 	emitLog := func(phase, stream, message string) {
 		redactedMsg := redactor.Redact(message)
-		_ = e.deploymentService.AddDeploymentLog(ctx, deployment.ID, phase, stream, redactedMsg)
+		persistedLog, err := e.deploymentService.AddDeploymentLog(ctx, deployment.ID, phase, stream, redactedMsg)
+		if err != nil {
+			slog.Error("failed to persist deployment log", "deployment_id", deployment.ID, "phase", phase, "error", err)
+			return
+		}
 		if e.wsHub != nil {
 			_ = e.wsHub.PublishEvent("deployment:"+deployment.ID.String(), &ws.EventMessage{
 				Type:    "log",
 				Channel: "deployment:" + deployment.ID.String(),
 				Data: map[string]interface{}{
-					"timestamp": time.Now().Format(time.RFC3339),
-					"phase":     phase,
-					"stream":    stream,
-					"message":   redactedMsg,
+					"id":            persistedLog.ID,
+					"deployment_id": deployment.ID.String(),
+					"timestamp":     persistedLog.Timestamp.Format(time.RFC3339Nano),
+					"phase":         persistedLog.Phase,
+					"stream":        persistedLog.Stream,
+					"message":       persistedLog.Message,
 				},
 			})
 		}
