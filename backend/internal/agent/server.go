@@ -29,8 +29,17 @@ type LocalSourceSession struct {
 	SourceID      uuid.UUID                `json:"source_id"`
 	CanonicalPath string                   `json:"-"` // Never exposed over HTTP/JSON
 	FolderName    string                   `json:"folder_name"`
-	Analysis      *analyzer.AnalysisResult `json:"analysis"`
+	Status        string                   `json:"status"` // "scanning", "detecting", "ready", "failed"
+	Phase         string                   `json:"phase"`  // "scanning", "detecting", "ready", "failed"
+	FilesScanned  int                      `json:"files_scanned"`
+	TotalFiles    int                      `json:"total_files"`
+	TotalBytes    int64                    `json:"total_bytes"`
+	DetectedCount int                      `json:"detected_count"`
+	Error         string                   `json:"error,omitempty"`
+	Analysis      *analyzer.AnalysisResult `json:"analysis,omitempty"`
 	CreatedAt     time.Time                `json:"created_at"`
+	UpdatedAt     time.Time                `json:"updated_at"`
+	mu            sync.RWMutex             `json:"-"`
 }
 
 type AgentServerConfig struct {
@@ -192,11 +201,6 @@ func (s *AgentServer) registerDirectory(rawPath string) (*LocalSourceSession, er
 		return nil, err
 	}
 
-	analysis, err := analyzer.AnalyzeRepository(canonicalPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to analyze repository structure: %w", err)
-	}
-
 	sourceID := uuid.New()
 	folderName := filepath.Base(canonicalPath)
 	if folderName == "" || folderName == "." || folderName == "/" {
@@ -207,42 +211,129 @@ func (s *AgentServer) registerDirectory(rawPath string) (*LocalSourceSession, er
 		SourceID:      sourceID,
 		CanonicalPath: canonicalPath,
 		FolderName:    folderName,
-		Analysis:      analysis,
+		Status:        "scanning",
+		Phase:         "scanning",
 		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 
 	s.mu.Lock()
 	s.sessions[sourceID] = session
 	s.mu.Unlock()
 
-	slog.Info("registered local source session",
-		"source_id", sourceID.String(),
-		"folder_name", folderName,
-		"services_count", len(analysis.Services),
-	)
+	// Channel to signal quick completion
+	doneCh := make(chan struct{})
+
+	go func() {
+		analysis, err := analyzer.AnalyzeRepositoryWithProgress(canonicalPath, func(phase string, filesScanned, totalFiles, detectedCount int) {
+			session.mu.Lock()
+			session.Phase = phase
+			session.FilesScanned = filesScanned
+			if totalFiles > 0 {
+				session.TotalFiles = totalFiles
+			}
+			session.DetectedCount = detectedCount
+			session.UpdatedAt = time.Now()
+			session.mu.Unlock()
+		})
+
+		session.mu.Lock()
+		if err != nil {
+			session.Status = "failed"
+			session.Phase = "failed"
+			session.Error = err.Error()
+			slog.Error("local agent analysis failed", "source_id", sourceID, "error", err)
+		} else {
+			session.Status = "ready"
+			session.Phase = "ready"
+			session.TotalFiles = analysis.TotalFiles
+			session.TotalBytes = analysis.TotalBytes
+			session.DetectedCount = len(analysis.Services)
+			session.Analysis = analysis
+			slog.Info("registered local source session",
+				"source_id", sourceID.String(),
+				"folder_name", folderName,
+				"services_count", len(analysis.Services),
+				"total_files", analysis.TotalFiles,
+			)
+		}
+		session.UpdatedAt = time.Now()
+		session.mu.Unlock()
+		close(doneCh)
+	}()
+
+	// Grace window: if analysis finishes quickly (< 120ms), return ready immediately;
+	// otherwise return initial scanning session and let frontend poll
+	select {
+	case <-doneCh:
+	case <-time.After(120 * time.Millisecond):
+	}
 
 	return session, nil
 }
 
 func (s *AgentServer) renderSessionResponse(w http.ResponseWriter, session *LocalSourceSession) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+
+	totalFiles := session.TotalFiles
+	totalBytes := session.TotalBytes
+	var services []analyzer.ServiceDefinition
+	if session.Analysis != nil {
+		totalFiles = session.Analysis.TotalFiles
+		totalBytes = session.Analysis.TotalBytes
+		services = session.Analysis.Services
+	}
+	if services == nil {
+		services = []analyzer.ServiceDefinition{}
+	}
+
+	status := session.Status
+	phase := session.Phase
+	if session.Analysis != nil || len(services) > 0 {
+		status = "ready"
+		phase = "ready"
+	}
+	if status == "" {
+		if session.Error != "" {
+			status = "failed"
+			phase = "failed"
+		} else {
+			status = "scanning"
+			phase = "scanning"
+		}
+	}
+
+	resp := map[string]interface{}{
 		"source": map[string]interface{}{
 			"id":               session.SourceID.String(),
 			"source_type":      "local_agent",
 			"source_reference": session.SourceID.String(),
 			"agent_id":         s.agentID,
 			"folder_name":      session.FolderName,
-			"total_files":      session.Analysis.TotalFiles,
-			"total_bytes":      session.Analysis.TotalBytes,
+			"status":           status,
+			"phase":            phase,
+			"total_files":      totalFiles,
+			"total_bytes":      totalBytes,
 		},
-		"source_id":     session.SourceID.String(),
-		"agent_id":      s.agentID,
-		"folder_name":   session.FolderName,
-		"total_files":   session.Analysis.TotalFiles,
-		"total_bytes":   session.Analysis.TotalBytes,
-		"services":      session.Analysis.Services,
-		"registered_at": session.CreatedAt.Format(time.RFC3339),
-	})
+		"source_id":      session.SourceID.String(),
+		"agent_id":       s.agentID,
+		"folder_name":    session.FolderName,
+		"status":         status,
+		"phase":          phase,
+		"files_scanned":  session.FilesScanned,
+		"total_files":    totalFiles,
+		"total_bytes":    totalBytes,
+		"detected_count": session.DetectedCount,
+		"services":       services,
+		"registered_at":  session.CreatedAt.Format(time.RFC3339),
+	}
+
+	if session.Error != "" {
+		resp["error"] = session.Error
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request) {

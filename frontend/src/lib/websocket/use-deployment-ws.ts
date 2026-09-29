@@ -218,6 +218,7 @@ export function useDeploymentWS({
                 const logEntry: DeploymentLog = {
                   id: msg.data.id,
                   deployment_id: msg.data.deployment_id || (channel ? channel.replace('deployment:', '') : ''),
+                  service_id: msg.data.service_id || null,
                   timestamp: msg.data.timestamp || new Date().toISOString(),
                   phase: msg.data.phase || 'runtime',
                   stream: msg.data.stream || 'stdout',

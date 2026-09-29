@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -8,24 +9,32 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/docker"
+	"github.com/forgelab/backend/internal/models"
+	"github.com/forgelab/backend/internal/queue"
 	"github.com/forgelab/backend/internal/services"
 )
 
 type ServiceHandler struct {
-	serviceService *services.ServiceService
-	projectService *services.ProjectService
-	dockerEngine   *docker.Engine
+	serviceService    *services.ServiceService
+	projectService    *services.ProjectService
+	deploymentService *services.DeploymentService
+	dockerEngine      *docker.Engine
+	deployQueue       *queue.DeploymentQueue
 }
 
 func NewServiceHandler(
 	serviceService *services.ServiceService,
 	projectService *services.ProjectService,
+	deploymentService *services.DeploymentService,
 	dockerEngine *docker.Engine,
+	deployQueue *queue.DeploymentQueue,
 ) *ServiceHandler {
 	return &ServiceHandler{
-		serviceService: serviceService,
-		projectService: projectService,
-		dockerEngine:   dockerEngine,
+		serviceService:    serviceService,
+		projectService:    projectService,
+		deploymentService: deploymentService,
+		dockerEngine:      dockerEngine,
+		deployQueue:       deployQueue,
 	}
 }
 
@@ -149,4 +158,82 @@ func (h *ServiceHandler) Restart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
+}
+
+// Deploy handles POST /api/projects/{id}/services/{serviceId}/deploy
+func (h *ServiceHandler) Deploy(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service ID")
+		return
+	}
+
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
+		return
+	}
+
+	if svc.Status == models.ProjectStatusDeploying {
+		writeError(w, http.StatusConflict, "this service is already deploying")
+		return
+	}
+
+	deployment, err := h.deploymentService.CreateServiceDeployment(r.Context(), project, svc)
+	if err != nil {
+		if errors.Is(err, services.ErrActiveDeployment) {
+			writeError(w, http.StatusConflict, "a deployment is already in progress for this project")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to create service deployment: "+err.Error())
+		return
+	}
+
+	if h.deployQueue != nil {
+		if err := h.deployQueue.EnqueueDeployment(r.Context(), deployment.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to enqueue deployment job")
+			return
+		}
+	} else if h.dockerEngine != nil {
+		go func() {
+			_ = h.dockerEngine.ExecuteDeployment(context.Background(), deployment.ID)
+		}()
+	}
+
+	writeJSON(w, http.StatusCreated, deployment)
 }

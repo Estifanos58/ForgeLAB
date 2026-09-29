@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 )
 
 var (
-	ErrDeploymentNotFound = errors.New("deployment not found")
+	ErrDeploymentNotFound     = errors.New("deployment not found")
 	ErrNoDeploymentToRollback = errors.New("no previous deployment to rollback to")
 )
 
@@ -138,14 +139,19 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	}
 
 	for _, s := range svcList {
+		svcDeployID := uuid.New()
 		svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, s.Name, deployNumber)
 		_, _ = tx.Exec(ctx,
 			`INSERT INTO service_deployments (
 				id, deployment_id, service_id, status, image_tag, build_strategy,
 				build_command, start_command, runtime_type, internal_port, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-			uuid.New(), deployment.ID, s.ID, models.DeployStatusQueued, svcTag,
+			svcDeployID, deployment.ID, s.ID, models.DeployStatusQueued, svcTag,
 			s.BuildStrategy, s.BuildCommand, s.StartCommand, s.RuntimeType, s.InternalPort, now,
+		)
+		_, _ = tx.Exec(ctx,
+			"UPDATE services SET status = $1, current_service_deployment_id = $2, updated_at = $3 WHERE id = $4",
+			models.DeployStatusQueued, svcDeployID, now, s.ID,
 		)
 	}
 
@@ -165,6 +171,183 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	slog.Info("deployment created",
 		"deployment_id", deployment.ID,
 		"project_id", project.ID,
+		"deploy_number", deployNumber,
+	)
+
+	return deployment, nil
+}
+
+// CreateServiceDeployment creates a new deployment record targeting a single specific service.
+func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project *models.Project, targetService *models.Service) (*models.Deployment, error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock the project row FOR UPDATE to prevent concurrent creation for the same project
+	var lockedProjectID uuid.UUID
+	err = tx.QueryRow(ctx, "SELECT id FROM projects WHERE id = $1 FOR UPDATE", project.ID).Scan(&lockedProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lock project row: %w", err)
+	}
+
+	// Check for existing active deployment
+	var activeCount int
+	err = tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM deployments 
+		 WHERE project_id = $1 AND status IN ($2, $3, $4, $5, $6)`,
+		project.ID,
+		models.DeployStatusQueued,
+		models.DeployStatusCloning,
+		models.DeployStatusBuilding,
+		models.DeployStatusStarting,
+		models.DeployStatusHealthChecking,
+	).Scan(&activeCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check active deployments: %w", err)
+	}
+	if activeCount > 0 {
+		return nil, ErrActiveDeployment
+	}
+
+	// Get next deploy number safely inside locked transaction
+	var maxNumber *int
+	err = tx.QueryRow(ctx,
+		"SELECT MAX(deploy_number) FROM deployments WHERE project_id = $1",
+		project.ID,
+	).Scan(&maxNumber)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get deploy number: %w", err)
+	}
+
+	deployNumber := 1
+	if maxNumber != nil {
+		deployNumber = *maxNumber + 1
+	}
+
+	now := time.Now()
+	imageTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, targetService.Name, deployNumber)
+
+	buildStrategy := targetService.BuildStrategy
+	if buildStrategy == "" {
+		buildStrategy = project.BuildStrategy
+	}
+	buildCommand := targetService.BuildCommand
+	if buildCommand == "" {
+		buildCommand = project.BuildCommand
+	}
+	startCommand := targetService.StartCommand
+	if startCommand == "" {
+		startCommand = project.StartCommand
+	}
+	runtimeType := targetService.RuntimeType
+	if runtimeType == "" {
+		runtimeType = project.RuntimeType
+	}
+	internalPort := targetService.InternalPort
+	if internalPort <= 0 {
+		internalPort = project.InternalPort
+	}
+	healthStrategy := targetService.HealthStrategy
+	if healthStrategy == "" {
+		healthStrategy = project.HealthStrategy
+	}
+
+	deployment := &models.Deployment{
+		ID:             uuid.New(),
+		ProjectID:      project.ID,
+		DeployNumber:   deployNumber,
+		Status:         models.DeployStatusQueued,
+		Branch:         project.Branch,
+		ImageTag:       &imageTag,
+		BuildStrategy:  buildStrategy,
+		BuildCommand:   buildCommand,
+		StartCommand:   startCommand,
+		RuntimeType:    runtimeType,
+		InternalPort:   internalPort,
+		HealthStrategy: healthStrategy,
+		StartedAt:      &now,
+		CreatedAt:      now,
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO deployments (
+			id, project_id, deploy_number, status, branch, image_tag,
+			build_strategy, build_command, start_command, runtime_type, internal_port, health_strategy,
+			started_at, created_at
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		deployment.ID, deployment.ProjectID, deployment.DeployNumber,
+		deployment.Status, deployment.Branch, deployment.ImageTag,
+		deployment.BuildStrategy, deployment.BuildCommand, deployment.StartCommand,
+		deployment.RuntimeType, deployment.InternalPort, deployment.HealthStrategy,
+		deployment.StartedAt, deployment.CreatedAt,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "uq_active_deployment_per_project") || strings.Contains(err.Error(), "uq_deployments_project_number") {
+			return nil, ErrActiveDeployment
+		}
+		return nil, fmt.Errorf("failed to create deployment: %w", err)
+	}
+
+	// Insert single service deployment for targeted service
+	svcDeployID := uuid.New()
+	_, err = tx.Exec(ctx,
+		`INSERT INTO service_deployments (
+			id, deployment_id, service_id, status, image_tag, build_strategy,
+			build_command, start_command, runtime_type, internal_port, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		svcDeployID, deployment.ID, targetService.ID, models.DeployStatusQueued, imageTag,
+		buildStrategy, buildCommand, startCommand, runtimeType, internalPort, now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create service deployment: %w", err)
+	}
+
+	// Update targeted service status to queued/deploying
+	_, err = tx.Exec(ctx,
+		"UPDATE services SET status = $1, current_service_deployment_id = $2, updated_at = $3 WHERE id = $4",
+		models.DeployStatusQueued, svcDeployID, now, targetService.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update target service status: %w", err)
+	}
+
+	// Update project status to deploying
+	_, err = tx.Exec(ctx,
+		"UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
+		models.ProjectStatusDeploying, time.Now(), project.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update project status: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit service deployment: %w", err)
+	}
+
+	deployment.ServiceDeployments = []*models.ServiceDeployment{
+		{
+			ID:            svcDeployID,
+			DeploymentID:  deployment.ID,
+			ServiceID:     targetService.ID,
+			ServiceName:   targetService.Name,
+			Status:        models.DeployStatusQueued,
+			ImageTag:      &imageTag,
+			InternalPort:  internalPort,
+			BuildStrategy: buildStrategy,
+			BuildCommand:  buildCommand,
+			StartCommand:  startCommand,
+			RuntimeType:   runtimeType,
+			CreatedAt:     now,
+		},
+	}
+
+	slog.Info("service deployment created",
+		"deployment_id", deployment.ID,
+		"project_id", project.ID,
+		"service_id", targetService.ID,
+		"service_name", targetService.Name,
 		"deploy_number", deployNumber,
 	)
 
@@ -456,7 +639,7 @@ func (s *DeploymentService) GetServiceLogs(ctx context.Context, deploymentID, se
 // ListServiceDeployments retrieves all service deployment records for a release.
 func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deploymentID uuid.UUID) ([]*models.ServiceDeployment, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, sd.status, sd.image_tag, sd.container_id,
+		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, s.public_exposed, sd.status, sd.image_tag, sd.container_id,
 		        sd.host_port, sd.internal_port, sd.build_strategy, sd.build_command, sd.start_command,
 		        sd.runtime_type, sd.started_at, sd.built_at, sd.deployed_at, sd.finished_at,
 		        sd.duration_ms, sd.failure_reason, sd.created_at
@@ -471,17 +654,30 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 	}
 	defer rows.Close()
 
+	publicHost := os.Getenv("FORGELAB_PUBLIC_HOST")
+	if publicHost == "" {
+		publicHost = os.Getenv("PUBLIC_HOST")
+	}
+	if publicHost == "" {
+		publicHost = "localhost"
+	}
+
 	var list []*models.ServiceDeployment
 	for rows.Next() {
 		sd := &models.ServiceDeployment{}
+		var publicExposed bool
 		err := rows.Scan(
-			&sd.ID, &sd.DeploymentID, &sd.ServiceID, &sd.ServiceName, &sd.Status, &sd.ImageTag,
+			&sd.ID, &sd.DeploymentID, &sd.ServiceID, &sd.ServiceName, &publicExposed, &sd.Status, &sd.ImageTag,
 			&sd.ContainerID, &sd.HostPort, &sd.InternalPort, &sd.BuildStrategy, &sd.BuildCommand,
 			&sd.StartCommand, &sd.RuntimeType, &sd.StartedAt, &sd.BuiltAt, &sd.DeployedAt,
 			&sd.FinishedAt, &sd.DurationMs, &sd.FailureReason, &sd.CreatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan service deployment: %w", err)
+		}
+		if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 {
+			url := fmt.Sprintf("http://%s:%d", publicHost, *sd.HostPort)
+			sd.PreviewURL = &url
 		}
 		list = append(list, sd)
 	}

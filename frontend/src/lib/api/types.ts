@@ -64,6 +64,7 @@ export interface Service {
   container_id?: string | null;
   image_tag?: string | null;
   current_service_deployment_id?: string | null;
+  preview_url?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -82,6 +83,7 @@ export interface ServiceDeployment {
   build_command: string;
   start_command: string;
   runtime_type: string;
+  preview_url?: string | null;
   started_at?: string | null;
   built_at?: string | null;
   deployed_at?: string | null;
@@ -127,8 +129,13 @@ export interface AgentSourceSession {
   source_id: string;
   agent_id: string;
   folder_name: string;
+  status?: 'scanning' | 'detecting' | 'ready' | 'failed';
+  phase?: string;
+  files_scanned?: number;
   total_files: number;
   total_bytes: number;
+  detected_count?: number;
+  error?: string | null;
   services: ServiceDefinition[];
   registered_at: string;
 }

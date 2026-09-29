@@ -44,31 +44,31 @@ type GitHubIntegration struct {
 // Project represents a registered project in ForgeLab.
 // A project is an application that ForgeLab manages, containing one or more services.
 type Project struct {
-	ID                  uuid.UUID   `json:"id"`
-	OwnerID             uuid.UUID   `json:"owner_id"`
-	SourceID            *uuid.UUID  `json:"source_id,omitempty"`
-	Name                string      `json:"name"`
-	Slug                string      `json:"slug"`
-	SourceType          string      `json:"source_type"` // "local_agent", "local_directory", "local_upload", "github", or legacy "local"
-	SourceReference     string      `json:"source_reference"` // repo "owner/repo" or local upload source_id
-	RepositoryPath      string      `json:"repository_path"` // host path for local_directory projects
-	Branch              string      `json:"branch"`
-	DockerfilePath      string      `json:"dockerfile_path"`
-	BuildContext        string      `json:"build_context"`
-	BuildStrategy       string      `json:"build_strategy"` // "auto" or "dockerfile"
-	BuildCommand        string      `json:"build_command"`
-	StartCommand        string      `json:"start_command"`
-	RuntimeType         string      `json:"runtime_type"` // "nextjs", "nodejs", "python-fastapi", "go", etc.
-	InternalPort        int         `json:"internal_port"` // 3000, 8000, 8080, etc.
-	HealthCheckPath     *string     `json:"health_check_path"` // Nullable
-	HealthCheckEnabled  bool        `json:"health_check_enabled"`
-	HealthStrategy      string      `json:"health_strategy"` // "auto", "http", "tcp", "none"
-	Status              string      `json:"status"` // inactive, deploying, running, partially_running, stopped, failed
-	CurrentDeploymentID *uuid.UUID  `json:"current_deployment_id"`
-	Port                *int        `json:"port"`
-	Services            []*Service  `json:"services,omitempty"`
-	CreatedAt           time.Time   `json:"created_at"`
-	UpdatedAt           time.Time   `json:"updated_at"`
+	ID                  uuid.UUID  `json:"id"`
+	OwnerID             uuid.UUID  `json:"owner_id"`
+	SourceID            *uuid.UUID `json:"source_id,omitempty"`
+	Name                string     `json:"name"`
+	Slug                string     `json:"slug"`
+	SourceType          string     `json:"source_type"`      // "local_agent", "local_directory", "local_upload", "github", or legacy "local"
+	SourceReference     string     `json:"source_reference"` // repo "owner/repo" or local upload source_id
+	RepositoryPath      string     `json:"repository_path"`  // host path for local_directory projects
+	Branch              string     `json:"branch"`
+	DockerfilePath      string     `json:"dockerfile_path"`
+	BuildContext        string     `json:"build_context"`
+	BuildStrategy       string     `json:"build_strategy"` // "auto" or "dockerfile"
+	BuildCommand        string     `json:"build_command"`
+	StartCommand        string     `json:"start_command"`
+	RuntimeType         string     `json:"runtime_type"`      // "nextjs", "nodejs", "python-fastapi", "go", etc.
+	InternalPort        int        `json:"internal_port"`     // 3000, 8000, 8080, etc.
+	HealthCheckPath     *string    `json:"health_check_path"` // Nullable
+	HealthCheckEnabled  bool       `json:"health_check_enabled"`
+	HealthStrategy      string     `json:"health_strategy"` // "auto", "http", "tcp", "none"
+	Status              string     `json:"status"`          // inactive, deploying, running, partially_running, stopped, failed
+	CurrentDeploymentID *uuid.UUID `json:"current_deployment_id"`
+	Port                *int       `json:"port"`
+	Services            []*Service `json:"services,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
 }
 
 // Source represents an abstracted code origin (local agent session, archive upload, or GitHub repo).
@@ -86,49 +86,50 @@ type Source struct {
 
 // BuildCandidate represents a detected build/start option for a service.
 type BuildCandidate struct {
-	ID             string  `json:"id"`
-	Strategy       string  `json:"strategy"` // "dockerfile", "auto", "custom"
-	Name           string  `json:"name"`
-	Description    string  `json:"description"`
-	Confidence     float64 `json:"confidence"` // 0.0 - 1.0
-	BuildCommand   string  `json:"build_command"`
-	StartCommand   string  `json:"start_command"`
-	DockerfilePath string  `json:"dockerfile_path,omitempty"`
-	PackageManager string  `json:"package_manager,omitempty"`
-	SuggestedPort  int     `json:"suggested_port"`
-	HealthCheckPath string `json:"health_check_path"`
-	HealthStrategy string  `json:"health_strategy"`
+	ID              string  `json:"id"`
+	Strategy        string  `json:"strategy"` // "dockerfile", "auto", "custom"
+	Name            string  `json:"name"`
+	Description     string  `json:"description"`
+	Confidence      float64 `json:"confidence"` // 0.0 - 1.0
+	BuildCommand    string  `json:"build_command"`
+	StartCommand    string  `json:"start_command"`
+	DockerfilePath  string  `json:"dockerfile_path,omitempty"`
+	PackageManager  string  `json:"package_manager,omitempty"`
+	SuggestedPort   int     `json:"suggested_port"`
+	HealthCheckPath string  `json:"health_check_path"`
+	HealthStrategy  string  `json:"health_strategy"`
 }
 
 // Service represents an individual deployable service within a parent Project.
 type Service struct {
-	ID                          uuid.UUID        `json:"id"`
-	ProjectID                   uuid.UUID        `json:"project_id"`
-	SourceID                    *uuid.UUID       `json:"source_id,omitempty"`
-	Name                        string           `json:"name"`
-	Role                        string           `json:"role"` // "frontend", "backend", "worker", "other"
-	SourcePath                  string           `json:"source_path"` // relative path inside repo, e.g. ".", "./frontend"
-	RuntimeType                 string           `json:"runtime_type"`
-	Framework                   string           `json:"framework"`
-	PackageManager              string           `json:"package_manager"`
-	BuildStrategy               string           `json:"build_strategy"`
-	BuildCandidates             []BuildCandidate `json:"build_candidates"`
-	BuildCommand                string           `json:"build_command"`
-	StartCommand                string           `json:"start_command"`
-	DockerfilePath              string           `json:"dockerfile_path"`
-	BuildContext                string           `json:"build_context"`
-	InternalPort                int              `json:"internal_port"`
-	HostPort                    *int             `json:"host_port"`
-	PublicExposed               bool             `json:"public_exposed"`
-	HealthStrategy              string           `json:"health_strategy"`
-	HealthCheckPath             *string          `json:"health_check_path"`
-	HealthCheckEnabled          bool             `json:"health_check_enabled"`
-	Status                      string           `json:"status"` // inactive, deploying, running, stopped, failed
-	ContainerID                 *string          `json:"container_id"`
-	ImageTag                    *string          `json:"image_tag"`
-	CurrentServiceDeploymentID  *uuid.UUID       `json:"current_service_deployment_id"`
-	CreatedAt                   time.Time        `json:"created_at"`
-	UpdatedAt                   time.Time        `json:"updated_at"`
+	ID                         uuid.UUID        `json:"id"`
+	ProjectID                  uuid.UUID        `json:"project_id"`
+	SourceID                   *uuid.UUID       `json:"source_id,omitempty"`
+	Name                       string           `json:"name"`
+	Role                       string           `json:"role"`        // "frontend", "backend", "worker", "other"
+	SourcePath                 string           `json:"source_path"` // relative path inside repo, e.g. ".", "./frontend"
+	RuntimeType                string           `json:"runtime_type"`
+	Framework                  string           `json:"framework"`
+	PackageManager             string           `json:"package_manager"`
+	BuildStrategy              string           `json:"build_strategy"`
+	BuildCandidates            []BuildCandidate `json:"build_candidates"`
+	BuildCommand               string           `json:"build_command"`
+	StartCommand               string           `json:"start_command"`
+	DockerfilePath             string           `json:"dockerfile_path"`
+	BuildContext               string           `json:"build_context"`
+	InternalPort               int              `json:"internal_port"`
+	HostPort                   *int             `json:"host_port"`
+	PublicExposed              bool             `json:"public_exposed"`
+	HealthStrategy             string           `json:"health_strategy"`
+	HealthCheckPath            *string          `json:"health_check_path"`
+	HealthCheckEnabled         bool             `json:"health_check_enabled"`
+	Status                     string           `json:"status"` // inactive, deploying, running, stopped, failed
+	ContainerID                *string          `json:"container_id"`
+	ImageTag                   *string          `json:"image_tag"`
+	PreviewURL                 *string          `json:"preview_url,omitempty"`
+	CurrentServiceDeploymentID *uuid.UUID       `json:"current_service_deployment_id"`
+	CreatedAt                  time.Time        `json:"created_at"`
+	UpdatedAt                  time.Time        `json:"updated_at"`
 }
 
 // ServiceDeployment represents the deployment record of a single service within a release.
@@ -142,6 +143,7 @@ type ServiceDeployment struct {
 	ContainerID   *string    `json:"container_id"`
 	HostPort      *int       `json:"host_port"`
 	InternalPort  int        `json:"internal_port"`
+	PreviewURL    *string    `json:"preview_url,omitempty"`
 	BuildStrategy string     `json:"build_strategy"`
 	BuildCommand  string     `json:"build_command"`
 	StartCommand  string     `json:"start_command"`

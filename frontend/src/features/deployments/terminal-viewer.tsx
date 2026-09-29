@@ -16,17 +16,79 @@ interface TerminalViewerProps {
   deploymentId?: string;
 }
 
+const MAX_RENDERED_LOGS = 1500;
+
 export function TerminalViewer({ logs, connected, connectionState, onClear, deploymentNumber, deploymentId }: TerminalViewerProps) {
-  const terminalEndRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [copied, setCopied] = useState(false);
+  const isAtBottomRef = useRef(true);
+  const rafIdRef = useRef<number | null>(null);
 
-  useEffect(() => {
-    if (autoScroll && terminalEndRef.current) {
-      terminalEndRef.current.scrollIntoView({ behavior: 'smooth' });
+  // Scroll to bottom using requestAnimationFrame
+  const scrollToBottom = (immediate = false) => {
+    if (!containerRef.current) return;
+    if (rafIdRef.current) {
+      cancelAnimationFrame(rafIdRef.current);
     }
-  }, [logs, autoScroll]);
+    const scrollFn = () => {
+      if (containerRef.current) {
+        containerRef.current.scrollTop = containerRef.current.scrollHeight;
+      }
+      rafIdRef.current = null;
+    };
+
+    if (immediate) {
+      scrollFn();
+    } else {
+      rafIdRef.current = requestAnimationFrame(scrollFn);
+    }
+  };
+
+  // Scroll on new logs if autoScroll is enabled and we are at the bottom
+  useEffect(() => {
+    if (autoScroll && isAtBottomRef.current) {
+      scrollToBottom();
+    }
+  }, [logs.length, autoScroll]);
+
+  // Clean up RAF on unmount
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current) {
+        cancelAnimationFrame(rafIdRef.current);
+      }
+    };
+  }, []);
+
+  // Handle user scroll to detect if they scrolled away from bottom
+  const handleScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const isBottom = distanceFromBottom < 40;
+
+    if (isBottom !== isAtBottomRef.current) {
+      isAtBottomRef.current = isBottom;
+      if (isBottom && !autoScroll) {
+        // Auto-resume autoScroll when user scrolls back to bottom
+        setAutoScroll(true);
+      } else if (!isBottom && autoScroll) {
+        // Pause autoScroll when user scrolls up
+        setAutoScroll(false);
+      }
+    }
+  };
+
+  const handleToggleAutoScroll = () => {
+    const nextState = !autoScroll;
+    setAutoScroll(nextState);
+    if (nextState) {
+      isAtBottomRef.current = true;
+      scrollToBottom(true);
+    }
+  };
 
   const effectiveState = connectionState || (connected ? 'subscribed' : 'offline');
 
@@ -93,6 +155,8 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
   };
 
   const statusBadge = getConnectionBadge();
+  const displayedLogs = logs.length > MAX_RENDERED_LOGS ? logs.slice(-MAX_RENDERED_LOGS) : logs;
+  const isTrimmed = logs.length > MAX_RENDERED_LOGS;
 
   return (
     <div className="flex flex-col h-full rounded-md border border-surface-border bg-[#09090b] shadow-subtle overflow-hidden font-mono text-xs">
@@ -124,17 +188,17 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
         {/* Toolbar Controls */}
         <div className="flex items-center gap-1 font-sans">
           <button
-            onClick={() => setAutoScroll(!autoScroll)}
+            onClick={handleToggleAutoScroll}
             className={cn(
               'px-2 py-1 rounded text-[11px] flex items-center gap-1 border transition-colors',
               autoScroll
                 ? 'bg-neutral-800 border-neutral-600 text-white'
                 : 'bg-transparent border-surface-border text-neutral-400 hover:text-white'
             )}
-            title="Auto-scroll"
+            title={autoScroll ? 'Auto-scroll is on (click to pause)' : 'Auto-scroll is paused (click to resume)'}
           >
-            <ArrowDown className="w-3 h-3" />
-            <span>Scroll</span>
+            <ArrowDown className={cn('w-3 h-3', autoScroll && 'text-emerald-400')} />
+            <span>{autoScroll ? 'Auto-scroll' : 'Paused'}</span>
           </button>
 
           <button
@@ -160,16 +224,22 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
       {/* Terminal Logs Output */}
       <div
         ref={containerRef}
+        onScroll={handleScroll}
         className="flex-1 p-3.5 overflow-y-auto space-y-1 min-h-[360px] max-h-[580px] bg-[#070709] text-[11px] leading-relaxed"
       >
-        {logs.length === 0 ? (
+        {isTrimmed && (
+          <div className="text-center py-1 mb-2 text-[10px] text-neutral-500 border-b border-surface-border font-sans">
+            Displaying latest {MAX_RENDERED_LOGS.toLocaleString()} of {logs.length.toLocaleString()} log entries. Copying includes full history.
+          </div>
+        )}
+        {displayedLogs.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-48 text-neutral-500 font-sans text-xs">
             <Terminal className="w-6 h-6 mb-2 opacity-30" />
             <p>No log records for this release. Trigger a deployment to view telemetry.</p>
           </div>
         ) : (
-          logs.map((log, idx) => (
-            <div key={log.id || idx} className="flex items-start gap-2 hover:bg-white/[0.02] px-1 rounded">
+          displayedLogs.map((log, idx) => (
+            <div key={log.id || `${log.timestamp}-${idx}`} className="flex items-start gap-2 hover:bg-white/[0.02] px-1 rounded">
               <span className="text-neutral-600 shrink-0 select-none text-[10px]">
                 {new Date(log.timestamp).toLocaleTimeString()}
               </span>
@@ -189,7 +259,6 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
             </div>
           ))
         )}
-        <div ref={terminalEndRef} />
       </div>
     </div>
   );

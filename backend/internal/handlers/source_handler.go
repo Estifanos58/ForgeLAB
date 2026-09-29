@@ -416,6 +416,8 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 	if h.sourceService != nil {
 		if err := h.sourceService.SaveSource(r.Context(), sourceRecord); err != nil {
 			slog.Error("failed to save agent source in database", "source_id", sourceUUID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to register agent source: "+err.Error())
+			return
 		}
 	}
 

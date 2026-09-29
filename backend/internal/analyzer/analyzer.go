@@ -84,9 +84,17 @@ func IsSecretFile(name string) bool {
 	return false
 }
 
+// ProgressCallback defines progress reporting for repository analysis.
+type ProgressCallback func(phase string, filesScanned int, totalFiles int, detectedCount int)
+
 // AnalyzeRepository recursively inspects the repository root, discovers services,
 // detects technologies using evidence, and produces ranked build candidates.
 func AnalyzeRepository(repoRoot string) (*AnalysisResult, error) {
+	return AnalyzeRepositoryWithProgress(repoRoot, nil)
+}
+
+// AnalyzeRepositoryWithProgress recursively inspects the repository root with progress reporting.
+func AnalyzeRepositoryWithProgress(repoRoot string, onProgress ProgressCallback) (*AnalysisResult, error) {
 	cleanRoot := filepath.Clean(repoRoot)
 	info, err := os.Stat(cleanRoot)
 	if err != nil {
@@ -99,6 +107,10 @@ func AnalyzeRepository(repoRoot string) (*AnalysisResult, error) {
 	repoName := filepath.Base(cleanRoot)
 	if repoName == "" || repoName == "/" || repoName == "." || repoName == "\\" {
 		repoName = "project"
+	}
+
+	if onProgress != nil {
+		onProgress("scanning", 0, 0, 0)
 	}
 
 	totalFiles := 0
@@ -120,9 +132,16 @@ func AnalyzeRepository(repoRoot string) (*AnalysisResult, error) {
 			if info, err := d.Info(); err == nil {
 				totalBytes += info.Size()
 			}
+			if onProgress != nil && totalFiles%50 == 0 {
+				onProgress("scanning", totalFiles, 0, 0)
+			}
 		}
 		return nil
 	})
+
+	if onProgress != nil {
+		onProgress("detecting", totalFiles, totalFiles, 0)
+	}
 
 	// 1. Discover potential service root subdirectories
 	servicePaths := discoverServicePaths(cleanRoot)
@@ -133,6 +152,9 @@ func AnalyzeRepository(repoRoot string) (*AnalysisResult, error) {
 		svc, err := inspectServiceDirectory(cleanRoot, svcDir, relPath)
 		if err == nil && svc != nil {
 			services = append(services, *svc)
+			if onProgress != nil {
+				onProgress("detecting", totalFiles, totalFiles, len(services))
+			}
 		}
 	}
 
@@ -146,6 +168,10 @@ func AnalyzeRepository(repoRoot string) (*AnalysisResult, error) {
 			// Fallback generic single service
 			services = append(services, createGenericService(repoName, "."))
 		}
+	}
+
+	if onProgress != nil {
+		onProgress("ready", totalFiles, totalFiles, len(services))
 	}
 
 	return &AnalysisResult{

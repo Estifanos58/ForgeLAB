@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -70,6 +71,7 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 			svc.BuildCandidates = []models.BuildCandidate{}
 		}
 
+		populateServicePreviewURL(svc)
 		services = append(services, svc)
 	}
 
@@ -118,7 +120,25 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 		svc.BuildCandidates = []models.BuildCandidate{}
 	}
 
+	populateServicePreviewURL(svc)
 	return svc, nil
+}
+
+func populateServicePreviewURL(svc *models.Service) {
+	if svc == nil {
+		return
+	}
+	if svc.PublicExposed && svc.HostPort != nil && *svc.HostPort > 0 {
+		host := os.Getenv("FORGELAB_PUBLIC_HOST")
+		if host == "" {
+			host = os.Getenv("PUBLIC_HOST")
+		}
+		if host == "" {
+			host = "localhost"
+		}
+		url := fmt.Sprintf("http://%s:%d", host, *svc.HostPort)
+		svc.PreviewURL = &url
+	}
 }
 
 // CreateService inserts a new service.

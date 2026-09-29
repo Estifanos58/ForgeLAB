@@ -23,6 +23,7 @@ import { Modal } from '@/components/ui/modal';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Alert } from '@/components/ui/alert';
+import { cn } from '@/lib/utils/cn';
 import {
   Github,
   Upload,
@@ -145,7 +146,13 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   const [localMode, setLocalMode] = useState<LocalMode>('agent');
   const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
   const [checkingAgent, setCheckingAgent] = useState<boolean>(false);
-  const [agentSelectingFolder, setAgentSelectingFolder] = useState<boolean>(false);
+  const [agentStage, setAgentStage] = useState<'idle' | 'selecting' | 'scanning' | 'detecting' | 'ready' | 'failed'>('idle');
+  const [agentProgress, setAgentProgress] = useState<{
+    filesScanned?: number;
+    totalFiles?: number;
+    phase?: string;
+    detectedCount?: number;
+  }>({});
   const [agentSession, setAgentSession] = useState<AgentSourceSession | null>(null);
   const [configuredServices, setConfiguredServices] = useState<ConfigurableService[]>([]);
   const [manualPathInput, setManualPathInput] = useState<string>('');
@@ -168,6 +175,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   // References for cancellation and polling cleanup
   const abortControllerRef = useRef<AbortController | null>(null);
   const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const agentPollTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Project configuration state
   const [projectName, setProjectName] = useState('');
@@ -196,10 +204,20 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     }
   }, [isOpen, sourceTab, localMode]);
 
-  // Cancel in-flight upload and clear polling when modal closes
+  // Cancel in-flight upload, stop agent polling, and reset local-agent state when modal closes
   useEffect(() => {
     if (!isOpen) {
       handleCancelUpload();
+      if (agentPollTimerRef.current) {
+        clearInterval(agentPollTimerRef.current);
+        agentPollTimerRef.current = null;
+      }
+      setAgentStage('idle');
+      setAgentSession(null);
+      setConfiguredServices([]);
+      setAgentProgress({});
+      setManualPathInput('');
+      setError(null);
     }
     return () => {
       if (abortControllerRef.current) {
@@ -209,6 +227,10 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       if (pollingTimerRef.current) {
         clearInterval(pollingTimerRef.current);
         pollingTimerRef.current = null;
+      }
+      if (agentPollTimerRef.current) {
+        clearInterval(agentPollTimerRef.current);
+        agentPollTimerRef.current = null;
       }
     };
   }, [isOpen]);
@@ -233,20 +255,107 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     }
   };
 
+  const isSessionReady = (s: AgentSourceSession | null | undefined): boolean => {
+    if (!s) return false;
+    if (s.status === 'ready') return true;
+    if (s.status === 'failed' || Boolean(s.error)) return false;
+    // If services array is returned with detected services, it is ready!
+    if (Array.isArray(s.services) && s.services.length > 0) return true;
+    // If status is not actively scanning or detecting, and has source_id and metadata, it is ready!
+    if (s.status !== 'scanning' && s.status !== 'detecting') {
+      if (s.source_id && (s.total_files !== undefined || Array.isArray(s.services))) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const isSessionFailed = (s: AgentSourceSession | null | undefined): boolean => {
+    if (!s) return false;
+    return s.status === 'failed' || Boolean(s.error);
+  };
+
+  const pollAgentSession = (sourceId: string) => {
+    if (agentPollTimerRef.current) {
+      clearInterval(agentPollTimerRef.current);
+      agentPollTimerRef.current = null;
+    }
+
+    agentPollTimerRef.current = setInterval(async () => {
+      try {
+        const s = await api.agent.getSource(sourceId);
+        setAgentProgress({
+          filesScanned: s.files_scanned,
+          totalFiles: s.total_files,
+          phase: s.phase,
+          detectedCount: s.detected_count || (Array.isArray(s.services) ? s.services.length : 0),
+        });
+
+        if (isSessionReady(s)) {
+          if (agentPollTimerRef.current) {
+            clearInterval(agentPollTimerRef.current);
+            agentPollTimerRef.current = null;
+          }
+          setAgentStage('ready');
+          handleApplyAgentSession(s);
+        } else if (isSessionFailed(s)) {
+          if (agentPollTimerRef.current) {
+            clearInterval(agentPollTimerRef.current);
+            agentPollTimerRef.current = null;
+          }
+          setAgentStage('failed');
+          setError(s.error || 'Failed to analyze repository with ForgeLAB Agent');
+        } else if (s.status === 'scanning' || s.status === 'detecting') {
+          setAgentStage(s.status);
+        }
+      } catch (err: any) {
+        if (agentPollTimerRef.current) {
+          clearInterval(agentPollTimerRef.current);
+          agentPollTimerRef.current = null;
+        }
+        setAgentStage('failed');
+        setError(err.message || 'Lost connection to ForgeLAB Agent during analysis');
+      }
+    }, 350);
+  };
+
   const handleSelectLocalFolder = async () => {
-    setAgentSelectingFolder(true);
+    setAgentStage('selecting');
     setError(null);
     try {
       const res = await api.agent.selectFolder('Select Project Folder for ForgeLAB');
       if ('cancelled' in res && res.cancelled) {
+        setAgentStage('idle');
         return;
       }
       const session = res as AgentSourceSession;
-      handleApplyAgentSession(session);
+      if (isSessionReady(session)) {
+        if (agentPollTimerRef.current) {
+          clearInterval(agentPollTimerRef.current);
+          agentPollTimerRef.current = null;
+        }
+        setAgentStage('ready');
+        handleApplyAgentSession(session);
+      } else if (isSessionFailed(session)) {
+        if (agentPollTimerRef.current) {
+          clearInterval(agentPollTimerRef.current);
+          agentPollTimerRef.current = null;
+        }
+        setAgentStage('failed');
+        setError(session.error || 'Repository analysis failed');
+      } else {
+        setAgentStage(session.status || 'scanning');
+        setAgentProgress({
+          filesScanned: session.files_scanned,
+          totalFiles: session.total_files,
+          phase: session.phase,
+          detectedCount: session.detected_count || (Array.isArray(session.services) ? session.services.length : 0),
+        });
+        pollAgentSession(session.source_id);
+      }
     } catch (err: any) {
+      setAgentStage('failed');
       setError(err.message || 'Failed to select and analyze directory via ForgeLAB Agent');
-    } finally {
-      setAgentSelectingFolder(false);
     }
   };
 
@@ -256,15 +365,37 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       setError('Please enter a directory path');
       return;
     }
-    setAgentSelectingFolder(true);
+    setAgentStage('selecting');
     setError(null);
     try {
       const session = await api.agent.selectPath(p);
-      handleApplyAgentSession(session);
+      if (isSessionReady(session)) {
+        if (agentPollTimerRef.current) {
+          clearInterval(agentPollTimerRef.current);
+          agentPollTimerRef.current = null;
+        }
+        setAgentStage('ready');
+        handleApplyAgentSession(session);
+      } else if (isSessionFailed(session)) {
+        if (agentPollTimerRef.current) {
+          clearInterval(agentPollTimerRef.current);
+          agentPollTimerRef.current = null;
+        }
+        setAgentStage('failed');
+        setError(session.error || 'Repository analysis failed');
+      } else {
+        setAgentStage(session.status || 'scanning');
+        setAgentProgress({
+          filesScanned: session.files_scanned,
+          totalFiles: session.total_files,
+          phase: session.phase,
+          detectedCount: session.detected_count || (Array.isArray(session.services) ? session.services.length : 0),
+        });
+        pollAgentSession(session.source_id);
+      }
     } catch (err: any) {
+      setAgentStage('failed');
       setError(err.message || 'Failed to validate and inspect path via ForgeLAB Agent');
-    } finally {
-      setAgentSelectingFolder(false);
     }
   };
 
@@ -301,9 +432,16 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   };
 
   const handleResetAgentSession = () => {
+    if (agentPollTimerRef.current) {
+      clearInterval(agentPollTimerRef.current);
+      agentPollTimerRef.current = null;
+    }
+    setAgentStage('idle');
     setAgentSession(null);
     setConfiguredServices([]);
+    setAgentProgress({});
     setManualPathInput('');
+    setError(null);
   };
 
   const handleCandidateChange = (svcIndex: number, candidateId: string) => {
@@ -716,8 +854,10 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
               total_bytes: agentSession.total_bytes,
             },
           });
-        } catch (err) {
-          console.warn('Agent source register status notice:', err);
+        } catch (err: any) {
+          setError(`Failed to register agent source with ForgeLAB server: ${err.message || 'connection error'}`);
+          setLoading(false);
+          return;
         }
 
         payload = {
@@ -966,72 +1106,247 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                     </div>
                   )}
 
-                  {/* Case 2: Agent Online - Folder Selection */}
+                  {/* Case 2: Agent Online - Folder Selection & Staged Progress */}
                   {isLocalAgentOnline && !agentSession && (
-                    <div className="rounded-lg border border-surface-border bg-surface-elevated/30 p-6 text-center space-y-4">
-                      <div className="w-12 h-12 mx-auto rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
-                        <FolderCheck className="w-6 h-6" />
-                      </div>
-
-                      <div className="space-y-1">
-                        <h4 className="text-sm font-semibold text-white">Select Project Folder on Your Computer</h4>
-                        <p className="text-xs text-neutral-400 max-w-md mx-auto leading-relaxed">
-                          Click below to open the native operating-system folder picker. ForgeLAB will automatically analyze monorepos, full-stack apps (frontend + backend), and independent services.
-                        </p>
-                      </div>
-
-                      <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
-                        <Button
-                          type="button"
-                          variant="primary"
-                          size="lg"
-                          onClick={handleSelectLocalFolder}
-                          loading={agentSelectingFolder}
-                          icon={<Folder className="w-4 h-4" />}
-                          className="px-6 py-2.5 text-sm font-medium shadow-md shadow-emerald-500/10"
+                    <div className="rounded-lg border border-surface-border bg-surface-elevated/30 p-6 space-y-5">
+                      {/* Staged Progress Indicator Bar */}
+                      <div className="flex items-center justify-between gap-1 text-[11px] font-mono border-b border-surface-border/60 pb-3">
+                        <div
+                          className={cn(
+                            'flex items-center gap-1.5 px-2 py-1 rounded transition-colors',
+                            agentStage === 'selecting'
+                              ? 'bg-emerald-500/10 text-emerald-400 font-semibold border border-emerald-500/20'
+                              : agentStage === 'scanning' || agentStage === 'detecting' || agentStage === 'ready'
+                              ? 'text-neutral-400 line-through opacity-70'
+                              : 'text-neutral-500'
+                          )}
                         >
-                          {agentSelectingFolder ? 'Waiting for Folder Selection...' : 'Select Folder'}
-                        </Button>
+                          <span className="w-4 h-4 rounded-full border border-current flex items-center justify-center text-[10px]">
+                            {agentStage === 'scanning' || agentStage === 'detecting' || agentStage === 'ready' ? '✓' : '1'}
+                          </span>
+                          <span>Selecting</span>
+                        </div>
+
+                        <span className="text-neutral-600">→</span>
+
+                        <div
+                          className={cn(
+                            'flex items-center gap-1.5 px-2 py-1 rounded transition-colors',
+                            agentStage === 'scanning'
+                              ? 'bg-blue-500/10 text-blue-400 font-semibold border border-blue-500/20 animate-pulse'
+                              : agentStage === 'detecting' || agentStage === 'ready'
+                              ? 'text-neutral-400 line-through opacity-70'
+                              : 'text-neutral-500'
+                          )}
+                        >
+                          <span className="w-4 h-4 rounded-full border border-current flex items-center justify-center text-[10px]">
+                            {agentStage === 'detecting' || agentStage === 'ready' ? '✓' : '2'}
+                          </span>
+                          <span>Scanning</span>
+                        </div>
+
+                        <span className="text-neutral-600">→</span>
+
+                        <div
+                          className={cn(
+                            'flex items-center gap-1.5 px-2 py-1 rounded transition-colors',
+                            agentStage === 'detecting'
+                              ? 'bg-purple-500/10 text-purple-400 font-semibold border border-purple-500/20 animate-pulse'
+                              : agentStage === 'ready'
+                              ? 'text-neutral-400 line-through opacity-70'
+                              : 'text-neutral-500'
+                          )}
+                        >
+                          <span className="w-4 h-4 rounded-full border border-current flex items-center justify-center text-[10px]">
+                            {agentStage === 'ready' ? '✓' : '3'}
+                          </span>
+                          <span>Detecting</span>
+                        </div>
+
+                        <span className="text-neutral-600">→</span>
+
+                        <div
+                          className={cn(
+                            'flex items-center gap-1.5 px-2 py-1 rounded transition-colors',
+                            agentStage === 'ready'
+                              ? 'bg-emerald-500/10 text-emerald-400 font-semibold border border-emerald-500/20'
+                              : 'text-neutral-500'
+                          )}
+                        >
+                          <span className="w-4 h-4 rounded-full border border-current flex items-center justify-center text-[10px]">
+                            4
+                          </span>
+                          <span>Ready</span>
+                        </div>
                       </div>
 
-                      <div className="pt-3 border-t border-surface-border/60">
-                        <button
-                          type="button"
-                          onClick={() => setShowManualPath(!showManualPath)}
-                          className="text-[11px] text-neutral-500 hover:text-neutral-300 font-mono transition-colors"
-                        >
-                          {showManualPath ? '▲ Hide manual path input' : '▼ Or enter directory path directly'}
-                        </button>
+                      {/* Stage: Idle */}
+                      {agentStage === 'idle' && (
+                        <div className="text-center space-y-4 pt-1">
+                          <div className="w-12 h-12 mx-auto rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+                            <FolderCheck className="w-6 h-6" />
+                          </div>
 
-                        {showManualPath && (
-                          <div className="mt-3 flex gap-2 max-w-lg mx-auto">
-                            <input
-                              type="text"
-                              placeholder="e.g. C:\Users\name\Projects\my-app or /home/user/my-app"
-                              value={manualPathInput}
-                              onChange={(e) => setManualPathInput(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') {
-                                  e.preventDefault();
-                                  handleManualPathSelect();
-                                }
-                              }}
-                              className="flex-1 h-8 px-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-neutral-500"
-                            />
+                          <div className="space-y-1">
+                            <h4 className="text-sm font-semibold text-white">Select Project Folder on Your Computer</h4>
+                            <p className="text-xs text-neutral-400 max-w-md mx-auto leading-relaxed">
+                              Click below to open the native operating-system folder picker. ForgeLAB will automatically analyze monorepos, full-stack apps (frontend + backend), and independent services.
+                            </p>
+                          </div>
+
+                          <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
+                            <Button
+                              type="button"
+                              variant="primary"
+                              size="lg"
+                              onClick={handleSelectLocalFolder}
+                              icon={<Folder className="w-4 h-4" />}
+                              className="px-6 py-2.5 text-sm font-medium shadow-md shadow-emerald-500/10"
+                            >
+                              Select Folder
+                            </Button>
+                          </div>
+
+                          <div className="pt-3 border-t border-surface-border/60">
+                            <button
+                              type="button"
+                              onClick={() => setShowManualPath(!showManualPath)}
+                              className="text-[11px] text-neutral-500 hover:text-neutral-300 font-mono transition-colors"
+                            >
+                              {showManualPath ? '▲ Hide manual path input' : '▼ Or enter directory path directly'}
+                            </button>
+
+                            {showManualPath && (
+                              <div className="mt-3 flex gap-2 max-w-lg mx-auto">
+                                <input
+                                  type="text"
+                                  placeholder="e.g. C:\Users\name\Projects\my-app or /home/user/my-app"
+                                  value={manualPathInput}
+                                  onChange={(e) => setManualPathInput(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      e.preventDefault();
+                                      handleManualPathSelect();
+                                    }
+                                  }}
+                                  className="flex-1 h-8 px-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-neutral-500"
+                                />
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={handleManualPathSelect}
+                                  disabled={!manualPathInput.trim()}
+                                  className="h-8 text-xs"
+                                >
+                                  Analyze
+                                </Button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Stage: Waiting for Native Picker */}
+                      {agentStage === 'selecting' && (
+                        <div className="text-center space-y-4 py-3">
+                          <div className="w-12 h-12 mx-auto rounded-full bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400 animate-pulse">
+                            <Folder className="w-6 h-6" />
+                          </div>
+                          <div className="space-y-1">
+                            <h4 className="text-sm font-semibold text-white">Opening Folder Picker...</h4>
+                            <p className="text-xs text-neutral-400 max-w-md mx-auto leading-relaxed">
+                              Please choose your project directory in the native folder selection window.
+                            </p>
+                          </div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setAgentStage('idle')}
+                            className="text-xs text-neutral-400 hover:text-white"
+                          >
+                            Cancel
+                          </Button>
+                        </div>
+                      )}
+
+                      {/* Stage: Scanning or Detecting Asynchronously */}
+                      {(agentStage === 'scanning' || agentStage === 'detecting') && (
+                        <div className="text-center space-y-4 py-3">
+                          <div className="w-12 h-12 mx-auto rounded-full bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400">
+                            <RefreshCw className="w-6 h-6 animate-spin" />
+                          </div>
+
+                          <div className="space-y-2">
+                            <h4 className="text-sm font-semibold text-white capitalize">
+                              {agentProgress.phase || (agentStage === 'scanning' ? 'Scanning repository files...' : 'Detecting services and runtimes...')}
+                            </h4>
+                            <div className="flex items-center justify-center gap-2 text-xs font-mono text-neutral-400">
+                              {agentProgress.filesScanned !== undefined && (
+                                <span>{agentProgress.filesScanned.toLocaleString()} files scanned</span>
+                              )}
+                              {agentProgress.detectedCount !== undefined && agentProgress.detectedCount > 0 && (
+                                <>
+                                  <span>•</span>
+                                  <span className="text-emerald-400 font-semibold">
+                                    {agentProgress.detectedCount} {agentProgress.detectedCount === 1 ? 'service' : 'services'} discovered
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                            <div className="w-48 h-1 bg-surface-border rounded-full mx-auto overflow-hidden">
+                              <div className="w-full h-full bg-emerald-500 animate-pulse rounded-full" />
+                            </div>
+                          </div>
+
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleResetAgentSession}
+                            className="text-xs text-neutral-400 hover:text-white"
+                          >
+                            Cancel Analysis
+                          </Button>
+                        </div>
+                      )}
+
+                      {/* Stage: Failed */}
+                      {agentStage === 'failed' && (
+                        <div className="text-center space-y-4 py-3">
+                          <div className="w-12 h-12 mx-auto rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400">
+                            <AlertCircle className="w-6 h-6" />
+                          </div>
+                          <div className="space-y-1">
+                            <h4 className="text-sm font-semibold text-white">Repository Analysis Failed</h4>
+                            <p className="text-xs text-red-400 max-w-md mx-auto leading-relaxed">
+                              {error || 'Unable to scan or inspect the selected project folder.'}
+                            </p>
+                          </div>
+                          <div className="flex items-center justify-center gap-3">
                             <Button
                               type="button"
                               variant="outline"
                               size="sm"
-                              onClick={handleManualPathSelect}
-                              loading={agentSelectingFolder}
-                              disabled={!manualPathInput.trim()}
-                              className="h-8 text-xs"
+                              onClick={handleResetAgentSession}
+                              className="text-xs"
                             >
-                              Analyze
+                              Try Again
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              size="sm"
+                              onClick={() => setLocalMode('archive')}
+                              icon={<FileArchive className="w-3.5 h-3.5" />}
+                              className="text-xs"
+                            >
+                              Use Archive Upload
                             </Button>
                           </div>
-                        )}
-                      </div>
+                        </div>
+                      )}
                     </div>
                   )}
 

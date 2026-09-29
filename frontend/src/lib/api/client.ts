@@ -275,6 +275,12 @@ export const api = {
       });
     },
 
+    async deploy(projectId: string, serviceId: string): Promise<Deployment> {
+      return apiFetch<Deployment>(`/api/projects/${projectId}/services/${serviceId}/deploy`, {
+        method: 'POST',
+      });
+    },
+
     async getServiceDeployments(projectId: string, deploymentId: string): Promise<ServiceDeployment[]> {
       return apiFetch<ServiceDeployment[]>(`/api/projects/${projectId}/deployments/${deploymentId}/services`);
     },
@@ -522,6 +528,10 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ path }),
       });
+    },
+
+    async getSource(sourceId: string): Promise<AgentSourceSession> {
+      return agentFetch<AgentSourceSession>(`/api/agent/sources/${encodeURIComponent(sourceId)}`);
     },
   },
 };

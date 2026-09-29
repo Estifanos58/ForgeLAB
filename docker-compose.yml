@@ -15,8 +15,8 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-forgelab} -d ${POSTGRES_DB:-forgelab}"]
       interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 20s
+      retries: 20
+      start_period: 45s
 
   redis:
     image: redis:7-alpine

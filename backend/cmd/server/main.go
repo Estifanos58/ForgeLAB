@@ -154,7 +154,7 @@ func main() {
 	oauthService := services.NewOAuthService(cfg.Google, cfg.GitHub, redisClient)
 	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
-	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, dockerEngine)
+	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, deploymentService, dockerEngine, deployQueue)
 	envHandler := handlers.NewEnvHandler(secretService)
 	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
@@ -242,6 +242,7 @@ func main() {
 
 				// Service Lifecycle Controls & Listing
 				r.Get("/{id}/services", serviceHandler.List)
+				r.Post("/{id}/services/{serviceId}/deploy", serviceHandler.Deploy)
 				r.Post("/{id}/services/{serviceId}/stop", serviceHandler.Stop)
 				r.Post("/{id}/services/{serviceId}/start", serviceHandler.Start)
 				r.Post("/{id}/services/{serviceId}/restart", serviceHandler.Restart)
