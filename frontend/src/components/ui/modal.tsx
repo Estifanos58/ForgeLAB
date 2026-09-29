@@ -10,7 +10,7 @@ export interface ModalProps {
   title: string;
   description?: string;
   children: React.ReactNode;
-  maxWidth?: 'sm' | 'md' | 'lg' | 'xl';
+  maxWidth?: 'sm' | 'md' | 'lg' | 'xl' | '2xl';
 }
 
 export function Modal({ isOpen, onClose, title, description, children, maxWidth = 'md' }: ModalProps) {
@@ -41,10 +41,11 @@ export function Modal({ isOpen, onClose, title, description, children, maxWidth 
     md: 'max-w-md',
     lg: 'max-w-lg',
     xl: 'max-w-xl',
+    '2xl': 'max-w-2xl',
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4">
       {/* Backdrop */}
       <div
         className="fixed inset-0 bg-black/60 transition-opacity animate-in fade-in duration-150"
@@ -52,18 +53,19 @@ export function Modal({ isOpen, onClose, title, description, children, maxWidth 
         aria-hidden="true"
       />
 
-      {/* Modal Dialog Panel */}
+      {/* Modal Dialog Panel - Constrained to viewport height */}
       <div
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="modal-title"
         className={cn(
-          'relative w-full rounded-lg bg-surface border border-surface-border shadow-popover p-5 sm:p-6 z-10 animate-in fade-in zoom-in-[0.98] duration-150',
+          'relative w-full max-h-[calc(100vh-2rem)] flex flex-col rounded-lg bg-surface border border-surface-border shadow-popover z-10 animate-in fade-in zoom-in-[0.98] duration-150 overflow-hidden',
           maxWidths[maxWidth]
         )}
       >
-        <div className="flex items-start justify-between pb-3.5 border-b border-surface-border">
+        {/* Fixed Header */}
+        <div className="flex items-start justify-between p-5 sm:p-6 pb-3.5 border-b border-surface-border flex-shrink-0 bg-surface">
           <div>
             <h3 id="modal-title" className="text-sm sm:text-base font-semibold text-white tracking-tight">
               {title}
@@ -79,7 +81,10 @@ export function Modal({ isOpen, onClose, title, description, children, maxWidth 
           </button>
         </div>
 
-        <div className="mt-4">{children}</div>
+        {/* Scrollable Content Body */}
+        <div className="p-5 sm:p-6 pt-4 overflow-y-auto flex-1 min-h-0 overscroll-contain">
+          {children}
+        </div>
       </div>
     </div>
   );

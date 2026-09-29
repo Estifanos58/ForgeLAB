@@ -779,7 +779,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           ? 'Select a project from your local computer or import from a GitHub repository.'
           : 'Review detected service architecture, configure build strategies and ports.'
       }
-      maxWidth="xl"
+      maxWidth="2xl"
     >
       {error && (
         <div className="mb-4">
@@ -910,18 +910,35 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                           <HardDrive className="w-5 h-5" />
                         </div>
                         <div className="space-y-1">
-                          <h4 className="text-sm font-semibold text-white">ForgeLAB Local Agent Not Detected</h4>
+                          <h4 className="text-sm font-semibold text-white">ForgeLAB Local Agent Not Running</h4>
                           <p className="text-xs text-neutral-400 leading-relaxed">
-                            The local agent provides a native OS folder dialog, analyzes full-stack projects in-place, and builds directly with your local Docker Engine without uploading files through the browser.
+                            The Local Agent must be running on your computer to open the native OS folder chooser, analyze multi-service projects in-place, and stream container builds directly to Docker without uploading project files through the browser.
                           </p>
                         </div>
                       </div>
 
-                      <div className="p-3 rounded bg-surface border border-surface-border text-xs font-mono text-neutral-300 space-y-1.5">
-                        <div className="text-[11px] text-neutral-500">Run the agent binary on your computer:</div>
-                        <div className="flex items-center justify-between bg-black/40 px-3 py-1.5 rounded border border-surface-border text-emerald-400">
-                          <code>./forgelab-agent</code>
-                          <span className="text-[10px] text-neutral-500 font-sans">Port 4142</span>
+                      <div className="p-3.5 rounded bg-surface border border-surface-border text-xs space-y-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-medium text-neutral-300">
+                            Start the agent on your computer (listening on 127.0.0.1:4142):
+                          </span>
+                          <span className="text-[10px] text-neutral-500 font-mono">Port 4142</span>
+                        </div>
+
+                        <div className="space-y-1.5 font-mono text-[11px]">
+                          <div className="text-[10px] text-neutral-400 font-sans">PowerShell (Project Root):</div>
+                          <div className="bg-black/50 px-3 py-1.5 rounded border border-surface-border text-emerald-400 select-all">
+                            .\start-agent.ps1
+                          </div>
+
+                          <div className="text-[10px] text-neutral-400 font-sans pt-1">Or run binary directly:</div>
+                          <div className="bg-black/50 px-3 py-1.5 rounded border border-surface-border text-emerald-400 select-all">
+                            .\backend\forgelab-agent.exe
+                          </div>
+                        </div>
+
+                        <div className="text-[10px] text-neutral-500 pt-1">
+                          Your code stays on your computer. ForgeLAB never transmits absolute local file paths to the backend.
                         </div>
                       </div>
 
@@ -1438,7 +1455,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             </div>
           )}
 
-          <div className="pt-3 border-t border-surface-border flex items-center justify-between">
+          {/* Action Bar */}
+          <div className="sticky bottom-0 -mx-5 sm:-mx-6 -mb-5 sm:-mb-6 px-5 sm:px-6 py-3.5 bg-surface/95 backdrop-blur border-t border-surface-border flex items-center justify-between z-10 mt-6">
             <Button
               type="button"
               variant="ghost"
@@ -1866,7 +1884,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           </div>
 
           {/* Action Buttons */}
-          <div className="pt-3 border-t border-surface-border flex items-center justify-between">
+          <div className="sticky bottom-0 -mx-5 sm:-mx-6 -mb-5 sm:-mb-6 px-5 sm:px-6 py-3.5 bg-surface/95 backdrop-blur border-t border-surface-border flex items-center justify-between z-10 mt-6">
             <Button
               type="button"
               variant="ghost"

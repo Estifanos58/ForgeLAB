@@ -5,16 +5,20 @@ FROM golang:alpine AS builder
 
 WORKDIR /app
 
+# Configure GOPROXY with fallback and retry for reliable module downloads
+ENV GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
+
 # Copy dependency files
 COPY go.mod go.sum ./
-RUN go mod download
+RUN for i in 1 2 3; do go mod download && break || (echo "Retrying go mod download in 3s..." && sleep 3); done
 
 # Copy source code
 COPY . .
 
 # Build binaries
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/forgelab-server ./cmd/server
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/forgelab-migrate ./cmd/migrate
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/forgelab-server ./cmd/server && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/forgelab-migrate ./cmd/migrate
 
 # Final runtime stage
 FROM alpine:3.19
