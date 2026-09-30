@@ -261,6 +261,37 @@ func (s *ServiceService) UpdateServiceStatus(
 	return nil
 }
 
+// PromoteServiceDeployment updates the service record after a successful service deployment.
+func (s *ServiceService) PromoteServiceDeployment(
+	ctx context.Context,
+	serviceID uuid.UUID,
+	serviceDeploymentID uuid.UUID,
+	containerID string,
+	imageTag string,
+	hostPort *int,
+) error {
+	if s.db == nil {
+		return nil
+	}
+
+	_, err := s.db.Exec(ctx,
+		`UPDATE services SET
+		 status = $2,
+		 current_service_deployment_id = $3,
+		 container_id = $4,
+		 image_tag = $5,
+		 host_port = $6,
+		 updated_at = NOW()
+		 WHERE id = $1`,
+		serviceID, models.DeployStatusRunning, serviceDeploymentID, containerID, imageTag, hostPort,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to promote service deployment: %w", err)
+	}
+
+	return nil
+}
+
 // CalculateProjectStatus derives overall project state from individual services.
 func CalculateProjectStatus(services []*models.Service) string {
 	if len(services) == 0 {

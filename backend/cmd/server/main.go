@@ -146,7 +146,12 @@ func main() {
 	var deployQueue *queue.DeploymentQueue
 	if redisClient != nil {
 		deployQueue = queue.NewDeploymentQueue(redisClient)
-		deployQueue.StartWorker(ctx, dockerEngine.ExecuteDeployment)
+		deployQueue.StartJobWorker(ctx, func(workerCtx context.Context, job queue.Job) error {
+			if job.Type == queue.JobTypeServiceDeployment {
+				return dockerEngine.ExecuteServiceDeployment(workerCtx, job.ID)
+			}
+			return dockerEngine.ExecuteDeployment(workerCtx, job.ID)
+		})
 		defer deployQueue.Stop()
 	}
 
@@ -248,6 +253,10 @@ func main() {
 				// Service Lifecycle Controls & Listing
 				r.Get("/{id}/services", serviceHandler.List)
 				r.Post("/{id}/services/{serviceId}/deploy", serviceHandler.Deploy)
+				r.Post("/{id}/services/{serviceId}/rollback", serviceHandler.Rollback)
+				r.Get("/{id}/services/{serviceId}/deployments", serviceHandler.ListDeployments)
+				r.Get("/{id}/services/{serviceId}/deployments/{deploymentId}", serviceHandler.GetDeployment)
+				r.Get("/{id}/services/{serviceId}/deployments/{deploymentId}/logs", serviceHandler.GetLogs)
 				r.Post("/{id}/services/{serviceId}/stop", serviceHandler.Stop)
 				r.Post("/{id}/services/{serviceId}/start", serviceHandler.Start)
 				r.Post("/{id}/services/{serviceId}/restart", serviceHandler.Restart)

@@ -855,9 +855,9 @@ func TestWebSocketReconnectReplay(t *testing.T) {
 		getLogsAfterFn: func(ctx context.Context, deployID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
 			if deployID == deploymentID && afterID == 50 {
 				return []*models.DeploymentLog{
-					{ID: 51, DeploymentID: deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 51", Timestamp: time.Now()},
-					{ID: 52, DeploymentID: deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 52", Timestamp: time.Now()},
-					{ID: 53, DeploymentID: deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 53", Timestamp: time.Now()},
+					{ID: 51, DeploymentID: &deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 51", Timestamp: time.Now()},
+					{ID: 52, DeploymentID: &deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 52", Timestamp: time.Now()},
+					{ID: 53, DeploymentID: &deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 53", Timestamp: time.Now()},
 				}, nil
 			}
 			return []*models.DeploymentLog{}, nil

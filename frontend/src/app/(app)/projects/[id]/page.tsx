@@ -37,6 +37,8 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   const [selectedDeployment, setSelectedDeployment] = useState<Deployment | null>(null);
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
   const [deployingServices, setDeployingServices] = useState<{ [serviceId: string]: boolean }>({});
+  const [rollingBackServices, setRollingBackServices] = useState<{ [serviceId: string]: boolean }>({});
+  const [isDeployingAll, setIsDeployingAll] = useState(false);
   const [serviceActionLoading, setServiceActionLoading] = useState<{ [serviceId: string]: string | null }>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -188,13 +190,27 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     setActiveTab('logs');
   }, []);
 
+  // Project-wide release deployment action (Deploy All)
+  const handleDeployAll = async () => {
+    setIsDeployingAll(true);
+    setError(null);
+    try {
+      const newRelease = await api.projects.deploy(projectId);
+      handleDeploymentCreated(newRelease);
+    } catch (err: any) {
+      setError(err.message || 'Failed to trigger release deployment');
+    } finally {
+      setIsDeployingAll(false);
+    }
+  };
+
   // Independent single-service deployment action
   const handleDeployService = async (serviceId: string) => {
     setDeployingServices((prev) => ({ ...prev, [serviceId]: true }));
     setError(null);
     try {
-      const newDeployment = await api.services.deploy(projectId, serviceId);
-      // Immediately reflect deploying state on this service
+      await api.services.deploy(projectId, serviceId);
+      // Immediately reflect deploying state on this service without replacing project release
       setProject((prev) => {
         if (!prev || !prev.services) return prev;
         return {
@@ -203,11 +219,35 @@ export default function ProjectPage({ params }: ProjectPageProps) {
           services: prev.services.map((s) => (s.id === serviceId ? { ...s, status: 'deploying' } : s)),
         };
       });
-      handleDeploymentCreated(newDeployment);
+      setSelectedServiceId(serviceId);
+      setActiveTab('logs');
     } catch (err: any) {
       setError(err.message || 'Failed to deploy service');
     } finally {
       setDeployingServices((prev) => ({ ...prev, [serviceId]: false }));
+    }
+  };
+
+  // Independent service rollback action
+  const handleRollbackService = async (serviceId: string) => {
+    setRollingBackServices((prev) => ({ ...prev, [serviceId]: true }));
+    setError(null);
+    try {
+      await api.services.rollback(projectId, serviceId);
+      setProject((prev) => {
+        if (!prev || !prev.services) return prev;
+        return {
+          ...prev,
+          status: 'deploying',
+          services: prev.services.map((s) => (s.id === serviceId ? { ...s, status: 'deploying' } : s)),
+        };
+      });
+      setSelectedServiceId(serviceId);
+      setActiveTab('logs');
+    } catch (err: any) {
+      setError(err.message || 'Failed to rollback service');
+    } finally {
+      setRollingBackServices((prev) => ({ ...prev, [serviceId]: false }));
     }
   };
 
@@ -363,9 +403,12 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               <ServicesSection
                 project={project}
                 deployingServices={deployingServices}
+                rollingBackServices={rollingBackServices}
                 actionLoading={serviceActionLoading}
-                isAnyDeploying={isAnyDeploying}
                 onDeployService={handleDeployService}
+                onRollbackService={handleRollbackService}
+                onDeployAll={handleDeployAll}
+                isDeployingAll={isDeployingAll}
                 onServiceAction={handleServiceAction}
                 onViewLogs={(svcId) => {
                   setSelectedServiceId(svcId);

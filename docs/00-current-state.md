@@ -51,6 +51,16 @@ ForgeLAB is a single control-plane, self-hosted application deployment platform.
 - **Dynamic Port Mapping & Health Strategies:**
   - Container internal ports (3000, 8000, 8080) are mapped to dynamic host ports (`10000–60000`).
   - Readiness checks support `auto`, `http`, `tcp`, and `none`. `auto` requires HTTP 2xx/3xx (explicitly rejecting HTTP 5xx server errors as healthy) or verified TCP socket connectivity before promotion.
+- **Service-First Deployment Architecture:**
+  - `ServiceDeployment` is the primary unit of deployment execution (`backend/internal/docker/engine.go -> ExecuteServiceDeployment`).
+  - `Deployment` represents the release orchestration layer (e.g. "Deploy All"), holding references to child `service_deployments`.
+  - The project-wide active deployment lock (`uq_active_deployment_per_project`) is removed. Instead, an active deployment lock is enforced per `service_id` via PostgreSQL partial unique index `uq_active_service_deployment`.
+  - Frontend and backend services deploy completely independently and concurrently without mutual blocking.
+  - Active jobs in Redis identify whether they represent an individual `service_deployment` (`JobTypeServiceDeployment`) or a full release `deployment` (`JobTypeDeployment`), processed across a concurrent 4-worker pool.
+  - Each service maintains independent sequential versioning (`deploy_number` on `service_deployments`) and independent rollback capability (`POST /api/projects/{id}/services/{serviceId}/rollback`).
+  - Service-only deployments update `services.current_service_deployment_id`, service status, container ID, and port without overwriting `projects.current_deployment_id`.
+  - Project status is dynamically derived from individual service states (`running`, `partially_running`, `stopped`, `failed`, `inactive`) and never violates valid state transitions.
+  - Health check safety invariant: failed new service deployments never destroy or replace existing healthy running service containers.
 - **Port Allocation:** Dynamic host port allocation in the range **`10000–60000`** managed by `internal/network/PortManager`.
 - **Realtime Pipeline:** Deployment events and container logs are pushed to Redis Pub/Sub channels (`forgelab:pubsub:deployment:<uuid>`), bridged to an in-memory WebSocket Hub, and streamed to authenticated client subscriptions.
 - **Rollback & Safety Invariant:** When a deployment fails at any stage (build, container startup, or readiness check), the previous running deployment container remains untouched, and `projects.current_deployment_id` remains unchanged. Rollback creates a new deployment referencing the prior known-good Docker image.
@@ -59,7 +69,7 @@ ForgeLAB is a single control-plane, self-hosted application deployment platform.
   - **ForgeLAB-Level Self-Healing:** ForgeLAB does **not** implement continuous background runtime health monitoring, crash-loop detection, or automated application rollback after promotion.
 
 ### Current Implementation vs. Verification Stage
-- **Implementation Stage:** The full-stack platform (Go backend, Next.js 16 frontend, PostgreSQL, Redis, Migrations, Worker, Google/GitHub OAuth, Direct Local-Directory Deployment, Streaming Tar Context, and Archive Ingestion) is **IMPLEMENTED** in the codebase.
+- **Implementation Stage:** The full-stack platform (Go backend, Next.js 16 frontend, PostgreSQL, Redis, Migrations, Worker, Google/GitHub OAuth, Direct Local-Directory Deployment, Streaming Tar Context, Archive Ingestion, and Independent Service Deployments) is **IMPLEMENTED** in the codebase.
 - **Verification Stage:** **NOT RECORDED** (or verified in live Docker stack). Per project policy, automated unit tests and mocks are non-authoritative artifacts. No capability may be classified as `PHYSICALLY VERIFIED` until the project owner executes the manual procedures defined in [docs/12-manual-verification.md](12-manual-verification.md) in the live development environment.
 
 ---

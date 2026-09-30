@@ -71,19 +71,24 @@ export interface Service {
 
 export interface ServiceDeployment {
   id: string;
-  deployment_id: string;
+  deployment_id?: string | null;
   service_id: string;
-  service_name: string;
+  service_name?: string;
+  deploy_number: number;
   status: DeploymentStatus;
   image_tag?: string | null;
   container_id?: string | null;
   host_port?: number | null;
   internal_port: number;
+  preview_url?: string | null;
   build_strategy: string;
   build_command: string;
   start_command: string;
   runtime_type: string;
-  preview_url?: string | null;
+  dockerfile_path?: string;
+  build_context?: string;
+  health_strategy?: string;
+  health_check_path?: string | null;
   started_at?: string | null;
   built_at?: string | null;
   deployed_at?: string | null;
@@ -201,7 +206,8 @@ export interface Deployment {
 
 export interface DeploymentLog {
   id: number;
-  deployment_id: string;
+  deployment_id?: string | null;
+  service_deployment_id?: string | null;
   service_id?: string | null;
   timestamp: string;
   phase: 'source' | 'build' | 'startup' | 'health' | 'runtime';

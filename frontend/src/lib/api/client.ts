@@ -289,10 +289,28 @@ export const api = {
       });
     },
 
-    async deploy(projectId: string, serviceId: string): Promise<Deployment> {
-      return apiFetch<Deployment>(`/api/projects/${projectId}/services/${serviceId}/deploy`, {
+    async deploy(projectId: string, serviceId: string): Promise<ServiceDeployment> {
+      return apiFetch<ServiceDeployment>(`/api/projects/${projectId}/services/${serviceId}/deploy`, {
         method: 'POST',
       });
+    },
+
+    async rollback(projectId: string, serviceId: string): Promise<ServiceDeployment> {
+      return apiFetch<ServiceDeployment>(`/api/projects/${projectId}/services/${serviceId}/rollback`, {
+        method: 'POST',
+      });
+    },
+
+    async listDeployments(projectId: string, serviceId: string): Promise<ServiceDeployment[]> {
+      return apiFetch<ServiceDeployment[]>(`/api/projects/${projectId}/services/${serviceId}/deployments`);
+    },
+
+    async getDeployment(projectId: string, serviceId: string, deploymentId: string): Promise<ServiceDeployment> {
+      return apiFetch<ServiceDeployment>(`/api/projects/${projectId}/services/${serviceId}/deployments/${deploymentId}`);
+    },
+
+    async getDeploymentLogs(projectId: string, serviceId: string, deploymentId: string): Promise<DeploymentLog[]> {
+      return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/services/${serviceId}/deployments/${deploymentId}/logs`);
     },
 
     async getServiceDeployments(projectId: string, deploymentId: string): Promise<ServiceDeployment[]> {

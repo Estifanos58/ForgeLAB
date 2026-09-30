@@ -1,9 +1,10 @@
 'use client';
 
-import React from 'react';
-import { Service } from '@/lib/api/types';
+import React, { useState } from 'react';
+import { Service, ServiceDeployment } from '@/lib/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { api } from '@/lib/api/client';
 import {
   ExternalLink,
   Lock,
@@ -12,41 +13,73 @@ import {
   RotateCcw,
   Rocket,
   Terminal,
-  Server,
-  Globe,
   Radio,
+  History,
+  ChevronDown,
+  ChevronUp,
+  Clock,
+  Undo2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
 interface ServiceCardProps {
+  projectId: string;
   service: Service;
   isDeployPending?: boolean;
+  isRollbackPending?: boolean;
   actionLoading?: string | null;
-  isAnyDeploying?: boolean;
   onDeploy: (serviceId: string) => void;
+  onRollback?: (serviceId: string) => void;
   onAction: (serviceId: string, action: 'start' | 'stop' | 'restart') => void;
   onViewLogs: (serviceId: string) => void;
 }
 
 export function ServiceCard({
+  projectId,
   service,
   isDeployPending = false,
+  isRollbackPending = false,
   actionLoading = null,
-  isAnyDeploying = false,
   onDeploy,
+  onRollback,
   onAction,
   onViewLogs,
 }: ServiceCardProps) {
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyDeployments, setHistoryDeployments] = useState<ServiceDeployment[]>([]);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+
   const isFrontend = service.role === 'frontend';
   const isBackend = service.role === 'backend';
   const isRunning = service.status === 'running';
+
   const isServiceDeploying = [
     'deploying',
     'building',
     'starting',
     'health_checking',
+    'cloning',
     'queued',
   ].includes(service.status);
+
+  // Status label for active deployment phases
+  const getDeployingLabel = () => {
+    switch (service.status) {
+      case 'cloning':
+        return 'Cloning...';
+      case 'building':
+        return 'Building...';
+      case 'starting':
+        return 'Starting...';
+      case 'health_checking':
+        return 'Health Checking...';
+      case 'queued':
+        return 'Queued...';
+      default:
+        return 'Deploying...';
+    }
+  };
 
   // Construct browser-accessible preview URL if public
   const previewUrl =
@@ -56,6 +89,26 @@ export function ServiceCard({
       : null);
 
   const internalEndpoint = `${service.name}:${service.internal_port}`;
+
+  const loadHistory = async () => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const data = await api.services.listDeployments(projectId, service.id);
+      setHistoryDeployments(data);
+    } catch (err: any) {
+      setHistoryError(err.message || 'Failed to load deployment history');
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const handleToggleHistory = () => {
+    if (!showHistory && historyDeployments.length === 0) {
+      loadHistory();
+    }
+    setShowHistory((prev) => !prev);
+  };
 
   return (
     <div className="rounded-lg border border-surface-border bg-surface-elevated/40 p-4 space-y-3.5 transition-colors hover:border-surface-border/90">
@@ -78,7 +131,7 @@ export function ServiceCard({
             {service.name}
           </span>
         </div>
-        <div className="shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           <Badge status={service.status} />
         </div>
       </div>
@@ -95,7 +148,7 @@ export function ServiceCard({
         </div>
 
         <div>
-          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Path</span>
+          <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">Source Path</span>
           <span className="text-neutral-200 truncate block" title={service.source_path}>
             {service.source_path || '.'}
           </span>
@@ -145,7 +198,7 @@ export function ServiceCard({
           <div className="flex items-center gap-2 min-w-0">
             <Radio className="w-3.5 h-3.5 text-emerald-400 shrink-0 animate-pulse" />
             <span className="text-neutral-300 text-[11px] font-sans truncate">
-              Preview accessible at{' '}
+              Preview live at{' '}
               <span className="font-mono text-emerald-300 font-semibold">{previewUrl}</span>
             </span>
           </div>
@@ -164,19 +217,35 @@ export function ServiceCard({
       {/* Bottom Actions Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-surface-border/60">
         <div className="flex items-center gap-1.5 flex-wrap">
-          {/* Independent Service Deploy Button */}
+          {/* Independent Service Deploy Button - Never blocked by other services */}
           <Button
             variant="primary"
             size="sm"
             onClick={() => onDeploy(service.id)}
             loading={isDeployPending}
-            disabled={isDeployPending || isServiceDeploying || isAnyDeploying}
+            disabled={isDeployPending || isServiceDeploying}
             className="h-7 text-xs px-2.5"
             icon={<Rocket className="w-3 h-3" />}
-            title="Deploy only this service"
+            title="Deploy only this service concurrently"
           >
-            {isServiceDeploying ? 'Deploying...' : 'Deploy'}
+            {isServiceDeploying ? getDeployingLabel() : 'Deploy Service'}
           </Button>
+
+          {/* Service-Specific Rollback */}
+          {onRollback && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => onRollback(service.id)}
+              loading={isRollbackPending}
+              disabled={isRollbackPending || isServiceDeploying}
+              className="h-7 text-xs px-2.5"
+              icon={<Undo2 className="w-3 h-3" />}
+              title="Roll back only this service to its previous successful deployment"
+            >
+              Rollback
+            </Button>
+          )}
 
           {/* Start / Stop / Restart Controls */}
           {isRunning ? (
@@ -219,16 +288,99 @@ export function ServiceCard({
           )}
         </div>
 
-        {/* View Logs Button */}
-        <button
-          type="button"
-          onClick={() => onViewLogs(service.id)}
-          className="text-xs text-neutral-400 hover:text-white font-mono flex items-center gap-1 transition-colors px-1 py-1 rounded"
-        >
-          <Terminal className="w-3 h-3 text-neutral-500" />
-          <span>Logs →</span>
-        </button>
+        {/* View Logs & History Buttons */}
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleToggleHistory}
+            className="text-xs text-neutral-400 hover:text-white font-mono flex items-center gap-1 transition-colors px-1 py-1 rounded"
+            title="View service deployment history"
+          >
+            <History className="w-3 h-3 text-neutral-400" />
+            <span>History</span>
+            {showHistory ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onViewLogs(service.id)}
+            className="text-xs text-neutral-400 hover:text-white font-mono flex items-center gap-1 transition-colors px-1 py-1 rounded"
+          >
+            <Terminal className="w-3 h-3 text-neutral-400" />
+            <span>Logs →</span>
+          </button>
+        </div>
       </div>
+
+      {/* Collapsible Service Deployment History */}
+      {showHistory && (
+        <div className="pt-2 border-t border-surface-border/50 space-y-2">
+          <div className="flex items-center justify-between text-[11px] font-mono text-neutral-400">
+            <span className="uppercase tracking-wider font-semibold">Deployment History</span>
+            <button
+              type="button"
+              onClick={loadHistory}
+              disabled={historyLoading}
+              className="text-emerald-400 hover:underline flex items-center gap-1"
+            >
+              <RotateCcw className={cn('w-2.5 h-2.5', historyLoading && 'animate-spin')} />
+              <span>Refresh</span>
+            </button>
+          </div>
+
+          {historyLoading ? (
+            <div className="text-xs font-mono text-neutral-500 py-2 text-center">Loading history...</div>
+          ) : historyError ? (
+            <div className="text-xs text-red-400 py-1">{historyError}</div>
+          ) : historyDeployments.length === 0 ? (
+            <div className="text-xs font-mono text-neutral-500 py-2 text-center">No service deployments yet.</div>
+          ) : (
+            <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+              {historyDeployments.map((sd) => {
+                const isCurrent = service.current_service_deployment_id === sd.id;
+                return (
+                  <div
+                    key={sd.id}
+                    className={cn(
+                      'flex items-center justify-between p-2 rounded text-xs font-mono border transition-colors',
+                      isCurrent
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-white'
+                        : 'bg-surface/50 border-surface-border/40 text-neutral-300'
+                    )}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-bold text-neutral-200 shrink-0">#{sd.deploy_number}</span>
+                      <Badge status={sd.status} showDot={false} className="py-0 px-1.5 text-[10px]" />
+                      {isCurrent && (
+                        <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 text-[9px] uppercase tracking-wider font-bold">
+                          Current
+                        </span>
+                      )}
+                      {sd.failure_reason && (
+                        <span className="text-red-400 text-[10px] truncate max-w-[140px]" title={sd.failure_reason}>
+                          {sd.failure_reason}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0 text-[11px] text-neutral-400">
+                      {sd.duration_ms && (
+                        <span className="flex items-center gap-0.5 text-neutral-500 text-[10px]">
+                          <Clock className="w-2.5 h-2.5" />
+                          <span>{(sd.duration_ms / 1000).toFixed(1)}s</span>
+                        </span>
+                      )}
+                      <span>
+                        {sd.created_at ? new Date(sd.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

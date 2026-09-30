@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -92,33 +93,580 @@ func (e *Engine) SetLocalBuildMode(mode string) {
 	}
 }
 
-// ExecuteDeployment runs the complete deployment pipeline.
+// resolveSourceDirectory acquires or resolves the source code directory for build operations.
+func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Project, execID string, emitLog func(phase, stream, message string)) (buildSourceDir string, cleanupDir string, err error) {
+	if project.SourceType == models.SourceTypeGitHub {
+		snapshotDir := filepath.Join(e.workDir, execID)
+		_ = os.MkdirAll(snapshotDir, 0755)
+		cleanupDir = snapshotDir
+		buildSourceDir = snapshotDir
+
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (branch: %s)...", project.SourceReference, project.Branch))
+		parts := strings.Split(project.SourceReference, "/")
+		if len(parts) != 2 {
+			return "", cleanupDir, fmt.Errorf("invalid GitHub repository reference '%s'. Expected format 'owner/repo'", project.SourceReference)
+		}
+		if e.githubService == nil {
+			return "", cleanupDir, errors.New("GitHub integration service is not available")
+		}
+		if err := e.githubService.AcquireRepoTarball(ctx, project.OwnerID, parts[0], parts[1], project.Branch, snapshotDir); err != nil {
+			return "", cleanupDir, fmt.Errorf("failed to acquire GitHub repository archive: %w", err)
+		}
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, "GitHub repository archive acquired successfully.")
+		return buildSourceDir, cleanupDir, nil
+
+	} else if project.SourceType == models.SourceTypeLocalUpload || (project.SourceType == models.SourceTypeLocal && project.SourceReference != "") {
+		sourceUUID, err := uuid.Parse(project.SourceReference)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid local source upload ID '%s': %w", project.SourceReference, err)
+		}
+		if e.sourceService == nil {
+			return "", "", errors.New("local source upload service is not available")
+		}
+		p, err := e.sourceService.GetSourcePath(ctx, project.OwnerID, sourceUUID)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to locate uploaded source files: %w", err)
+		}
+		buildSourceDir = p
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using isolated uploaded source workspace.")
+		return buildSourceDir, "", nil
+
+	} else if project.SourceType == models.SourceTypeLocalDirectory || project.RepositoryPath != "" {
+		canonicalSource, err := e.pathValidator.ValidateSourcePath(project.RepositoryPath)
+		if err != nil {
+			return "", "", fmt.Errorf("source path validation failed: %w", err)
+		}
+
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Using local directory: %s", project.RepositoryPath))
+
+		if e.localBuildMode == "snapshot" {
+			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using snapshot filesystem build mode.")
+			snapshotDir := filepath.Join(e.workDir, execID)
+			_ = os.MkdirAll(snapshotDir, 0755)
+			cleanupDir = snapshotDir
+			if err := copyDirectory(canonicalSource, snapshotDir); err != nil {
+				return "", cleanupDir, fmt.Errorf("failed to snapshot source files: %w", err)
+			}
+			buildSourceDir = snapshotDir
+		} else {
+			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using direct filesystem build mode.")
+			buildSourceDir = canonicalSource
+		}
+		return buildSourceDir, cleanupDir, nil
+
+	} else if project.SourceType == models.SourceTypeLocalAgent {
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Connected to ForgeLAB local agent (session: %s).", project.SourceReference))
+		return "", "", nil
+	}
+
+	return "", "", errors.New("no valid local directory, uploaded source, or repository configured")
+}
+
+// recalculateAndUpdateProjectStatus derives the project status from its services and persists it.
+func (e *Engine) recalculateAndUpdateProjectStatus(ctx context.Context, projectID uuid.UUID) (string, error) {
+	if e.serviceService == nil {
+		return models.ProjectStatusInactive, nil
+	}
+	svcs, err := e.serviceService.ListServices(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	if len(svcs) == 0 {
+		return models.ProjectStatusInactive, nil
+	}
+	newStatus := services.CalculateProjectStatus(svcs)
+	_ = e.projectService.UpdateProjectStatus(ctx, projectID, newStatus)
+	return newStatus, nil
+}
+
+// ExecuteServiceDeployment runs the deployment pipeline for a single service deployment unit:
+// source -> build -> container -> start -> health check -> promote service -> cleanup old service.
+// It enforces the safety invariant: a failed deployment never replaces the previous healthy service container.
+func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) error {
+	serviceDeploy, err := e.deploymentService.GetServiceDeployment(ctx, serviceDeploymentID)
+	if err != nil {
+		return fmt.Errorf("failed to get service deployment %s: %w", serviceDeploymentID, err)
+	}
+
+	service, err := e.serviceService.GetService(ctx, serviceDeploy.ServiceID)
+	if err != nil {
+		return fmt.Errorf("failed to get service %s: %w", serviceDeploy.ServiceID, err)
+	}
+
+	project, err := e.getProjectByID(ctx, service.ProjectID)
+	if err != nil {
+		return fmt.Errorf("failed to get project %s: %w", service.ProjectID, err)
+	}
+
+	// Capture previous service state for safe rollback if health checks fail
+	previousServiceStatus := service.Status
+	previousContainerID := service.ContainerID
+	hasPreviousHealthy := (previousServiceStatus == models.ProjectStatusRunning && previousContainerID != nil && *previousContainerID != "")
+
+	redactor := logging.NewLogRedactor()
+	if e.secretService != nil {
+		_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID)
+		if err == nil {
+			redactor.SetSecrets(secrets)
+		}
+	}
+
+	emitLog := func(phase, stream, message string) {
+		redactedMsg := redactor.Redact(message)
+		persistedLog, err := e.deploymentService.AddDeploymentServiceLog(ctx, serviceDeploy.DeploymentID, &serviceDeploy.ID, &service.ID, phase, stream, redactedMsg)
+		if err != nil {
+			slog.Error("failed to persist service deployment log", "service_deployment_id", serviceDeploy.ID, "phase", phase, "error", err)
+			return
+		}
+		if e.wsHub != nil {
+			data := map[string]interface{}{
+				"id":                    persistedLog.ID,
+				"service_deployment_id": serviceDeploy.ID.String(),
+				"service_id":            service.ID.String(),
+				"service_name":          service.Name,
+				"timestamp":             persistedLog.Timestamp.Format(time.RFC3339Nano),
+				"phase":                 persistedLog.Phase,
+				"stream":                persistedLog.Stream,
+				"message":               persistedLog.Message,
+			}
+			if serviceDeploy.DeploymentID != nil {
+				data["deployment_id"] = serviceDeploy.DeploymentID.String()
+				serviceChannel := fmt.Sprintf("deployment:%s:service:%s", serviceDeploy.DeploymentID.String(), service.ID.String())
+				_ = e.wsHub.PublishEvent(serviceChannel, &ws.EventMessage{
+					Type:    "log",
+					Channel: serviceChannel,
+					Data:    data,
+				})
+				channel := "deployment:" + serviceDeploy.DeploymentID.String()
+				_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
+					Type:    "log",
+					Channel: channel,
+					Data:    data,
+				})
+			}
+			projectChannel := fmt.Sprintf("project:%s", project.ID.String())
+			_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
+				Type:    "service_deployment_log",
+				Channel: projectChannel,
+				Data:    data,
+			})
+		}
+	}
+
+	emitStatus := func(newStatus string, hostPort *int, failureReason *string) {
+		_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, newStatus, failureReason)
+		_ = e.serviceService.UpdateServiceStatus(ctx, service.ID, newStatus, nil, nil, hostPort)
+		newProjStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
+
+		if e.wsHub != nil {
+			data := map[string]interface{}{
+				"service_deployment_id": serviceDeploy.ID.String(),
+				"service_id":            service.ID.String(),
+				"service_name":          service.Name,
+				"deploy_number":         serviceDeploy.DeployNumber,
+				"new_status":            newStatus,
+				"timestamp":             time.Now().Format(time.RFC3339),
+			}
+			if hostPort != nil {
+				data["host_port"] = *hostPort
+			}
+			if failureReason != nil {
+				data["failure_reason"] = *failureReason
+			}
+			if serviceDeploy.DeploymentID != nil {
+				data["deployment_id"] = serviceDeploy.DeploymentID.String()
+				serviceChannel := fmt.Sprintf("deployment:%s:service:%s", serviceDeploy.DeploymentID.String(), service.ID.String())
+				_ = e.wsHub.PublishEvent(serviceChannel, &ws.EventMessage{
+					Type:    "status_change",
+					Channel: serviceChannel,
+					Data:    data,
+				})
+			}
+			projectChannel := fmt.Sprintf("project:%s", project.ID.String())
+			_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
+				Type:    "service_status_change",
+				Channel: projectChannel,
+				Data:    data,
+			})
+			_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
+				Type:    "project_status",
+				Channel: projectChannel,
+				Data: map[string]interface{}{
+					"project_id": project.ID.String(),
+					"status":     newProjStatus,
+				},
+			})
+		}
+	}
+
+	emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Starting service deployment #%d for '%s' (role: %s, runtime: %s)...", serviceDeploy.DeployNumber, service.Name, service.Role, service.RuntimeType))
+
+	// 1. Source acquisition & resolution
+	emitStatus(models.DeployStatusCloning, nil, nil)
+	buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, serviceDeploy.ID.String(), emitLog)
+	if cleanupDir != "" {
+		defer func() {
+			_ = os.RemoveAll(cleanupDir)
+		}()
+	}
+	if err != nil {
+		reason := fmt.Sprintf("Failed to resolve source: %v", err)
+		emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
+	}
+
+	// 2. Building Docker Image
+	emitStatus(models.DeployStatusBuilding, nil, nil)
+	svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, service.Name, serviceDeploy.DeployNumber)
+	relDockerPath := "Dockerfile"
+	var tarArchive io.ReadCloser
+
+	if project.SourceType == models.SourceTypeLocalAgent {
+		baseURL := resolveAgentBaseURL()
+		agentToken := ""
+		if e.sourceService != nil {
+			if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
+				if src, err := e.sourceService.GetSource(ctx, project.OwnerID, srcUUID); err == nil && src != nil && src.Metadata != nil {
+					if tok, ok := src.Metadata["session_token"].(string); ok {
+						agentToken = tok
+					}
+				}
+			}
+		}
+		agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s",
+			baseURL,
+			project.SourceReference,
+			url.QueryEscape(service.SourcePath),
+			url.QueryEscape(service.RuntimeType),
+			service.InternalPort,
+			url.QueryEscape(service.StartCommand),
+		)
+		if agentToken != "" {
+			agentURL += "&token=" + url.QueryEscape(agentToken)
+		}
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+		if reqErr == nil && agentToken != "" {
+			req.Header.Set("Authorization", "Bearer "+agentToken)
+		}
+		if reqErr != nil {
+			reason := fmt.Sprintf("Failed to request agent stream context: %v", reqErr)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
+		}
+		resp, httpErr := http.DefaultClient.Do(req)
+		if httpErr != nil || resp.StatusCode != http.StatusOK {
+			reason := "Failed to stream source from local agent"
+			if httpErr != nil {
+				reason = httpErr.Error()
+			} else if resp != nil {
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusNotFound {
+					reason = "Local agent source session expired or agent restarted. Please re-select the project folder."
+				} else {
+					reason = fmt.Sprintf("agent returned status %d", resp.StatusCode)
+				}
+			}
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
+		}
+		tarArchive = resp.Body
+		if service.BuildStrategy == models.BuildStrategyAuto {
+			relDockerPath = "Dockerfile.forgelab"
+		}
+	} else {
+		svcContextDir := filepath.Join(buildSourceDir, service.SourcePath)
+		if _, err := os.Stat(svcContextDir); err != nil {
+			svcContextDir = buildSourceDir
+		}
+
+		var virtualFiles map[string][]byte
+		if service.BuildStrategy == models.BuildStrategyAuto {
+			intPort := service.InternalPort
+			if intPort <= 0 {
+				intPort = 8080
+			}
+			generatedContent := detector.GenerateDockerfile(service.RuntimeType, intPort, service.StartCommand)
+			relDockerPath = "Dockerfile.forgelab"
+			virtualFiles = map[string][]byte{
+				"Dockerfile.forgelab": []byte(generatedContent),
+			}
+		} else {
+			if service.DockerfilePath != "" {
+				relDockerPath = service.DockerfilePath
+			} else {
+				relDockerPath = "Dockerfile"
+			}
+		}
+
+		matcher, _ := LoadDockerignore(svcContextDir)
+		if matcher == nil {
+			matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
+		}
+
+		tarArchive = StreamBuildContext(ctx, TarStreamerOptions{
+			BuildContextDir: svcContextDir,
+			Matcher:         matcher,
+			VirtualFiles:    virtualFiles,
+			EmitLog: func(phase, stream, msg string) {
+				emitLog(phase, stream, msg)
+			},
+		})
+	}
+
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Building Docker image '%s'...", svcTag))
+	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
+	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, tarArchive, types.ImageBuildOptions{
+		Tags:       []string{svcTag},
+		Dockerfile: relDockerPath,
+		Remove:     true,
+	})
+	tarArchive.Close()
+	buildCancel()
+	if err != nil {
+		reason := fmt.Sprintf("Docker build failed: %v", err)
+		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
+	}
+
+	if err := e.parseDockerStream(buildResponse.Body, func(msg string) {
+		emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
+	}); err != nil {
+		buildResponse.Body.Close()
+		reason := fmt.Sprintf("Docker build error: %v", err)
+		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
+	}
+	buildResponse.Body.Close()
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Docker image '%s' built successfully.", svcTag))
+
+	// 3. Container Startup
+	emitStatus(models.DeployStatusStarting, nil, nil)
+	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Creating container for service '%s'...", service.Name))
+
+	intPort := service.InternalPort
+	if intPort <= 0 {
+		intPort = 8080
+	}
+
+	var hostPort *int
+	var portBindings nat.PortMap
+	targetPortStr := fmt.Sprintf("%d/tcp", intPort)
+
+	allProjectServices, _ := e.serviceService.ListServices(ctx, project.ID)
+	if service.PublicExposed || service.Role == models.RoleFrontend || len(allProjectServices) <= 1 {
+		allocated, err := e.portManager.AllocatePort()
+		if err == nil {
+			hostPort = &allocated
+			portBindings = nat.PortMap{
+				nat.Port(targetPortStr): []nat.PortBinding{
+					{
+						HostIP:   "0.0.0.0",
+						HostPort: fmt.Sprintf("%d", allocated),
+					},
+				},
+			}
+		}
+	}
+
+	var envMap map[string]string
+	if e.secretService != nil {
+		envMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID)
+	}
+	svcEnv := make([]string, 0, len(envMap)+len(allProjectServices)*3+2)
+	for k, v := range envMap {
+		svcEnv = append(svcEnv, fmt.Sprintf("%s=%s", k, v))
+	}
+	svcEnv = append(svcEnv, fmt.Sprintf("PORT=%d", intPort))
+	svcEnv = append(svcEnv, fmt.Sprintf("SERVICE_NAME=%s", service.Name))
+
+	for _, peer := range allProjectServices {
+		peerIntPort := peer.InternalPort
+		if peerIntPort <= 0 {
+			peerIntPort = 8080
+		}
+		upperName := strings.ToUpper(strings.ReplaceAll(peer.Name, "-", "_"))
+		svcEnv = append(svcEnv, fmt.Sprintf("%s_HOST=%s", upperName, peer.Name))
+		svcEnv = append(svcEnv, fmt.Sprintf("%s_PORT=%d", upperName, peerIntPort))
+		svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=http://%s:%d", upperName, peer.Name, peerIntPort))
+		if peer.Role == models.RoleBackend {
+			svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_URL=http://%s:%d", peer.Name, peerIntPort))
+			svcEnv = append(svcEnv, fmt.Sprintf("API_URL=http://%s:%d", peer.Name, peerIntPort))
+		}
+	}
+
+	networkName := fmt.Sprintf("forgelab-net-%s", project.ID.String())
+	_, netErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{})
+	if netErr != nil {
+		_, _ = e.dockerClient.NetworkCreate(ctx, networkName, dockernetwork.CreateOptions{
+			Driver: "bridge",
+		})
+	}
+
+	containerName := fmt.Sprintf("forgelab-app-%s-%s", serviceDeploy.ID.String()[:8], service.Name)
+	containerConfig := &container.Config{
+		Image: svcTag,
+		Env:   svcEnv,
+		ExposedPorts: nat.PortSet{
+			nat.Port(targetPortStr): struct{}{},
+		},
+		Labels: map[string]string{
+			"forgelab.project_id":            project.ID.String(),
+			"forgelab.service_id":            service.ID.String(),
+			"forgelab.service_deployment_id": serviceDeploy.ID.String(),
+			"forgelab.service_name":          service.Name,
+		},
+	}
+	if serviceDeploy.DeploymentID != nil {
+		containerConfig.Labels["forgelab.deployment_id"] = serviceDeploy.DeploymentID.String()
+	}
+
+	pidsLimit := int64(256)
+	hostConfig := &container.HostConfig{
+		PortBindings: portBindings,
+		RestartPolicy: container.RestartPolicy{
+			Name: "unless-stopped",
+		},
+		Resources: container.Resources{
+			Memory:    1024 * 1024 * 1024,
+			NanoCPUs:  1_000_000_000,
+			PidsLimit: &pidsLimit,
+		},
+	}
+
+	netConfig := &dockernetwork.NetworkingConfig{
+		EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
+			networkName: {
+				Aliases: []string{service.Name},
+			},
+		},
+	}
+
+	_ = e.dockerClient.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
+
+	resp, err := e.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, netConfig, nil, containerName)
+	if err != nil {
+		if hostPort != nil {
+			e.portManager.ReleasePort(*hostPort)
+		}
+		reason := fmt.Sprintf("Failed to create container for service '%s': %v", service.Name, err)
+		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
+	}
+
+	containerID := resp.ID
+	if err := e.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+		if hostPort != nil {
+			e.portManager.ReleasePort(*hostPort)
+		}
+		reason := fmt.Sprintf("Failed to start container for service '%s': %v", service.Name, err)
+		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
+	}
+
+	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started for service '%s'.", containerID[:12], service.Name))
+
+	// 4. Health Checking
+	emitStatus(models.DeployStatusHealthChecking, hostPort, nil)
+	emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Verifying health for service '%s'...", service.Name))
+
+	healthStrat := service.HealthStrategy
+	if healthStrat == "" {
+		healthStrat = models.HealthStrategyAuto
+	}
+	healthPath := "/"
+	if service.HealthCheckPath != nil && *service.HealthCheckPath != "" {
+		healthPath = *service.HealthCheckPath
+	}
+
+	svcHealthy, _ := e.verifyServiceHealth(
+		ctx,
+		containerID,
+		intPort,
+		hostPort,
+		healthStrat,
+		healthPath,
+		func(msg string) { emitLog(models.LogPhaseHealth, models.LogStreamSystem, msg) },
+		func(msg string) { emitLog(models.LogPhaseHealth, models.LogStreamStderr, msg) },
+	)
+
+	if !svcHealthy {
+		// Health check failed - ENFORCE SAFETY INVARIANT:
+		// Destroy newly spawned broken container and preserve previously healthy container intact!
+		_ = e.dockerClient.ContainerStop(ctx, containerID, container.StopOptions{})
+		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+		if hostPort != nil {
+			e.portManager.ReleasePort(*hostPort)
+		}
+
+		reason := fmt.Sprintf("Health check failed for service '%s' after retries", service.Name)
+		emitLog(models.LogPhaseHealth, models.LogStreamStderr, reason)
+		_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, models.DeployStatusFailed, &reason)
+
+		// Restore previous healthy status on service record if it was previously running
+		if hasPreviousHealthy {
+			emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("SAFETY INVARIANT ENFORCED: New deployment for '%s' failed health check. Previous healthy container remains active!", service.Name))
+			_ = e.serviceService.UpdateServiceStatus(ctx, service.ID, models.ProjectStatusRunning, nil, nil, nil)
+		} else {
+			_ = e.serviceService.UpdateServiceStatus(ctx, service.ID, models.DeployStatusFailed, nil, nil, nil)
+		}
+
+		_, _ = e.recalculateAndUpdateProjectStatus(ctx, project.ID)
+		return errors.New(reason)
+	}
+
+	// 5. Promote service
+	err = e.serviceService.PromoteServiceDeployment(ctx, service.ID, serviceDeploy.ID, containerID, svcTag, hostPort)
+	if err != nil {
+		slog.Error("failed to promote service deployment", "service_id", service.ID, "service_deployment_id", serviceDeploy.ID, "error", err)
+	}
+	_ = e.deploymentService.UpdateServiceDeploymentContainer(ctx, serviceDeploy.ID, containerID, hostPort)
+	_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, models.DeployStatusRunning, nil)
+	emitStatus(models.DeployStatusRunning, hostPort, nil)
+
+	// 6. Cleanup previous container for this service if different
+	if previousContainerID != nil && *previousContainerID != "" && *previousContainerID != containerID {
+		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for service '%s'...", (*previousContainerID)[:12], service.Name))
+		_ = e.dockerClient.ContainerStop(ctx, *previousContainerID, container.StopOptions{})
+		_ = e.dockerClient.ContainerRemove(ctx, *previousContainerID, container.RemoveOptions{Force: true})
+	}
+
+	// Update project port if this service is public or frontend
+	if hostPort != nil && (service.Role == models.RoleFrontend || service.PublicExposed) {
+		_, _ = e.projectService.UpdateProjectPort(ctx, project.ID, *hostPort)
+	}
+
+	emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Service '%s' deployment #%d is now RUNNING and live!", service.Name, serviceDeploy.DeployNumber))
+	return nil
+}
+
+// ExecuteDeployment runs the project-wide release deployment orchestration layer.
 func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) error {
 	deployment, err := e.deploymentService.GetDeployment(ctx, deploymentID)
 	if err != nil {
 		return fmt.Errorf("failed to get deployment %s: %w", deploymentID, err)
 	}
 
-	project, err := e.projectService.GetProject(ctx, deployment.ProjectID, deployment.ProjectID)
+	project, err := e.getProjectByID(ctx, deployment.ProjectID)
 	if err != nil {
-		// Fallback without ownership filter for background worker execution
-		project, err = e.getProjectByID(ctx, deployment.ProjectID)
-		if err != nil {
-			return fmt.Errorf("failed to get project %s: %w", deployment.ProjectID, err)
-		}
+		return fmt.Errorf("failed to get project %s: %w", deployment.ProjectID, err)
 	}
 
 	redactor := logging.NewLogRedactor()
-
-	// Helper to log and publish status/log events
-	emitServiceLog := func(serviceID *uuid.UUID, phase, stream, message string) {
+	emitLog := func(phase, stream, message string) {
 		redactedMsg := redactor.Redact(message)
-		persistedLog, err := e.deploymentService.AddDeploymentServiceLog(ctx, deployment.ID, serviceID, phase, stream, redactedMsg)
+		persistedLog, err := e.deploymentService.AddDeploymentServiceLog(ctx, &deployment.ID, nil, nil, phase, stream, redactedMsg)
 		if err != nil {
-			slog.Error("failed to persist deployment log", "deployment_id", deployment.ID, "phase", phase, "error", err)
+			slog.Error("failed to persist release deployment log", "deployment_id", deployment.ID, "phase", phase, "error", err)
 			return
 		}
-		slog.Debug("deployment log persisted", "deployment_id", deployment.ID, "log_id", persistedLog.ID, "phase", phase)
 		if e.wsHub != nil {
 			data := map[string]interface{}{
 				"id":            persistedLog.ID,
@@ -128,40 +676,142 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 				"stream":        persistedLog.Stream,
 				"message":       persistedLog.Message,
 			}
-			if serviceID != nil {
-				data["service_id"] = serviceID.String()
-				serviceChannel := fmt.Sprintf("deployment:%s:service:%s", deployment.ID.String(), serviceID.String())
-				_ = e.wsHub.PublishEvent(serviceChannel, &ws.EventMessage{
-					Type:    "log",
-					Channel: serviceChannel,
-					Data:    data,
-				})
-			}
 			channel := "deployment:" + deployment.ID.String()
-			err := e.wsHub.PublishEvent(channel, &ws.EventMessage{
+			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
 				Type:    "log",
 				Channel: channel,
 				Data:    data,
 			})
-			if err != nil {
-				slog.Error("failed to publish deployment log event", "deployment_id", deployment.ID, "channel", channel, "event_type", "log", "error", err)
-			}
+			projectChannel := fmt.Sprintf("project:%s", project.ID.String())
+			_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
+				Type:    "release_log",
+				Channel: projectChannel,
+				Data:    data,
+			})
 		}
 	}
 
+	updateReleaseStatus := func(newStatus string, failureReason *string) {
+		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason)
+		if e.wsHub != nil {
+			channel := "deployment:" + deployment.ID.String()
+			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
+				Type:    "status_change",
+				Channel: channel,
+				Data: map[string]interface{}{
+					"deployment_id":  deployment.ID.String(),
+					"project_id":     project.ID.String(),
+					"new_status":     newStatus,
+					"failure_reason": failureReason,
+					"timestamp":      time.Now().Format(time.RFC3339),
+				},
+			})
+		}
+	}
+
+	var allProjectServices []*models.Service
+	if e.serviceService != nil {
+		allProjectServices, _ = e.serviceService.ListServices(ctx, project.ID)
+	}
+
+	// Legacy single-container project fallback if 0 services defined
+	if len(allProjectServices) == 0 {
+		return e.executeLegacySingleContainerDeployment(ctx, deployment, project)
+	}
+
+	// Multi-service project release deployment
+	updateReleaseStatus(models.DeployStatusBuilding, nil)
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Initiating Release #%d for %d service(s)...", deployment.DeployNumber, len(allProjectServices)))
+
+	svcDeploys, err := e.deploymentService.ListServiceDeployments(ctx, deployment.ID)
+	if err != nil || len(svcDeploys) == 0 {
+		reason := "No service deployments configured for this release"
+		updateReleaseStatus(models.DeployStatusFailed, &reason)
+		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+		return errors.New(reason)
+	}
+
+	var (
+		wg         sync.WaitGroup
+		mu         sync.Mutex
+		allHealthy = true
+		anyHealthy = false
+		errList    []string
+	)
+
+	for _, sd := range svcDeploys {
+		wg.Add(1)
+		go func(sdItem *models.ServiceDeployment) {
+			defer wg.Done()
+			if execErr := e.ExecuteServiceDeployment(ctx, sdItem.ID); execErr != nil {
+				mu.Lock()
+				allHealthy = false
+				errList = append(errList, fmt.Sprintf("%s: %v", sdItem.ServiceName, execErr))
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				anyHealthy = true
+				mu.Unlock()
+			}
+		}(sd)
+	}
+	wg.Wait()
+
+	newProjectStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
+
+	if allHealthy && anyHealthy {
+		updateReleaseStatus(models.DeployStatusRunning, nil)
+		_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
+		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d successfully deployed all services!", deployment.DeployNumber))
+		return nil
+	} else if anyHealthy {
+		// Valid state transition: deployment status is Running (not partially_running!), while project status reflects partially_running
+		updateReleaseStatus(models.DeployStatusRunning, nil)
+		_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
+		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d finished with partial success (%s).", deployment.DeployNumber, strings.Join(errList, "; ")))
+		return nil
+	} else {
+		reason := fmt.Sprintf("All services failed deployment: %s", strings.Join(errList, "; "))
+		updateReleaseStatus(models.DeployStatusFailed, &reason)
+		emitLog(models.LogPhaseHealth, models.LogStreamStderr, reason)
+		return errors.New(reason)
+	}
+}
+
+// executeLegacySingleContainerDeployment provides fallback execution for legacy projects with 0 services.
+func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, deployment *models.Deployment, project *models.Project) error {
+	redactor := logging.NewLogRedactor()
 	emitLog := func(phase, stream, message string) {
-		emitServiceLog(nil, phase, stream, message)
+		redactedMsg := redactor.Redact(message)
+		persistedLog, err := e.deploymentService.AddDeploymentServiceLog(ctx, &deployment.ID, nil, nil, phase, stream, redactedMsg)
+		if err != nil {
+			return
+		}
+		if e.wsHub != nil {
+			data := map[string]interface{}{
+				"id":            persistedLog.ID,
+				"deployment_id": deployment.ID.String(),
+				"timestamp":     persistedLog.Timestamp.Format(time.RFC3339Nano),
+				"phase":         persistedLog.Phase,
+				"stream":        persistedLog.Stream,
+				"message":       persistedLog.Message,
+			}
+			channel := "deployment:" + deployment.ID.String()
+			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
+				Type:    "log",
+				Channel: channel,
+				Data:    data,
+			})
+		}
 	}
 
 	updateStatus := func(newStatus string, failureReason *string) {
 		prevStatus := deployment.Status
-		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason); err != nil {
-			slog.Error("failed to update deployment status", "deployment_id", deployment.ID, "status", newStatus, "error", err)
-		}
+		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason)
 		deployment.Status = newStatus
 		if e.wsHub != nil {
 			channel := "deployment:" + deployment.ID.String()
-			err := e.wsHub.PublishEvent(channel, &ws.EventMessage{
+			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
 				Type:    "status_change",
 				Channel: channel,
 				Data: map[string]interface{}{
@@ -172,553 +822,30 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					"timestamp":       time.Now().Format(time.RFC3339),
 				},
 			})
-			if err != nil {
-				slog.Error("failed to publish deployment status event", "deployment_id", deployment.ID, "channel", channel, "event_type", "status_change", "error", err)
-			}
 		}
 	}
 
-	// Fetch environment variables and configure secret redactor
-	envMap, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID)
-	if err == nil {
-		redactor.SetSecrets(secrets)
+	if e.secretService != nil {
+		_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID)
+		if err == nil {
+			redactor.SetSecrets(secrets)
+		}
 	}
 
-	// 1. SOURCE ACQUISITION & RESOLUTION
 	updateStatus(models.DeployStatusCloning, nil)
-
-	var (
-		buildSourceDir string
-		cleanupDir     string
-	)
-	defer func() {
-		if cleanupDir != "" {
+	buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, deployment.ID.String(), emitLog)
+	if cleanupDir != "" {
+		defer func() {
 			_ = os.RemoveAll(cleanupDir)
-		}
-	}()
-
-	if project.SourceType == models.SourceTypeGitHub {
-		snapshotDir := filepath.Join(e.workDir, deployment.ID.String())
-		_ = os.MkdirAll(snapshotDir, 0755)
-		cleanupDir = snapshotDir
-		buildSourceDir = snapshotDir
-
-		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (branch: %s)...", project.SourceReference, project.Branch))
-		parts := strings.Split(project.SourceReference, "/")
-		if len(parts) != 2 {
-			reason := fmt.Sprintf("Invalid GitHub repository reference '%s'. Expected format 'owner/repo'", project.SourceReference)
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
-		if e.githubService == nil {
-			reason := "GitHub integration service is not available"
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
-		if err := e.githubService.AcquireRepoTarball(ctx, project.OwnerID, parts[0], parts[1], project.Branch, snapshotDir); err != nil {
-			reason := fmt.Sprintf("Failed to acquire GitHub repository archive: %v", err)
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
-		emitLog(models.LogPhaseSource, models.LogStreamSystem, "GitHub repository archive acquired successfully.")
-
-	} else if project.SourceType == models.SourceTypeLocalUpload || (project.SourceType == models.SourceTypeLocal && project.SourceReference != "") {
-		sourceUUID, err := uuid.Parse(project.SourceReference)
-		if err != nil {
-			reason := fmt.Sprintf("Invalid local source upload ID '%s': %v", project.SourceReference, err)
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
-		if e.sourceService == nil {
-			reason := "Local source upload service is not available"
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
-		p, err := e.sourceService.GetSourcePath(ctx, project.OwnerID, sourceUUID)
-		if err != nil {
-			reason := fmt.Sprintf("Failed to locate uploaded source files: %v", err)
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
-		buildSourceDir = p
-		emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using isolated uploaded source workspace.")
-
-	} else if project.SourceType == models.SourceTypeLocalDirectory || project.RepositoryPath != "" {
-		canonicalSource, err := e.pathValidator.ValidateSourcePath(project.RepositoryPath)
-		if err != nil {
-			reason := fmt.Sprintf("Source path validation failed: %v", err)
-			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
-
-		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Using local directory: %s", project.RepositoryPath))
-		emitLog(models.LogPhaseSource, models.LogStreamSystem, "Validated local source directory.")
-
-		if e.localBuildMode == "snapshot" {
-			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using snapshot filesystem build mode.")
-			snapshotDir := filepath.Join(e.workDir, deployment.ID.String())
-			_ = os.MkdirAll(snapshotDir, 0755)
-			cleanupDir = snapshotDir
-			if err := copyDirectory(canonicalSource, snapshotDir); err != nil {
-				reason := fmt.Sprintf("Failed to snapshot source files: %v", err)
-				emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-				updateStatus(models.DeployStatusFailed, &reason)
-				return errors.New(reason)
-			}
-			buildSourceDir = snapshotDir
-		} else {
-			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using direct filesystem build mode.")
-			buildSourceDir = canonicalSource
-		}
-
-	} else if project.SourceType == models.SourceTypeLocalAgent {
-		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Connected to ForgeLAB local agent (session: %s).", project.SourceReference))
-		buildSourceDir = "" // Source streamed dynamically per service
-	} else {
-		reason := "No valid local directory, uploaded source, or repository configured"
+		}()
+	}
+	if err != nil {
+		reason := fmt.Sprintf("Source resolution failed: %v", err)
 		emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
 		return errors.New(reason)
 	}
 
-	// Check if multi-service project
-	var allProjectServices []*models.Service
-	if e.serviceService != nil {
-		allProjectServices, _ = e.serviceService.ListServices(ctx, project.ID)
-	}
-	if len(allProjectServices) == 0 && len(project.Services) > 0 {
-		allProjectServices = project.Services
-	}
-
-	// Filter services to deploy based on this release's service_deployments records
-	var servicesToDeploy []*models.Service
-	svcDeploys, _ := e.deploymentService.ListServiceDeployments(ctx, deployment.ID)
-	if len(svcDeploys) > 0 {
-		targetMap := make(map[uuid.UUID]bool)
-		for _, sd := range svcDeploys {
-			targetMap[sd.ServiceID] = true
-		}
-		for _, s := range allProjectServices {
-			if targetMap[s.ID] {
-				servicesToDeploy = append(servicesToDeploy, s)
-			}
-		}
-	} else {
-		servicesToDeploy = allProjectServices
-	}
-
-	emitServiceStatusChange := func(svcID uuid.UUID, svcName, newStatus string, hostPort *int, failureReason *string) {
-		if e.wsHub != nil {
-			data := map[string]interface{}{
-				"deployment_id": deployment.ID.String(),
-				"project_id":    project.ID.String(),
-				"service_id":    svcID.String(),
-				"service_name":  svcName,
-				"new_status":    newStatus,
-				"timestamp":     time.Now().Format(time.RFC3339),
-			}
-			if hostPort != nil {
-				data["host_port"] = *hostPort
-			}
-			if failureReason != nil {
-				data["failure_reason"] = *failureReason
-			}
-			channel := "deployment:" + deployment.ID.String()
-			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
-				Type:    "status_change",
-				Channel: channel,
-				Data:    data,
-			})
-			serviceChannel := fmt.Sprintf("deployment:%s:service:%s", deployment.ID.String(), svcID.String())
-			_ = e.wsHub.PublishEvent(serviceChannel, &ws.EventMessage{
-				Type:    "status_change",
-				Channel: serviceChannel,
-				Data:    data,
-			})
-		}
-	}
-
-	if len(servicesToDeploy) > 0 {
-		updateStatus(models.DeployStatusBuilding, nil)
-		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Starting multi-service deployment pipeline for %d service(s)...", len(servicesToDeploy)))
-
-		// Ensure isolated project Docker bridge network
-		networkName := fmt.Sprintf("forgelab-net-%s", project.ID.String())
-		_, netErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{})
-		if netErr != nil {
-			_, _ = e.dockerClient.NetworkCreate(ctx, networkName, dockernetwork.CreateOptions{
-				Driver: "bridge",
-			})
-		}
-
-		allHealthy := true
-		anyHealthy := false
-		var primaryPort int
-
-		for _, svc := range servicesToDeploy {
-			svcID := svc.ID
-			emitServiceLog(&svcID, models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Starting build for service '%s' (role: %s, runtime: %s)...", svc.Name, svc.Role, svc.RuntimeType))
-			_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusBuilding, nil)
-			_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusBuilding, nil, nil, nil)
-			emitServiceStatusChange(svcID, svc.Name, models.DeployStatusBuilding, nil, nil)
-
-			svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, svc.Name, deployment.DeployNumber)
-			relDockerPath := "Dockerfile"
-			var tarArchive io.ReadCloser
-
-			if project.SourceType == models.SourceTypeLocalAgent {
-				// Stream build context directly from local agent without copying full repository
-				baseURL := resolveAgentBaseURL()
-				agentToken := ""
-				if e.sourceService != nil {
-					if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
-						if src, err := e.sourceService.GetSource(ctx, project.OwnerID, srcUUID); err == nil && src != nil && src.Metadata != nil {
-							if tok, ok := src.Metadata["session_token"].(string); ok {
-								agentToken = tok
-							}
-						}
-					}
-				}
-				agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s",
-					baseURL,
-					project.SourceReference,
-					url.QueryEscape(svc.SourcePath),
-					url.QueryEscape(svc.RuntimeType),
-					svc.InternalPort,
-					url.QueryEscape(svc.StartCommand),
-				)
-				if agentToken != "" {
-					agentURL += "&token=" + url.QueryEscape(agentToken)
-				}
-				req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-				if reqErr == nil && agentToken != "" {
-					req.Header.Set("Authorization", "Bearer "+agentToken)
-				}
-				if reqErr != nil {
-					reason := fmt.Sprintf("Failed to request agent stream context: %v", reqErr)
-					emitServiceLog(&svcID, models.LogPhaseBuild, models.LogStreamStderr, reason)
-					_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusFailed, &reason)
-					_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusFailed, nil, nil, nil)
-					emitServiceStatusChange(svcID, svc.Name, models.DeployStatusFailed, nil, &reason)
-					allHealthy = false
-					continue
-				}
-				resp, httpErr := http.DefaultClient.Do(req)
-				if httpErr != nil || resp.StatusCode != http.StatusOK {
-					reason := "Failed to stream source from local agent"
-					if httpErr != nil {
-						reason = httpErr.Error()
-					} else if resp != nil {
-						resp.Body.Close()
-						if resp.StatusCode == http.StatusNotFound {
-							reason = "Local agent source session expired or agent restarted. Please re-select the project folder."
-						} else {
-							reason = fmt.Sprintf("agent returned status %d", resp.StatusCode)
-						}
-					}
-					emitServiceLog(&svcID, models.LogPhaseBuild, models.LogStreamStderr, reason)
-					_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusFailed, &reason)
-					_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusFailed, nil, nil, nil)
-					emitServiceStatusChange(svcID, svc.Name, models.DeployStatusFailed, nil, &reason)
-					allHealthy = false
-					continue
-				}
-				tarArchive = resp.Body
-				if svc.BuildStrategy == models.BuildStrategyAuto {
-					relDockerPath = "Dockerfile.forgelab"
-				}
-			} else {
-				// Standard local or extracted archive directory
-				svcContextDir := filepath.Join(buildSourceDir, svc.SourcePath)
-				if _, err := os.Stat(svcContextDir); err != nil {
-					svcContextDir = buildSourceDir
-				}
-
-				var virtualFiles map[string][]byte
-				if svc.BuildStrategy == models.BuildStrategyAuto {
-					intPort := svc.InternalPort
-					if intPort <= 0 {
-						intPort = 8080
-					}
-					generatedContent := detector.GenerateDockerfile(svc.RuntimeType, intPort, svc.StartCommand)
-					relDockerPath = "Dockerfile.forgelab"
-					virtualFiles = map[string][]byte{
-						"Dockerfile.forgelab": []byte(generatedContent),
-					}
-				} else {
-					if svc.DockerfilePath != "" {
-						relDockerPath = svc.DockerfilePath
-					} else {
-						relDockerPath = "Dockerfile"
-					}
-				}
-
-				matcher, _ := LoadDockerignore(svcContextDir)
-				if matcher == nil {
-					matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
-				}
-
-				tarArchive = StreamBuildContext(ctx, TarStreamerOptions{
-					BuildContextDir: svcContextDir,
-					Matcher:         matcher,
-					VirtualFiles:    virtualFiles,
-					EmitLog: func(phase, stream, msg string) {
-						emitServiceLog(&svcID, phase, stream, msg)
-					},
-				})
-			}
-
-			// Image Build with 15-minute build timeout limit
-			emitServiceLog(&svcID, models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Building Docker image '%s'...", svcTag))
-			buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
-			buildResponse, err := e.dockerClient.ImageBuild(buildCtx, tarArchive, types.ImageBuildOptions{
-				Tags:       []string{svcTag},
-				Dockerfile: relDockerPath,
-				Remove:     true,
-			})
-			tarArchive.Close()
-			buildCancel()
-			if err != nil {
-				reason := fmt.Sprintf("Docker build failed: %v", err)
-				emitServiceLog(&svcID, models.LogPhaseBuild, models.LogStreamStderr, reason)
-				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusFailed, &reason)
-				_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusFailed, nil, nil, nil)
-				emitServiceStatusChange(svcID, svc.Name, models.DeployStatusFailed, nil, &reason)
-				allHealthy = false
-				continue
-			}
-
-			if err := e.parseDockerStream(buildResponse.Body, func(msg string) {
-				emitServiceLog(&svcID, models.LogPhaseBuild, models.LogStreamStdout, msg)
-			}); err != nil {
-				buildResponse.Body.Close()
-				reason := fmt.Sprintf("Docker build error: %v", err)
-				emitServiceLog(&svcID, models.LogPhaseBuild, models.LogStreamStderr, reason)
-				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusFailed, &reason)
-				_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusFailed, nil, nil, nil)
-				emitServiceStatusChange(svcID, svc.Name, models.DeployStatusFailed, nil, &reason)
-				allHealthy = false
-				continue
-			}
-			buildResponse.Body.Close()
-			emitServiceLog(&svcID, models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Docker image '%s' built successfully.", svcTag))
-
-			// Container Startup
-			_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusStarting, nil)
-			_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusStarting, nil, &svcTag, nil)
-			emitServiceStatusChange(svcID, svc.Name, models.DeployStatusStarting, nil, nil)
-			emitServiceLog(&svcID, models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Creating container for service '%s'...", svc.Name))
-
-			intPort := svc.InternalPort
-			if intPort <= 0 {
-				intPort = 8080
-			}
-
-			var hostPort *int
-			var portBindings nat.PortMap
-			targetPortStr := fmt.Sprintf("%d/tcp", intPort)
-
-			// Allocate host port if public or frontend or single service
-			if svc.PublicExposed || svc.Role == models.RoleFrontend || len(allProjectServices) == 1 {
-				allocated, err := e.portManager.AllocatePort()
-				if err == nil {
-					hostPort = &allocated
-					if primaryPort == 0 {
-						primaryPort = allocated
-					}
-					portBindings = nat.PortMap{
-						nat.Port(targetPortStr): []nat.PortBinding{
-							{
-								HostIP:   "0.0.0.0",
-								HostPort: fmt.Sprintf("%d", allocated),
-							},
-						},
-					}
-				}
-			}
-
-			// Container environment
-			svcEnv := make([]string, 0, len(envMap)+len(allProjectServices)*3+2)
-			for k, v := range envMap {
-				svcEnv = append(svcEnv, fmt.Sprintf("%s=%s", k, v))
-			}
-			svcEnv = append(svcEnv, fmt.Sprintf("PORT=%d", intPort))
-			svcEnv = append(svcEnv, fmt.Sprintf("SERVICE_NAME=%s", svc.Name))
-
-			// Peer service discovery
-			for _, peer := range allProjectServices {
-				peerIntPort := peer.InternalPort
-				if peerIntPort <= 0 {
-					peerIntPort = 8080
-				}
-				upperName := strings.ToUpper(strings.ReplaceAll(peer.Name, "-", "_"))
-				svcEnv = append(svcEnv, fmt.Sprintf("%s_HOST=%s", upperName, peer.Name))
-				svcEnv = append(svcEnv, fmt.Sprintf("%s_PORT=%d", upperName, peerIntPort))
-				svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=http://%s:%d", upperName, peer.Name, peerIntPort))
-				if peer.Role == models.RoleBackend {
-					svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_URL=http://%s:%d", peer.Name, peerIntPort))
-					svcEnv = append(svcEnv, fmt.Sprintf("API_URL=http://%s:%d", peer.Name, peerIntPort))
-				}
-			}
-
-			containerName := fmt.Sprintf("forgelab-app-%s-%s", deployment.ID.String()[:8], svc.Name)
-			containerConfig := &container.Config{
-				Image: svcTag,
-				Env:   svcEnv,
-				ExposedPorts: nat.PortSet{
-					nat.Port(targetPortStr): struct{}{},
-				},
-				Labels: map[string]string{
-					"forgelab.project_id":    project.ID.String(),
-					"forgelab.deployment_id": deployment.ID.String(),
-					"forgelab.service_id":    svcID.String(),
-					"forgelab.service_name":  svc.Name,
-				},
-			}
-
-			pidsLimit := int64(256)
-			hostConfig := &container.HostConfig{
-				PortBindings: portBindings,
-				RestartPolicy: container.RestartPolicy{
-					Name: "unless-stopped",
-				},
-				Resources: container.Resources{
-					Memory:    1024 * 1024 * 1024, // 1GB memory limit
-					NanoCPUs:  1_000_000_000,      // 1.0 CPU quota
-					PidsLimit: &pidsLimit,         // 256 PID limit
-				},
-			}
-
-			netConfig := &dockernetwork.NetworkingConfig{
-				EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
-					networkName: {
-						Aliases: []string{svc.Name},
-					},
-				},
-			}
-
-			// Remove any existing container with same name
-			_ = e.dockerClient.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
-
-			resp, err := e.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, netConfig, nil, containerName)
-			if err != nil {
-				reason := fmt.Sprintf("Failed to create container for service '%s': %v", svc.Name, err)
-				emitServiceLog(&svcID, models.LogPhaseStartup, models.LogStreamStderr, reason)
-				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusFailed, &reason)
-				_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusFailed, nil, nil, nil)
-				emitServiceStatusChange(svcID, svc.Name, models.DeployStatusFailed, nil, &reason)
-				allHealthy = false
-				continue
-			}
-
-			containerID := resp.ID
-			_ = e.deploymentService.UpdateServiceDeploymentContainer(ctx, deployment.ID, svcID, containerID, hostPort)
-			_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusStarting, &containerID, &svcTag, hostPort)
-			emitServiceStatusChange(svcID, svc.Name, models.DeployStatusStarting, hostPort, nil)
-
-			if err := e.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-				reason := fmt.Sprintf("Failed to start container for service '%s': %v", svc.Name, err)
-				emitServiceLog(&svcID, models.LogPhaseStartup, models.LogStreamStderr, reason)
-				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusFailed, &reason)
-				_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusFailed, nil, nil, nil)
-				emitServiceStatusChange(svcID, svc.Name, models.DeployStatusFailed, nil, &reason)
-				allHealthy = false
-				continue
-			}
-
-			emitServiceLog(&svcID, models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started for service '%s'.", containerID[:12], svc.Name))
-
-			// Health Checking
-			_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusHealthChecking, nil)
-			_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusHealthChecking, &containerID, &svcTag, hostPort)
-			emitServiceStatusChange(svcID, svc.Name, models.DeployStatusHealthChecking, hostPort, nil)
-			emitServiceLog(&svcID, models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Verifying health for service '%s'...", svc.Name))
-
-			healthStrat := svc.HealthStrategy
-			if healthStrat == "" {
-				healthStrat = models.HealthStrategyAuto
-			}
-			healthPath := "/"
-			if svc.HealthCheckPath != nil && *svc.HealthCheckPath != "" {
-				healthPath = *svc.HealthCheckPath
-			}
-
-			svcHealthy, _ := e.verifyServiceHealth(
-				ctx,
-				containerID,
-				intPort,
-				hostPort,
-				healthStrat,
-				healthPath,
-				func(msg string) { emitServiceLog(&svcID, models.LogPhaseHealth, models.LogStreamSystem, msg) },
-				func(msg string) { emitServiceLog(&svcID, models.LogPhaseHealth, models.LogStreamStderr, msg) },
-			)
-
-			if svcHealthy {
-				// Clean up previous container for this service if different
-				if svc.ContainerID != nil && *svc.ContainerID != "" && *svc.ContainerID != containerID {
-					_ = e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{})
-					_ = e.dockerClient.ContainerRemove(ctx, *svc.ContainerID, container.RemoveOptions{Force: true})
-				}
-
-				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusRunning, nil)
-				_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusRunning, &containerID, &svcTag, hostPort)
-				emitServiceStatusChange(svcID, svc.Name, models.DeployStatusRunning, hostPort, nil)
-				emitServiceLog(&svcID, models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Service '%s' is RUNNING!", svc.Name))
-				anyHealthy = true
-			} else {
-				// Stop and remove broken container
-				_ = e.dockerClient.ContainerStop(ctx, containerID, container.StopOptions{})
-				_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
-				if hostPort != nil {
-					e.portManager.ReleasePort(*hostPort)
-				}
-				reason := "Health check failed after retries"
-				emitServiceLog(&svcID, models.LogPhaseHealth, models.LogStreamStderr, reason)
-				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, deployment.ID, svcID, models.DeployStatusFailed, &reason)
-				_ = e.serviceService.UpdateServiceStatus(ctx, svcID, models.DeployStatusFailed, nil, nil, nil)
-				emitServiceStatusChange(svcID, svc.Name, models.DeployStatusFailed, nil, &reason)
-				allHealthy = false
-			}
-		}
-
-		// Overall Project & Deployment state calculation
-		allCurrentServices, _ := e.serviceService.ListServices(ctx, project.ID)
-		newProjectStatus := services.CalculateProjectStatus(allCurrentServices)
-		_ = e.projectService.UpdateProjectStatus(ctx, project.ID, newProjectStatus)
-
-		if allHealthy && anyHealthy {
-			updateStatus(models.DeployStatusRunning, nil)
-			_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
-			if primaryPort > 0 {
-				_, _ = e.projectService.UpdateProjectPort(ctx, project.ID, primaryPort)
-			}
-			emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d successfully deployed!", deployment.DeployNumber))
-			return nil
-		} else if anyHealthy {
-			updateStatus(models.ProjectStatusPartiallyRunning, nil)
-			_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
-			if primaryPort > 0 {
-				_, _ = e.projectService.UpdateProjectPort(ctx, project.ID, primaryPort)
-			}
-			emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d partially running (some services degraded).", deployment.DeployNumber))
-			return nil
-		} else {
-			reason := "All target services failed health check or deployment"
-			updateStatus(models.DeployStatusFailed, &reason)
-			emitLog(models.LogPhaseHealth, models.LogStreamStderr, reason)
-			return errors.New(reason)
-		}
-	}
-
-	// 2. BUILDING DOCKER IMAGE
 	updateStatus(models.DeployStatusBuilding, nil)
 	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Preparing build for image '%s'...", *deployment.ImageTag))
 
@@ -759,114 +886,96 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 			updateStatus(models.DeployStatusFailed, &reason)
 			return errors.New(reason)
 		}
-		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Using Dockerfile build strategy with '%s'...", dockerfilePath))
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Using Dockerfile at '%s'", dockerfilePath))
 	} else {
-		// Automatic Build Strategy: generate container image specification in memory (no disk modification)
-		runtimeType := deployment.RuntimeType
-		if runtimeType == "" {
-			runtimeType = project.RuntimeType
+		port := deployment.InternalPort
+		if port == 0 {
+			port = project.InternalPort
 		}
-		intPort := deployment.InternalPort
-		if intPort <= 0 {
-			intPort = project.InternalPort
-		}
-		if intPort <= 0 {
-			intPort = 8080
+		if port == 0 {
+			port = 8080
 		}
 		startCmd := deployment.StartCommand
 		if startCmd == "" {
 			startCmd = project.StartCommand
 		}
-
-		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Generating automatic build recipe for runtime: %s (internal port: %d)...", runtimeType, intPort))
-		generatedContent := detector.GenerateDockerfile(runtimeType, intPort, startCmd)
+		dockerfileContent := detector.GenerateDockerfile(deployment.RuntimeType, port, startCmd)
 		relDockerPath = "Dockerfile.forgelab"
 		virtualFiles = map[string][]byte{
-			"Dockerfile.forgelab": []byte(generatedContent),
+			"Dockerfile.forgelab": []byte(dockerfileContent),
 		}
 	}
 
-	// Load and apply .dockerignore
-	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Applying .dockerignore...")
-	matcher, err := LoadDockerignore(buildContextDir)
-	if err != nil {
-		emitLog(models.LogPhaseBuild, models.LogStreamStderr, fmt.Sprintf("Warning reading .dockerignore: %v. Using default filters.", err))
+	matcher, _ := LoadDockerignore(buildContextDir)
+	if matcher == nil {
 		matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 	}
 
-	// Stream build context concurrently without materializing tar in RAM
-	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Streaming Docker build context...")
-	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker build started.")
-
-	streamCtx, cancelStream := context.WithCancel(ctx)
-	defer cancelStream()
-
-	tarArchive := StreamBuildContext(streamCtx, TarStreamerOptions{
+	tarStream := StreamBuildContext(ctx, TarStreamerOptions{
 		BuildContextDir: buildContextDir,
 		Matcher:         matcher,
 		VirtualFiles:    virtualFiles,
-		EmitLog:         emitLog,
+		EmitLog: func(phase, stream, msg string) {
+			emitLog(phase, stream, msg)
+		},
 	})
-	defer tarArchive.Close()
 
 	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
-	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, tarArchive, types.ImageBuildOptions{
+	defer buildCancel()
+
+	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, tarStream, types.ImageBuildOptions{
 		Tags:       []string{*deployment.ImageTag},
 		Dockerfile: relDockerPath,
 		Remove:     true,
 	})
-	buildCancel()
 	if err != nil {
-		reason := fmt.Sprintf("Docker build initialization failed: %v", err)
+		tarStream.Close()
+		reason := fmt.Sprintf("Docker build failed: %v", err)
 		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
 		return errors.New(reason)
 	}
-	defer buildResponse.Body.Close()
 
-	// Parse build logs line by line
 	if err := e.parseDockerStream(buildResponse.Body, func(msg string) {
 		emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 	}); err != nil {
-		reason := fmt.Sprintf("Docker image build failed: %v", err)
+		buildResponse.Body.Close()
+		tarStream.Close()
+		reason := fmt.Sprintf("Build error: %v", err)
 		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
 		return errors.New(reason)
 	}
+	buildResponse.Body.Close()
+	tarStream.Close()
 
-	emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker build completed.")
-
-	// 3. STARTING CONTAINER
 	updateStatus(models.DeployStatusStarting, nil)
-	emitLog(models.LogPhaseStartup, models.LogStreamSystem, "Creating application container...")
-
-	// Allocate host port
 	allocatedPort, err := e.portManager.AllocatePort()
 	if err != nil {
-		reason := fmt.Sprintf("Failed to allocate host port: %v", err)
+		reason := fmt.Sprintf("Failed to allocate port: %v", err)
 		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
 		return errors.New(reason)
 	}
 
-	// Internal application port
 	intPort := deployment.InternalPort
-	if intPort <= 0 {
+	if intPort == 0 {
 		intPort = project.InternalPort
 	}
-	if intPort <= 0 {
+	if intPort == 0 {
 		intPort = 8080
 	}
+	targetPortStr := fmt.Sprintf("%d/tcp", intPort)
 
-	// Prepare container env vars
+	var envMap map[string]string
+	if e.secretService != nil {
+		envMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID)
+	}
 	envSlice := make([]string, 0, len(envMap)+1)
 	for k, v := range envMap {
 		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
 	}
 	envSlice = append(envSlice, fmt.Sprintf("PORT=%d", intPort))
-
-	containerName := fmt.Sprintf("forgelab-app-%s", deployment.ID.String())
-	targetPortStr := fmt.Sprintf("%d/tcp", intPort)
 
 	containerConfig := &container.Config{
 		Image: *deployment.ImageTag,
@@ -894,11 +1003,14 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 			Name: "unless-stopped",
 		},
 		Resources: container.Resources{
-			Memory:    1024 * 1024 * 1024, // 1GB memory limit
-			NanoCPUs:  1_000_000_000,      // 1.0 CPU quota
-			PidsLimit: &pidsLimit,         // 256 PID limit
+			Memory:    1024 * 1024 * 1024,
+			NanoCPUs:  1_000_000_000,
+			PidsLimit: &pidsLimit,
 		},
 	}
+
+	containerName := fmt.Sprintf("forgelab-%s-%d", project.Slug, deployment.DeployNumber)
+	_ = e.dockerClient.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
 
 	resp, err := e.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
 	if err != nil {
@@ -913,6 +1025,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	_ = e.deploymentService.UpdateDeploymentContainer(ctx, deployment.ID, containerID)
 
 	if err := e.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
 		e.portManager.ReleasePort(allocatedPort)
 		reason := fmt.Sprintf("Failed to start container: %v", err)
 		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
@@ -920,63 +1033,45 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		return errors.New(reason)
 	}
 
-	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started (host port %d -> internal port %d).", containerID[:12], allocatedPort, intPort))
-
-	// 4. HEALTH CHECKING
 	updateStatus(models.DeployStatusHealthChecking, nil)
-
-	healthStrategy := deployment.HealthStrategy
-	if healthStrategy == "" {
-		healthStrategy = project.HealthStrategy
-	}
-	if healthStrategy == "" {
-		healthStrategy = models.HealthStrategyAuto
-	}
+	emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Starting health checks on port %d...", allocatedPort))
 
 	healthPath := "/"
-	if project.HealthCheckPath != nil && *project.HealthCheckPath != "" {
-		healthPath = *project.HealthCheckPath
+	if deployment.HealthStrategy != "" {
+		if project.HealthCheckPath != nil && *project.HealthCheckPath != "" {
+			healthPath = *project.HealthCheckPath
+		}
+	}
+	healthStrat := deployment.HealthStrategy
+	if healthStrat == "" {
+		healthStrat = project.HealthStrategy
 	}
 
-	emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Performing health check (strategy: %s, port: %d, path: %s)...", healthStrategy, allocatedPort, healthPath))
-
-	var healthy bool
-	healthy, _ = e.verifyServiceHealth(
+	healthy, _ := e.verifyServiceHealth(
 		ctx,
 		containerID,
 		intPort,
 		&allocatedPort,
-		healthStrategy,
+		healthStrat,
 		healthPath,
 		func(msg string) { emitLog(models.LogPhaseHealth, models.LogStreamSystem, msg) },
 		func(msg string) { emitLog(models.LogPhaseHealth, models.LogStreamStderr, msg) },
 	)
 
-	// 5. PROMOTION OR SAFETY FAILURE INVARIANT
 	if !healthy {
-		// Stop broken container
 		_ = e.dockerClient.ContainerStop(ctx, containerID, container.StopOptions{})
 		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
 		e.portManager.ReleasePort(allocatedPort)
-
 		reason := "Health check failed after 10 retries"
 		emitLog(models.LogPhaseHealth, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
-
-		// Deployment Safety Invariant:
-		// project.current_deployment_id remains unchanged! Previous healthy deployment survives.
 		emitLog(models.LogPhaseHealth, models.LogStreamSystem, "SAFETY INVARIANT ENFORCED: New deployment failed health check. Previous healthy release remains active!")
 		return errors.New(reason)
 	}
 
-	// Health check passed! Promote new deployment to current
 	updateStatus(models.DeployStatusRunning, nil)
-
-	// Clean up previous container if exists
 	oldDeploymentID := project.CurrentDeploymentID
 	_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, models.ProjectStatusRunning)
-
-	// Update project port
 	_, _ = e.projectService.UpdateProjectPort(ctx, project.ID, allocatedPort)
 
 	if oldDeploymentID != nil && *oldDeploymentID != deployment.ID {
@@ -992,6 +1087,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Deployment #%d is now RUNNING and live on port %d!", deployment.DeployNumber, allocatedPort))
 	return nil
 }
+
 
 // Helper methods for Docker Engine
 func (e *Engine) getProjectByID(ctx context.Context, projectID uuid.UUID) (*models.Project, error) {

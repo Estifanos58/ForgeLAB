@@ -666,3 +666,186 @@ Verify that `PathValidator` prevents path traversal, rejects restricted system d
 - **Date:** —
 - **Environment:** —
 - **Notes:** —
+
+---
+
+### Procedure 9: Deploy Frontend Only
+
+#### Purpose
+Verify that deploying a frontend service independently triggers a `ServiceDeployment` pipeline without triggering or stopping the backend service, updates `services.current_service_deployment_id`, increments the frontend `deploy_number`, updates `services.status`, and leaves `projects.current_deployment_id` intact.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- A multi-service project created in ForgeLAB with at least two services (Frontend and Backend).
+- Both services are initially in `inactive` or `running` state.
+
+#### Test Procedure
+1. Navigate to the project page (`/projects/<id>`).
+2. Locate the **Frontend** service card in the Services section.
+3. Click the **Deploy Service** button on the Frontend card only.
+4. Observe the UI:
+   - Frontend card transitions to `Deploying` → `Building` → `Health Checking` → `Running`.
+   - Backend service card remains unchanged (in its previous state, e.g. `running` or `inactive`).
+   - The Deploy button on the Backend card remains enabled and clickable.
+5. In PostgreSQL, run:
+   ```sql
+   SELECT id, service_id, deploy_number, status, deployment_id FROM service_deployments WHERE service_id = '<frontend_service_id>' ORDER BY deploy_number DESC LIMIT 1;
+   SELECT current_deployment_id, status FROM projects WHERE id = '<project_id>';
+   SELECT id, current_service_deployment_id, status FROM services WHERE id = '<frontend_service_id>';
+   ```
+6. Verify:
+   - `service_deployments.deployment_id` is NULL (indicating an independent service deployment).
+   - `services.current_service_deployment_id` points to the new `service_deployments.id`.
+   - `projects.current_deployment_id` was NOT replaced.
+   - `projects.status` reflects the composite state (`running` if all are running, or `partially_running`).
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### Procedure 10: Deploy Backend Only
+
+#### Purpose
+Verify that deploying a backend service independently triggers an isolated `ServiceDeployment` pipeline, allocates an internal mesh endpoint or host port, generates peer discovery environment variables (`BACKEND_URL`, `API_URL`), updates `services.current_service_deployment_id`, and leaves the frontend container running and undisturbed.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- Multi-service project with frontend and backend services.
+- Frontend is running on an allocated port.
+
+#### Test Procedure
+1. Note the running frontend container ID and port using `docker ps`.
+2. On the project page, click **Deploy Service** on the **Backend** service card only.
+3. Observe live logs in the Terminal viewer scoped to the backend service.
+4. Verify backend image builds, container starts on network `forgelab-net-<project-id>`, and health checks complete.
+5. After backend is marked `Running`:
+   - Inspect `docker ps` to verify the frontend container was NEVER stopped or restarted.
+   - Send an HTTP request to the frontend to ensure it remains responsive throughout.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### Procedure 11: Deploy Frontend and Backend Simultaneously (Concurrent Execution)
+
+#### Purpose
+Verify that frontend and backend service deployments can be initiated simultaneously without encountering lock contention or `409 Conflict` (confirming removal of project-wide deployment lock and addition of per-service locks).
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- Multi-service project with frontend and backend.
+
+#### Test Procedure
+1. Open the project page.
+2. In rapid succession (or across two browser tabs / curl requests simultaneously), trigger:
+   - Click **Deploy Service** on Frontend (`POST /api/projects/<id>/services/<frontend_id>/deploy`)
+   - Click **Deploy Service** on Backend (`POST /api/projects/<id>/services/<backend_id>/deploy`)
+3. Verify both requests return HTTP `201 Created` with their respective `ServiceDeployment` records.
+4. Verify neither returns HTTP `409 Conflict`.
+5. Observe both cards displaying active progress states (`Building` / `Starting`) concurrently.
+6. Verify in Redis and logs that the worker pool processes both jobs concurrently in parallel goroutines without deadlock.
+7. Both services should transition to `Running` once their respective health checks pass.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### Procedure 12: Independent Health Check Failure (Frontend Fails While Backend Remains Healthy)
+
+#### Purpose
+Verify that a failure in a new frontend service deployment does not stop, crash, or replace the currently running healthy frontend container, and has zero negative effect on the running backend service.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- Both frontend and backend are currently `Running` and healthy.
+- Note the active frontend container ID via `docker ps`.
+
+#### Test Procedure
+1. Update frontend service configuration or source with an intentionally failing health check (e.g. invalid start command or non-existent health check path `/failing-endpoint`).
+2. Click **Deploy Service** on the Frontend service card.
+3. Observe the build and startup:
+   - Container starts and health checks fail after configured retries.
+   - New failed container is stopped and removed (`ContainerRemove`).
+   - Any allocated host port for the failed container is released.
+4. Verify Safety Invariant enforcement:
+   - The previously healthy frontend container is NOT stopped or destroyed.
+   - `services.container_id` and `services.status` for frontend remain `running`.
+   - The backend service container continues running with zero downtime or disruption.
+   - Project status reflects `running` or `partially_running` without invalid enum state transitions.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### Procedure 13: Independent Service Rollback (Roll Back Frontend Without Affecting Backend)
+
+#### Purpose
+Verify that clicking Rollback on an individual service rolls back only that specific service to its previous successful image tag, increments that service's `deploy_number`, promotes the rolled-back container, and does not alter or disrupt other services.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- Frontend service has had at least two deployments:
+  - Deployment #1: Healthy (`Running`)
+  - Deployment #2: Modified or deployed with a change.
+- Backend service is running.
+
+#### Test Procedure
+1. On the Frontend service card, click **Rollback** (or expand **History** and trigger rollback to Deployment #1).
+2. Verify API calls `POST /api/projects/<id>/services/<frontend_id>/rollback`.
+3. Verify a new `ServiceDeployment` record (Deployment #3) is created using the image tag from Deployment #1.
+4. Verify Deployment #3 is queued, started, health checked, and promoted.
+5. Verify the Frontend service card updates to `Running` on Deployment #3.
+6. Verify the Backend service remained running throughout the rollback with unchanged container ID and port.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+

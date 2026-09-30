@@ -133,29 +133,35 @@ type Service struct {
 	UpdatedAt                  time.Time        `json:"updated_at"`
 }
 
-// ServiceDeployment represents the deployment record of a single service within a release.
+// ServiceDeployment represents the deployment record of an individual service.
+// In a service-only deployment, DeploymentID is nil. In a release deployment, it references the parent release.
 type ServiceDeployment struct {
-	ID            uuid.UUID  `json:"id"`
-	DeploymentID  uuid.UUID  `json:"deployment_id"`
-	ServiceID     uuid.UUID  `json:"service_id"`
-	ServiceName   string     `json:"service_name,omitempty"`
-	Status        string     `json:"status"`
-	ImageTag      *string    `json:"image_tag"`
-	ContainerID   *string    `json:"container_id"`
-	HostPort      *int       `json:"host_port"`
-	InternalPort  int        `json:"internal_port"`
-	PreviewURL    *string    `json:"preview_url,omitempty"`
-	BuildStrategy string     `json:"build_strategy"`
-	BuildCommand  string     `json:"build_command"`
-	StartCommand  string     `json:"start_command"`
-	RuntimeType   string     `json:"runtime_type"`
-	StartedAt     *time.Time `json:"started_at"`
-	BuiltAt       *time.Time `json:"built_at"`
-	DeployedAt    *time.Time `json:"deployed_at"`
-	FinishedAt    *time.Time `json:"finished_at"`
-	DurationMs    *int64     `json:"duration_ms"`
-	FailureReason *string    `json:"failure_reason"`
-	CreatedAt     time.Time  `json:"created_at"`
+	ID              uuid.UUID  `json:"id"`
+	DeploymentID    *uuid.UUID `json:"deployment_id,omitempty"`
+	ServiceID       uuid.UUID  `json:"service_id"`
+	ServiceName     string     `json:"service_name,omitempty"`
+	DeployNumber    int        `json:"deploy_number"`
+	Status          string     `json:"status"`
+	ImageTag        *string    `json:"image_tag"`
+	ContainerID     *string    `json:"container_id"`
+	HostPort        *int       `json:"host_port"`
+	InternalPort    int        `json:"internal_port"`
+	PreviewURL      *string    `json:"preview_url,omitempty"`
+	BuildStrategy   string     `json:"build_strategy"`
+	BuildCommand    string     `json:"build_command"`
+	StartCommand    string     `json:"start_command"`
+	RuntimeType     string     `json:"runtime_type"`
+	DockerfilePath  string     `json:"dockerfile_path,omitempty"`
+	BuildContext    string     `json:"build_context,omitempty"`
+	HealthStrategy  string     `json:"health_strategy,omitempty"`
+	HealthCheckPath *string    `json:"health_check_path,omitempty"`
+	StartedAt       *time.Time `json:"started_at"`
+	BuiltAt         *time.Time `json:"built_at"`
+	DeployedAt      *time.Time `json:"deployed_at"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	DurationMs      *int64     `json:"duration_ms"`
+	FailureReason   *string    `json:"failure_reason"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
 // Source provider constants
@@ -253,15 +259,16 @@ type EnvironmentVariable struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
-// DeploymentLog represents a single log entry for a deployment and optional service.
+// DeploymentLog represents a single log entry for a deployment or service deployment.
 type DeploymentLog struct {
-	ID           int64      `json:"id"`
-	DeploymentID uuid.UUID  `json:"deployment_id"`
-	ServiceID    *uuid.UUID `json:"service_id,omitempty"`
-	Timestamp    time.Time  `json:"timestamp"`
-	Phase        string     `json:"phase"`  // source, build, startup, health, runtime
-	Stream       string     `json:"stream"` // stdout, stderr, system
-	Message      string     `json:"message"`
+	ID                  int64      `json:"id"`
+	DeploymentID        *uuid.UUID `json:"deployment_id,omitempty"`
+	ServiceDeploymentID *uuid.UUID `json:"service_deployment_id,omitempty"`
+	ServiceID           *uuid.UUID `json:"service_id,omitempty"`
+	Timestamp           time.Time  `json:"timestamp"`
+	Phase               string     `json:"phase"`  // source, build, startup, health, runtime
+	Stream              string     `json:"stream"` // stdout, stderr, system
+	Message             string     `json:"message"`
 }
 
 // Log phase constants

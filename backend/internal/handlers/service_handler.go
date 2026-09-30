@@ -217,7 +217,7 @@ func (h *ServiceHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	deployment, err := h.deploymentService.CreateServiceDeployment(r.Context(), project, svc)
 	if err != nil {
 		if errors.Is(err, services.ErrActiveDeployment) {
-			writeError(w, http.StatusConflict, "a deployment is already in progress for this project")
+			writeError(w, http.StatusConflict, "a deployment is already in progress for this service")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to create service deployment: "+err.Error())
@@ -225,15 +225,250 @@ func (h *ServiceHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.deployQueue != nil {
-		if err := h.deployQueue.EnqueueDeployment(r.Context(), deployment.ID); err != nil {
+		if err := h.deployQueue.EnqueueServiceDeployment(r.Context(), deployment.ID); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to enqueue deployment job")
 			return
 		}
 	} else if h.dockerEngine != nil {
 		go func() {
-			_ = h.dockerEngine.ExecuteDeployment(context.Background(), deployment.ID)
+			_ = h.dockerEngine.ExecuteServiceDeployment(context.Background(), deployment.ID)
 		}()
 	}
 
 	writeJSON(w, http.StatusCreated, deployment)
 }
+
+// Rollback handles POST /api/projects/{id}/services/{serviceId}/rollback
+func (h *ServiceHandler) Rollback(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service ID")
+		return
+	}
+
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
+		return
+	}
+
+	rollbackDeploy, err := h.deploymentService.RollbackServiceDeployment(r.Context(), project, svc)
+	if err != nil {
+		if errors.Is(err, services.ErrActiveDeployment) {
+			writeError(w, http.StatusConflict, "a deployment is already in progress for this service")
+			return
+		}
+		if errors.Is(err, services.ErrNoDeploymentToRollback) {
+			writeError(w, http.StatusBadRequest, "no previous successful deployment found to roll back to")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to rollback service: "+err.Error())
+		return
+	}
+
+	if h.deployQueue != nil {
+		if err := h.deployQueue.EnqueueServiceDeployment(r.Context(), rollbackDeploy.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to enqueue rollback job")
+			return
+		}
+	} else if h.dockerEngine != nil {
+		go func() {
+			_ = h.dockerEngine.ExecuteServiceDeployment(context.Background(), rollbackDeploy.ID)
+		}()
+	}
+
+	writeJSON(w, http.StatusCreated, rollbackDeploy)
+}
+
+// ListDeployments handles GET /api/projects/{id}/services/{serviceId}/deployments
+func (h *ServiceHandler) ListDeployments(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service ID")
+		return
+	}
+
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	deployments, err := h.deploymentService.ListServiceDeploymentsByService(r.Context(), serviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list service deployments: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, deployments)
+}
+
+// GetDeployment handles GET /api/projects/{id}/services/{serviceId}/deployments/{deploymentId}
+func (h *ServiceHandler) GetDeployment(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service ID")
+		return
+	}
+
+	deploymentID, err := uuid.Parse(chi.URLParam(r, "deploymentId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid deployment ID")
+		return
+	}
+
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	sd, err := h.deploymentService.GetServiceDeployment(r.Context(), deploymentID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "service deployment not found")
+		return
+	}
+
+	if sd.ServiceID != serviceID {
+		writeError(w, http.StatusBadRequest, "deployment does not belong to specified service")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, sd)
+}
+
+// GetLogs handles GET /api/projects/{id}/services/{serviceId}/deployments/{deploymentId}/logs
+func (h *ServiceHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service ID")
+		return
+	}
+
+	deploymentID, err := uuid.Parse(chi.URLParam(r, "deploymentId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid deployment ID")
+		return
+	}
+
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	sd, err := h.deploymentService.GetServiceDeployment(r.Context(), deploymentID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "service deployment not found")
+		return
+	}
+
+	if sd.ServiceID != serviceID {
+		writeError(w, http.StatusBadRequest, "deployment does not belong to specified service")
+		return
+	}
+
+	logs, err := h.deploymentService.GetServiceDeploymentLogs(r.Context(), deploymentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get service deployment logs: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, logs)
+}
+

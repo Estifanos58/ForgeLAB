@@ -610,7 +610,126 @@ Common status codes:
     }
   ]
   ```
-- **Security Rule:** Messages have all project secret values redacted (`[REDACTED]`) before database storage.
+---
+
+## 8. Service Lifecycle & Independent Deployment Endpoints
+
+### `GET /api/projects/{id}/services`
+- **Authentication:** Required (Bearer JWT)
+- **Authorization:** Checks project ownership.
+- **Success Response:** `200 OK` (Array of Service objects).
+  ```json
+  [
+    {
+      "id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e",
+      "project_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "name": "frontend",
+      "role": "frontend",
+      "source_path": "./frontend",
+      "runtime_type": "nextjs",
+      "framework": "nextjs",
+      "package_manager": "npm",
+      "build_strategy": "auto",
+      "internal_port": 3000,
+      "host_port": 10005,
+      "public_exposed": true,
+      "health_strategy": "http",
+      "health_check_path": "/",
+      "health_check_enabled": true,
+      "status": "running",
+      "container_id": "78a9b0c1d2e3",
+      "image_tag": "forgelab/a1b2c3d4/frontend:1",
+      "current_service_deployment_id": "e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+      "preview_url": "http://localhost:10005",
+      "created_at": "2026-09-30T10:00:00Z",
+      "updated_at": "2026-09-30T10:05:00Z"
+    }
+  ]
+  ```
+
+---
+
+### `POST /api/projects/{id}/services/{serviceId}/deploy`
+- **Authentication:** Required (Bearer JWT)
+- **Authorization:** Checks project ownership and service association.
+- **Concurrency Rule:** Enforces lock per `service_id` (`uq_active_service_deployment`). A frontend deployment does NOT block a backend deployment.
+- **Side Effects:**
+  - Creates a new `ServiceDeployment` record with incremented `deploy_number` for that service.
+  - Leaves `deployment_id` as `NULL` (service-only deployment).
+  - Pushes job with type `service_deployment` to Redis queue.
+  - Updates service status to `queued`.
+- **Success Response:** `201 Created` (Returns newly created ServiceDeployment object).
+  ```json
+  {
+    "id": "e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    "service_id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e",
+    "service_name": "frontend",
+    "deploy_number": 2,
+    "status": "queued",
+    "image_tag": "forgelab/a1b2c3d4/frontend:2",
+    "internal_port": 3000,
+    "build_strategy": "auto",
+    "build_command": "npm run build",
+    "start_command": "npm start",
+    "runtime_type": "nextjs",
+    "created_at": "2026-09-30T11:00:00Z"
+  }
+  ```
+- **Error Responses:**
+  - `409 Conflict`: A deployment is already in progress for this specific service.
+
+---
+
+### `POST /api/projects/{id}/services/{serviceId}/rollback`
+- **Authentication:** Required (Bearer JWT)
+- **Authorization:** Checks project ownership and service association.
+- **Side Effects:**
+  - Finds the most recent successful prior deployment for this service.
+  - Creates a new `ServiceDeployment` record referencing the prior known-good image tag.
+  - Enqueues the service deployment job in Redis.
+- **Success Response:** `201 Created` (Returns created rollback ServiceDeployment object).
+- **Error Responses:**
+  - `400 Bad Request`: No previous successful deployment found for this service.
+  - `409 Conflict`: A deployment is already in progress for this service.
+
+---
+
+### `GET /api/projects/{id}/services/{serviceId}/deployments`
+- **Authentication:** Required (Bearer JWT)
+- **Success Response:** `200 OK` (Array of ServiceDeployment records ordered by `deploy_number DESC`).
+
+---
+
+### `GET /api/projects/{id}/services/{serviceId}/deployments/{deploymentId}`
+- **Authentication:** Required (Bearer JWT)
+- **Success Response:** `200 OK` (Single ServiceDeployment object).
+
+---
+
+### `GET /api/projects/{id}/services/{serviceId}/deployments/{deploymentId}/logs`
+- **Authentication:** Required (Bearer JWT)
+- **Success Response:** `200 OK` (Array of DeploymentLog entries scoped to the specific service deployment).
+
+---
+
+### `POST /api/projects/{id}/services/{serviceId}/stop`
+- **Authentication:** Required (Bearer JWT)
+- **Side Effects:** Stops container for this service; recalculates composite project status.
+- **Success Response:** `200 OK` (`{"status": "stopped"}`).
+
+---
+
+### `POST /api/projects/{id}/services/{serviceId}/start`
+- **Authentication:** Required (Bearer JWT)
+- **Side Effects:** Starts container for this service; recalculates composite project status.
+- **Success Response:** `200 OK` (`{"status": "running"}`).
+
+---
+
+### `POST /api/projects/{id}/services/{serviceId}/restart`
+- **Authentication:** Required (Bearer JWT)
+- **Side Effects:** Restarts container for this service.
+- **Success Response:** `200 OK` (`{"status": "running"}`).
 
 ---
 

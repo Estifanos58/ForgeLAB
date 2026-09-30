@@ -168,3 +168,59 @@ func TestDeploymentQueue_RetryAndDeadLetterQueue(t *testing.T) {
 		t.Errorf("expected 1 in dead letter queue, got %d", dlq)
 	}
 }
+
+func TestDeploymentQueue_ConcurrentServiceDeployments(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.SetWorkerCount(4)
+	q.SetMaxRetries(1) // fail fast to DLQ
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	frontendID := uuid.New()
+	backendID := uuid.New()
+
+	backendCompleted := make(chan struct{})
+	frontendFailed := make(chan struct{})
+
+	q.StartJobWorker(ctx, func(wCtx context.Context, job Job) error {
+		if job.ID == frontendID {
+			close(frontendFailed)
+			return errors.New("frontend build syntax error")
+		}
+		if job.ID == backendID {
+			// simulate some work
+			time.Sleep(100 * time.Millisecond)
+			close(backendCompleted)
+			return nil
+		}
+		return nil
+	})
+	defer q.Stop()
+
+	// Enqueue both simultaneously
+	if err := q.EnqueueServiceDeployment(ctx, frontendID); err != nil {
+		t.Fatalf("failed to enqueue frontend: %v", err)
+	}
+	if err := q.EnqueueServiceDeployment(ctx, backendID); err != nil {
+		t.Fatalf("failed to enqueue backend: %v", err)
+	}
+
+	// Verify backend completes successfully even while frontend fails
+	select {
+	case <-backendCompleted:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for backend deployment to complete successfully")
+	}
+
+	select {
+	case <-frontendFailed:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for frontend deployment to fail")
+	}
+}
+
