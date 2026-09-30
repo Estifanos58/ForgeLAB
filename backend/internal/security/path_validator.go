@@ -110,7 +110,7 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 
 func normalizePathForPrefix(p string) string {
 	s := strings.TrimSpace(p)
-	s = filepath.ToSlash(s)
+	s = strings.ReplaceAll(s, "\\", "/")
 	s = strings.TrimRight(s, "/")
 	return s
 }

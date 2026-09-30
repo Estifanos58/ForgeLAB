@@ -141,18 +141,22 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	for _, s := range svcList {
 		svcDeployID := uuid.New()
 		svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, s.Name, deployNumber)
-		_, _ = tx.Exec(ctx,
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO service_deployments (
 				id, deployment_id, service_id, status, image_tag, build_strategy,
 				build_command, start_command, runtime_type, internal_port, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 			svcDeployID, deployment.ID, s.ID, models.DeployStatusQueued, svcTag,
 			s.BuildStrategy, s.BuildCommand, s.StartCommand, s.RuntimeType, s.InternalPort, now,
-		)
-		_, _ = tx.Exec(ctx,
+		); err != nil {
+			return nil, fmt.Errorf("failed to create service deployment record: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
 			"UPDATE services SET status = $1, current_service_deployment_id = $2, updated_at = $3 WHERE id = $4",
 			models.DeployStatusQueued, svcDeployID, now, s.ID,
-		)
+		); err != nil {
+			return nil, fmt.Errorf("failed to update service deployment status: %w", err)
+		}
 	}
 
 	// Update project status to deploying

@@ -688,10 +688,9 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 	if meta == nil {
 		meta = make(map[string]interface{})
 	}
+	delete(meta, "session_token")
+	delete(meta, "token")
 	meta["folder_name"] = folderName
-	if req.Token != "" {
-		meta["session_token"] = req.Token
-	}
 
 	sourceRecord := &models.Source{
 		ID:              verifiedSourceID,

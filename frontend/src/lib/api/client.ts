@@ -559,12 +559,13 @@ export const api = {
       }
     },
 
-    async selectFolder(title?: string, token?: string): Promise<AgentSourceSession | { cancelled: true }> {
+    async selectFolder(title?: string, token?: string, signal?: AbortSignal): Promise<AgentSourceSession | { cancelled: true }> {
       return agentFetch<AgentSourceSession | { cancelled: true }>(
         '/api/agent/select-folder',
         {
           method: 'POST',
           body: JSON.stringify({ title: title || 'Select Project Folder' }),
+          signal,
         },
         token
       );

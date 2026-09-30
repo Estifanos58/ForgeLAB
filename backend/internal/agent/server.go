@@ -23,7 +23,7 @@ import (
 
 	"github.com/forgelab/backend/internal/analyzer"
 	"github.com/forgelab/backend/internal/detector"
-	"github.com/forgelab/backend/internal/docker"
+	"github.com/forgelab/backend/internal/dockerignore"
 )
 
 // LocalSourceSession stores the in-memory mapping between an opaque source ID and the local host path
@@ -227,9 +227,6 @@ func extractToken(r *http.Request) string {
 	if tok := r.Header.Get("X-Agent-Session-Token"); tok != "" {
 		return strings.TrimSpace(tok)
 	}
-	if tok := r.URL.Query().Get("token"); tok != "" {
-		return strings.TrimSpace(tok)
-	}
 	return ""
 }
 
@@ -362,9 +359,15 @@ func (s *AgentServer) handleSelectFolder(w http.ResponseWriter, r *http.Request)
 
 	selectedPath, err := s.picker.PickFolder(r.Context(), req.Title)
 	if err != nil {
-		if err == ErrPickerCancelled {
+		if errors.Is(err, ErrPickerCancelled) {
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"cancelled": true,
+			})
+			return
+		}
+		if errors.Is(err, ErrPickerBusy) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "folder picker is already in progress",
 			})
 			return
 		}
@@ -407,6 +410,45 @@ func (s *AgentServer) handleSelectPath(w http.ResponseWriter, r *http.Request) {
 	s.renderSessionResponse(w, session)
 }
 
+func (s *AgentServer) notifyBackendSession(token string, sourceID uuid.UUID, folderName string) {
+	if s.backendURL == "" {
+		return
+	}
+	go func() {
+		validateURL := fmt.Sprintf("%s/api/sources/agent/session/validate", strings.TrimRight(s.backendURL, "/"))
+		payload, _ := json.Marshal(map[string]string{
+			"token":       token,
+			"source_id":   sourceID.String(),
+			"agent_id":    s.agentID,
+			"folder_name": folderName,
+		})
+		req, err := http.NewRequest(http.MethodPost, validateURL, bytes.NewReader(payload))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			client := &http.Client{Timeout: 3 * time.Second}
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}
+	}()
+}
+
+// ConsumeSession marks a local source session as consumed by a created project
+func (s *AgentServer) ConsumeSession(sourceID uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, exists := s.sessions[sourceID]
+	if !exists {
+		return ErrSessionNotFound
+	}
+	session.Status = "consumed"
+	session.Phase = "consumed"
+	session.UpdatedAt = time.Now()
+	return nil
+}
+
 func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSession, error) {
 	canonicalPath, err := s.pathValidator.ValidateSourcePath(rawPath)
 	if err != nil {
@@ -419,11 +461,51 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 		folderName = "local-project"
 	}
 
+	// Avoid repeatedly scanning the same repository if a recent completed analysis exists
+	s.mu.RLock()
+	var cachedAnalysis *analyzer.AnalysisResult
+	for _, sess := range s.sessions {
+		if sess.CanonicalPath == canonicalPath && (sess.Status == "ready" || sess.Status == "consumed") && sess.Analysis != nil && time.Since(sess.UpdatedAt) < 10*time.Minute {
+			cachedAnalysis = sess.Analysis
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if cachedAnalysis != nil {
+		session := &LocalSourceSession{
+			SourceID:      sourceID,
+			CanonicalPath: canonicalPath,
+			FolderName:    folderName,
+			Status:        "ready",
+			Phase:         "ready",
+			TotalFiles:    cachedAnalysis.TotalFiles,
+			TotalBytes:    cachedAnalysis.TotalBytes,
+			DetectedCount: len(cachedAnalysis.Services),
+			Analysis:      cachedAnalysis,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+			ExpiresAt:     time.Now().Add(s.sessionTTL),
+			Token:         token,
+		}
+		s.mu.Lock()
+		s.sessions[sourceID] = session
+		s.mu.Unlock()
+
+		if token != "" {
+			if sm := GetGlobalSessionManager(); sm != nil {
+				_, _ = sm.BindSource(token, sourceID, folderName, s.agentID)
+			}
+			s.notifyBackendSession(token, sourceID, folderName)
+		}
+		return session, nil
+	}
+
 	session := &LocalSourceSession{
 		SourceID:      sourceID,
 		CanonicalPath: canonicalPath,
 		FolderName:    folderName,
-		Status:        "scanning",
+		Status:        "created",
 		Phase:         "scanning",
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
@@ -440,26 +522,7 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 		if sm := GetGlobalSessionManager(); sm != nil {
 			_, _ = sm.BindSource(token, sourceID, folderName, s.agentID)
 		}
-		if s.backendURL != "" {
-			go func() {
-				validateURL := fmt.Sprintf("%s/api/sources/agent/session/validate", strings.TrimRight(s.backendURL, "/"))
-				payload, _ := json.Marshal(map[string]string{
-					"token":       token,
-					"source_id":   sourceID.String(),
-					"agent_id":    s.agentID,
-					"folder_name": folderName,
-				})
-				req, err := http.NewRequest(http.MethodPost, validateURL, bytes.NewReader(payload))
-				if err == nil {
-					req.Header.Set("Content-Type", "application/json")
-					client := &http.Client{Timeout: 3 * time.Second}
-					resp, err := client.Do(req)
-					if err == nil {
-						resp.Body.Close()
-					}
-				}
-			}()
-		}
+		s.notifyBackendSession(token, sourceID, folderName)
 	}
 
 	// Channel to signal quick completion
@@ -469,6 +532,9 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 		analysis, err := analyzer.AnalyzeRepositoryWithProgress(canonicalPath, func(phase string, filesScanned, totalFiles, detectedCount int) {
 			session.mu.Lock()
 			session.Phase = phase
+			if phase == "scanning" || phase == "detecting" {
+				session.Status = phase
+			}
 			session.FilesScanned = filesScanned
 			if totalFiles > 0 {
 				session.TotalFiles = totalFiles
@@ -531,17 +597,19 @@ func (s *AgentServer) renderSessionResponse(w http.ResponseWriter, session *Loca
 
 	status := session.Status
 	phase := session.Phase
-	if session.Analysis != nil || len(services) > 0 {
-		status = "ready"
-		phase = "ready"
-	}
-	if status == "" {
-		if session.Error != "" {
-			status = "failed"
-			phase = "failed"
-		} else {
-			status = "scanning"
-			phase = "scanning"
+	if status != "consumed" {
+		if session.Analysis != nil || len(services) > 0 {
+			status = "ready"
+			phase = "ready"
+		}
+		if status == "" {
+			if session.Error != "" {
+				status = "failed"
+				phase = "failed"
+			} else {
+				status = "scanning"
+				phase = "scanning"
+			}
 		}
 	}
 
@@ -601,14 +669,14 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 	s.mu.RUnlock()
 
 	if !exists {
-		http.Error(w, "source session not found or expired", http.StatusNotFound)
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "source session not found or expired"})
 		return
 	}
 
 	// Verify token match
 	token, _ := r.Context().Value("agent_token").(string)
 	if session.Token != "" && token != "" && session.Token != token {
-		http.Error(w, "forbidden: token does not match source session", http.StatusForbidden)
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden: token does not match source session"})
 		return
 	}
 
@@ -630,6 +698,18 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 
 	action := parts[1]
 	switch action {
+	case "consume":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.mu.Lock()
+		session.Status = "consumed"
+		session.Phase = "consumed"
+		session.UpdatedAt = time.Now()
+		s.mu.Unlock()
+		s.renderSessionResponse(w, session)
+
 	case "analyze":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -659,7 +739,13 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		}
 
 		serviceDir := filepath.Join(session.CanonicalPath, filepath.FromSlash(serviceRelPath))
-		if !strings.HasPrefix(filepath.Clean(serviceDir), session.CanonicalPath) {
+		evalServiceDir, err := filepath.EvalSymlinks(serviceDir)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid service directory: %v", err), http.StatusBadRequest)
+			return
+		}
+		relCheck, err := filepath.Rel(session.CanonicalPath, evalServiceDir)
+		if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
 			http.Error(w, "invalid service path traversal", http.StatusForbidden)
 			return
 		}
@@ -670,16 +756,29 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		tarWriter := tar.NewWriter(w)
 		defer tarWriter.Close()
 
-		matcher, _ := docker.LoadDockerignore(serviceDir)
+		matcher, _ := dockerignore.LoadDockerignore(evalServiceDir)
 
-		_ = filepath.WalkDir(serviceDir, func(p string, d os.DirEntry, err error) error {
+		walkErr := filepath.WalkDir(evalServiceDir, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
-				return nil
+				return err
 			}
-			rel, err := filepath.Rel(serviceDir, p)
+			rel, err := filepath.Rel(evalServiceDir, p)
 			if err != nil || rel == "." || rel == "" {
 				return nil
 			}
+
+			// Boundary check: symlinks must not escape evalServiceDir
+			if d.Type()&os.ModeSymlink != 0 {
+				target, evalErr := filepath.EvalSymlinks(p)
+				if evalErr != nil {
+					return nil // Skip unresolvable broken symlinks safely
+				}
+				targetRel, err := filepath.Rel(evalServiceDir, target)
+				if err != nil || targetRel == ".." || strings.HasPrefix(targetRel, ".."+string(filepath.Separator)) {
+					return fmt.Errorf("symlink %s escapes service directory boundary", p)
+				}
+			}
+
 			slashRel := filepath.ToSlash(rel)
 			isDir := d.IsDir()
 
@@ -704,12 +803,12 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 
 			info, err := d.Info()
 			if err != nil {
-				return nil
+				return err
 			}
 
 			header, err := tar.FileInfoHeader(info, "")
 			if err != nil {
-				return nil
+				return err
 			}
 			header.Name = slashRel
 			if isDir {
@@ -723,13 +822,19 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			if !isDir && info.Mode().IsRegular() {
 				f, err := os.Open(p)
 				if err != nil {
-					return nil
+					return err
 				}
-				_, _ = io.Copy(tarWriter, f)
-				f.Close()
+				defer f.Close()
+				if _, err := io.Copy(tarWriter, f); err != nil {
+					return err
+				}
 			}
 			return nil
 		})
+		if walkErr != nil {
+			slog.Error("error during stream-context WalkDir", "source_id", session.SourceID, "error", walkErr)
+			return
+		}
 
 		// If runtime is specified for auto build, inject virtual Dockerfile.forgelab into the stream
 		genRuntime := r.URL.Query().Get("runtime")

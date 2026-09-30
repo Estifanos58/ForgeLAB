@@ -120,7 +120,8 @@ func (v *PathValidator) ValidateSourcePath(rawPath string) (string, error) {
 	if len(v.allowedRoots) > 0 {
 		allowed := false
 		for _, root := range v.allowedRoots {
-			if realClean == root || strings.HasPrefix(realClean, root+string(filepath.Separator)) {
+			rel, err := filepath.Rel(root, realClean)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				allowed = true
 				break
 			}

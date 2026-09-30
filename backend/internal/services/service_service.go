@@ -186,6 +186,51 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 	return nil
 }
 
+// CreateServiceTx inserts a new service inside an active database transaction.
+func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *models.Service) error {
+	if tx == nil {
+		return s.CreateService(ctx, svc)
+	}
+
+	if svc.ID == uuid.Nil {
+		svc.ID = uuid.New()
+	}
+	now := time.Now()
+	svc.CreatedAt = now
+	svc.UpdatedAt = now
+
+	candidatesJSON, _ := json.Marshal(svc.BuildCandidates)
+	if len(candidatesJSON) == 0 {
+		candidatesJSON = []byte("[]")
+	}
+
+	_, err := tx.Exec(ctx,
+		`INSERT INTO services (
+			id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
+			build_strategy, build_candidates, build_command, start_command, dockerfile_path, build_context,
+			internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
+			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9,
+			$10, $11, $12, $13, $14, $15,
+			$16, $17, $18, $19, $20, $21,
+			$22, $23, $24, $25, $26, $27
+		)`,
+		svc.ID, svc.ProjectID, svc.SourceID, svc.Name, svc.Role, svc.SourcePath, svc.RuntimeType,
+		svc.Framework, svc.PackageManager, svc.BuildStrategy, candidatesJSON, svc.BuildCommand,
+		svc.StartCommand, svc.DockerfilePath, svc.BuildContext, svc.InternalPort, svc.HostPort,
+		svc.PublicExposed, svc.HealthStrategy, svc.HealthCheckPath, svc.HealthCheckEnabled,
+		svc.Status, svc.ContainerID, svc.ImageTag, svc.CurrentServiceDeploymentID,
+		svc.CreatedAt, svc.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert service: %w", err)
+	}
+
+	slog.Info("service created in tx", "service_id", svc.ID, "project_id", svc.ProjectID, "name", svc.Name)
+	return nil
+}
+
 // UpdateServiceStatus updates a service's status and runtime container/port fields.
 func (s *ServiceService) UpdateServiceStatus(
 	ctx context.Context,

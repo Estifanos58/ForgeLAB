@@ -5,11 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
@@ -161,3 +163,112 @@ func TestProjectService_CreateProject_LocalDirectory(t *testing.T) {
 		})
 	})
 }
+
+func TestProjectService_CreateProject_LocalAgent_Validation(t *testing.T) {
+	sm := agent.GetGlobalSessionManager()
+	projectSvc := services.NewProjectService(nil, nil, nil, nil)
+	ctx := context.Background()
+	ownerID := uuid.New()
+	agentID := "test-agent-local-1"
+
+	t.Run("invalid UUID source reference", func(t *testing.T) {
+		_, err := projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+			Name:            "Agent Project",
+			SourceType:      models.SourceTypeLocalAgent,
+			SourceReference: "invalid-uuid-string",
+			AgentID:         agentID,
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, services.ErrInvalidSource)
+		assert.Contains(t, err.Error(), "invalid agent source ID")
+	})
+
+	t.Run("unowned or unknown agent session", func(t *testing.T) {
+		randomSourceID := uuid.New().String()
+		_, err := projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+			Name:            "Agent Project",
+			SourceType:      models.SourceTypeLocalAgent,
+			SourceReference: randomSourceID,
+			AgentID:         agentID,
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, services.ErrInvalidSource)
+		assert.Contains(t, err.Error(), "agent source not found or unauthorized")
+	})
+
+	t.Run("session belonging to another user rejected", func(t *testing.T) {
+		otherUser := uuid.New()
+		sess, err := sm.CreateSession(otherUser, agentID, 10*time.Minute)
+		require.NoError(t, err)
+		sourceUUID := uuid.New()
+		_, err = sm.BindSource(sess.Token, sourceUUID, "repo", agentID)
+		require.NoError(t, err)
+
+		_, err = projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+			Name:            "Agent Project",
+			SourceType:      models.SourceTypeLocalAgent,
+			SourceReference: sourceUUID.String(),
+			AgentID:         agentID,
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, services.ErrInvalidSource)
+		assert.Contains(t, err.Error(), "does not belong to user")
+	})
+
+	t.Run("consumed session rejected", func(t *testing.T) {
+		sess, err := sm.CreateSession(ownerID, agentID, 10*time.Minute)
+		require.NoError(t, err)
+		sourceUUID := uuid.New()
+		_, err = sm.BindSource(sess.Token, sourceUUID, "repo", agentID)
+		require.NoError(t, err)
+		require.NoError(t, sm.MarkConsumed(sess.ID))
+
+		_, err = projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+			Name:            "Agent Project",
+			SourceType:      models.SourceTypeLocalAgent,
+			SourceReference: sourceUUID.String(),
+			AgentID:         agentID,
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, services.ErrInvalidSource)
+		assert.Contains(t, err.Error(), "already been consumed")
+	})
+
+	t.Run("agent ID mismatch rejected", func(t *testing.T) {
+		sess, err := sm.CreateSession(ownerID, "actual-agent-id", 10*time.Minute)
+		require.NoError(t, err)
+		sourceUUID := uuid.New()
+		_, err = sm.BindSource(sess.Token, sourceUUID, "repo", "actual-agent-id")
+		require.NoError(t, err)
+
+		wrongAgentID := "wrong-agent-id"
+		_, err = projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+			Name:            "Agent Project",
+			SourceType:      models.SourceTypeLocalAgent,
+			SourceReference: sourceUUID.String(),
+			AgentID:         wrongAgentID,
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, services.ErrValidationFailed)
+		assert.Contains(t, err.Error(), "agent ID mismatch")
+	})
+
+	t.Run("valid session passes validation and consumes session", func(t *testing.T) {
+		sess, err := sm.CreateSession(ownerID, agentID, 10*time.Minute)
+		require.NoError(t, err)
+		sourceUUID := uuid.New()
+		_, err = sm.BindSource(sess.Token, sourceUUID, "repo", agentID)
+		require.NoError(t, err)
+
+		// Without DB pool, it will pass validation and panic on DB query execution
+		assert.Panics(t, func() {
+			_, _ = projectSvc.CreateProject(ctx, ownerID, services.CreateProjectInput{
+				Name:            "Agent Project",
+				SourceType:      models.SourceTypeLocalAgent,
+				SourceReference: sourceUUID.String(),
+				AgentID:         agentID,
+			})
+		})
+	})
+}
+

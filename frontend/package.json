@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "test": "node --test test/websocket.test.mjs"
+    "test": "node --test test/websocket.test.mjs test/local_agent_import.test.mjs"
   },
   "dependencies": {
     "clsx": "^2.1.1",

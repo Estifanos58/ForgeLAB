@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
 )
@@ -159,6 +160,63 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		if sourceRef == "" {
 			return nil, fmt.Errorf("%w: source session ID is required for local agent import", ErrValidationFailed)
 		}
+		sourceUUID, err := uuid.Parse(sourceRef)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid agent source ID", ErrInvalidSource)
+		}
+
+		// Validate source ownership/session/agent association server-side rather than trusting frontend IDs
+		var verifiedAgentID string
+		var verifiedInDB bool
+
+		if s.sourceService != nil {
+			if existingSource, err := s.sourceService.GetSource(ctx, sourceUUID, ownerID); err == nil && existingSource != nil {
+				verifiedInDB = true
+				if existingSource.AgentID != "" {
+					verifiedAgentID = existingSource.AgentID
+				}
+			}
+		}
+
+		if !verifiedInDB && s.db != nil {
+			var dbOwner uuid.UUID
+			var dbAgentID string
+			err := s.db.QueryRow(ctx, "SELECT owner_id, agent_id FROM sources WHERE id = $1", sourceUUID).Scan(&dbOwner, &dbAgentID)
+			if err == nil {
+				if dbOwner != ownerID {
+					return nil, fmt.Errorf("%w: agent source does not belong to user", ErrInvalidSource)
+				}
+				verifiedInDB = true
+				verifiedAgentID = dbAgentID
+			}
+		}
+
+		// Fallback check against in-memory session manager
+		if sm := agent.GetGlobalSessionManager(); sm != nil {
+			if sess, err := sm.FindSessionBySourceID(sourceUUID); err == nil && sess != nil {
+				if sess.UserID != ownerID {
+					return nil, fmt.Errorf("%w: agent source session does not belong to user", ErrInvalidSource)
+				}
+				if sess.Consumed {
+					return nil, fmt.Errorf("%w: agent source session has already been consumed", ErrInvalidSource)
+				}
+				if verifiedAgentID == "" {
+					verifiedAgentID = sess.AgentID
+				}
+			} else if !verifiedInDB {
+				return nil, fmt.Errorf("%w: agent source not found or unauthorized", ErrInvalidSource)
+			}
+		} else if !verifiedInDB {
+			return nil, fmt.Errorf("%w: agent source not found or unauthorized", ErrInvalidSource)
+		}
+
+		if verifiedAgentID != "" {
+			if input.AgentID != "" && input.AgentID != verifiedAgentID {
+				return nil, fmt.Errorf("%w: agent ID mismatch with authenticated source", ErrValidationFailed)
+			}
+			input.AgentID = verifiedAgentID
+		}
+
 		repoPath = ""
 	case models.SourceTypeLocalDirectory:
 		if repoPath == "" {
@@ -278,23 +336,6 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		sourceUUID = parsedUUID
 	}
 	agentIDStr := strings.TrimSpace(input.AgentID)
-	if s.sourceService != nil {
-		_ = s.sourceService.SaveSource(ctx, &models.Source{
-			ID:              sourceUUID,
-			OwnerID:         ownerID,
-			SourceType:      sourceType,
-			SourceReference: sourceRef,
-			AgentID:         agentIDStr,
-			Metadata:        map[string]interface{}{},
-		})
-	} else if s.db != nil {
-		_, _ = s.db.Exec(ctx,
-			`INSERT INTO sources (id, owner_id, source_type, source_reference, agent_id, metadata, created_at, updated_at)
-			 VALUES ($1, $2, $3, $4, $5, '{}', NOW(), NOW())
-			 ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
-			sourceUUID, ownerID, sourceType, sourceRef, agentIDStr,
-		)
-	}
 	sourceIDPtr = &sourceUUID
 
 	project := &models.Project{
@@ -322,133 +363,176 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		UpdatedAt:          now,
 	}
 
-	_, err := s.db.Exec(ctx,
-			`INSERT INTO projects (
-				id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
-				dockerfile_path, build_context, build_strategy, build_command, start_command,
-				runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
-				status, created_at, updated_at
-			) VALUES (
-				$1, $2, $3, $4, $5, $6, $7, $8, $9,
-				$10, $11, $12, $13, $14,
-				$15, $16, $17, $18, $19,
-				$20, $21, $22
-			)`,
-			project.ID, project.OwnerID, project.SourceID, project.Name, project.Slug, project.SourceType, project.SourceReference,
-			project.RepositoryPath, project.Branch, project.DockerfilePath, project.BuildContext,
-			project.BuildStrategy, project.BuildCommand, project.StartCommand,
-			project.RuntimeType, project.InternalPort, project.HealthCheckPath, project.HealthCheckEnabled,
-			project.HealthStrategy, project.Status, project.CreatedAt, project.UpdatedAt,
-		)
-		if err != nil {
-			if strings.Contains(err.Error(), "uq_projects_owner_slug") {
-				return nil, ErrProjectSlugTaken
+	// Prepare service models
+	var servicesToCreate []*models.Service
+	if len(input.Services) > 0 {
+		for _, svcIn := range input.Services {
+			svcName := strings.TrimSpace(svcIn.Name)
+			if svcName == "" {
+				svcName = project.Name
 			}
-			return nil, fmt.Errorf("failed to create project: %w", err)
-		}
-
-		// Persist services
-		svcService := s.getServiceService()
-		if len(input.Services) > 0 {
-			for _, svcIn := range input.Services {
-				svcName := strings.TrimSpace(svcIn.Name)
-				if svcName == "" {
-					svcName = project.Name
-				}
-				svcRole := strings.TrimSpace(svcIn.Role)
-				if svcRole == "" {
-					svcRole = models.RoleOther
-				}
-				svcStrat := strings.TrimSpace(svcIn.BuildStrategy)
-				if svcStrat == "" {
-					svcStrat = models.BuildStrategyAuto
-				}
-				svcPort := svcIn.InternalPort
-				if svcPort <= 0 {
-					svcPort = project.InternalPort
-				}
-				svcSourcePath := strings.TrimSpace(svcIn.SourcePath)
-				if svcSourcePath == "" {
-					svcSourcePath = "."
-				}
-				svcHealthStrat := strings.TrimSpace(svcIn.HealthStrategy)
-				if svcHealthStrat == "" {
-					svcHealthStrat = models.HealthStrategyAuto
-				}
-				svcHealthPath := "/health"
-				if svcIn.HealthCheckPath != nil && *svcIn.HealthCheckPath != "" {
-					svcHealthPath = *svcIn.HealthCheckPath
-				}
-
-				rt := strings.TrimSpace(svcIn.RuntimeType)
-				if rt == "" {
-					rt = strings.TrimSpace(svcIn.Runtime)
-				}
-				if rt == "" {
-					rt = "generic"
-				}
-
-				dfPath := strings.TrimSpace(svcIn.DockerfilePath)
-				if dfPath == "" {
-					dfPath = "Dockerfile"
-				}
-				bCtx := strings.TrimSpace(svcIn.BuildContext)
-				if bCtx == "" {
-					bCtx = svcSourcePath
-				}
-
-				svc := &models.Service{
-					ID:                  uuid.New(),
-					ProjectID:           project.ID,
-					SourceID:            project.SourceID,
-					Name:                svcName,
-					Role:                svcRole,
-					SourcePath:          svcSourcePath,
-					RuntimeType:         rt,
-					Framework:           svcIn.Framework,
-					PackageManager:      svcIn.PackageManager,
-					BuildStrategy:       svcStrat,
-					BuildCandidates:     svcIn.BuildCandidates,
-					BuildCommand:        strings.TrimSpace(svcIn.BuildCommand),
-					StartCommand:        strings.TrimSpace(svcIn.StartCommand),
-					DockerfilePath:      dfPath,
-					BuildContext:        bCtx,
-					InternalPort:        svcPort,
-					HostPort:            svcIn.HostPort,
-					PublicExposed:       svcIn.PublicExposed,
-					HealthStrategy:      svcHealthStrat,
-					HealthCheckPath:     &svcHealthPath,
-					HealthCheckEnabled:  true,
-					Status:              models.ProjectStatusInactive,
-				}
-				_ = svcService.CreateService(ctx, svc)
-				project.Services = append(project.Services, svc)
+			svcRole := strings.TrimSpace(svcIn.Role)
+			if svcRole == "" {
+				svcRole = models.RoleOther
 			}
-		} else {
-			// Single service fallback ensuring every project is modeled with at least 1 service
+			svcStrat := strings.TrimSpace(svcIn.BuildStrategy)
+			if svcStrat == "" {
+				svcStrat = models.BuildStrategyAuto
+			}
+			svcPort := svcIn.InternalPort
+			if svcPort <= 0 {
+				svcPort = project.InternalPort
+			}
+			svcSourcePath := strings.TrimSpace(svcIn.SourcePath)
+			if svcSourcePath == "" {
+				svcSourcePath = "."
+			}
+			svcHealthStrat := strings.TrimSpace(svcIn.HealthStrategy)
+			if svcHealthStrat == "" {
+				svcHealthStrat = models.HealthStrategyAuto
+			}
+			svcHealthPath := "/health"
+			if svcIn.HealthCheckPath != nil && *svcIn.HealthCheckPath != "" {
+				svcHealthPath = *svcIn.HealthCheckPath
+			}
+
+			rt := strings.TrimSpace(svcIn.RuntimeType)
+			if rt == "" {
+				rt = strings.TrimSpace(svcIn.Runtime)
+			}
+			if rt == "" {
+				rt = "generic"
+			}
+
+			dfPath := strings.TrimSpace(svcIn.DockerfilePath)
+			if dfPath == "" {
+				dfPath = "Dockerfile"
+			}
+			bCtx := strings.TrimSpace(svcIn.BuildContext)
+			if bCtx == "" {
+				bCtx = svcSourcePath
+			}
+
 			svc := &models.Service{
 				ID:                  uuid.New(),
 				ProjectID:           project.ID,
 				SourceID:            project.SourceID,
-				Name:                project.Name,
-				Role:                models.RoleOther,
-				SourcePath:          project.BuildContext,
-				RuntimeType:         project.RuntimeType,
-				BuildStrategy:       project.BuildStrategy,
-				BuildCommand:        project.BuildCommand,
-				StartCommand:        project.StartCommand,
-				DockerfilePath:      project.DockerfilePath,
-				BuildContext:        project.BuildContext,
-				InternalPort:        project.InternalPort,
-				PublicExposed:       true,
-				HealthStrategy:      project.HealthStrategy,
-				HealthCheckPath:     project.HealthCheckPath,
-				HealthCheckEnabled:  project.HealthCheckEnabled,
-				Status:              project.Status,
+				Name:                svcName,
+				Role:                svcRole,
+				SourcePath:          svcSourcePath,
+				RuntimeType:         rt,
+				Framework:           svcIn.Framework,
+				PackageManager:      svcIn.PackageManager,
+				BuildStrategy:       svcStrat,
+				BuildCandidates:     svcIn.BuildCandidates,
+				BuildCommand:        strings.TrimSpace(svcIn.BuildCommand),
+				StartCommand:        strings.TrimSpace(svcIn.StartCommand),
+				DockerfilePath:      dfPath,
+				BuildContext:        bCtx,
+				InternalPort:        svcPort,
+				HostPort:            svcIn.HostPort,
+				PublicExposed:       svcIn.PublicExposed,
+				HealthStrategy:      svcHealthStrat,
+				HealthCheckPath:     &svcHealthPath,
+				HealthCheckEnabled:  true,
+				Status:              models.ProjectStatusInactive,
 			}
-			_ = svcService.CreateService(ctx, svc)
-			project.Services = append(project.Services, svc)
+			servicesToCreate = append(servicesToCreate, svc)
 		}
+	} else {
+		// Single service fallback ensuring every project is modeled with at least 1 service
+		svc := &models.Service{
+			ID:                  uuid.New(),
+			ProjectID:           project.ID,
+			SourceID:            project.SourceID,
+			Name:                project.Name,
+			Role:                models.RoleOther,
+			SourcePath:          project.BuildContext,
+			RuntimeType:         project.RuntimeType,
+			BuildStrategy:       project.BuildStrategy,
+			BuildCommand:        project.BuildCommand,
+			StartCommand:        project.StartCommand,
+			DockerfilePath:      project.DockerfilePath,
+			BuildContext:        project.BuildContext,
+			InternalPort:        project.InternalPort,
+			PublicExposed:       true,
+			HealthStrategy:      project.HealthStrategy,
+			HealthCheckPath:     project.HealthCheckPath,
+			HealthCheckEnabled:  project.HealthCheckEnabled,
+			Status:              project.Status,
+		}
+		servicesToCreate = append(servicesToCreate, svc)
+	}
+
+	// Transactional persistence for project, source, and services
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// 1. Insert or update source record
+	_, err = tx.Exec(ctx,
+		`INSERT INTO sources (id, owner_id, source_type, source_reference, agent_id, metadata, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, '{}', NOW(), NOW())
+		 ON CONFLICT (id) DO UPDATE SET
+		    source_type = EXCLUDED.source_type,
+		    source_reference = EXCLUDED.source_reference,
+		    agent_id = EXCLUDED.agent_id,
+		    updated_at = NOW()`,
+		sourceUUID, ownerID, sourceType, sourceRef, agentIDStr,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to save source record: %w", err)
+	}
+
+	// 2. Insert project record
+	_, err = tx.Exec(ctx,
+		`INSERT INTO projects (
+			id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
+			dockerfile_path, build_context, build_strategy, build_command, start_command,
+			runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
+			status, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9,
+			$10, $11, $12, $13, $14,
+			$15, $16, $17, $18, $19,
+			$20, $21, $22
+		)`,
+		project.ID, project.OwnerID, project.SourceID, project.Name, project.Slug, project.SourceType, project.SourceReference,
+		project.RepositoryPath, project.Branch, project.DockerfilePath, project.BuildContext,
+		project.BuildStrategy, project.BuildCommand, project.StartCommand,
+		project.RuntimeType, project.InternalPort, project.HealthCheckPath, project.HealthCheckEnabled,
+		project.HealthStrategy, project.Status, project.CreatedAt, project.UpdatedAt,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "uq_projects_owner_slug") {
+			return nil, ErrProjectSlugTaken
+		}
+		return nil, fmt.Errorf("failed to create project: %w", err)
+	}
+
+	// 3. Insert services transactionally
+	svcService := s.getServiceService()
+	for _, svc := range servicesToCreate {
+		if err := svcService.CreateServiceTx(ctx, tx, svc); err != nil {
+			return nil, fmt.Errorf("failed to create service %q: %w", svc.Name, err)
+		}
+		project.Services = append(project.Services, svc)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit project creation: %w", err)
+	}
+
+	// If local agent source, mark session consumed in SessionManager
+	if sourceType == models.SourceTypeLocalAgent {
+		if sm := agent.GetGlobalSessionManager(); sm != nil {
+			if sess, err := sm.FindSessionBySourceID(sourceUUID); err == nil && sess != nil {
+				_ = sm.MarkConsumed(sess.ID)
+			}
+		}
+	}
 
 	s.populateProjectPreviewURL(project)
 	slog.Info("project created", "project_id", project.ID, "name", project.Name, "owner_id", ownerID)

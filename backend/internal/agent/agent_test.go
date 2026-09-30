@@ -3,7 +3,10 @@ package agent
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -392,3 +395,366 @@ func TestAgentServer_StreamContext(t *testing.T) {
 		t.Errorf("security violation: .env secret file included in streamed tar!")
 	}
 }
+
+func TestAgentServer_SelectPath_PollingLifecycle_SameToken(t *testing.T) {
+	tempDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tempDir, "package.json"), []byte(`{"name":"web","dependencies":{"react":"19.0.0"}}`), 0644)
+
+	sm := GetGlobalSessionManager()
+	testUser := uuid.New()
+	authSession, err := sm.CreateSession(testUser, "agent-poll-test", 10*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to create auth session: %v", err)
+	}
+
+	srv := NewAgentServer(AgentServerConfig{
+		Port: 4142,
+		SessionValidator: func(token, agentID string) (*AgentSession, error) {
+			if token == authSession.Token {
+				return authSession, nil
+			}
+			return nil, ErrSessionNotFound
+		},
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Router())
+	defer ts.Close()
+
+	// 1. Select path
+	payload, _ := json.Marshal(map[string]string{"path": tempDir})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/agent/select-path", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+authSession.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("select-path failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	var sessionResp map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&sessionResp)
+	sourceID := sessionResp["source_id"].(string)
+
+	// 2. Poll session with exact matching token until status reaches ready
+	pollReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/agent/sources/"+sourceID, nil)
+	pollReq.Header.Set("Authorization", "Bearer "+authSession.Token)
+
+	pollResp, err := http.DefaultClient.Do(pollReq)
+	if err != nil {
+		t.Fatalf("poll failed: %v", err)
+	}
+	defer pollResp.Body.Close()
+
+	if pollResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on poll, got %d", pollResp.StatusCode)
+	}
+
+	var pollData map[string]interface{}
+	_ = json.NewDecoder(pollResp.Body).Decode(&pollData)
+
+	if pollData["status"] != "ready" {
+		t.Errorf("expected status 'ready', got %v", pollData["status"])
+	}
+	if pollData["phase"] != "ready" {
+		t.Errorf("expected phase 'ready', got %v", pollData["phase"])
+	}
+}
+
+func TestAgentServer_ChangeFolders_OldTokenCannotPollNewSource(t *testing.T) {
+	tempDir1 := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tempDir1, "package.json"), []byte(`{"name":"app-one"}`), 0644)
+
+	tempDir2 := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tempDir2, "package.json"), []byte(`{"name":"app-two"}`), 0644)
+
+	sm := GetGlobalSessionManager()
+	testUser := uuid.New()
+
+	authSession1, _ := sm.CreateSession(testUser, "agent-test-1", 10*time.Minute)
+	authSession2, _ := sm.CreateSession(testUser, "agent-test-1", 10*time.Minute)
+
+	srv := NewAgentServer(AgentServerConfig{
+		Port: 4142,
+		SessionValidator: func(token, agentID string) (*AgentSession, error) {
+			if token == authSession1.Token {
+				return authSession1, nil
+			}
+			if token == authSession2.Token {
+				return authSession2, nil
+			}
+			return nil, ErrSessionNotFound
+		},
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Router())
+	defer ts.Close()
+
+	// 1. User selects folder 1 with token 1
+	p1, _ := json.Marshal(map[string]string{"path": tempDir1})
+	req1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/agent/select-path", bytes.NewReader(p1))
+	req1.Header.Set("Authorization", "Bearer "+authSession1.Token)
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil || resp1.StatusCode != http.StatusOK {
+		t.Fatalf("folder 1 selection failed")
+	}
+	var res1 map[string]interface{}
+	_ = json.NewDecoder(resp1.Body).Decode(&res1)
+	resp1.Body.Close()
+
+	// 2. User changes folders -> selects folder 2 with token 2
+	p2, _ := json.Marshal(map[string]string{"path": tempDir2})
+	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/agent/select-path", bytes.NewReader(p2))
+	req2.Header.Set("Authorization", "Bearer "+authSession2.Token)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil || resp2.StatusCode != http.StatusOK {
+		t.Fatalf("folder 2 selection failed")
+	}
+	var res2 map[string]interface{}
+	_ = json.NewDecoder(resp2.Body).Decode(&res2)
+	resp2.Body.Close()
+	sourceID2 := res2["source_id"].(string)
+
+	// 3. User attempts to poll folder 2's source with the old token 1
+	// MUST be rejected with 403 Forbidden because token does not match source session!
+	badPoll, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/agent/sources/"+sourceID2, nil)
+	badPoll.Header.Set("Authorization", "Bearer "+authSession1.Token)
+	badResp, err := http.DefaultClient.Do(badPoll)
+	if err != nil {
+		t.Fatalf("poll failed: %v", err)
+	}
+	defer badResp.Body.Close()
+
+	if badResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("security violation: expected 403 Forbidden for mismatched session token, got %d", badResp.StatusCode)
+	}
+
+	var errBody map[string]string
+	_ = json.NewDecoder(badResp.Body).Decode(&errBody)
+	if !strings.Contains(errBody["error"], "does not match source session") {
+		t.Errorf("expected 'does not match source session' in error, got %q", errBody["error"])
+	}
+
+	// 4. Polling folder 2 with matching token 2 succeeds with 200 OK
+	goodPoll, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/agent/sources/"+sourceID2, nil)
+	goodPoll.Header.Set("Authorization", "Bearer "+authSession2.Token)
+	goodResp, err := http.DefaultClient.Do(goodPoll)
+	if err != nil {
+		t.Fatalf("good poll failed: %v", err)
+	}
+	defer goodResp.Body.Close()
+
+	if goodResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK with correct token, got %d", goodResp.StatusCode)
+	}
+}
+
+func TestAgentServer_HeaderOnlyAuth_QueryStringRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tempDir, "package.json"), []byte(`{"name":"test"}`), 0644)
+
+	sm := GetGlobalSessionManager()
+	testUser := uuid.New()
+	authSession, _ := sm.CreateSession(testUser, "agent-test-1", 10*time.Minute)
+
+	srv := NewAgentServer(AgentServerConfig{
+		Port: 4142,
+		SessionValidator: func(token, agentID string) (*AgentSession, error) {
+			if token == authSession.Token {
+				return authSession, nil
+			}
+			return nil, ErrSessionNotFound
+		},
+	})
+	defer srv.Close()
+
+	sess, err := srv.registerDirectory(tempDir, authSession.Token)
+	if err != nil {
+		t.Fatalf("failed to register directory: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.Router())
+	defer ts.Close()
+
+	// 1. Query parameter token ?token=... is rejected with 401 Unauthorized
+	queryURL := fmt.Sprintf("%s/api/agent/sources/%s?token=%s", ts.URL, sess.SourceID, authSession.Token)
+	resp, err := http.Get(queryURL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for query string token, got %d", resp.StatusCode)
+	}
+
+	// 2. Header X-Agent-Session-Token is accepted with 200 OK
+	reqHeader, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/agent/sources/"+sess.SourceID.String(), nil)
+	reqHeader.Header.Set("X-Agent-Session-Token", authSession.Token)
+	respHeader, err := http.DefaultClient.Do(reqHeader)
+	if err != nil {
+		t.Fatalf("request with X-Agent-Session-Token failed: %v", err)
+	}
+	defer respHeader.Body.Close()
+
+	if respHeader.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK with X-Agent-Session-Token, got %d", respHeader.StatusCode)
+	}
+}
+
+func TestAgentServer_Picker_CancellationVsFailureVsBusy(t *testing.T) {
+	picker := NewNativeFolderPicker()
+
+	// 1. Context cancellation returns ErrPickerCancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context
+
+	_, err := picker.PickFolder(ctx, "Test Title")
+	if !errors.Is(err, ErrPickerCancelled) {
+		t.Errorf("expected ErrPickerCancelled on cancelled context, got %v", err)
+	}
+
+	// 2. Picker busy concurrency guard
+	picker.picking = true
+	_, busyErr := picker.PickFolder(context.Background(), "Another Title")
+	if !errors.Is(busyErr, ErrPickerBusy) {
+		t.Errorf("expected ErrPickerBusy when picker is running, got %v", busyErr)
+	}
+	picker.picking = false
+}
+
+func TestAgentServer_SymlinkEscape_Rejected(t *testing.T) {
+	tempDir := t.TempDir()
+	outsideDir := filepath.Join(tempDir, "outside_secret")
+	_ = os.MkdirAll(outsideDir, 0755)
+	_ = os.WriteFile(filepath.Join(outsideDir, "secret_password.txt"), []byte("super-secret"), 0644)
+
+	repoDir := filepath.Join(tempDir, "project")
+	serviceDir := filepath.Join(repoDir, "service")
+	_ = os.MkdirAll(serviceDir, 0755)
+	_ = os.WriteFile(filepath.Join(serviceDir, "index.js"), []byte("console.log('hi')"), 0644)
+
+	// Create symlink escaping outside serviceDir boundary
+	escapeLink := filepath.Join(serviceDir, "escape_link")
+	symlinkErr := os.Symlink(outsideDir, escapeLink)
+	if symlinkErr != nil {
+		t.Skip("Symlink creation not permitted in this environment, skipping symlink escape test")
+	}
+
+	sm := GetGlobalSessionManager()
+	testUser := uuid.New()
+	authSession, _ := sm.CreateSession(testUser, "agent-test-symlink", 10*time.Minute)
+
+	srv := NewAgentServer(AgentServerConfig{
+		Port: 4142,
+		SessionValidator: func(token, agentID string) (*AgentSession, error) {
+			if token == authSession.Token {
+				return authSession, nil
+			}
+			return nil, ErrSessionNotFound
+		},
+	})
+	defer srv.Close()
+
+	session, err := srv.registerDirectory(repoDir, authSession.Token)
+	if err != nil {
+		t.Fatalf("failed to register directory: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.Router())
+	defer ts.Close()
+
+	streamURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=service", ts.URL, session.SourceID)
+	req, _ := http.NewRequest(http.MethodGet, streamURL, nil)
+	req.Header.Set("Authorization", "Bearer "+authSession.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stream-context failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read tar stream and verify outside secret file was NOT included
+	tarReader := tar.NewReader(resp.Body)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+		if strings.Contains(header.Name, "secret_password.txt") {
+			t.Fatalf("security violation: outside symlink target leaked into streamed tar archive!")
+		}
+	}
+}
+
+func TestAgentServer_Lifecycle_ConsumedSession(t *testing.T) {
+	tempDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tempDir, "package.json"), []byte(`{"name":"consumed-test"}`), 0644)
+
+	sm := GetGlobalSessionManager()
+	testUser := uuid.New()
+	authSession, _ := sm.CreateSession(testUser, "agent-test-consume", 10*time.Minute)
+
+	srv := NewAgentServer(AgentServerConfig{
+		Port: 4142,
+		SessionValidator: func(token, agentID string) (*AgentSession, error) {
+			if token == authSession.Token {
+				return authSession, nil
+			}
+			return nil, ErrSessionNotFound
+		},
+	})
+	defer srv.Close()
+
+	session, err := srv.registerDirectory(tempDir, authSession.Token)
+	if err != nil {
+		t.Fatalf("failed to register directory: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.Router())
+	defer ts.Close()
+
+	// 1. Consume session on local agent
+	consumeURL := fmt.Sprintf("%s/api/agent/sources/%s/consume", ts.URL, session.SourceID)
+	req, _ := http.NewRequest(http.MethodPost, consumeURL, nil)
+	req.Header.Set("Authorization", "Bearer "+authSession.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("consume request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on consume, got %d", resp.StatusCode)
+	}
+
+	var data map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&data)
+	if data["status"] != "consumed" {
+		t.Errorf("expected status 'consumed', got %v", data["status"])
+	}
+
+	// 2. Mark consumed in SessionManager and verify subsequent validation fails
+	if err := sm.MarkConsumed(authSession.ID); err != nil {
+		t.Fatalf("mark consumed error: %v", err)
+	}
+
+	_, valErr := sm.ValidateToken(authSession.Token)
+	if !errors.Is(valErr, ErrSessionConsumed) {
+		t.Errorf("expected ErrSessionConsumed on ValidateToken, got %v", valErr)
+	}
+
+	_, regErr := sm.VerifyForRegistration(testUser, authSession.ID, authSession.Token)
+	if !errors.Is(regErr, ErrSessionConsumed) {
+		t.Errorf("expected ErrSessionConsumed on VerifyForRegistration, got %v", regErr)
+	}
+}
+

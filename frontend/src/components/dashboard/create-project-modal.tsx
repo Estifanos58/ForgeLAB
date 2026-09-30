@@ -175,6 +175,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
   // References for cancellation and polling cleanup
   const abortControllerRef = useRef<AbortController | null>(null);
+  const folderPickerAbortRef = useRef<AbortController | null>(null);
   const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const agentPollTimerRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -209,6 +210,10 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   useEffect(() => {
     if (!isOpen) {
       handleCancelUpload();
+      if (folderPickerAbortRef.current) {
+        folderPickerAbortRef.current.abort();
+        folderPickerAbortRef.current = null;
+      }
       if (agentPollTimerRef.current) {
         clearInterval(agentPollTimerRef.current);
         agentPollTimerRef.current = null;
@@ -225,6 +230,10 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
+      }
+      if (folderPickerAbortRef.current) {
+        folderPickerAbortRef.current.abort();
+        folderPickerAbortRef.current = null;
       }
       if (pollingTimerRef.current) {
         clearInterval(pollingTimerRef.current);
@@ -277,15 +286,20 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     return s.status === 'failed' || Boolean(s.error);
   };
 
-  const pollAgentSession = (sourceId: string) => {
+  const pollAgentSession = (sourceId: string, token: string) => {
     if (agentPollTimerRef.current) {
       clearInterval(agentPollTimerRef.current);
       agentPollTimerRef.current = null;
     }
 
+    let consecutiveFailures = 0;
+    const maxConsecutiveFailures = 4;
+
     agentPollTimerRef.current = setInterval(async () => {
       try {
-        const s = await api.agent.getSource(sourceId, agentAuthSession?.token);
+        const s = await api.agent.getSource(sourceId, token);
+        consecutiveFailures = 0;
+
         setAgentProgress({
           filesScanned: s.files_scanned,
           totalFiles: s.total_files,
@@ -311,26 +325,89 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           setAgentStage(s.status);
         }
       } catch (err: any) {
-        if (agentPollTimerRef.current) {
-          clearInterval(agentPollTimerRef.current);
-          agentPollTimerRef.current = null;
+        const status = err.status || err.statusCode;
+        if (status === 401) {
+          if (agentPollTimerRef.current) {
+            clearInterval(agentPollTimerRef.current);
+            agentPollTimerRef.current = null;
+          }
+          setAgentStage('failed');
+          setError('Agent session is unauthorized or expired. Please re-select the folder.');
+          return;
         }
-        setAgentStage('failed');
-        setError(err.message || 'Lost connection to ForgeLAB Agent during analysis');
+        if (status === 403) {
+          if (agentPollTimerRef.current) {
+            clearInterval(agentPollTimerRef.current);
+            agentPollTimerRef.current = null;
+          }
+          setAgentStage('failed');
+          setError('Access forbidden: session token does not match or has expired. Please re-select the folder.');
+          return;
+        }
+        if (status === 404) {
+          if (agentPollTimerRef.current) {
+            clearInterval(agentPollTimerRef.current);
+            agentPollTimerRef.current = null;
+          }
+          setAgentStage('failed');
+          setError('Source session not found or expired on the local agent. Please re-select the folder.');
+          return;
+        }
+
+        // Retry transient network errors with small backoff
+        consecutiveFailures++;
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          if (agentPollTimerRef.current) {
+            clearInterval(agentPollTimerRef.current);
+            agentPollTimerRef.current = null;
+          }
+          setAgentStage('failed');
+          setError(err.message || 'Lost connection to ForgeLAB Agent during analysis. Please check that the agent is running.');
+        }
       }
-    }, 350);
+    }, 750);
+  };
+
+  const handleCancelSelecting = () => {
+    if (folderPickerAbortRef.current) {
+      folderPickerAbortRef.current.abort();
+      folderPickerAbortRef.current = null;
+    }
+    setAgentAuthSession(null);
+    setAgentSession(null);
+    setAgentStage('idle');
   };
 
   const handleSelectLocalFolder = async () => {
+    // Prevent duplicate folder selection requests while one is already running
+    if (agentStage === 'selecting') {
+      return;
+    }
+
+    if (folderPickerAbortRef.current) {
+      folderPickerAbortRef.current.abort();
+    }
+    if (agentPollTimerRef.current) {
+      clearInterval(agentPollTimerRef.current);
+      agentPollTimerRef.current = null;
+    }
+
+    const abortController = new AbortController();
+    folderPickerAbortRef.current = abortController;
+
+    // Reset previous session state so changing folders always creates fresh matching session
+    setAgentAuthSession(null);
+    setAgentSession(null);
     setAgentStage('selecting');
     setError(null);
+
     try {
       // 1. Obtain short-lived authenticated session from ForgeLAB backend
       const authSession = await api.sources.createAgentSession(agentStatus?.agent_id);
       setAgentAuthSession(authSession);
 
-      // 2. Invoke local agent with the authenticated session token
-      const res = await api.agent.selectFolder('Select Project Folder for ForgeLAB', authSession.token);
+      // 2. Invoke local agent with the authenticated session token and abort signal
+      const res = await api.agent.selectFolder('Select Project Folder for ForgeLAB', authSession.token, abortController.signal);
       if ('cancelled' in res && res.cancelled) {
         setAgentStage('idle');
         return;
@@ -358,11 +435,24 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           phase: session.phase,
           detectedCount: session.detected_count || (Array.isArray(session.services) ? session.services.length : 0),
         });
-        pollAgentSession(session.source_id);
+        pollAgentSession(session.source_id, authSession.token);
       }
     } catch (err: any) {
+      if (err.name === 'AbortError' || err.message?.includes('aborted') || err.message?.includes('cancelled')) {
+        setAgentStage('idle');
+        return;
+      }
+      if (err.status === 409 || err.message?.includes('already in progress')) {
+        setError('Folder picker dialog is already open on your computer.');
+        setAgentStage('idle');
+        return;
+      }
       setAgentStage('failed');
       setError(err.message || 'Failed to select and analyze directory via ForgeLAB Agent');
+    } finally {
+      if (folderPickerAbortRef.current === abortController) {
+        folderPickerAbortRef.current = null;
+      }
     }
   };
 
@@ -372,8 +462,18 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       setError('Please enter a directory path');
       return;
     }
+
+    if (agentPollTimerRef.current) {
+      clearInterval(agentPollTimerRef.current);
+      agentPollTimerRef.current = null;
+    }
+
+    // Reset previous session state so fresh session and token are used
+    setAgentAuthSession(null);
+    setAgentSession(null);
     setAgentStage('selecting');
     setError(null);
+
     try {
       // 1. Obtain short-lived authenticated session from ForgeLAB backend
       const authSession = await api.sources.createAgentSession(agentStatus?.agent_id);
@@ -403,7 +503,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           phase: session.phase,
           detectedCount: session.detected_count || (Array.isArray(session.services) ? session.services.length : 0),
         });
-        pollAgentSession(session.source_id);
+        pollAgentSession(session.source_id, authSession.token);
       }
     } catch (err: any) {
       setAgentStage('failed');
@@ -444,12 +544,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   };
 
   const handleResetAgentSession = () => {
+    if (folderPickerAbortRef.current) {
+      folderPickerAbortRef.current.abort();
+      folderPickerAbortRef.current = null;
+    }
     if (agentPollTimerRef.current) {
       clearInterval(agentPollTimerRef.current);
       agentPollTimerRef.current = null;
     }
     setAgentStage('idle');
     setAgentSession(null);
+    setAgentAuthSession(null);
     setConfiguredServices([]);
     setAgentProgress({});
     setManualPathInput('');
@@ -1277,7 +1382,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                             type="button"
                             variant="ghost"
                             size="sm"
-                            onClick={() => setAgentStage('idle')}
+                            onClick={handleCancelSelecting}
                             className="text-xs text-neutral-400 hover:text-white"
                           >
                             Cancel

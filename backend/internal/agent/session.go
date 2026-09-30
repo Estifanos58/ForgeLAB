@@ -15,6 +15,7 @@ import (
 var (
 	ErrSessionNotFound = errors.New("agent session not found")
 	ErrSessionExpired  = errors.New("agent session has expired")
+	ErrSessionConsumed = errors.New("agent session has already been consumed")
 	ErrUnauthorized    = errors.New("unauthorized agent session access")
 	ErrInvalidToken    = errors.New("invalid agent session token")
 )
@@ -31,6 +32,7 @@ type AgentSession struct {
 	AgentID    string     `json:"agent_id"`
 	SourceID   *uuid.UUID `json:"source_id,omitempty"`
 	FolderName string     `json:"folder_name,omitempty"`
+	Consumed   bool       `json:"consumed"`
 	ExpiresAt  time.Time  `json:"expires_at"`
 	CreatedAt  time.Time  `json:"created_at"`
 }
@@ -159,6 +161,9 @@ func (sm *SessionManager) ValidateToken(token string) (*AgentSession, error) {
 	if session.IsExpired() {
 		return nil, ErrSessionExpired
 	}
+	if session.Consumed {
+		return nil, ErrSessionConsumed
+	}
 
 	return session, nil
 }
@@ -172,6 +177,10 @@ func (sm *SessionManager) BindSource(token string, sourceID uuid.UUID, folderNam
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+
+	if session.Consumed {
+		return nil, ErrSessionConsumed
+	}
 
 	// If agentID was not specified during session creation, bind it now; otherwise verify match
 	if session.AgentID != "" && agentID != "" && session.AgentID != agentID {
@@ -200,6 +209,10 @@ func (sm *SessionManager) VerifyForRegistration(userID uuid.UUID, sessionID uuid
 		return nil, ErrSessionExpired
 	}
 
+	if session.Consumed {
+		return nil, ErrSessionConsumed
+	}
+
 	if session.UserID != userID {
 		return nil, ErrUnauthorized
 	}
@@ -213,4 +226,33 @@ func (sm *SessionManager) VerifyForRegistration(userID uuid.UUID, sessionID uuid
 	}
 
 	return session, nil
+}
+
+// MarkConsumed flags a session as consumed so it cannot be reused
+func (sm *SessionManager) MarkConsumed(sessionID uuid.UUID) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	session, exists := sm.sessions[sessionID]
+	if !exists {
+		return ErrSessionNotFound
+	}
+	session.Consumed = true
+	return nil
+}
+
+// FindSessionBySourceID finds an active session by source ID
+func (sm *SessionManager) FindSessionBySourceID(sourceID uuid.UUID) (*AgentSession, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, s := range sm.sessions {
+		if s.SourceID != nil && *s.SourceID == sourceID {
+			if s.IsExpired() {
+				return nil, ErrSessionExpired
+			}
+			return s, nil
+		}
+	}
+	return nil, ErrSessionNotFound
 }
