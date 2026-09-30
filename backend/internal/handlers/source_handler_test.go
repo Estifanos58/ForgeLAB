@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -518,6 +519,64 @@ func TestSourceHandler_ValidateLocalPath_Success_WithDockerignoreAndDetector(t *
 	// node_modules excluded: package.json, next.config.js, .dockerignore, src/index.ts = 4 files
 	assert.Equal(t, 4, res.FilesCount)
 	assert.True(t, res.TotalBytes > 0)
+}
+
+func TestSourceHandler_ValidateLocalPath_AsyncPolling(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-async-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	_ = os.WriteFile(filepath.Join(tempDir, "package.json"), []byte(`{"name":"test-app"}`), 0644)
+
+	validator := security.NewPathValidator([]string{tempDir})
+	handler := handlers.NewSourceHandler(nil, validator)
+
+	testUserID := uuid.New()
+
+	// 1. Request async validation
+	payload, _ := json.Marshal(map[string]interface{}{
+		"repository_path": tempDir,
+		"async":           true,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/sources/local/validate", bytes.NewBuffer(payload))
+	req = req.WithContext(withTestUser(req.Context(), testUserID))
+	rec := httptest.NewRecorder()
+
+	handler.ValidateLocalPath(rec, req)
+	assert.Equal(t, http.StatusAccepted, rec.Code)
+
+	var res handlers.ValidateLocalPathResponse
+	err = json.NewDecoder(rec.Body).Decode(&res)
+	require.NoError(t, err)
+	assert.NotEmpty(t, res.SessionID)
+	assert.Equal(t, "scanning", res.Status)
+
+	// 2. Poll session status until ready
+	var pollMap map[string]interface{}
+	for i := 0; i < 20; i++ {
+		time.Sleep(50 * time.Millisecond)
+
+		pollReq := httptest.NewRequest(http.MethodGet, "/api/sources/local/validate/"+res.SessionID, nil)
+		pollReq = pollReq.WithContext(withTestUser(pollReq.Context(), testUserID))
+
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("sessionId", res.SessionID)
+		pollReq = pollReq.WithContext(context.WithValue(pollReq.Context(), chi.RouteCtxKey, rctx))
+
+		pollRec := httptest.NewRecorder()
+		handler.GetLocalValidationStatus(pollRec, pollReq)
+		assert.Equal(t, http.StatusOK, pollRec.Code)
+
+		err = json.NewDecoder(pollRec.Body).Decode(&pollMap)
+		require.NoError(t, err)
+
+		if pollMap["status"] == "ready" {
+			break
+		}
+	}
+
+	assert.Equal(t, "ready", pollMap["status"])
+	assert.NotNil(t, pollMap["result"])
 }
 
 

@@ -39,14 +39,17 @@ export function ProjectCard({ project }: ProjectCardProps) {
 
       <div className="pt-2.5 border-t border-surface-border flex items-center justify-between font-mono text-[11px]">
         <div>
-          {project.status === 'running' && project.port ? (
+          {project.status === 'running' && (project.preview_url || project.port) ? (
             <a
-              href={`http://localhost:${project.port}`}
+              href={
+                project.preview_url ||
+                `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`
+              }
               target="_blank"
               rel="noreferrer"
               className="inline-flex items-center gap-1 text-emerald-400 hover:underline"
             >
-              <span>:{project.port}</span>
+              <span>{project.port ? `:${project.port}` : 'preview'}</span>
               <ExternalLink className="w-3 h-3" />
             </a>
           ) : (

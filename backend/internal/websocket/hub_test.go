@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
@@ -34,6 +36,7 @@ func (m *mockProjectAuthorizer) GetProject(ctx context.Context, id, ownerID uuid
 
 type mockDeploymentResolver struct {
 	getDeploymentFn func(ctx context.Context, id uuid.UUID) (*models.Deployment, error)
+	getLogsAfterFn  func(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error)
 }
 
 func (m *mockDeploymentResolver) GetDeployment(ctx context.Context, id uuid.UUID) (*models.Deployment, error) {
@@ -41,6 +44,13 @@ func (m *mockDeploymentResolver) GetDeployment(ctx context.Context, id uuid.UUID
 		return m.getDeploymentFn(ctx, id)
 	}
 	return nil, errors.New("deployment not found")
+}
+
+func (m *mockDeploymentResolver) GetDeploymentLogsAfter(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
+	if m.getLogsAfterFn != nil {
+		return m.getLogsAfterFn(ctx, deploymentID, serviceID, afterID, limit)
+	}
+	return []*models.DeploymentLog{}, nil
 }
 
 // 1. Channel isolation test
@@ -779,3 +789,188 @@ func TestWebSocketEndToEndWithRequestLoggerAndCookie(t *testing.T) {
 		}
 	}
 }
+
+// 12. Strict Origin allowlist validation
+func TestWebSocketOriginAllowlist(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000", "https://forgelab.example.com")
+	defer hub.cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeWS))
+	defer server.Close()
+
+	userID := uuid.New()
+	token, err := jwtManager.GenerateAccessToken(userID, "user@example.com")
+	if err != nil {
+		t.Fatalf("failed to generate access token: %v", err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
+
+	// Allowed origin
+	headerAllowed := http.Header{"Origin": []string{"http://localhost:3000"}}
+	connAllowed, respAllowed, err := websocket.DefaultDialer.Dial(wsURL, headerAllowed)
+	if err != nil {
+		t.Fatalf("expected allowed origin to succeed, got: %v", err)
+	}
+	defer connAllowed.Close()
+	if respAllowed.StatusCode != http.StatusSwitchingProtocols {
+		t.Errorf("expected status 101, got %d", respAllowed.StatusCode)
+	}
+
+	// Disallowed origin
+	headerDisallowed := http.Header{"Origin": []string{"http://evil-attacker-site.com"}}
+	_, respDisallowed, err := websocket.DefaultDialer.Dial(wsURL, headerDisallowed)
+	if err == nil {
+		t.Errorf("expected disallowed origin to fail, but dial succeeded")
+	}
+	if respDisallowed != nil && respDisallowed.StatusCode != http.StatusForbidden {
+		t.Errorf("expected status 403 Forbidden for disallowed origin, got %d", respDisallowed.StatusCode)
+	}
+}
+
+// 13. Reconnect replay of missed log events
+func TestWebSocketReconnectReplay(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	userID := uuid.New()
+	projectID := uuid.New()
+	deploymentID := uuid.New()
+
+	mockProjectSvc := &mockProjectAuthorizer{
+		getProjectFn: func(ctx context.Context, id, ownerID uuid.UUID) (*models.Project, error) {
+			if id == projectID && ownerID == userID {
+				return &models.Project{ID: projectID, OwnerID: userID}, nil
+			}
+			return nil, errors.New("access denied")
+		},
+	}
+
+	mockDeploySvc := &mockDeploymentResolver{
+		getDeploymentFn: func(ctx context.Context, id uuid.UUID) (*models.Deployment, error) {
+			if id == deploymentID {
+				return &models.Deployment{ID: deploymentID, ProjectID: projectID}, nil
+			}
+			return nil, errors.New("not found")
+		},
+		getLogsAfterFn: func(ctx context.Context, deployID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
+			if deployID == deploymentID && afterID == 50 {
+				return []*models.DeploymentLog{
+					{ID: 51, DeploymentID: deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 51", Timestamp: time.Now()},
+					{ID: 52, DeploymentID: deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 52", Timestamp: time.Now()},
+					{ID: 53, DeploymentID: deploymentID, Phase: "build", Stream: "stdout", Message: "replayed log 53", Timestamp: time.Now()},
+				}, nil
+			}
+			return []*models.DeploymentLog{}, nil
+		},
+	}
+
+	hub := NewHub(jwtManager, mockProjectSvc, mockDeploySvc, nil)
+	defer hub.cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeWS))
+	defer server.Close()
+
+	token, _ := jwtManager.GenerateAccessToken(userID, "user@example.com")
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
+
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer wsConn.Close()
+
+	channel := "deployment:" + deploymentID.String()
+
+	// Send subscribe with last_sequence: 50
+	subMsg := ClientMessage{
+		Type:         "subscribe",
+		Channel:      channel,
+		LastSequence: 50,
+	}
+	if err := wsConn.WriteJSON(subMsg); err != nil {
+		t.Fatalf("failed to send subscribe frame: %v", err)
+	}
+
+	// 1. Acknowledgment
+	var ack EventMessage
+	if err := wsConn.ReadJSON(&ack); err != nil {
+		t.Fatalf("failed to read ack: %v", err)
+	}
+	if ack.Type != "subscribed" || ack.Sequence != 50 {
+		t.Fatalf("expected subscribed ack with sequence 50, got %+v", ack)
+	}
+
+	// 2. Expect 3 replayed logs in sequence
+	for expectedID := int64(51); expectedID <= 53; expectedID++ {
+		var logMsg EventMessage
+		if err := wsConn.ReadJSON(&logMsg); err != nil {
+			t.Fatalf("failed to read replayed log %d: %v", expectedID, err)
+		}
+		if logMsg.Type != "log" || logMsg.Sequence != expectedID {
+			t.Fatalf("expected replayed log sequence %d, got %+v", expectedID, logMsg)
+		}
+	}
+}
+
+// 14. Log events are not dropped on burst / buffer pressure
+func TestWebSocketLogEventsNotDroppedOnBurst(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	userID := uuid.New()
+	projectID := uuid.New()
+	deploymentID := uuid.New()
+
+	mockProjectSvc := &mockProjectAuthorizer{
+		getProjectFn: func(ctx context.Context, id, ownerID uuid.UUID) (*models.Project, error) {
+			return &models.Project{ID: projectID, OwnerID: userID}, nil
+		},
+	}
+	mockDeploySvc := &mockDeploymentResolver{
+		getDeploymentFn: func(ctx context.Context, id uuid.UUID) (*models.Deployment, error) {
+			return &models.Deployment{ID: deploymentID, ProjectID: projectID}, nil
+		},
+	}
+
+	hub := NewHub(jwtManager, mockProjectSvc, mockDeploySvc, nil)
+	defer hub.cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeWS))
+	defer server.Close()
+
+	token, _ := jwtManager.GenerateAccessToken(userID, "user@example.com")
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
+
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer wsConn.Close()
+
+	channel := "deployment:" + deploymentID.String()
+	_ = wsConn.WriteJSON(ClientMessage{Type: "subscribe", Channel: channel})
+
+	var ack EventMessage
+	_ = wsConn.ReadJSON(&ack)
+
+	// Send burst of 300 messages (exceeding traditional 256 channel buffer limit)
+	const burstCount = 300
+	for i := 1; i <= burstCount; i++ {
+		_ = hub.PublishEvent(channel, &EventMessage{
+			Type:     "log",
+			Channel:  channel,
+			Sequence: int64(i),
+			Data:     map[string]interface{}{"msg": fmt.Sprintf("burst log %d", i)},
+		})
+	}
+
+	// Verify all 300 messages are received sequentially without drops
+	for i := 1; i <= burstCount; i++ {
+		var received EventMessage
+		if err := wsConn.ReadJSON(&received); err != nil {
+			t.Fatalf("failed to read burst message %d: %v", i, err)
+		}
+		if received.Sequence != int64(i) {
+			t.Fatalf("expected message sequence %d, got %d", i, received.Sequence)
+		}
+	}
+}
+

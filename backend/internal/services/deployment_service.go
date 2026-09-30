@@ -354,11 +354,17 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	return deployment, nil
 }
 
-// UpdateDeploymentStatus updates the status of a deployment enforcing valid state transitions.
+// UpdateDeploymentStatus updates the status of a deployment enforcing valid state transitions atomically.
 func (s *DeploymentService) UpdateDeploymentStatus(ctx context.Context, deploymentID uuid.UUID, newStatus string, failureReason *string) error {
-	// 1. Fetch current status
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// 1. Fetch current status with row-level exclusive lock
 	var currentStatus string
-	err := s.db.QueryRow(ctx, "SELECT status FROM deployments WHERE id = $1", deploymentID).Scan(&currentStatus)
+	err = tx.QueryRow(ctx, "SELECT status FROM deployments WHERE id = $1 FOR UPDATE", deploymentID).Scan(&currentStatus)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrDeploymentNotFound
@@ -420,12 +426,16 @@ func (s *DeploymentService) UpdateDeploymentStatus(ctx context.Context, deployme
 	query += fmt.Sprintf(" WHERE id = $%d", argIdx)
 	args = append(args, deploymentID)
 
-	_, err = s.db.Exec(ctx, query, args...)
+	_, err = tx.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to update deployment status: %w", err)
 	}
 
-	slog.Info("deployment status updated", "deployment_id", deploymentID, "status", newStatus)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit deployment status update: %w", err)
+	}
+
+	slog.Info("deployment status updated atomically", "deployment_id", deploymentID, "status", newStatus)
 	return nil
 }
 
@@ -636,6 +646,58 @@ func (s *DeploymentService) GetServiceLogs(ctx context.Context, deploymentID, se
 	return logs, nil
 }
 
+// GetDeploymentLogsAfter retrieves logs for a deployment (optionally scoped to a service) created after a given log ID sequence.
+func (s *DeploymentService) GetDeploymentLogsAfter(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
+	if s.db == nil {
+		return []*models.DeploymentLog{}, nil
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	if serviceID != nil {
+		rows, err = s.db.Query(ctx,
+			`SELECT id, deployment_id, service_id, timestamp, phase, stream, message
+			 FROM deployment_logs 
+			 WHERE deployment_id = $1 AND service_id = $2 AND id > $3
+			 ORDER BY id ASC LIMIT $4`,
+			deploymentID, *serviceID, afterID, limit,
+		)
+	} else {
+		rows, err = s.db.Query(ctx,
+			`SELECT id, deployment_id, service_id, timestamp, phase, stream, message
+			 FROM deployment_logs 
+			 WHERE deployment_id = $1 AND id > $2
+			 ORDER BY id ASC LIMIT $3`,
+			deploymentID, afterID, limit,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get deployment logs after sequence: %w", err)
+	}
+	defer rows.Close()
+
+	var logs []*models.DeploymentLog
+	for rows.Next() {
+		l := &models.DeploymentLog{}
+		if err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message); err != nil {
+			return nil, fmt.Errorf("failed to scan log: %w", err)
+		}
+		logs = append(logs, l)
+	}
+
+	if logs == nil {
+		logs = []*models.DeploymentLog{}
+	}
+
+	return logs, nil
+}
+
+
 // ListServiceDeployments retrieves all service deployment records for a release.
 func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deploymentID uuid.UUID) ([]*models.ServiceDeployment, error) {
 	rows, err := s.db.Query(ctx,
@@ -689,8 +751,36 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 	return list, nil
 }
 
-// UpdateServiceDeploymentStatus updates status for an individual service deployment.
+// UpdateServiceDeploymentStatus updates status for an individual service deployment with state validation and atomic lock.
 func (s *DeploymentService) UpdateServiceDeploymentStatus(ctx context.Context, deploymentID, serviceID uuid.UUID, newStatus string, failureReason *string) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var currentStatus string
+	err = tx.QueryRow(ctx,
+		"SELECT status FROM service_deployments WHERE deployment_id = $1 AND service_id = $2 FOR UPDATE",
+		deploymentID, serviceID,
+	).Scan(&currentStatus)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("failed to fetch service deployment status: %w", err)
+	}
+
+	if currentStatus != "" {
+		if err := models.ValidateStateTransition(currentStatus, newStatus); err != nil {
+			slog.Warn("skipping invalid service deployment status transition",
+				"deployment_id", deploymentID,
+				"service_id", serviceID,
+				"from", currentStatus,
+				"to", newStatus,
+				"error", err,
+			)
+			return err
+		}
+	}
+
 	now := time.Now()
 	var deployedAt, finishedAt *time.Time
 	if newStatus == models.DeployStatusRunning {
@@ -700,7 +790,7 @@ func (s *DeploymentService) UpdateServiceDeploymentStatus(ctx context.Context, d
 		finishedAt = &now
 	}
 
-	_, err := s.db.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		`UPDATE service_deployments SET
 		 status = $3,
 		 deployed_at = COALESCE($4, deployed_at),
@@ -709,7 +799,11 @@ func (s *DeploymentService) UpdateServiceDeploymentStatus(ctx context.Context, d
 		 WHERE deployment_id = $1 AND service_id = $2`,
 		deploymentID, serviceID, newStatus, deployedAt, finishedAt, failureReason,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to update service deployment status: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 // UpdateServiceDeploymentContainer records container ID and allocated host port for a service deployment.

@@ -25,3 +25,7 @@ frontend/out/
 
 # Go
 backend/tmp/
+backend/scratch/
+*.exe
+forgelab-agent.exe
+

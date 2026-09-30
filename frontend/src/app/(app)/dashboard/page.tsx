@@ -159,14 +159,17 @@ export default function DashboardPage() {
                           </span>
                         </td>
                         <td className="py-3 px-4 whitespace-nowrap">
-                          {p.status === 'running' && p.port ? (
+                          {p.status === 'running' && (p.preview_url || p.port) ? (
                             <a
-                              href={`http://localhost:${p.port}`}
+                              href={
+                                p.preview_url ||
+                                `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${p.port}`
+                              }
                               target="_blank"
                               rel="noreferrer"
                               className="inline-flex items-center gap-1 font-mono text-[11px] text-emerald-400 hover:underline"
                             >
-                              <span>:{p.port}</span>
+                              <span>{p.port ? `:${p.port}` : 'preview'}</span>
                               <ExternalLink className="w-3 h-3" />
                             </a>
                           ) : (

@@ -22,30 +22,32 @@ export function ProjectHeader({
   const services = project.services || [];
 
   // Determine the primary preview URL across running services
-  // 1. First choice: running frontend service with a preview URL or host port
-  // 2. Second choice: any running public service with a preview URL or host port
-  // 3. Fallback: project.port if project is running
-  let primaryPreviewUrl: string | null = null;
-  const runningServices = services.filter((s) => s.status === 'running');
-
-  const frontendSvc = runningServices.find(
-    (s) => s.role === 'frontend' && (s.preview_url || (s.public_exposed && s.host_port))
-  );
-
-  if (frontendSvc) {
-    primaryPreviewUrl =
-      frontendSvc.preview_url ||
-      `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${frontendSvc.host_port}`;
-  } else {
-    const anyPublicSvc = runningServices.find(
-      (s) => s.preview_url || (s.public_exposed && s.host_port)
+  // 1. Authoritative backend project preview URL
+  // 2. Running frontend service with a preview URL or host port
+  // 3. Any running public service with a preview URL or host port
+  // 4. Fallback: project.port if project is running
+  let primaryPreviewUrl: string | null = project.preview_url || null;
+  if (!primaryPreviewUrl) {
+    const runningServices = services.filter((s) => s.status === 'running');
+    const frontendSvc = runningServices.find(
+      (s) => s.role === 'frontend' && (s.preview_url || (s.public_exposed && s.host_port))
     );
-    if (anyPublicSvc) {
+
+    if (frontendSvc) {
       primaryPreviewUrl =
-        anyPublicSvc.preview_url ||
-        `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${anyPublicSvc.host_port}`;
-    } else if (project.status === 'running' && project.port) {
-      primaryPreviewUrl = `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`;
+        frontendSvc.preview_url ||
+        `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${frontendSvc.host_port}`;
+    } else {
+      const anyPublicSvc = runningServices.find(
+        (s) => s.preview_url || (s.public_exposed && s.host_port)
+      );
+      if (anyPublicSvc) {
+        primaryPreviewUrl =
+          anyPublicSvc.preview_url ||
+          `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${anyPublicSvc.host_port}`;
+      } else if (project.status === 'running' && project.port) {
+        primaryPreviewUrl = `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`;
+      }
     }
   }
 

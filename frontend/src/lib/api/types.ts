@@ -163,6 +163,7 @@ export interface Project {
   status: ProjectStatus;
   current_deployment_id: string | null;
   port: number | null;
+  preview_url?: string | null;
   services?: Service[];
   created_at: string;
   updated_at: string;
@@ -333,6 +334,8 @@ export interface SourceUploadResult {
 }
 
 export interface LocalPathValidationResult {
+  session_id?: string;
+  status?: 'ready' | 'scanning' | 'failed';
   valid: boolean;
   repository_path: string;
   project_name: string;

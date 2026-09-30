@@ -94,6 +94,7 @@ type SourceService struct {
 	sourcesDir      string
 	fallbackOwners  sync.Map
 	fallbackSources sync.Map
+	analysisCache   sync.Map
 }
 
 func NewSourceService(db *pgxpool.Pool, sourcesDir string) *SourceService {
@@ -105,6 +106,40 @@ func NewSourceService(db *pgxpool.Pool, sourcesDir string) *SourceService {
 	return &SourceService{
 		db:         db,
 		sourcesDir: sourcesDir,
+	}
+}
+
+func (s *SourceService) getOrComputeAnalysis(sourceID uuid.UUID, dirPath string) *analyzer.AnalysisResult {
+	if val, ok := s.analysisCache.Load(sourceID); ok {
+		if res, ok := val.(*analyzer.AnalysisResult); ok && res != nil {
+			return res
+		}
+	}
+
+	analysisPath := filepath.Join(dirPath, ".forgelab-analysis.json")
+	if data, err := os.ReadFile(analysisPath); err == nil {
+		var res analyzer.AnalysisResult
+		if err := json.Unmarshal(data, &res); err == nil {
+			s.analysisCache.Store(sourceID, &res)
+			return &res
+		}
+	}
+
+	if res, err := analyzer.AnalyzeRepository(dirPath); err == nil && res != nil {
+		s.saveAnalysis(sourceID, dirPath, res)
+		return res
+	}
+
+	return nil
+}
+
+func (s *SourceService) saveAnalysis(sourceID uuid.UUID, dirPath string, res *analyzer.AnalysisResult) {
+	if res == nil {
+		return
+	}
+	s.analysisCache.Store(sourceID, res)
+	if data, err := json.Marshal(res); err == nil {
+		_ = os.WriteFile(filepath.Join(dirPath, ".forgelab-analysis.json"), data, 0644)
 	}
 }
 
@@ -226,7 +261,8 @@ func (s *SourceService) GetSourceStatus(ctx context.Context, ownerID, sourceID u
 			}
 		}
 		if _, err := os.Stat(filepath.Join(s.sourcesDir, sourceID.String())); err == nil {
-			if a, err := analyzer.AnalyzeRepository(filepath.Join(s.sourcesDir, sourceID.String())); err == nil {
+			dirPath := filepath.Join(s.sourcesDir, sourceID.String())
+			if a := s.getOrComputeAnalysis(sourceID, dirPath); a != nil {
 				res.Analysis = a
 				res.Services = a.Services
 				res.Source = map[string]interface{}{
@@ -356,6 +392,7 @@ func (s *SourceService) DeleteSource(ctx context.Context, ownerID, sourceID uuid
 	}
 
 	// Clean up both finalized workspace and any temporary upload staging directory
+	s.analysisCache.Delete(sourceID)
 	uploadStaging := filepath.Join(s.sourcesDir, ".uploads", sourceID.String())
 	_ = removeAllWithRetry(uploadStaging)
 	return removeAllWithRetry(dir)
@@ -798,7 +835,7 @@ func (s *SourceService) ingestArchivePart(
 
 // processSourceBackground inspects unpacked files to detect runtime/framework and transitions state to ready or failed.
 func (s *SourceService) processSourceBackground(sourceID, ownerID uuid.UUID, targetDir string) {
-	analysis, _ := analyzer.AnalyzeRepository(targetDir)
+	analysis := s.getOrComputeAnalysis(sourceID, targetDir)
 	detection, err := detector.Detect(targetDir)
 	if err != nil && analysis == nil {
 		slog.Warn("source detection failed",

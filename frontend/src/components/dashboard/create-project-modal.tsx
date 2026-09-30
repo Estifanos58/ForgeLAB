@@ -154,6 +154,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     detectedCount?: number;
   }>({});
   const [agentSession, setAgentSession] = useState<AgentSourceSession | null>(null);
+  const [agentAuthSession, setAgentAuthSession] = useState<{ session_id: string; token: string; expires_at: string } | null>(null);
   const [configuredServices, setConfiguredServices] = useState<ConfigurableService[]>([]);
   const [manualPathInput, setManualPathInput] = useState<string>('');
   const [showManualPath, setShowManualPath] = useState<boolean>(false);
@@ -214,6 +215,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       }
       setAgentStage('idle');
       setAgentSession(null);
+      setAgentAuthSession(null);
       setConfiguredServices([]);
       setAgentProgress({});
       setManualPathInput('');
@@ -283,7 +285,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
     agentPollTimerRef.current = setInterval(async () => {
       try {
-        const s = await api.agent.getSource(sourceId);
+        const s = await api.agent.getSource(sourceId, agentAuthSession?.token);
         setAgentProgress({
           filesScanned: s.files_scanned,
           totalFiles: s.total_files,
@@ -323,7 +325,12 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     setAgentStage('selecting');
     setError(null);
     try {
-      const res = await api.agent.selectFolder('Select Project Folder for ForgeLAB');
+      // 1. Obtain short-lived authenticated session from ForgeLAB backend
+      const authSession = await api.sources.createAgentSession(agentStatus?.agent_id);
+      setAgentAuthSession(authSession);
+
+      // 2. Invoke local agent with the authenticated session token
+      const res = await api.agent.selectFolder('Select Project Folder for ForgeLAB', authSession.token);
       if ('cancelled' in res && res.cancelled) {
         setAgentStage('idle');
         return;
@@ -368,7 +375,12 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     setAgentStage('selecting');
     setError(null);
     try {
-      const session = await api.agent.selectPath(p);
+      // 1. Obtain short-lived authenticated session from ForgeLAB backend
+      const authSession = await api.sources.createAgentSession(agentStatus?.agent_id);
+      setAgentAuthSession(authSession);
+
+      // 2. Validate path with local agent using authenticated session token
+      const session = await api.agent.selectPath(p, authSession.token);
       if (isSessionReady(session)) {
         if (agentPollTimerRef.current) {
           clearInterval(agentPollTimerRef.current);
@@ -846,6 +858,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         // Register agent source in ForgeLAB backend
         try {
           await api.sources.registerAgentSource({
+            session_id: agentAuthSession?.session_id,
+            token: agentAuthSession?.token,
             source_id: agentSession.source_id,
             agent_id: agentSession.agent_id,
             folder_name: agentSession.folder_name,

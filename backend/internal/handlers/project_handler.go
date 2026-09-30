@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -566,15 +567,34 @@ func (h *ProjectHandler) GetDeploymentLogs(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	var serviceUUIDPtr *uuid.UUID
+	if serviceIDStr := r.URL.Query().Get("service_id"); serviceIDStr != "" {
+		if serviceUUID, parseErr := uuid.Parse(serviceIDStr); parseErr == nil {
+			serviceUUIDPtr = &serviceUUID
+		}
+	}
+
+	limit := 1000
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if lim, parseErr := strconv.Atoi(limitStr); parseErr == nil && lim > 0 {
+			limit = lim
+		}
+	}
+
 	var logs []*models.DeploymentLog
-	serviceIDStr := r.URL.Query().Get("service_id")
-	if serviceIDStr != "" {
-		serviceUUID, parseErr := uuid.Parse(serviceIDStr)
-		if parseErr == nil {
-			logs, err = h.deploymentService.GetServiceLogs(r.Context(), deploymentID, serviceUUID)
+	cursorStr := r.URL.Query().Get("cursor")
+	if cursorStr == "" {
+		cursorStr = r.URL.Query().Get("after_id")
+	}
+
+	if cursorStr != "" {
+		if cursorVal, parseErr := strconv.ParseInt(cursorStr, 10, 64); parseErr == nil && cursorVal > 0 {
+			logs, err = h.deploymentService.GetDeploymentLogsAfter(r.Context(), deploymentID, serviceUUIDPtr, cursorVal, limit)
 		} else {
 			logs, err = h.deploymentService.GetDeploymentLogs(r.Context(), deploymentID)
 		}
+	} else if serviceUUIDPtr != nil {
+		logs, err = h.deploymentService.GetServiceLogs(r.Context(), deploymentID, *serviceUUIDPtr)
 	} else {
 		logs, err = h.deploymentService.GetDeploymentLogs(r.Context(), deploymentID)
 	}

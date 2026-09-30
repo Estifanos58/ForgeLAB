@@ -49,9 +49,11 @@ export function useDeploymentWS({
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const backoffDelayRef = useRef<number>(1000); // 1s, 2s, 4s, 8s, 16s, max 30s
   const isIntentionalCloseRef = useRef<boolean>(false);
+  const lastSequenceRef = useRef<number>(0);
 
   const clearLogs = useCallback(() => {
     setLogs([]);
+    lastSequenceRef.current = 0;
   }, []);
 
   // Safe merge strategy: combines historical REST logs and live WebSocket logs,
@@ -62,6 +64,9 @@ export function useDeploymentWS({
 
       // 1. Index historical logs
       for (const log of historical) {
+        if (typeof log.id === 'number' && log.id > lastSequenceRef.current) {
+          lastSequenceRef.current = log.id;
+        }
         const key = log.id !== undefined && log.id !== null ? `id:${log.id}` : `ts:${log.timestamp}:${log.message}`;
         map.set(key, log);
       }
@@ -97,6 +102,7 @@ export function useDeploymentWS({
     // Reset logs and state when switching to a new channel
     setLogs([]);
     setStatusChange(null);
+    lastSequenceRef.current = 0;
     backoffDelayRef.current = 1000;
     isIntentionalCloseRef.current = false;
 
@@ -164,15 +170,19 @@ export function useDeploymentWS({
 
         if (process.env.NODE_ENV === 'development') {
           console.log('[ForgeLAB WS] connected');
-          console.log(`[ForgeLAB WS] subscribing ${channel}`);
+          console.log(`[ForgeLAB WS] subscribing ${channel} (last_sequence=${lastSequenceRef.current})`);
         }
 
         // Socket is open at the transport layer; now subscribe to the channel
         setConnectionState('subscribing');
 
-        // Send subscription request
+        // Send subscription request with replay support
         try {
-          ws.send(JSON.stringify({ type: 'subscribe', channel }));
+          const subFrame: Record<string, any> = { type: 'subscribe', channel };
+          if (lastSequenceRef.current > 0) {
+            subFrame.last_sequence = lastSequenceRef.current;
+          }
+          ws.send(JSON.stringify(subFrame));
         } catch (sendErr) {
           console.error('[ForgeLAB WS] Failed to send subscription frame:', sendErr);
         }
@@ -224,6 +234,11 @@ export function useDeploymentWS({
                   stream: msg.data.stream || 'stdout',
                   message: msg.data.message || '',
                 };
+
+                const seq = typeof msg.sequence === 'number' ? msg.sequence : (typeof logEntry.id === 'number' ? logEntry.id : 0);
+                if (seq > lastSequenceRef.current) {
+                  lastSequenceRef.current = seq;
+                }
 
                 if (process.env.NODE_ENV === 'development') {
                   console.log(`[ForgeLAB WS] received log ${logEntry.id ?? 'noid'}`);

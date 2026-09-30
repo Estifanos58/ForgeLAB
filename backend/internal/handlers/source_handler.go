@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/detector"
 	"github.com/forgelab/backend/internal/docker"
 	"github.com/forgelab/backend/internal/models"
@@ -29,8 +31,9 @@ const MaxUncompressedSourceBytes = 100 * 1024 * 1024 // 100MB
 const MaxUploadBytes = 105 * 1024 * 1024 // 105MB
 
 type SourceHandler struct {
-	sourceService *services.SourceService
-	pathValidator *security.PathValidator
+	sourceService           *services.SourceService
+	pathValidator           *security.PathValidator
+	localValidationSessions sync.Map
 }
 
 func NewSourceHandler(sourceService *services.SourceService, pathValidator *security.PathValidator) *SourceHandler {
@@ -212,10 +215,13 @@ func (h *SourceHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // ValidateLocalPathRequest defines payload for POST /api/sources/local/validate
 type ValidateLocalPathRequest struct {
 	RepositoryPath string `json:"repository_path"`
+	Async          bool   `json:"async,omitempty"`
 }
 
 // ValidateLocalPathResponse defines metadata response for validated local paths
 type ValidateLocalPathResponse struct {
+	SessionID       string `json:"session_id,omitempty"`
+	Status          string `json:"status,omitempty"` // "ready", "scanning", "failed"
 	Valid           bool   `json:"valid"`
 	RepositoryPath  string `json:"repository_path"`
 	ProjectName     string `json:"project_name"`
@@ -234,9 +240,23 @@ type ValidateLocalPathResponse struct {
 	Error           string `json:"error,omitempty"`
 }
 
+type LocalValidationSession struct {
+	SessionID      string                     `json:"session_id"`
+	UserID         uuid.UUID                  `json:"user_id"`
+	Status         string                     `json:"status"` // "scanning", "ready", "failed"
+	RepositoryPath string                     `json:"repository_path"`
+	FilesScanned   int                        `json:"files_scanned"`
+	TotalBytes     int64                      `json:"total_bytes"`
+	Result         *ValidateLocalPathResponse `json:"result,omitempty"`
+	Error          string                     `json:"error,omitempty"`
+	CreatedAt      time.Time                  `json:"created_at"`
+	UpdatedAt      time.Time                  `json:"updated_at"`
+	mu             sync.RWMutex
+}
+
 // ValidateLocalPath handles POST /api/sources/local/validate
 func (h *SourceHandler) ValidateLocalPath(w http.ResponseWriter, r *http.Request) {
-	_, ok := getUserIDFromContext(r)
+	userID, ok := getUserIDFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -281,98 +301,295 @@ func (h *SourceHandler) ValidateLocalPath(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Efficiently inspect files and calculate total size without walking ignored directories
-	matcher, _ := docker.LoadDockerignore(canonicalPath)
-	filesCount := 0
-	var totalBytes int64
+	sessionID := uuid.New().String()
+	session := &LocalValidationSession{
+		SessionID:      sessionID,
+		UserID:         userID,
+		Status:         "scanning",
+		RepositoryPath: canonicalPath,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	h.localValidationSessions.Store(sessionID, session)
 
-	_ = filepath.WalkDir(canonicalPath, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		rel, err := filepath.Rel(canonicalPath, path)
-		if err != nil || rel == "." || rel == "" {
-			return nil
-		}
-		slashRel := filepath.ToSlash(rel)
-		isDir := d.IsDir()
+	go h.cleanupValidationSessions()
 
-		if matcher != nil {
-			if isDir && matcher.CanSkipDir(slashRel) {
-				return filepath.SkipDir
-			}
-			if matcher.Matches(slashRel, isDir) {
-				if isDir {
-					return filepath.SkipDir
-				}
+	doneCh := make(chan struct{})
+
+	go func() {
+		defer close(doneCh)
+		matcher, _ := docker.LoadDockerignore(canonicalPath)
+		filesCount := 0
+		var totalBytes int64
+
+		_ = filepath.WalkDir(canonicalPath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
 				return nil
 			}
-		}
+			rel, err := filepath.Rel(canonicalPath, path)
+			if err != nil || rel == "." || rel == "" {
+				return nil
+			}
+			slashRel := filepath.ToSlash(rel)
+			isDir := d.IsDir()
 
-		if !isDir {
-			info, err := d.Info()
-			if err == nil && info.Mode().IsRegular() {
-				filesCount++
-				totalBytes += info.Size()
+			if matcher != nil {
+				if isDir && matcher.CanSkipDir(slashRel) {
+					return filepath.SkipDir
+				}
+				if matcher.Matches(slashRel, isDir) {
+					if isDir {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+
+			if !isDir {
+				info, err := d.Info()
+				if err == nil && info.Mode().IsRegular() {
+					filesCount++
+					totalBytes += info.Size()
+					if filesCount%50 == 0 {
+						session.mu.Lock()
+						session.FilesScanned = filesCount
+						session.TotalBytes = totalBytes
+						session.UpdatedAt = time.Now()
+						session.mu.Unlock()
+					}
+				}
+			}
+			return nil
+		})
+
+		detectionRes, err := detector.Detect(canonicalPath)
+		if err != nil {
+			detectionRes = &detector.DetectionResult{
+				Runtime:         "generic",
+				Framework:       "Generic",
+				BuildStrategy:   "auto",
+				SuggestedPort:   8080,
+				HealthCheckPath: "/health",
+				HealthStrategy:  "auto",
 			}
 		}
-		return nil
-	})
 
-	// Run detector on canonical path
-	detectionRes, err := detector.Detect(canonicalPath)
-	if err != nil {
-		detectionRes = &detector.DetectionResult{
-			Runtime:         "generic",
-			Framework:       "Generic",
-			BuildStrategy:   "auto",
-			SuggestedPort:   8080,
-			HealthCheckPath: "/health",
-			HealthStrategy:  "auto",
+		hasDockerfile := false
+		if _, err := os.Stat(filepath.Join(canonicalPath, "Dockerfile")); err == nil {
+			hasDockerfile = true
 		}
+
+		buildStrategy := detectionRes.BuildStrategy
+		if hasDockerfile {
+			buildStrategy = "dockerfile"
+		} else if buildStrategy == "" {
+			buildStrategy = "auto"
+		}
+
+		projectName := filepath.Base(canonicalPath)
+		if projectName == "" || projectName == "/" || projectName == "." {
+			projectName = "local-project"
+		}
+
+		resp := ValidateLocalPathResponse{
+			SessionID:       sessionID,
+			Status:          "ready",
+			Valid:           true,
+			RepositoryPath:  canonicalPath,
+			ProjectName:     projectName,
+			FilesCount:      filesCount,
+			TotalBytes:      totalBytes,
+			Runtime:         detectionRes.Runtime,
+			Framework:       detectionRes.Framework,
+			BuildStrategy:   buildStrategy,
+			DockerfilePath:  "Dockerfile",
+			BuildContext:    ".",
+			BuildCommand:    detectionRes.BuildCommand,
+			StartCommand:    detectionRes.StartCommand,
+			SuggestedPort:   detectionRes.SuggestedPort,
+			HealthStrategy:  detectionRes.HealthStrategy,
+			HealthCheckPath: detectionRes.HealthCheckPath,
+		}
+
+		session.mu.Lock()
+		session.Status = "ready"
+		session.FilesScanned = filesCount
+		session.TotalBytes = totalBytes
+		session.Result = &resp
+		session.UpdatedAt = time.Now()
+		session.mu.Unlock()
+	}()
+
+	if req.Async {
+		writeJSON(w, http.StatusAccepted, ValidateLocalPathResponse{
+			SessionID:      sessionID,
+			Status:         "scanning",
+			Valid:          true,
+			RepositoryPath: canonicalPath,
+		})
+		return
 	}
 
-	// Check if Dockerfile exists in project
-	hasDockerfile := false
-	if _, err := os.Stat(filepath.Join(canonicalPath, "Dockerfile")); err == nil {
-		hasDockerfile = true
+	select {
+	case <-doneCh:
+		session.mu.RLock()
+		res := session.Result
+		session.mu.RUnlock()
+		if res != nil {
+			writeJSON(w, http.StatusOK, res)
+			return
+		}
+	case <-time.After(150 * time.Millisecond):
+		writeJSON(w, http.StatusAccepted, ValidateLocalPathResponse{
+			SessionID:      sessionID,
+			Status:         "scanning",
+			Valid:          true,
+			RepositoryPath: canonicalPath,
+		})
+		return
+	}
+}
+
+// GetLocalValidationStatus handles GET /api/sources/local/validate/{sessionId}
+func (h *SourceHandler) GetLocalValidationStatus(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
 	}
 
-	buildStrategy := detectionRes.BuildStrategy
-	if hasDockerfile {
-		buildStrategy = "dockerfile"
-	} else if buildStrategy == "" {
-		buildStrategy = "auto"
+	sessionID := chi.URLParam(r, "sessionId")
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "sessionId is required")
+		return
 	}
 
-	projectName := filepath.Base(canonicalPath)
-	if projectName == "" || projectName == "/" || projectName == "." {
-		projectName = "local-project"
+	val, ok := h.localValidationSessions.Load(sessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "validation session not found")
+		return
 	}
 
-	resp := ValidateLocalPathResponse{
-		Valid:           true,
-		RepositoryPath:  canonicalPath,
-		ProjectName:     projectName,
-		FilesCount:      filesCount,
-		TotalBytes:      totalBytes,
-		Runtime:         detectionRes.Runtime,
-		Framework:       detectionRes.Framework,
-		BuildStrategy:   buildStrategy,
-		DockerfilePath:  "Dockerfile",
-		BuildContext:    ".",
-		BuildCommand:    detectionRes.BuildCommand,
-		StartCommand:    detectionRes.StartCommand,
-		SuggestedPort:   detectionRes.SuggestedPort,
-		HealthStrategy:  detectionRes.HealthStrategy,
-		HealthCheckPath: detectionRes.HealthCheckPath,
+	session := val.(*LocalValidationSession)
+	if session.UserID != userID {
+		writeError(w, http.StatusForbidden, "unauthorized access to validation session")
+		return
 	}
 
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session_id":      session.SessionID,
+		"status":          session.Status,
+		"repository_path": session.RepositoryPath,
+		"files_scanned":   session.FilesScanned,
+		"total_bytes":     session.TotalBytes,
+		"result":          session.Result,
+		"error":           session.Error,
+		"updated_at":      session.UpdatedAt,
+	})
+}
+
+func (h *SourceHandler) cleanupValidationSessions() {
+	now := time.Now()
+	h.localValidationSessions.Range(func(key, value any) bool {
+		sess, ok := value.(*LocalValidationSession)
+		if ok && now.Sub(sess.CreatedAt) > 30*time.Minute {
+			h.localValidationSessions.Delete(key)
+		}
+		return true
+	})
+}
+
+// CreateAgentSession handles POST /api/sources/agent/session
+// Issues a short-lived authenticated session token for the user
+func (h *SourceHandler) CreateAgentSession(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req struct {
+		AgentID string `json:"agent_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	sm := agent.GetGlobalSessionManager()
+	session, err := sm.CreateSession(userID, req.AgentID, 30*time.Minute)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create agent session: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"session_id": session.ID.String(),
+		"token":      session.Token,
+		"agent_id":   session.AgentID,
+		"expires_at": session.ExpiresAt.Format(time.RFC3339),
+	})
+}
+
+// ValidateAgentSession handles POST /api/sources/agent/session/validate
+// Used by local agent or backend to verify and bind sessions
+func (h *SourceHandler) ValidateAgentSession(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token      string `json:"token"`
+		SourceID   string `json:"source_id"`
+		AgentID    string `json:"agent_id"`
+		FolderName string `json:"folder_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Token) == "" {
+		writeError(w, http.StatusBadRequest, "valid session token is required")
+		return
+	}
+
+	sm := agent.GetGlobalSessionManager()
+	var session *agent.AgentSession
+	var err error
+
+	if req.SourceID != "" {
+		sourceUUID, parseErr := uuid.Parse(req.SourceID)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid source_id format")
+			return
+		}
+		session, err = sm.BindSource(req.Token, sourceUUID, req.FolderName, req.AgentID)
+	} else {
+		session, err = sm.ValidateToken(req.Token)
+	}
+
+	if err != nil {
+		if errors.Is(err, agent.ErrSessionExpired) {
+			writeError(w, http.StatusUnauthorized, "agent session has expired")
+			return
+		}
+		if errors.Is(err, agent.ErrUnauthorized) {
+			writeError(w, http.StatusForbidden, "unauthorized session access: "+err.Error())
+			return
+		}
+		writeError(w, http.StatusUnauthorized, "invalid agent session: "+err.Error())
+		return
+	}
+
+	resp := map[string]interface{}{
+		"valid":      true,
+		"session_id": session.ID.String(),
+		"user_id":    session.UserID.String(),
+		"agent_id":   session.AgentID,
+		"expires_at": session.ExpiresAt.Format(time.RFC3339),
+	}
+	if session.SourceID != nil {
+		resp["source_id"] = session.SourceID.String()
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // RegisterAgentSourceRequest defines payload for POST /api/sources/agent/register
 type RegisterAgentSourceRequest struct {
+	SessionID  string                 `json:"session_id"`
+	Token      string                 `json:"token"`
 	SourceID   string                 `json:"source_id"`
 	AgentID    string                 `json:"agent_id"`
 	FolderName string                 `json:"folder_name"`
@@ -393,29 +610,101 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	sourceUUID, err := uuid.Parse(req.SourceID)
-	if err != nil {
-		sourceUUID = uuid.New()
+	sm := agent.GetGlobalSessionManager()
+	var verifiedSourceID uuid.UUID
+	var verifiedAgentID string
+	var folderName string = req.FolderName
+
+	// If session_id is provided, verify session ownership and bound source/agent IDs
+	if strings.TrimSpace(req.SessionID) != "" {
+		sessionUUID, err := uuid.Parse(req.SessionID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid session_id format")
+			return
+		}
+		sess, err := sm.VerifyForRegistration(userID, sessionUUID, req.Token)
+		if err != nil {
+			slog.Warn("agent source registration rejected: session verification failed",
+				"user_id", userID.String(),
+				"session_id", req.SessionID,
+				"error", err.Error(),
+			)
+			if errors.Is(err, agent.ErrUnauthorized) {
+				writeError(w, http.StatusForbidden, "unauthorized: session does not belong to authenticated user")
+				return
+			}
+			if errors.Is(err, agent.ErrSessionExpired) {
+				writeError(w, http.StatusUnauthorized, "agent session has expired; please re-select folder")
+				return
+			}
+			writeError(w, http.StatusBadRequest, "invalid session for registration: "+err.Error())
+			return
+		}
+
+		// Security: Do NOT trust client-provided source IDs or agent IDs!
+		// Authoritative IDs come strictly from the verified session.
+		verifiedSourceID = *sess.SourceID
+		verifiedAgentID = sess.AgentID
+		if sess.FolderName != "" {
+			folderName = sess.FolderName
+		}
+
+		// Reject forged client-provided IDs if they do not match the session
+		if req.SourceID != "" && req.SourceID != verifiedSourceID.String() {
+			writeError(w, http.StatusForbidden, "security violation: client-provided source_id does not match authenticated session")
+			return
+		}
+		if req.AgentID != "" && req.AgentID != verifiedAgentID {
+			writeError(w, http.StatusForbidden, "security violation: client-provided agent_id does not match authenticated session")
+			return
+		}
+	} else if strings.TrimSpace(req.Token) != "" {
+		// Validated via token
+		sess, err := sm.ValidateToken(req.Token)
+		if err != nil || sess.UserID != userID || sess.SourceID == nil {
+			writeError(w, http.StatusForbidden, "unauthorized or unverified agent session")
+			return
+		}
+		verifiedSourceID = *sess.SourceID
+		verifiedAgentID = sess.AgentID
+		if sess.FolderName != "" {
+			folderName = sess.FolderName
+		}
+	} else {
+		// If no session token is provided, only allow in non-production/test fallback
+		if os.Getenv("APP_ENV") == "production" || os.Getenv("FORGELAB_ENV") == "production" {
+			writeError(w, http.StatusForbidden, "authenticated agent session required in production")
+			return
+		}
+		sourceUUID, err := uuid.Parse(req.SourceID)
+		if err != nil {
+			sourceUUID = uuid.New()
+		}
+		verifiedSourceID = sourceUUID
+		verifiedAgentID = req.AgentID
 	}
 
 	meta := req.Metadata
 	if meta == nil {
 		meta = make(map[string]interface{})
 	}
-	meta["folder_name"] = req.FolderName
+	meta["folder_name"] = folderName
+	if req.Token != "" {
+		meta["session_token"] = req.Token
+	}
 
 	sourceRecord := &models.Source{
-		ID:              sourceUUID,
+		ID:              verifiedSourceID,
 		OwnerID:         userID,
 		SourceType:      models.SourceTypeLocalAgent,
-		SourceReference: sourceUUID.String(),
-		AgentID:         req.AgentID,
+		SourceReference: verifiedSourceID.String(),
+		AgentID:         verifiedAgentID,
 		Metadata:        meta,
 	}
 
 	if h.sourceService != nil {
 		if err := h.sourceService.SaveSource(r.Context(), sourceRecord); err != nil {
-			slog.Error("failed to save agent source in database", "source_id", sourceUUID, "error", err)
+			slog.Error("failed to save agent source in database", "source_id", verifiedSourceID, "error", err)
 			writeError(w, http.StatusInternalServerError, "failed to register agent source: "+err.Error())
 			return
 		}
@@ -423,19 +712,19 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 
 	res := map[string]interface{}{
 		"source": map[string]interface{}{
-			"id":               sourceUUID.String(),
+			"id":               verifiedSourceID.String(),
 			"source_type":      models.SourceTypeLocalAgent,
-			"source_reference": sourceUUID.String(),
-			"agent_id":         req.AgentID,
-			"folder_name":      req.FolderName,
+			"source_reference": verifiedSourceID.String(),
+			"agent_id":         verifiedAgentID,
+			"folder_name":      folderName,
 			"metadata":         meta,
 		},
-		"source_id":   sourceUUID.String(),
+		"source_id":   verifiedSourceID.String(),
 		"owner_id":    userID.String(),
-		"agent_id":    req.AgentID,
+		"agent_id":    verifiedAgentID,
 		"type":        models.SourceTypeLocalAgent,
 		"status":      "ready",
-		"folder_name": req.FolderName,
+		"folder_name": folderName,
 		"metadata":    meta,
 	}
 

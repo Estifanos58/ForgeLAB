@@ -124,7 +124,7 @@ func main() {
 	secretService := services.NewSecretService(pool, encryptor, projectService)
 
 	// Initialize WebSocket Hub
-	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient)
+	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient, cfg.App.AllowedOriginsList()...)
 
 	// Initialize Docker Engine
 	dockerEngine := docker.NewEngine(
@@ -185,6 +185,9 @@ func main() {
 		// Public GitHub OAuth integration callback
 		r.Get("/integrations/github/callback", integrationHandler.GitHubCallback)
 
+		// Agent session validation (token-authenticated by agent)
+		r.Post("/sources/agent/session/validate", sourceHandler.ValidateAgentSession)
+
 		// Auth routes (public)
 		r.Route("/auth", func(r chi.Router) {
 			r.Post("/register", authHandler.Register)
@@ -212,8 +215,10 @@ func main() {
 			// Source Management & Uploads
 			r.Route("/sources", func(r chi.Router) {
 				r.Post("/upload", sourceHandler.Upload)
+				r.Post("/agent/session", sourceHandler.CreateAgentSession)
 				r.Post("/agent/register", sourceHandler.RegisterAgentSource)
 				r.Post("/local/validate", sourceHandler.ValidateLocalPath)
+				r.Get("/local/validate/{sessionId}", sourceHandler.GetLocalValidationStatus)
 				r.Get("/{id}", sourceHandler.GetStatus)
 				r.Delete("/{id}", sourceHandler.Delete)
 			})

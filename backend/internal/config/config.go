@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -23,10 +24,41 @@ type Config struct {
 
 // AppConfig holds application, CORS, and cookie settings.
 type AppConfig struct {
+	Environment        string
 	FrontendURL        string
 	CORSAllowedOrigins string
 	CookieSecure       bool
 }
+
+// AllowedOriginsList returns a slice of allowed origins parsed from CORSAllowedOrigins and FrontendURL.
+func (a AppConfig) AllowedOriginsList() []string {
+	origins := make(map[string]bool)
+	if a.FrontendURL != "" {
+		origins[strings.TrimRight(strings.TrimSpace(a.FrontendURL), "/")] = true
+	}
+	if a.CORSAllowedOrigins != "" {
+		for _, o := range strings.Split(a.CORSAllowedOrigins, ",") {
+			trimmed := strings.TrimRight(strings.TrimSpace(o), "/")
+			if trimmed != "" {
+				origins[trimmed] = true
+			}
+		}
+	}
+	// Always include loopback origins in local development
+	if a.Environment != "production" {
+		origins["http://localhost:3000"] = true
+		origins["http://127.0.0.1:3000"] = true
+		origins["http://localhost:8080"] = true
+		origins["http://127.0.0.1:8080"] = true
+	}
+
+	result := make([]string, 0, len(origins))
+	for o := range origins {
+		result = append(result, o)
+	}
+	return result
+}
+
 
 // OAuthConfig holds OAuth provider settings.
 type OAuthConfig struct {
@@ -116,13 +148,32 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("JWT_SECRET is required")
 	}
 
+	envMode := strings.ToLower(getEnv("APP_ENV", getEnv("FORGELAB_ENV", getEnv("ENV", "development"))))
+	isProd := envMode == "production" || envMode == "prod"
+
+	dbURL := getEnv("DATABASE_URL", "postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable")
+	encKey := getEnv("FORGELAB_ENCRYPTION_KEY", "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=")
+
+	if isProd {
+		if jwtSecret == "dev-jwt-secret-change-in-production" || jwtSecret == "your-super-secret-jwt-key" ||
+			jwtSecret == "example-jwt-secret" || len(jwtSecret) < 32 {
+			return nil, fmt.Errorf("production configuration error: JWT_SECRET must be a secure random secret of at least 32 characters in production mode")
+		}
+		if encKey == "" || encKey == "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=" {
+			return nil, fmt.Errorf("production configuration error: default development FORGELAB_ENCRYPTION_KEY is not allowed in production mode")
+		}
+		if strings.Contains(dbURL, "forgelab_dev_password") {
+			return nil, fmt.Errorf("production configuration error: default development database password (forgelab_dev_password) is not allowed in production mode")
+		}
+	}
+
 	cfg := &Config{
 		Server: ServerConfig{
 			Host: getEnv("SERVER_HOST", "0.0.0.0"),
 			Port: port,
 		},
 		Database: DatabaseConfig{
-			URL: getEnv("DATABASE_URL", "postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable"),
+			URL: dbURL,
 		},
 		Redis: RedisConfig{
 			URL: getEnv("REDIS_URL", "redis://localhost:6379/0"),
@@ -133,7 +184,7 @@ func Load() (*Config, error) {
 			RefreshTokenExpiry: time.Duration(refreshExpiry) * 24 * time.Hour,
 		},
 		Encryption: EncryptionConfig{
-			Key: getEnv("FORGELAB_ENCRYPTION_KEY", "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q="),
+			Key: encKey,
 		},
 		Docker: DockerConfig{
 			Host:                getEnv("DOCKER_HOST", ""),
@@ -149,6 +200,7 @@ func Load() (*Config, error) {
 			Format: getEnv("LOG_FORMAT", "text"),
 		},
 		App: AppConfig{
+			Environment:        envMode,
 			FrontendURL:        getEnv("FRONTEND_URL", "http://localhost:3000"),
 			CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
 			CookieSecure:       getEnv("COOKIE_SECURE", "false") == "true",

@@ -2,8 +2,10 @@ package agent
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -39,24 +41,33 @@ type LocalSourceSession struct {
 	Analysis      *analyzer.AnalysisResult `json:"analysis,omitempty"`
 	CreatedAt     time.Time                `json:"created_at"`
 	UpdatedAt     time.Time                `json:"updated_at"`
+	ExpiresAt     time.Time                `json:"expires_at"`
+	Token         string                   `json:"-"`
 	mu            sync.RWMutex             `json:"-"`
 }
 
 type AgentServerConfig struct {
-	Port         int
-	AllowedRoots []string
-	BackendURL   string
+	Port             int
+	AllowedRoots     []string
+	BackendURL       string
+	AllowedOrigins   []string
+	SessionValidator func(token, agentID string) (*AgentSession, error)
+	SessionTTL       time.Duration
 }
 
 type AgentServer struct {
-	agentID       string
-	port          int
-	backendURL    string
-	pathValidator *PathValidator
-	picker        *NativeFolderPicker
-	sessions      map[uuid.UUID]*LocalSourceSession
-	mu            sync.RWMutex
-	dockerClient  *client.Client
+	agentID          string
+	port             int
+	backendURL       string
+	allowedOrigins   []string
+	pathValidator    *PathValidator
+	picker           *NativeFolderPicker
+	sessions         map[uuid.UUID]*LocalSourceSession
+	mu               sync.RWMutex
+	dockerClient     *client.Client
+	sessionValidator func(token, agentID string) (*AgentSession, error)
+	sessionTTL       time.Duration
+	stopCleanup      chan struct{}
 }
 
 func NewAgentServer(cfg AgentServerConfig) *AgentServer {
@@ -65,15 +76,99 @@ func NewAgentServer(cfg AgentServerConfig) *AgentServer {
 	}
 	cli, _ := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 
-	return &AgentServer{
-		agentID:       uuid.New().String(),
-		port:          cfg.Port,
-		backendURL:    cfg.BackendURL,
-		pathValidator: NewPathValidator(cfg.AllowedRoots),
-		picker:        NewNativeFolderPicker(),
-		sessions:      make(map[uuid.UUID]*LocalSourceSession),
-		dockerClient:  cli,
+	origins := []string{
+		"http://localhost:3000",
+		"http://127.0.0.1:3000",
+		"http://localhost:8080",
+		"http://127.0.0.1:8080",
 	}
+	if cfg.BackendURL != "" {
+		origins = append(origins, strings.TrimRight(cfg.BackendURL, "/"))
+	}
+	for _, o := range cfg.AllowedOrigins {
+		trimmed := strings.TrimSpace(o)
+		if trimmed != "" {
+			origins = append(origins, trimmed)
+		}
+	}
+	if envOrigins := os.Getenv("FORGELAB_ALLOWED_ORIGINS"); envOrigins != "" {
+		for _, o := range strings.Split(envOrigins, ",") {
+			trimmed := strings.TrimSpace(o)
+			if trimmed != "" {
+				origins = append(origins, trimmed)
+			}
+		}
+	}
+
+	ttl := cfg.SessionTTL
+	if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+
+	srv := &AgentServer{
+		agentID:          uuid.New().String(),
+		port:             cfg.Port,
+		backendURL:       cfg.BackendURL,
+		allowedOrigins:   origins,
+		pathValidator:    NewPathValidator(cfg.AllowedRoots),
+		picker:           NewNativeFolderPicker(),
+		sessions:         make(map[uuid.UUID]*LocalSourceSession),
+		dockerClient:     cli,
+		sessionValidator: cfg.SessionValidator,
+		sessionTTL:       ttl,
+		stopCleanup:      make(chan struct{}),
+	}
+
+	go srv.cleanupLoop(5 * time.Minute)
+	return srv
+}
+
+// Close gracefully stops background tasks in the agent server
+func (s *AgentServer) Close() {
+	select {
+	case <-s.stopCleanup:
+	default:
+		close(s.stopCleanup)
+	}
+}
+
+func (s *AgentServer) cleanupLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCleanup:
+			return
+		case <-ticker.C:
+			s.CleanupExpiredSessions()
+		}
+	}
+}
+
+// CleanupExpiredSessions removes sessions whose TTL has elapsed
+func (s *AgentServer) CleanupExpiredSessions() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	removed := 0
+	for id, sess := range s.sessions {
+		if now.After(sess.ExpiresAt) {
+			delete(s.sessions, id)
+			removed++
+		}
+	}
+	return removed
+}
+
+// ListenAddr returns the strictly loopback bound address
+func (s *AgentServer) ListenAddr() string {
+	return fmt.Sprintf("127.0.0.1:%d", s.port)
+}
+
+// AgentID returns the current agent instance ID
+func (s *AgentServer) AgentID() string {
+	return s.agentID
 }
 
 // Router returns an http.Handler with all agent endpoints and CORS support
@@ -81,23 +176,39 @@ func (s *AgentServer) Router() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/agent/status", s.handleStatus)
-	mux.HandleFunc("/api/agent/select-folder", s.handleSelectFolder)
-	mux.HandleFunc("/api/agent/select-path", s.handleSelectPath)
-	mux.HandleFunc("/api/agent/sources/", s.handleSourcesRoutes)
+	mux.HandleFunc("/api/agent/select-folder", s.requireAuth(s.handleSelectFolder))
+	mux.HandleFunc("/api/agent/select-path", s.requireAuth(s.handleSelectPath))
+	mux.HandleFunc("/api/agent/sources/", s.requireAuth(s.handleSourcesRoutes))
 
 	return s.corsMiddleware(mux)
+}
+
+func (s *AgentServer) isOriginAllowed(origin string) bool {
+	if origin == "" {
+		return true // Same-host or non-browser client (e.g. backend container dialing agent)
+	}
+	norm := strings.ToLower(strings.TrimRight(origin, "/"))
+	for _, o := range s.allowedOrigins {
+		if strings.ToLower(strings.TrimRight(o, "/")) == norm {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *AgentServer) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "" {
-			origin = "*"
+		if origin != "" {
+			if !s.isOriginAllowed(origin) {
+				http.Error(w, "origin not allowed by agent security policy", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-ForgeLAB-Agent, X-Agent-Session-Token")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-ForgeLAB-Agent")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
@@ -106,6 +217,105 @@ func (s *AgentServer) corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func extractToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	if tok := r.Header.Get("X-Agent-Session-Token"); tok != "" {
+		return strings.TrimSpace(tok)
+	}
+	if tok := r.URL.Query().Get("token"); tok != "" {
+		return strings.TrimSpace(tok)
+	}
+	return ""
+}
+
+func (s *AgentServer) validateToken(ctx context.Context, token string) (*AgentSession, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("missing session token")
+	}
+
+	// 1. Custom configured validator
+	if s.sessionValidator != nil {
+		return s.sessionValidator(token, s.agentID)
+	}
+
+	// 2. Global session manager (same-host / local runtime)
+	if sm := GetGlobalSessionManager(); sm != nil {
+		if sess, err := sm.ValidateToken(token); err == nil {
+			return sess, nil
+		}
+	}
+
+	// 3. Fallback: call backend HTTP verification endpoint
+	if s.backendURL != "" {
+		validateURL := fmt.Sprintf("%s/api/sources/agent/session/validate", strings.TrimRight(s.backendURL, "/"))
+		payload, _ := json.Marshal(map[string]string{
+			"token":    token,
+			"agent_id": s.agentID,
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, validateURL, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("backend session validation failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("backend rejected session token with status %d", resp.StatusCode)
+		}
+
+		var res struct {
+			Valid     bool      `json:"valid"`
+			SessionID string    `json:"session_id"`
+			UserID    string    `json:"user_id"`
+			AgentID   string    `json:"agent_id"`
+			ExpiresAt time.Time `json:"expires_at"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			return nil, err
+		}
+		sID, _ := uuid.Parse(res.SessionID)
+		uID, _ := uuid.Parse(res.UserID)
+		return &AgentSession{
+			ID:        sID,
+			Token:     token,
+			UserID:    uID,
+			AgentID:   res.AgentID,
+			ExpiresAt: res.ExpiresAt,
+		}, nil
+	}
+
+	return nil, ErrSessionNotFound
+}
+
+func (s *AgentServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := extractToken(r)
+		if token == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: agent session token is required"})
+			return
+		}
+
+		sess, err := s.validateToken(r.Context(), token)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: " + err.Error()})
+			return
+		}
+
+		// Store session in context if needed
+		ctx := context.WithValue(r.Context(), "agent_session", sess)
+		ctx = context.WithValue(ctx, "agent_token", token)
+		next(w, r.WithContext(ctx))
+	}
 }
 
 func (s *AgentServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +372,8 @@ func (s *AgentServer) handleSelectFolder(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	session, err := s.registerDirectory(selectedPath)
+	token, _ := r.Context().Value("agent_token").(string)
+	session, err := s.registerDirectory(selectedPath, token)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to inspect selected directory: %v", err), http.StatusBadRequest)
 		return
@@ -171,7 +382,7 @@ func (s *AgentServer) handleSelectFolder(w http.ResponseWriter, r *http.Request)
 	s.renderSessionResponse(w, session)
 }
 
-// handleSelectPath directly validates and analyzes a path (e.g. for CLI/automated testing)
+// handleSelectPath directly validates and analyzes a path (e.g. for automated CLI/tests)
 func (s *AgentServer) handleSelectPath(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -186,7 +397,8 @@ func (s *AgentServer) handleSelectPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, err := s.registerDirectory(req.Path)
+	token, _ := r.Context().Value("agent_token").(string)
+	session, err := s.registerDirectory(req.Path, token)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Path validation failed: %v", err), http.StatusBadRequest)
 		return
@@ -195,7 +407,7 @@ func (s *AgentServer) handleSelectPath(w http.ResponseWriter, r *http.Request) {
 	s.renderSessionResponse(w, session)
 }
 
-func (s *AgentServer) registerDirectory(rawPath string) (*LocalSourceSession, error) {
+func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSession, error) {
 	canonicalPath, err := s.pathValidator.ValidateSourcePath(rawPath)
 	if err != nil {
 		return nil, err
@@ -215,11 +427,40 @@ func (s *AgentServer) registerDirectory(rawPath string) (*LocalSourceSession, er
 		Phase:         "scanning",
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(s.sessionTTL),
+		Token:         token,
 	}
 
 	s.mu.Lock()
 	s.sessions[sourceID] = session
 	s.mu.Unlock()
+
+	// Bind source and folder on backend session
+	if token != "" {
+		if sm := GetGlobalSessionManager(); sm != nil {
+			_, _ = sm.BindSource(token, sourceID, folderName, s.agentID)
+		}
+		if s.backendURL != "" {
+			go func() {
+				validateURL := fmt.Sprintf("%s/api/sources/agent/session/validate", strings.TrimRight(s.backendURL, "/"))
+				payload, _ := json.Marshal(map[string]string{
+					"token":       token,
+					"source_id":   sourceID.String(),
+					"agent_id":    s.agentID,
+					"folder_name": folderName,
+				})
+				req, err := http.NewRequest(http.MethodPost, validateURL, bytes.NewReader(payload))
+				if err == nil {
+					req.Header.Set("Content-Type", "application/json")
+					client := &http.Client{Timeout: 3 * time.Second}
+					resp, err := client.Do(req)
+					if err == nil {
+						resp.Body.Close()
+					}
+				}
+			}()
+		}
+	}
 
 	// Channel to signal quick completion
 	doneCh := make(chan struct{})
@@ -364,6 +605,13 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Verify token match
+	token, _ := r.Context().Value("agent_token").(string)
+	if session.Token != "" && token != "" && session.Token != token {
+		http.Error(w, "forbidden: token does not match source session", http.StatusForbidden)
+		return
+	}
+
 	if len(parts) == 1 {
 		if r.Method == http.MethodGet {
 			s.renderSessionResponse(w, session)
@@ -394,6 +642,7 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		}
 		s.mu.Lock()
 		session.Analysis = analysis
+		session.UpdatedAt = time.Now()
 		s.mu.Unlock()
 		s.renderSessionResponse(w, session)
 

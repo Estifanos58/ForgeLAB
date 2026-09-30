@@ -127,15 +127,29 @@ async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {}): Pro
 }
 
 const AGENT_URL = 'http://127.0.0.1:4142';
+let currentAgentToken: string | null = null;
 
-async function agentFetch<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+export function setAgentToken(token: string | null) {
+  currentAgentToken = token;
+}
+
+export function getAgentToken(): string | null {
+  return currentAgentToken;
+}
+
+async function agentFetch<T>(endpoint: string, options: RequestInit = {}, token?: string): Promise<T> {
   const url = `${AGENT_URL}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+  const authToken = token || currentAgentToken;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string>),
+  };
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
   const response = await fetch(url, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers as Record<string, string>),
-    },
+    headers,
   });
   if (!response.ok) {
     const errorText = await response.text();
@@ -459,15 +473,44 @@ export const api = {
     },
 
     async validateLocalPath(repositoryPath: string): Promise<LocalPathValidationResult> {
-      return apiFetch<LocalPathValidationResult>('/api/sources/local/validate', {
+      const res = await apiFetch<LocalPathValidationResult>('/api/sources/local/validate', {
         method: 'POST',
         body: JSON.stringify({ repository_path: repositoryPath }),
+      });
+
+      if (res.status === 'scanning' && res.session_id) {
+        for (let i = 0; i < 60; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const pollRes = await apiFetch<{
+            session_id: string;
+            status: string;
+            result?: LocalPathValidationResult;
+            error?: string;
+          }>(`/api/sources/local/validate/${res.session_id}`);
+
+          if (pollRes.status === 'ready' && pollRes.result) {
+            return pollRes.result;
+          }
+          if (pollRes.status === 'failed') {
+            throw new Error(pollRes.error || 'Directory scanning failed');
+          }
+        }
+      }
+      return res;
+    },
+
+    async createAgentSession(agentId?: string): Promise<{ session_id: string; token: string; expires_at: string }> {
+      return apiFetch('/api/sources/agent/session', {
+        method: 'POST',
+        body: JSON.stringify({ agent_id: agentId || '' }),
       });
     },
 
     async registerAgentSource(data: {
-      source_id: string;
-      agent_id: string;
+      session_id?: string;
+      token?: string;
+      source_id?: string;
+      agent_id?: string;
       folder_name: string;
       metadata?: Record<string, any>;
     }): Promise<{
@@ -516,22 +559,30 @@ export const api = {
       }
     },
 
-    async selectFolder(title?: string): Promise<AgentSourceSession | { cancelled: true }> {
-      return agentFetch<AgentSourceSession | { cancelled: true }>('/api/agent/select-folder', {
-        method: 'POST',
-        body: JSON.stringify({ title: title || 'Select Project Folder' }),
-      });
+    async selectFolder(title?: string, token?: string): Promise<AgentSourceSession | { cancelled: true }> {
+      return agentFetch<AgentSourceSession | { cancelled: true }>(
+        '/api/agent/select-folder',
+        {
+          method: 'POST',
+          body: JSON.stringify({ title: title || 'Select Project Folder' }),
+        },
+        token
+      );
     },
 
-    async selectPath(path: string): Promise<AgentSourceSession> {
-      return agentFetch<AgentSourceSession>('/api/agent/select-path', {
-        method: 'POST',
-        body: JSON.stringify({ path }),
-      });
+    async selectPath(path: string, token?: string): Promise<AgentSourceSession> {
+      return agentFetch<AgentSourceSession>(
+        '/api/agent/select-path',
+        {
+          method: 'POST',
+          body: JSON.stringify({ path }),
+        },
+        token
+      );
     },
 
-    async getSource(sourceId: string): Promise<AgentSourceSession> {
-      return agentFetch<AgentSourceSession>(`/api/agent/sources/${encodeURIComponent(sourceId)}`);
+    async getSource(sourceId: string, token?: string): Promise<AgentSourceSession> {
+      return agentFetch<AgentSourceSession>(`/api/agent/sources/${encodeURIComponent(sourceId)}`, {}, token);
     },
   },
 };

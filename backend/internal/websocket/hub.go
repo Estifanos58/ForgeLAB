@@ -18,35 +18,33 @@ import (
 	"github.com/forgelab/backend/internal/models"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow development frontend origins
-	},
-}
-
 type Client struct {
 	hub           *Hub
 	conn          *websocket.Conn
 	userID        uuid.UUID
 	userEmail     string
 	subscriptions map[string]bool
-	send          chan []byte
+	send          chan []byte // preserved for mock/direct test channel inspection
+	pending       [][]byte
+	notify        chan struct{}
+	closed        bool
 	mu            sync.RWMutex
 }
 
 type ClientMessage struct {
-	Type    string `json:"type"`    // subscribe | unsubscribe | ping
-	Channel string `json:"channel"` // deployment:<uuid> | project:<uuid>
+	Type          string `json:"type"`                     // subscribe | unsubscribe | ping
+	Channel       string `json:"channel"`                  // deployment:<uuid> | project:<uuid>
+	LastSequence  int64  `json:"last_sequence,omitempty"`  // replay logs after this sequence
+	AfterSequence int64  `json:"after_sequence,omitempty"` // alias for last_sequence
 }
 
 type EventMessage struct {
-	Type    string      `json:"type"`    // subscribed | error | log | status_change | project_event | pong
-	Channel string      `json:"channel,omitempty"`
-	Code    string      `json:"code,omitempty"`
-	Message string      `json:"message,omitempty"`
-	Data    interface{} `json:"data,omitempty"`
+	Type     string      `json:"type"`               // subscribed | error | log | status_change | project_event | pong
+	Channel  string      `json:"channel,omitempty"`
+	Sequence int64       `json:"sequence,omitempty"` // reliable event sequence
+	Code     string      `json:"code,omitempty"`
+	Message  string      `json:"message,omitempty"`
+	Data     interface{} `json:"data,omitempty"`
 }
 
 type RedisEnvelope struct {
@@ -60,9 +58,10 @@ type ProjectAuthorizer interface {
 	GetProject(ctx context.Context, id, ownerID uuid.UUID) (*models.Project, error)
 }
 
-// DeploymentResolver defines the interface required by the Hub for resolving deployment metadata.
+// DeploymentResolver defines the interface required by the Hub for resolving deployment metadata and replay logs.
 type DeploymentResolver interface {
 	GetDeployment(ctx context.Context, id uuid.UUID) (*models.Deployment, error)
+	GetDeploymentLogsAfter(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error)
 }
 
 type Hub struct {
@@ -76,11 +75,12 @@ type Hub struct {
 	projectService    ProjectAuthorizer
 	deploymentService DeploymentResolver
 	redisClient       *redis.Client
+	allowedOrigins    []string
 	ctx               context.Context
 	cancel            context.CancelFunc
 }
 
-func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deploymentService DeploymentResolver, redisClient *redis.Client) *Hub {
+func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deploymentService DeploymentResolver, redisClient *redis.Client, allowedOrigins ...string) *Hub {
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
 		nodeID:            uuid.New().String(),
@@ -92,6 +92,7 @@ func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deplo
 		projectService:    projectService,
 		deploymentService: deploymentService,
 		redisClient:       redisClient,
+		allowedOrigins:    allowedOrigins,
 		ctx:               ctx,
 		cancel:            cancel,
 	}
@@ -101,6 +102,42 @@ func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deplo
 		go h.listenRedisPubSub()
 	}
 	return h
+}
+
+// SetAllowedOrigins configures the allowed origin domains for WebSocket connections.
+func (h *Hub) SetAllowedOrigins(origins []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.allowedOrigins = origins
+}
+
+// CheckOrigin validates the incoming HTTP request Origin header against allowed origins.
+func (h *Hub) CheckOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // Direct non-browser clients or same-origin
+	}
+	origin = strings.TrimRight(strings.ToLower(origin), "/")
+
+	h.mu.RLock()
+	origins := h.allowedOrigins
+	h.mu.RUnlock()
+
+	if len(origins) == 0 {
+		// Strict default development allowlist
+		if origin == "http://localhost:3000" || origin == "http://127.0.0.1:3000" ||
+			origin == "http://localhost:8080" || origin == "http://127.0.0.1:8080" {
+			return true
+		}
+		return false
+	}
+
+	for _, o := range origins {
+		if strings.TrimRight(strings.ToLower(o), "/") == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // NodeID returns the unique runtime identifier of this backend instance.
@@ -130,6 +167,8 @@ func (h *Hub) run() {
 				delete(h.clients, client)
 				// Remove client from all channel subscriptions
 				client.mu.Lock()
+				client.closed = true
+				client.pending = nil
 				for channel := range client.subscriptions {
 					if clients, exists := h.channels[channel]; exists {
 						delete(clients, client)
@@ -139,12 +178,50 @@ func (h *Hub) run() {
 					}
 				}
 				client.mu.Unlock()
-				close(client.send)
+				if client.send != nil {
+					close(client.send)
+				}
+				select {
+				case client.notify <- struct{}{}:
+				default:
+				}
 				slog.Info("ws client unregistered", "user_id", client.userID)
 			}
 			h.mu.Unlock()
 		}
 	}
+}
+
+// enqueue queues a payload for writing to the client without dropping events on full buffer.
+func (c *Client) enqueue(payload []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+	// For mock test clients without a live WebSocket connection, push to c.send
+	if c.conn == nil && c.send != nil {
+		select {
+		case c.send <- payload:
+		default:
+		}
+	}
+	// Safety ceiling of 50,000 pending messages prevents unbounded memory exhaustion if socket completely hangs
+	if len(c.pending) > 50000 {
+		c.closed = true
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+		return false
+	}
+	c.pending = append(c.pending, payload)
+	if c.notify != nil {
+		select {
+		case c.notify <- struct{}{}:
+		default:
+		}
+	}
+	return true
 }
 
 // broadcastLocally sends an event payload to all local connected clients subscribed to the channel.
@@ -154,12 +231,7 @@ func (h *Hub) broadcastLocally(channel string, payload []byte) {
 	subscribers, exists := h.channels[channel]
 	if exists {
 		for client := range subscribers {
-			select {
-			case client.send <- payload:
-				slog.Debug("ws event delivered to local subscriber", "user_id", client.userID, "channel", channel)
-			default:
-				slog.Warn("ws client send buffer full, dropping event", "user_id", client.userID, "channel", channel)
-			}
+			client.enqueue(payload)
 		}
 	}
 }
@@ -285,8 +357,11 @@ func (h *Hub) listenRedisPubSub() {
 
 // ServeWS handles GET /api/ws endpoint.
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
-	// Authenticate JWT token from query param or header or cookie
-	tokenString := r.URL.Query().Get("token")
+	// Authenticate JWT token: 1. Cookie, 2. Auth header, 3. Query param (compatibility fallback)
+	var tokenString string
+	if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
+		tokenString = cookie.Value
+	}
 	if tokenString == "" {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader != "" {
@@ -297,9 +372,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if tokenString == "" {
-		if cookie, err := r.Cookie("forgelab_access_token"); err == nil {
-			tokenString = cookie.Value
-		}
+		tokenString = r.URL.Query().Get("token")
 	}
 
 	if tokenString == "" {
@@ -317,6 +390,12 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("ws authentication success", "user_id", claims.UserID)
 
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     h.CheckOrigin,
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("ws upgrade failed", "error", err, "remote_addr", r.RemoteAddr)
@@ -330,6 +409,8 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		userEmail:     claims.Email,
 		subscriptions: make(map[string]bool),
 		send:          make(chan []byte, 256),
+		pending:       make([][]byte, 0, 32),
+		notify:        make(chan struct{}, 1),
 	}
 
 	h.register <- client
@@ -373,7 +454,11 @@ func (c *Client) readPump() {
 			c.sendEvent(&EventMessage{Type: "pong"})
 
 		case "subscribe":
-			c.handleSubscribe(req.Channel)
+			lastSeq := req.LastSequence
+			if lastSeq == 0 && req.AfterSequence > 0 {
+				lastSeq = req.AfterSequence
+			}
+			c.handleSubscribe(req.Channel, lastSeq)
 
 		case "unsubscribe":
 			c.handleUnsubscribe(req.Channel)
@@ -393,27 +478,28 @@ func (c *Client) writePump() {
 
 	for {
 		select {
-		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		case msg, ok := <-c.send:
 			if !ok {
 				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-
-			// Write primary message as an individual WebSocket TextMessage
-			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				slog.Warn("ws write failure", "user_id", c.userID, "error", err)
 				return
 			}
 
-			// Drain queued messages, writing EACH as an individual WebSocket TextMessage frame
-			n := len(c.send)
-			for i := 0; i < n; i++ {
-				msg, ok := <-c.send
-				if !ok {
-					_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-					return
-				}
+		case <-c.notify:
+			c.mu.Lock()
+			if c.closed || len(c.pending) == 0 {
+				c.mu.Unlock()
+				continue
+			}
+			messages := c.pending
+			c.pending = nil
+			c.mu.Unlock()
+
+			for _, msg := range messages {
 				c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 					slog.Warn("ws write failure", "user_id", c.userID, "error", err)
@@ -431,8 +517,13 @@ func (c *Client) writePump() {
 	}
 }
 
-func (c *Client) handleSubscribe(channel string) {
-	slog.Info("ws subscription requested", "user_id", c.userID, "channel", channel)
+func (c *Client) handleSubscribe(channel string, lastSequence ...int64) {
+	var lastSeq int64
+	if len(lastSequence) > 0 {
+		lastSeq = lastSequence[0]
+	}
+	slog.Info("ws subscription requested", "user_id", c.userID, "channel", channel, "last_sequence", lastSeq)
+
 
 	if channel == "" {
 		slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "channel is required")
@@ -538,9 +629,52 @@ func (c *Client) handleSubscribe(channel string) {
 
 	slog.Info("ws subscription authorized", "user_id", c.userID, "channel", channel, "project_id", projectID)
 	c.sendEvent(&EventMessage{
-		Type:    "subscribed",
-		Channel: channel,
+		Type:     "subscribed",
+		Channel:  channel,
+		Sequence: lastSeq,
 	})
+
+	// Replay missed log events if lastSeq > 0 and deploymentService is available
+	if channelType == "deployment" && lastSeq > 0 && c.hub.deploymentService != nil {
+		var serviceUUIDPtr *uuid.UUID
+		if strings.Contains(channel, ":service:") {
+			subParts := strings.Split(channel, ":")
+			if len(subParts) == 4 {
+				if parsedSvcID, err := uuid.Parse(subParts[3]); err == nil {
+					serviceUUIDPtr = &parsedSvcID
+				}
+			}
+		}
+		replayLogs, err := c.hub.deploymentService.GetDeploymentLogsAfter(ctx, resourceID, serviceUUIDPtr, lastSeq, 2000)
+		if err == nil && len(replayLogs) > 0 {
+			slog.Info("replaying missed logs for reconnected subscriber",
+				"user_id", c.userID,
+				"channel", channel,
+				"last_sequence", lastSeq,
+				"count", len(replayLogs),
+			)
+			for _, l := range replayLogs {
+				logData := map[string]interface{}{
+					"id":            l.ID,
+					"sequence":      l.ID,
+					"deployment_id": l.DeploymentID.String(),
+					"timestamp":     l.Timestamp.Format(time.RFC3339Nano),
+					"phase":         l.Phase,
+					"stream":        l.Stream,
+					"message":       l.Message,
+				}
+				if l.ServiceID != nil {
+					logData["service_id"] = l.ServiceID.String()
+				}
+				c.sendEvent(&EventMessage{
+					Type:     "log",
+					Channel:  channel,
+					Sequence: l.ID,
+					Data:     logData,
+				})
+			}
+		}
+	}
 }
 
 func (c *Client) handleUnsubscribe(channel string) {
@@ -565,11 +699,7 @@ func (c *Client) sendEvent(event *EventMessage) {
 	if err != nil {
 		return
 	}
-	select {
-	case c.send <- payload:
-	default:
-		slog.Warn("ws client send buffer full during direct event", "user_id", c.userID)
-	}
+	c.enqueue(payload)
 }
 
 func (c *Client) sendError(code, message string) {
@@ -579,3 +709,4 @@ func (c *Client) sendError(code, message string) {
 		Message: message,
 	})
 }
+

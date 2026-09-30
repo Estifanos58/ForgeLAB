@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -448,6 +450,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			project.Services = append(project.Services, svc)
 		}
 
+	s.populateProjectPreviewURL(project)
 	slog.Info("project created", "project_id", project.ID, "name", project.Name, "owner_id", ownerID)
 	return project, nil
 }
@@ -523,6 +526,7 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID) ([
 			}
 			p.Services = svcs
 		}
+		s.populateProjectPreviewURL(p)
 		projects = append(projects, p)
 	}
 
@@ -627,6 +631,7 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 		return nil, fmt.Errorf("failed to update project: %w", err)
 	}
 
+	s.populateProjectPreviewURL(project)
 	slog.Info("project updated", "project_id", project.ID)
 	return project, nil
 }
@@ -703,6 +708,7 @@ func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, pro
 		}
 		p.Services = svcs
 	}
+	s.populateProjectPreviewURL(p)
 	return p, nil
 }
 
@@ -725,6 +731,53 @@ func (s *ProjectService) UpdateProjectPort(ctx context.Context, projectID uuid.U
 		return nil, fmt.Errorf("failed to update project port: %w", err)
 	}
 	return s.GetProjectByIDWithoutOwnership(ctx, projectID)
+}
+
+func (s *ProjectService) resolveAuthoritativeHost() string {
+	if host := os.Getenv("FORGELAB_PUBLIC_HOST"); host != "" {
+		return host
+	}
+	if host := os.Getenv("PUBLIC_HOST"); host != "" {
+		return host
+	}
+	if frontendURL := os.Getenv("FRONTEND_URL"); frontendURL != "" {
+		if u, err := url.Parse(frontendURL); err == nil && u.Hostname() != "" {
+			return u.Hostname()
+		}
+	}
+	return "localhost"
+}
+
+func (s *ProjectService) populateProjectPreviewURL(p *models.Project) {
+	if p == nil {
+		return
+	}
+	publicHost := s.resolveAuthoritativeHost()
+
+	var primarySvcURL *string
+	var frontendSvcURL *string
+
+	for _, svc := range p.Services {
+		if svc.HostPort != nil && *svc.HostPort > 0 && svc.PublicExposed {
+			urlStr := fmt.Sprintf("http://%s:%d", publicHost, *svc.HostPort)
+			svc.PreviewURL = &urlStr
+
+			if svc.Role == models.RoleFrontend && frontendSvcURL == nil {
+				frontendSvcURL = &urlStr
+			} else if primarySvcURL == nil {
+				primarySvcURL = &urlStr
+			}
+		}
+	}
+
+	if frontendSvcURL != nil {
+		p.PreviewURL = frontendSvcURL
+	} else if primarySvcURL != nil {
+		p.PreviewURL = primarySvcURL
+	} else if p.Port != nil && *p.Port > 0 {
+		urlStr := fmt.Sprintf("http://%s:%d", publicHost, *p.Port)
+		p.PreviewURL = &urlStr
+	}
 }
 
 func generateSlug(name string) string {

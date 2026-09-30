@@ -66,6 +66,7 @@ type Project struct {
 	Status              string     `json:"status"`          // inactive, deploying, running, partially_running, stopped, failed
 	CurrentDeploymentID *uuid.UUID `json:"current_deployment_id"`
 	Port                *int       `json:"port"`
+	PreviewURL          *string    `json:"preview_url,omitempty"`
 	Services            []*Service `json:"services,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`
