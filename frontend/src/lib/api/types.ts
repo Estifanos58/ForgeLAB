@@ -65,6 +65,10 @@ export interface Service {
   image_tag?: string | null;
   current_service_deployment_id?: string | null;
   preview_url?: string | null;
+  cpu_millicores?: number;
+  memory_mb?: number;
+  pids_limit?: number;
+  ephemeral_storage_mb?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -89,6 +93,13 @@ export interface ServiceDeployment {
   build_context?: string;
   health_strategy?: string;
   health_check_path?: string | null;
+  cpu_millicores?: number;
+  memory_mb?: number;
+  pids_limit?: number;
+  ephemeral_storage_mb?: number | null;
+  image_digest?: string | null;
+  source_revision?: string | null;
+  env_config_hash?: string | null;
   started_at?: string | null;
   built_at?: string | null;
   deployed_at?: string | null;
@@ -218,9 +229,11 @@ export interface DeploymentLog {
 export interface EnvVar {
   id: string;
   project_id: string;
+  service_id?: string | null;
   key: string;
   value: string;
   is_secret: boolean;
+  scope?: 'runtime' | 'build' | 'both';
   created_at: string;
   updated_at: string;
 }
@@ -265,6 +278,15 @@ export interface SetEnvInput {
   key: string;
   value: string;
   is_secret: boolean;
+  service_id?: string | null;
+  scope?: 'runtime' | 'build' | 'both';
+}
+
+export interface UpdateServiceResourcesInput {
+  cpu_millicores?: number;
+  memory_mb?: number;
+  pids_limit?: number;
+  ephemeral_storage_mb?: number | null;
 }
 
 export interface ApiError {

@@ -112,7 +112,14 @@ func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.secretService.DeleteEnvVar(r.Context(), projectID, userID, key)
+	var serviceID *uuid.UUID
+	if svcIDStr := r.URL.Query().Get("service_id"); svcIDStr != "" {
+		if parsed, err := uuid.Parse(svcIDStr); err == nil {
+			serviceID = &parsed
+		}
+	}
+
+	err = h.secretService.DeleteEnvVar(r.Context(), projectID, userID, key, serviceID)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")

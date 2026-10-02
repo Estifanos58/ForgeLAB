@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -226,6 +227,7 @@ func (h *ServiceHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	if h.deployQueue != nil {
 		if err := h.deployQueue.EnqueueServiceDeployment(r.Context(), deployment.ID); err != nil {
+			_ = h.deploymentService.FailServiceDeployment(r.Context(), deployment.ID, "failed to enqueue deployment job: "+err.Error())
 			writeError(w, http.StatusInternalServerError, "failed to enqueue deployment job")
 			return
 		}
@@ -303,6 +305,7 @@ func (h *ServiceHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 
 	if h.deployQueue != nil {
 		if err := h.deployQueue.EnqueueServiceDeployment(r.Context(), rollbackDeploy.ID); err != nil {
+			_ = h.deploymentService.FailServiceDeployment(r.Context(), rollbackDeploy.ID, "failed to enqueue rollback job: "+err.Error())
 			writeError(w, http.StatusInternalServerError, "failed to enqueue rollback job")
 			return
 		}
@@ -470,5 +473,103 @@ func (h *ServiceHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, logs)
+}
+
+// UpdateResourcesInput represents the JSON body for configuring service resource limits.
+type UpdateResourcesInput struct {
+	CpuMillicores      *int `json:"cpu_millicores,omitempty"`
+	MemoryMB           *int `json:"memory_mb,omitempty"`
+	PidsLimit          *int `json:"pids_limit,omitempty"`
+	EphemeralStorageMB *int `json:"ephemeral_storage_mb,omitempty"`
+}
+
+// UpdateResources handles PATCH /api/projects/{id}/services/{serviceId}/resources
+func (h *ServiceHandler) UpdateResources(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service ID")
+		return
+	}
+
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to specified project")
+		return
+	}
+
+	var input UpdateResourcesInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	cfg := svc.ResourceConfig
+	if input.CpuMillicores != nil {
+		if *input.CpuMillicores < 100 || *input.CpuMillicores > 64000 {
+			writeError(w, http.StatusBadRequest, "cpu_millicores must be between 100 and 64000 (0.1 to 64 cores)")
+			return
+		}
+		cfg.CpuMillicores = *input.CpuMillicores
+	}
+	if input.MemoryMB != nil {
+		if *input.MemoryMB < 64 || *input.MemoryMB > 524288 {
+			writeError(w, http.StatusBadRequest, "memory_mb must be between 64 and 524288 (64MB to 512GB)")
+			return
+		}
+		cfg.MemoryMB = *input.MemoryMB
+	}
+	if input.PidsLimit != nil {
+		if *input.PidsLimit < 16 || *input.PidsLimit > 32768 {
+			writeError(w, http.StatusBadRequest, "pids_limit must be between 16 and 32768")
+			return
+		}
+		cfg.PidsLimit = *input.PidsLimit
+	}
+	if input.EphemeralStorageMB != nil {
+		cfg.EphemeralStorageMB = input.EphemeralStorageMB
+	}
+
+	if err := h.serviceService.UpdateServiceResources(r.Context(), serviceID, cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update service resources: "+err.Error())
+		return
+	}
+
+	svc.ResourceConfig = cfg
+	writeJSON(w, http.StatusOK, svc)
 }
 

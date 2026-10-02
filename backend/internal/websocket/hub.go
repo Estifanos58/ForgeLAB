@@ -64,20 +64,33 @@ type DeploymentResolver interface {
 	GetDeploymentLogsAfter(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error)
 }
 
+// ServiceDeploymentResolver defines the interface for resolving service deployments and their logs for WS replay.
+type ServiceDeploymentResolver interface {
+	GetServiceDeployment(ctx context.Context, id uuid.UUID) (*models.ServiceDeployment, error)
+	GetServiceDeploymentLogsAfter(ctx context.Context, serviceDeploymentID uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error)
+}
+
+// ServiceResolver defines the interface for resolving service metadata (service → project mapping).
+type ServiceResolver interface {
+	GetServiceByID(ctx context.Context, serviceID uuid.UUID) (*models.Service, error)
+}
+
 type Hub struct {
-	nodeID            string
-	clients           map[*Client]bool
-	channels          map[string]map[*Client]bool
-	register          chan *Client
-	unregister        chan *Client
-	mu                sync.RWMutex
-	jwtManager        *auth.JWTManager
-	projectService    ProjectAuthorizer
-	deploymentService DeploymentResolver
-	redisClient       *redis.Client
-	allowedOrigins    []string
-	ctx               context.Context
-	cancel            context.CancelFunc
+	nodeID                   string
+	clients                  map[*Client]bool
+	channels                 map[string]map[*Client]bool
+	register                 chan *Client
+	unregister               chan *Client
+	mu                       sync.RWMutex
+	jwtManager               *auth.JWTManager
+	projectService           ProjectAuthorizer
+	deploymentService        DeploymentResolver
+	serviceDeploymentService ServiceDeploymentResolver
+	serviceService           ServiceResolver
+	redisClient              *redis.Client
+	allowedOrigins           []string
+	ctx                      context.Context
+	cancel                   context.CancelFunc
 }
 
 func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deploymentService DeploymentResolver, redisClient *redis.Client, allowedOrigins ...string) *Hub {
@@ -102,6 +115,20 @@ func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deplo
 		go h.listenRedisPubSub()
 	}
 	return h
+}
+
+// SetServiceDeploymentResolver sets the resolver used for service-deployment channel authorization and replay.
+func (h *Hub) SetServiceDeploymentResolver(resolver ServiceDeploymentResolver) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.serviceDeploymentService = resolver
+}
+
+// SetServiceResolver sets the resolver used for service → project mapping during authorization.
+func (h *Hub) SetServiceResolver(resolver ServiceResolver) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.serviceService = resolver
 }
 
 // SetAllowedOrigins configures the allowed origin domains for WebSocket connections.
@@ -596,6 +623,26 @@ func (c *Client) handleSubscribe(channel string, lastSequence ...int64) {
 			return
 		}
 		projectID = deployment.ProjectID
+	} else if channelType == "service-deployment" {
+		// Authorize service-deployment channels: resolve service deployment → service → project → owner
+		if c.hub.serviceDeploymentService == nil || c.hub.serviceService == nil {
+			slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "service-deployment resolver unavailable")
+			c.sendError("SERVICE_UNAVAILABLE", "service-deployment service unavailable")
+			return
+		}
+		sd, err := c.hub.serviceDeploymentService.GetServiceDeployment(ctx, resourceID)
+		if err != nil {
+			slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "service deployment not found")
+			c.sendError("UNAUTHORIZED", "service deployment not found")
+			return
+		}
+		svc, err := c.hub.serviceService.GetServiceByID(ctx, sd.ServiceID)
+		if err != nil {
+			slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "parent service not found")
+			c.sendError("UNAUTHORIZED", "parent service not found")
+			return
+		}
+		projectID = svc.ProjectID
 	} else {
 		slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "unknown channel type")
 		c.sendError("INVALID_CHANNEL", "unknown channel type")
@@ -634,7 +681,7 @@ func (c *Client) handleSubscribe(channel string, lastSequence ...int64) {
 		Sequence: lastSeq,
 	})
 
-	// Replay missed log events if lastSeq > 0 and deploymentService is available
+	// Replay missed log events if lastSeq > 0 and service is available
 	if channelType == "deployment" && lastSeq > 0 && c.hub.deploymentService != nil {
 		var serviceUUIDPtr *uuid.UUID
 		if strings.Contains(channel, ":service:") {
@@ -665,6 +712,42 @@ func (c *Client) handleSubscribe(channel string, lastSequence ...int64) {
 				}
 				if l.ServiceID != nil {
 					logData["service_id"] = l.ServiceID.String()
+				}
+				c.sendEvent(&EventMessage{
+					Type:     "log",
+					Channel:  channel,
+					Sequence: l.ID,
+					Data:     logData,
+				})
+			}
+		}
+	}
+
+	// Replay missed logs for service-deployment channels
+	if channelType == "service-deployment" && lastSeq > 0 && c.hub.serviceDeploymentService != nil {
+		replayLogs, err := c.hub.serviceDeploymentService.GetServiceDeploymentLogsAfter(ctx, resourceID, lastSeq, 2000)
+		if err == nil && len(replayLogs) > 0 {
+			slog.Info("replaying missed service-deployment logs",
+				"user_id", c.userID,
+				"channel", channel,
+				"last_sequence", lastSeq,
+				"count", len(replayLogs),
+			)
+			for _, l := range replayLogs {
+				logData := map[string]interface{}{
+					"id":                    l.ID,
+					"sequence":              l.ID,
+					"service_deployment_id": resourceID.String(),
+					"timestamp":             l.Timestamp.Format(time.RFC3339Nano),
+					"phase":                 l.Phase,
+					"stream":                l.Stream,
+					"message":               l.Message,
+				}
+				if l.ServiceID != nil {
+					logData["service_id"] = l.ServiceID.String()
+				}
+				if l.DeploymentID != nil {
+					logData["deployment_id"] = l.DeploymentID.String()
 				}
 				c.sendEvent(&EventMessage{
 					Type:     "log",

@@ -124,6 +124,11 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 	return svc, nil
 }
 
+// GetServiceByID is an alias for GetService satisfying the websocket.ServiceResolver interface.
+func (s *ServiceService) GetServiceByID(ctx context.Context, serviceID uuid.UUID) (*models.Service, error) {
+	return s.GetService(ctx, serviceID)
+}
+
 func populateServicePreviewURL(svc *models.Service) {
 	if svc == nil {
 		return
@@ -292,7 +297,7 @@ func (s *ServiceService) PromoteServiceDeployment(
 	return nil
 }
 
-// CalculateProjectStatus derives overall project state from individual services.
+// CalculateProjectStatus derives overall project state from individual service coarse statuses.
 func CalculateProjectStatus(services []*models.Service) string {
 	if len(services) == 0 {
 		return models.ProjectStatusInactive
@@ -301,14 +306,16 @@ func CalculateProjectStatus(services []*models.Service) string {
 	var runningCount, failedCount, stoppedCount, deployingCount, inactiveCount int
 
 	for _, svc := range services {
-		switch svc.Status {
-		case models.ProjectStatusRunning:
+		switch {
+		case svc.Status == models.ProjectStatusRunning:
 			runningCount++
-		case models.ProjectStatusDeploying:
+		case svc.Status == models.ProjectStatusDeploying ||
+			models.IsDeploymentActiveStatus(svc.Status):
+			// Count queued, cloning, building, starting, health_checking as deploying
 			deployingCount++
-		case models.ProjectStatusFailed:
+		case svc.Status == models.ProjectStatusFailed || svc.Status == models.DeployStatusCrashed:
 			failedCount++
-		case models.ProjectStatusStopped:
+		case svc.Status == models.ProjectStatusStopped:
 			stoppedCount++
 		default:
 			inactiveCount++
@@ -347,3 +354,28 @@ func CalculateProjectStatus(services []*models.Service) string {
 
 	return models.ProjectStatusInactive
 }
+
+// UpdateServiceResources updates the configurable resource limits for a service.
+func (s *ServiceService) UpdateServiceResources(ctx context.Context, serviceID uuid.UUID, cfg models.ResourceConfig) error {
+	if s.db == nil {
+		return nil
+	}
+
+	_, err := s.db.Exec(ctx,
+		`UPDATE services SET
+		 cpu_millicores = $2,
+		 memory_mb = $3,
+		 pids_limit = $4,
+		 ephemeral_storage_mb = $5,
+		 updated_at = NOW()
+		 WHERE id = $1`,
+		serviceID, cfg.CpuMillicores, cfg.MemoryMB, cfg.PidsLimit, cfg.EphemeralStorageMB,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update service resources: %w", err)
+	}
+
+	slog.Info("service resources updated", "service_id", serviceID, "cpu", cfg.CpuMillicores, "mem", cfg.MemoryMB, "pids", cfg.PidsLimit)
+	return nil
+}
+

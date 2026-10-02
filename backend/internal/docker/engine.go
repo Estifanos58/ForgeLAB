@@ -34,18 +34,19 @@ import (
 )
 
 type Engine struct {
-	dockerClient      *client.Client
-	projectService    *services.ProjectService
-	deploymentService *services.DeploymentService
-	secretService     *services.SecretService
-	sourceService     *services.SourceService
-	githubService     *services.GitHubService
-	serviceService    *services.ServiceService
-	portManager       *network.PortManager
-	pathValidator     *security.PathValidator
-	wsHub             *ws.Hub
-	workDir           string
-	localBuildMode    string
+	dockerClient       *client.Client
+	projectService     *services.ProjectService
+	deploymentService  *services.DeploymentService
+	secretService      *services.SecretService
+	sourceService      *services.SourceService
+	githubService      *services.GitHubService
+	serviceService     *services.ServiceService
+	portManager        *network.PortManager
+	pathValidator      *security.PathValidator
+	wsHub              *ws.Hub
+	workDir            string
+	localBuildMode     string
+	activeLogCollectors sync.Map // map[string]context.CancelFunc — tracks running log collector goroutines
 }
 
 func NewEngine(
@@ -205,7 +206,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	redactor := logging.NewLogRedactor()
 	if e.secretService != nil {
-		_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID)
+		_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID, &service.ID, "")
 		if err == nil {
 			redactor.SetSecrets(secrets)
 		}
@@ -229,6 +230,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				"stream":                persistedLog.Stream,
 				"message":               persistedLog.Message,
 			}
+
+			// ALWAYS publish to the canonical service-deployment channel (works for independent AND release deploys)
+			sdChannel := fmt.Sprintf("service-deployment:%s", serviceDeploy.ID.String())
+			_ = e.wsHub.PublishEvent(sdChannel, &ws.EventMessage{
+				Type:    "log",
+				Channel: sdChannel,
+				Data:    data,
+			})
+
+			// If part of a release, also publish to the release-scoped channels
 			if serviceDeploy.DeploymentID != nil {
 				data["deployment_id"] = serviceDeploy.DeploymentID.String()
 				serviceChannel := fmt.Sprintf("deployment:%s:service:%s", serviceDeploy.DeploymentID.String(), service.ID.String())
@@ -417,10 +428,21 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Building Docker image '%s'...", svcTag))
+
+	buildArgs := make(map[string]*string)
+	if e.secretService != nil {
+		buildEnv, _, _ := e.secretService.GetDecryptedEnvMap(ctx, project.ID, &service.ID, models.EnvScopeBuild)
+		for k, v := range buildEnv {
+			val := v
+			buildArgs[k] = &val
+		}
+	}
+
 	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
 	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, tarArchive, types.ImageBuildOptions{
 		Tags:       []string{svcTag},
 		Dockerfile: relDockerPath,
+		BuildArgs:  buildArgs,
 		Remove:     true,
 	})
 	tarArchive.Close()
@@ -443,6 +465,19 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 	buildResponse.Body.Close()
 	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Docker image '%s' built successfully.", svcTag))
+
+	// Inspect image to record immutable digest for rollback / reproducibility
+	if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, svcTag); err == nil {
+		var digest string
+		if len(inspect.RepoDigests) > 0 {
+			digest = inspect.RepoDigests[0]
+		} else if inspect.ID != "" {
+			digest = inspect.ID
+		}
+		if digest != "" && e.deploymentService != nil {
+			_ = e.deploymentService.UpdateServiceDeploymentImageDigest(ctx, serviceDeploy.ID, digest)
+		}
+	}
 
 	// 3. Container Startup
 	emitStatus(models.DeployStatusStarting, nil, nil)
@@ -475,7 +510,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	var envMap map[string]string
 	if e.secretService != nil {
-		envMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID)
+		envMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, &service.ID, models.EnvScopeRuntime)
 	}
 	svcEnv := make([]string, 0, len(envMap)+len(allProjectServices)*3+2)
 	for k, v := range envMap {
@@ -525,15 +560,27 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		containerConfig.Labels["forgelab.deployment_id"] = serviceDeploy.DeploymentID.String()
 	}
 
-	pidsLimit := int64(256)
+	// Use snapshotted resource configuration from the service deployment, not hard-coded values
+	cpuNano := int64(serviceDeploy.CpuMillicores) * 1_000_000 // millicores -> nanocores
+	memBytes := int64(serviceDeploy.MemoryMB) * 1024 * 1024    // MB -> bytes
+	pidsLimit := int64(serviceDeploy.PidsLimit)
+	if cpuNano <= 0 {
+		cpuNano = 1_000_000_000
+	}
+	if memBytes <= 0 {
+		memBytes = 1024 * 1024 * 1024
+	}
+	if pidsLimit <= 0 {
+		pidsLimit = 256
+	}
 	hostConfig := &container.HostConfig{
 		PortBindings: portBindings,
 		RestartPolicy: container.RestartPolicy{
 			Name: "unless-stopped",
 		},
 		Resources: container.Resources{
-			Memory:    1024 * 1024 * 1024,
-			NanoCPUs:  1_000_000_000,
+			Memory:    memBytes,
+			NanoCPUs:  cpuNano,
 			PidsLimit: &pidsLimit,
 		},
 	}
@@ -573,6 +620,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started for service '%s'.", containerID[:12], service.Name))
 
+	// Start runtime log collector — continuously reads container stdout/stderr
+	e.startRuntimeLogCollector(ctx, containerID, serviceDeploy.ID, service.ID, project.ID, redactor, emitLog)
+
 	// 4. Health Checking
 	emitStatus(models.DeployStatusHealthChecking, hostPort, nil)
 	emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Verifying health for service '%s'...", service.Name))
@@ -600,6 +650,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	if !svcHealthy {
 		// Health check failed - ENFORCE SAFETY INVARIANT:
 		// Destroy newly spawned broken container and preserve previously healthy container intact!
+		e.StopLogCollector(serviceDeploy.ID)
 		_ = e.dockerClient.ContainerStop(ctx, containerID, container.StopOptions{})
 		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
 		if hostPort != nil {
@@ -739,10 +790,15 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		errList    []string
 	)
 
+	maxConcurrent := 4
+	sem := make(chan struct{}, maxConcurrent)
+
 	for _, sd := range svcDeploys {
 		wg.Add(1)
 		go func(sdItem *models.ServiceDeployment) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			if execErr := e.ExecuteServiceDeployment(ctx, sdItem.ID); execErr != nil {
 				mu.Lock()
 				allHealthy = false
@@ -826,7 +882,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	}
 
 	if e.secretService != nil {
-		_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID)
+		_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, "")
 		if err == nil {
 			redactor.SetSecrets(secrets)
 		}
@@ -923,9 +979,19 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer buildCancel()
 
+	buildArgs := make(map[string]*string)
+	if e.secretService != nil {
+		buildEnv, _, _ := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeBuild)
+		for k, v := range buildEnv {
+			val := v
+			buildArgs[k] = &val
+		}
+	}
+
 	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, tarStream, types.ImageBuildOptions{
 		Tags:       []string{*deployment.ImageTag},
 		Dockerfile: relDockerPath,
+		BuildArgs:  buildArgs,
 		Remove:     true,
 	})
 	if err != nil {
@@ -969,7 +1035,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 
 	var envMap map[string]string
 	if e.secretService != nil {
-		envMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID)
+		envMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeRuntime)
 	}
 	envSlice := make([]string, 0, len(envMap)+1)
 	for k, v := range envMap {
@@ -1088,6 +1154,116 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	return nil
 }
 
+
+// startRuntimeLogCollector starts a background goroutine that reads container stdout/stderr
+// from the Docker daemon and persists + publishes each line. It exits cleanly when the
+// container exits (io.EOF) or the context is cancelled.
+func (e *Engine) startRuntimeLogCollector(parentCtx context.Context, containerID string, serviceDeployID, serviceID, projectID uuid.UUID, redactor *logging.LogRedactor, emitLog func(phase, stream, message string)) {
+	logCtx, logCancel := context.WithCancel(context.Background())
+	collectorKey := serviceDeployID.String()
+
+	// Cancel any previous collector for this service deployment
+	if prev, loaded := e.activeLogCollectors.LoadAndDelete(collectorKey); loaded {
+		if cancelFn, ok := prev.(context.CancelFunc); ok {
+			cancelFn()
+		}
+	}
+	e.activeLogCollectors.Store(collectorKey, logCancel)
+
+	go func() {
+		defer func() {
+			e.activeLogCollectors.Delete(collectorKey)
+			logCancel()
+		}()
+
+		reader, err := e.dockerClient.ContainerLogs(logCtx, containerID, container.LogsOptions{
+			ShowStdout: true,
+			ShowStderr: true,
+			Follow:     true,
+			Timestamps: true,
+			Since:      time.Now().Add(-2 * time.Second).Format(time.RFC3339),
+		})
+		if err != nil {
+			slog.Error("failed to attach runtime log collector", "container", containerID[:12], "error", err)
+			return
+		}
+		defer reader.Close()
+
+		// Docker multiplexed stream: 8-byte header per frame
+		// [0]: stream type (1=stdout, 2=stderr), [4-7]: big-endian uint32 payload size
+		hdr := make([]byte, 8)
+		for {
+			select {
+			case <-logCtx.Done():
+				return
+			default:
+			}
+
+			_, err := io.ReadFull(reader, hdr)
+			if err != nil {
+				if err == io.EOF || errors.Is(err, context.Canceled) {
+					slog.Info("runtime log collector ended", "container", containerID[:12], "service_deployment_id", serviceDeployID)
+				} else {
+					slog.Warn("runtime log collector read error", "container", containerID[:12], "error", err)
+				}
+				return
+			}
+
+			streamType := hdr[0]
+			payloadSize := int(hdr[4])<<24 | int(hdr[5])<<16 | int(hdr[6])<<8 | int(hdr[7])
+
+			if payloadSize <= 0 || payloadSize > 1024*1024 {
+				continue
+			}
+
+			payload := make([]byte, payloadSize)
+			_, err = io.ReadFull(reader, payload)
+			if err != nil {
+				return
+			}
+
+			line := strings.TrimRight(string(payload), "\r\n")
+			if line == "" {
+				continue
+			}
+
+			// Strip Docker timestamp prefix if present (format: "2006-01-02T15:04:05.999999999Z ")
+			if len(line) > 31 && line[4] == '-' && line[10] == 'T' {
+				if spaceIdx := strings.IndexByte(line, ' '); spaceIdx > 20 && spaceIdx < 40 {
+					line = line[spaceIdx+1:]
+				}
+			}
+
+			stream := models.LogStreamStdout
+			if streamType == 2 {
+				stream = models.LogStreamStderr
+			}
+
+			emitLog(models.LogPhaseRuntime, stream, line)
+		}
+	}()
+}
+
+// StopLogCollector stops the runtime log collector for a specific service deployment.
+func (e *Engine) StopLogCollector(serviceDeployID uuid.UUID) {
+	if cancelFn, loaded := e.activeLogCollectors.LoadAndDelete(serviceDeployID.String()); loaded {
+		if fn, ok := cancelFn.(context.CancelFunc); ok {
+			fn()
+		}
+	}
+}
+
+// StopAllLogCollectors stops all active runtime log collector goroutines (used during shutdown).
+func (e *Engine) StopAllLogCollectors() {
+	e.activeLogCollectors.Range(func(key, value interface{}) bool {
+		if cancelFn, ok := value.(context.CancelFunc); ok {
+			cancelFn()
+		}
+		e.activeLogCollectors.Delete(key)
+		return true
+	})
+	slog.Info("all runtime log collectors stopped")
+}
 
 // Helper methods for Docker Engine
 func (e *Engine) getProjectByID(ctx context.Context, projectID uuid.UUID) (*models.Project, error) {

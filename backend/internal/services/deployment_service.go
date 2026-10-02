@@ -125,7 +125,8 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	rows, err := tx.Query(ctx,
 		`SELECT id, name, role, build_strategy, build_command, start_command, runtime_type, internal_port,
 		        COALESCE(dockerfile_path, 'Dockerfile'), COALESCE(build_context, '.'),
-		        COALESCE(health_strategy, 'auto'), health_check_path
+		        COALESCE(health_strategy, 'auto'), health_check_path,
+		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
 		 FROM services WHERE project_id = $1`,
 		project.ID,
 	)
@@ -136,6 +137,7 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 			if err := rows.Scan(
 				&s.ID, &s.Name, &s.Role, &s.BuildStrategy, &s.BuildCommand, &s.StartCommand, &s.RuntimeType,
 				&s.InternalPort, &s.DockerfilePath, &s.BuildContext, &s.HealthStrategy, &s.HealthCheckPath,
+				&s.CpuMillicores, &s.MemoryMB, &s.PidsLimit, &s.EphemeralStorageMB,
 			); err == nil {
 				svcList = append(svcList, s)
 			}
@@ -157,17 +159,22 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 			`INSERT INTO service_deployments (
 				id, deployment_id, service_id, deploy_number, status, image_tag, build_strategy,
 				build_command, start_command, runtime_type, dockerfile_path, build_context, internal_port,
-				health_strategy, health_check_path, started_at, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+				health_strategy, health_check_path, cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
+				started_at, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
 			svcDeployID, deployment.ID, s.ID, svcDeployNum, models.DeployStatusQueued, svcTag,
 			s.BuildStrategy, s.BuildCommand, s.StartCommand, s.RuntimeType, s.DockerfilePath, s.BuildContext,
-			s.InternalPort, s.HealthStrategy, s.HealthCheckPath, now, now,
+			s.InternalPort, s.HealthStrategy, s.HealthCheckPath,
+			s.CpuMillicores, s.MemoryMB, s.PidsLimit, s.EphemeralStorageMB,
+			now, now,
 		); err != nil {
 			return nil, fmt.Errorf("failed to create service deployment record: %w", err)
 		}
+		// Set service status to deploying but do NOT update current_service_deployment_id.
+		// current_service_deployment_id must only be set on successful promotion.
 		if _, err := tx.Exec(ctx,
-			"UPDATE services SET status = $1, current_service_deployment_id = $2, updated_at = $3 WHERE id = $4",
-			models.DeployStatusQueued, svcDeployID, now, s.ID,
+			"UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ServiceStatusDeploying, now, s.ID,
 		); err != nil {
 			return nil, fmt.Errorf("failed to update service deployment status: %w", err)
 		}
@@ -285,6 +292,18 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	}
 	healthCheckPath := targetService.HealthCheckPath
 
+	// Snapshot resource config from the service
+	resConfig := targetService.ResourceConfig
+	if resConfig.CpuMillicores <= 0 {
+		resConfig.CpuMillicores = 1000
+	}
+	if resConfig.MemoryMB <= 0 {
+		resConfig.MemoryMB = 1024
+	}
+	if resConfig.PidsLimit <= 0 {
+		resConfig.PidsLimit = 256
+	}
+
 	svcDeployID := uuid.New()
 	serviceDeployment := &models.ServiceDeployment{
 		ID:              svcDeployID,
@@ -303,6 +322,7 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		BuildContext:    buildContext,
 		HealthStrategy:  healthStrategy,
 		HealthCheckPath: healthCheckPath,
+		ResourceConfig:  resConfig,
 		StartedAt:       &now,
 		CreatedAt:       now,
 	}
@@ -312,13 +332,15 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 			id, deployment_id, service_id, deploy_number, status, image_tag,
 			build_strategy, build_command, start_command, runtime_type,
 			dockerfile_path, build_context, internal_port, health_strategy, health_check_path,
+			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 			started_at, created_at
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
 		serviceDeployment.ID, serviceDeployment.DeploymentID, serviceDeployment.ServiceID,
 		serviceDeployment.DeployNumber, serviceDeployment.Status, serviceDeployment.ImageTag,
 		serviceDeployment.BuildStrategy, serviceDeployment.BuildCommand, serviceDeployment.StartCommand,
 		serviceDeployment.RuntimeType, serviceDeployment.DockerfilePath, serviceDeployment.BuildContext,
 		serviceDeployment.InternalPort, serviceDeployment.HealthStrategy, serviceDeployment.HealthCheckPath,
+		resConfig.CpuMillicores, resConfig.MemoryMB, resConfig.PidsLimit, resConfig.EphemeralStorageMB,
 		serviceDeployment.StartedAt, serviceDeployment.CreatedAt,
 	)
 	if err != nil {
@@ -328,10 +350,11 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		return nil, fmt.Errorf("failed to create service deployment: %w", err)
 	}
 
-	// Update targeted service status to queued/deploying and link pending service deployment
+	// Set service status to deploying but do NOT update current_service_deployment_id.
+	// current_service_deployment_id must only be updated on successful promotion.
 	_, err = tx.Exec(ctx,
-		"UPDATE services SET status = $1, current_service_deployment_id = $2, updated_at = $3 WHERE id = $4",
-		models.DeployStatusQueued, svcDeployID, now, targetService.ID,
+		"UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+		models.ServiceStatusDeploying, now, targetService.ID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update target service status: %w", err)
@@ -654,6 +677,7 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		BuildContext:    prev.BuildContext,
 		HealthStrategy:  prev.HealthStrategy,
 		HealthCheckPath: prev.HealthCheckPath,
+		ResourceConfig:  prev.ResourceConfig,
 		StartedAt:       &now,
 		CreatedAt:       now,
 	}
@@ -663,22 +687,25 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 			id, deployment_id, service_id, deploy_number, status, image_tag,
 			build_strategy, build_command, start_command, runtime_type,
 			dockerfile_path, build_context, internal_port, health_strategy, health_check_path,
+			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 			started_at, created_at
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
 		serviceDeployment.ID, serviceDeployment.DeploymentID, serviceDeployment.ServiceID,
 		serviceDeployment.DeployNumber, serviceDeployment.Status, serviceDeployment.ImageTag,
 		serviceDeployment.BuildStrategy, serviceDeployment.BuildCommand, serviceDeployment.StartCommand,
 		serviceDeployment.RuntimeType, serviceDeployment.DockerfilePath, serviceDeployment.BuildContext,
 		serviceDeployment.InternalPort, serviceDeployment.HealthStrategy, serviceDeployment.HealthCheckPath,
+		serviceDeployment.CpuMillicores, serviceDeployment.MemoryMB, serviceDeployment.PidsLimit, serviceDeployment.EphemeralStorageMB,
 		serviceDeployment.StartedAt, serviceDeployment.CreatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert rollback service deployment: %w", err)
 	}
 
+	// Set service to deploying but do NOT update current_service_deployment_id.
 	_, err = tx.Exec(ctx,
-		"UPDATE services SET status = $1, current_service_deployment_id = $2, updated_at = $3 WHERE id = $4",
-		models.DeployStatusQueued, svcDeployID, now, targetService.ID,
+		"UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+		models.ServiceStatusDeploying, now, targetService.ID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update service status for rollback: %w", err)
@@ -1167,3 +1194,127 @@ func resolvePublicHost() string {
 	}
 	return publicHost
 }
+
+// GetServiceDeploymentLogsAfter retrieves logs for a service deployment after a given log ID for WS replay.
+func (s *DeploymentService) GetServiceDeploymentLogsAfter(ctx context.Context, serviceDeploymentID uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
+	if s.db == nil {
+		return []*models.DeploymentLog{}, nil
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+		 FROM deployment_logs
+		 WHERE service_deployment_id = $1 AND id > $2
+		 ORDER BY id ASC LIMIT $3`,
+		serviceDeploymentID, afterID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get service deployment logs after sequence: %w", err)
+	}
+	defer rows.Close()
+
+	var logs []*models.DeploymentLog
+	for rows.Next() {
+		l := &models.DeploymentLog{}
+		if err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceDeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message); err != nil {
+			return nil, fmt.Errorf("failed to scan log: %w", err)
+		}
+		logs = append(logs, l)
+	}
+
+	if logs == nil {
+		logs = []*models.DeploymentLog{}
+	}
+
+	return logs, nil
+}
+
+// ReconcileOrphanedDeployments finds service deployments stuck in active states for too long
+// and marks them as failed. This prevents permanently-queued records when Redis enqueue fails.
+func (s *DeploymentService) ReconcileOrphanedDeployments(ctx context.Context, staleDuration time.Duration) (int, error) {
+	if s.db == nil {
+		return 0, nil
+	}
+
+	reason := "Reconciliation: deployment was stuck in an active state beyond the stale threshold"
+	tag, err := s.db.Exec(ctx,
+		`UPDATE service_deployments SET
+		 status = $1,
+		 failure_reason = $2,
+		 finished_at = NOW(),
+		 duration_ms = EXTRACT(EPOCH FROM (NOW() - COALESCE(started_at, created_at))) * 1000
+		 WHERE status IN ($3, $4, $5, $6, $7)
+		   AND created_at < NOW() - $8::interval`,
+		models.DeployStatusFailed, reason,
+		models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
+		models.DeployStatusStarting, models.DeployStatusHealthChecking,
+		staleDuration.String(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to reconcile orphaned deployments: %w", err)
+	}
+
+	count := int(tag.RowsAffected())
+	if count > 0 {
+		slog.Warn("reconciled orphaned service deployments", "count", count, "stale_threshold", staleDuration.String())
+	}
+	return count, nil
+}
+
+// UpdateServiceDeploymentImageDigest stores the immutable Docker image digest for rollback.
+func (s *DeploymentService) UpdateServiceDeploymentImageDigest(ctx context.Context, serviceDeploymentID uuid.UUID, digest string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE service_deployments SET image_digest = $2 WHERE id = $1`,
+		serviceDeploymentID, digest,
+	)
+	return err
+}
+
+// FailServiceDeployment marks a service deployment as failed and restores the service status.
+// Used when enqueue fails or for cleanup of zombie records.
+func (s *DeploymentService) FailServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID, reason string) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	now := time.Now()
+	_, err = tx.Exec(ctx,
+		`UPDATE service_deployments SET
+		 status = $2, failure_reason = $3, finished_at = $4,
+		 duration_ms = EXTRACT(EPOCH FROM ($4 - COALESCE(started_at, created_at))) * 1000
+		 WHERE id = $1 AND status NOT IN ($5, $6, $7, $8)`,
+		serviceDeploymentID, models.DeployStatusFailed, reason, now,
+		models.DeployStatusRunning, models.DeployStatusStopped, models.DeployStatusCrashed, models.DeployStatusFailed,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to fail service deployment: %w", err)
+	}
+
+	// Restore the service status: if it was running before this deploy, restore to running.
+	// Otherwise set to failed.
+	var serviceID uuid.UUID
+	_ = tx.QueryRow(ctx, "SELECT service_id FROM service_deployments WHERE id = $1", serviceDeploymentID).Scan(&serviceID)
+	if serviceID != uuid.Nil {
+		var prevRunningID *uuid.UUID
+		_ = tx.QueryRow(ctx,
+			`SELECT id FROM service_deployments WHERE service_id = $1 AND status = $2 AND id != $3 ORDER BY deploy_number DESC LIMIT 1`,
+			serviceID, models.DeployStatusRunning, serviceDeploymentID,
+		).Scan(&prevRunningID)
+
+		if prevRunningID != nil {
+			_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+				models.ServiceStatusRunning, now, serviceID)
+		} else {
+			_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+				models.ServiceStatusFailed, now, serviceID)
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+

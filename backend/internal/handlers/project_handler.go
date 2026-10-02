@@ -252,6 +252,9 @@ func (h *ProjectHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	if h.deployQueue != nil {
 		if err := h.deployQueue.EnqueueDeployment(r.Context(), deployment.ID); err != nil {
+			reason := "failed to enqueue deployment job: " + err.Error()
+			_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), deployment.ID, models.DeployStatusFailed, &reason)
+			_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
 			writeError(w, http.StatusInternalServerError, "failed to enqueue deployment job")
 			return
 		}

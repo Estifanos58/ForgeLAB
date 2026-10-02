@@ -22,6 +22,7 @@ import (
 	"github.com/forgelab/backend/internal/docker"
 	"github.com/forgelab/backend/internal/handlers"
 	"github.com/forgelab/backend/internal/middleware"
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/network"
 	"github.com/forgelab/backend/internal/queue"
 	"github.com/forgelab/backend/internal/security"
@@ -125,6 +126,8 @@ func main() {
 
 	// Initialize WebSocket Hub
 	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient, cfg.App.AllowedOriginsList()...)
+	wsHub.SetServiceDeploymentResolver(deploymentService)
+	wsHub.SetServiceResolver(serviceService)
 
 	// Initialize Docker Engine
 	dockerEngine := docker.NewEngine(
@@ -141,11 +144,26 @@ func main() {
 	)
 	dockerEngine.SetServiceService(serviceService)
 	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
+	defer dockerEngine.StopAllLogCollectors()
 
 	// Initialize Redis deployment queue & worker
 	var deployQueue *queue.DeploymentQueue
 	if redisClient != nil {
 		deployQueue = queue.NewDeploymentQueue(redisClient)
+		deployQueue.SetTerminalChecker(func(ctx context.Context, job queue.Job) (bool, error) {
+			if job.Type == queue.JobTypeServiceDeployment {
+				sd, err := deploymentService.GetServiceDeployment(ctx, job.ID)
+				if err != nil {
+					return false, err
+				}
+				return models.IsDeploymentTerminalStatus(sd.Status), nil
+			}
+			dep, err := deploymentService.GetDeployment(ctx, job.ID)
+			if err != nil {
+				return false, err
+			}
+			return models.IsDeploymentTerminalStatus(dep.Status), nil
+		})
 		deployQueue.StartJobWorker(ctx, func(workerCtx context.Context, job queue.Job) error {
 			if job.Type == queue.JobTypeServiceDeployment {
 				return dockerEngine.ExecuteServiceDeployment(workerCtx, job.ID)
@@ -154,6 +172,25 @@ func main() {
 		})
 		defer deployQueue.Stop()
 	}
+
+	// Startup reconciliation for orphaned deployments
+	if reconciled, err := deploymentService.ReconcileOrphanedDeployments(ctx, 30*time.Minute); err != nil {
+		slog.Warn("failed to reconcile orphaned deployments on startup", "error", err)
+	} else if reconciled > 0 {
+		slog.Info("reconciled orphaned deployments on startup", "count", reconciled)
+	}
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = deploymentService.ReconcileOrphanedDeployments(ctx, 30*time.Minute)
+			}
+		}
+	}()
 
 	// Initialize handlers
 	oauthService := services.NewOAuthService(cfg.Google, cfg.GitHub, redisClient)
@@ -260,6 +297,7 @@ func main() {
 				r.Post("/{id}/services/{serviceId}/stop", serviceHandler.Stop)
 				r.Post("/{id}/services/{serviceId}/start", serviceHandler.Start)
 				r.Post("/{id}/services/{serviceId}/restart", serviceHandler.Restart)
+				r.Patch("/{id}/services/{serviceId}/resources", serviceHandler.UpdateResources)
 
 				// Application Lifecycle Controls
 				r.Post("/{id}/stop", projectHandler.Stop)

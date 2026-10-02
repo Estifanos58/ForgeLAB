@@ -78,12 +78,16 @@ func ParseJob(item string) (Job, error) {
 	}, nil
 }
 
+// TerminalChecker is an optional function that reports whether a job is already in a terminal state.
+type TerminalChecker func(ctx context.Context, job Job) (bool, error)
+
 type DeploymentQueue struct {
-	client      *redis.Client
-	maxRetries  int
-	workerCount int
-	wg          sync.WaitGroup
-	cancel      context.CancelFunc
+	client          *redis.Client
+	maxRetries      int
+	workerCount     int
+	terminalChecker TerminalChecker
+	wg              sync.WaitGroup
+	cancel          context.CancelFunc
 }
 
 func NewDeploymentQueue(client *redis.Client) *DeploymentQueue {
@@ -92,6 +96,11 @@ func NewDeploymentQueue(client *redis.Client) *DeploymentQueue {
 		maxRetries:  DefaultMaxRetries,
 		workerCount: DefaultWorkerCount,
 	}
+}
+
+// SetTerminalChecker configures a callback to check if a job is in a terminal state before retrying.
+func (q *DeploymentQueue) SetTerminalChecker(tc TerminalChecker) {
+	q.terminalChecker = tc
 }
 
 // SetMaxRetries configures the maximum retry attempts for a failing deployment job.
@@ -257,7 +266,17 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 						q.client.LRem(context.Background(), ProcessingQueueKey, 1, itemStr)
 						q.client.Del(context.Background(), lockKey)
 
-						if int(attempts) < q.maxRetries {
+						isTerminal := false
+						if q.terminalChecker != nil {
+							checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
+							term, err := q.terminalChecker(checkCtx, job)
+							checkCancel()
+							if err == nil && term {
+								isTerminal = true
+							}
+						}
+
+						if !isTerminal && int(attempts) < q.maxRetries {
 							slog.Warn("re-queueing failed deployment for retry",
 								"job_id", job.ID,
 								"attempt", attempts,
@@ -266,10 +285,17 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 							time.Sleep(DefaultRetryBackoff)
 							_ = q.client.LPush(context.Background(), DeploymentQueueKey, itemStr)
 						} else {
-							slog.Error("deployment job exceeded max retry attempts; moving to dead-letter queue",
-								"job_id", job.ID,
-								"attempts", attempts,
-							)
+							if isTerminal {
+								slog.Info("deployment job is already in terminal state; skipping retry",
+									"job_id", job.ID,
+									"attempts", attempts,
+								)
+							} else {
+								slog.Error("deployment job exceeded max retry attempts; moving to dead-letter queue",
+									"job_id", job.ID,
+									"attempts", attempts,
+								)
+							}
 							_ = q.client.LPush(context.Background(), DeadLetterQueueKey, itemStr)
 						}
 					} else {

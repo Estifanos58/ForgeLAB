@@ -101,6 +101,23 @@ type BuildCandidate struct {
 	HealthStrategy  string  `json:"health_strategy"`
 }
 
+// ResourceConfig holds per-service resource limits for Docker container creation.
+type ResourceConfig struct {
+	CpuMillicores      int  `json:"cpu_millicores"`       // 1000 = 1 CPU core
+	MemoryMB           int  `json:"memory_mb"`            // megabytes
+	PidsLimit          int  `json:"pids_limit"`           // max PIDs in container
+	EphemeralStorageMB *int `json:"ephemeral_storage_mb"` // informational; not enforced on all hosts
+}
+
+// DefaultResourceConfig returns the default resource limits.
+func DefaultResourceConfig() ResourceConfig {
+	return ResourceConfig{
+		CpuMillicores: 1000,
+		MemoryMB:      1024,
+		PidsLimit:     256,
+	}
+}
+
 // Service represents an individual deployable service within a parent Project.
 type Service struct {
 	ID                         uuid.UUID        `json:"id"`
@@ -129,6 +146,7 @@ type Service struct {
 	ImageTag                   *string          `json:"image_tag"`
 	PreviewURL                 *string          `json:"preview_url,omitempty"`
 	CurrentServiceDeploymentID *uuid.UUID       `json:"current_service_deployment_id"`
+	ResourceConfig                              // embedded resource limits
 	CreatedAt                  time.Time        `json:"created_at"`
 	UpdatedAt                  time.Time        `json:"updated_at"`
 }
@@ -143,6 +161,7 @@ type ServiceDeployment struct {
 	DeployNumber    int        `json:"deploy_number"`
 	Status          string     `json:"status"`
 	ImageTag        *string    `json:"image_tag"`
+	ImageDigest     *string    `json:"image_digest,omitempty"`
 	ContainerID     *string    `json:"container_id"`
 	HostPort        *int       `json:"host_port"`
 	InternalPort    int        `json:"internal_port"`
@@ -155,6 +174,9 @@ type ServiceDeployment struct {
 	BuildContext    string     `json:"build_context,omitempty"`
 	HealthStrategy  string     `json:"health_strategy,omitempty"`
 	HealthCheckPath *string    `json:"health_check_path,omitempty"`
+	ResourceConfig                             // snapshotted resource limits at deploy time
+	SourceRevision  *string    `json:"source_revision,omitempty"`
+	EnvConfigHash   *string    `json:"env_config_hash,omitempty"`
 	StartedAt       *time.Time `json:"started_at"`
 	BuiltAt         *time.Time `json:"built_at"`
 	DeployedAt      *time.Time `json:"deployed_at"`
@@ -196,7 +218,7 @@ const (
 	HealthStrategyNone = "none"
 )
 
-// ProjectStatus constants
+// ProjectStatus constants (coarse states for display — derived from service states)
 const (
 	ProjectStatusInactive         = "inactive"
 	ProjectStatusDeploying        = "deploying"
@@ -205,6 +227,33 @@ const (
 	ProjectStatusStopped          = "stopped"
 	ProjectStatusFailed           = "failed"
 )
+
+// ServiceStatus constants (coarse service-level states)
+const (
+	ServiceStatusInactive  = "inactive"
+	ServiceStatusDeploying = "deploying"
+	ServiceStatusRunning   = "running"
+	ServiceStatusStopped   = "stopped"
+	ServiceStatusFailed    = "failed"
+)
+
+// IsDeploymentActiveStatus returns true for statuses representing an in-progress deployment.
+func IsDeploymentActiveStatus(status string) bool {
+	switch status {
+	case DeployStatusQueued, DeployStatusCloning, DeployStatusBuilding, DeployStatusStarting, DeployStatusHealthChecking:
+		return true
+	}
+	return false
+}
+
+// IsDeploymentTerminalStatus returns true for final/completed deployment statuses.
+func IsDeploymentTerminalStatus(status string) bool {
+	switch status {
+	case DeployStatusRunning, DeployStatusStopped, DeployStatusCrashed, DeployStatusFailed:
+		return true
+	}
+	return false
+}
 
 // Deployment represents a single deployment release for a project.
 // In multi-service projects, a deployment is a parent release containing service deployments.
@@ -255,9 +304,17 @@ type EnvironmentVariable struct {
 	Key            string     `json:"key"`
 	EncryptedValue []byte     `json:"-"` // Never serialized
 	IsSecret       bool       `json:"is_secret"`
+	Scope          string     `json:"scope"` // "runtime", "build", "both"
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
+
+// Environment variable scope constants
+const (
+	EnvScopeRuntime = "runtime"
+	EnvScopeBuild   = "build"
+	EnvScopeBoth    = "both"
+)
 
 // DeploymentLog represents a single log entry for a deployment or service deployment.
 type DeploymentLog struct {

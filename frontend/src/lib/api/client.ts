@@ -17,6 +17,7 @@ import {
   SetEnvInput,
   SourceUploadResult,
   UpdateProjectInput,
+  UpdateServiceResourcesInput,
   User,
 } from './types';
 
@@ -316,6 +317,17 @@ export const api = {
     async getServiceDeployments(projectId: string, deploymentId: string): Promise<ServiceDeployment[]> {
       return apiFetch<ServiceDeployment[]>(`/api/projects/${projectId}/deployments/${deploymentId}/services`);
     },
+
+    async updateResources(
+      projectId: string,
+      serviceId: string,
+      input: UpdateServiceResourcesInput
+    ): Promise<Service> {
+      return apiFetch<Service>(`/api/projects/${projectId}/services/${serviceId}/resources`, {
+        method: 'PATCH',
+        body: JSON.stringify(input),
+      });
+    },
   },
 
   env: {
@@ -330,8 +342,9 @@ export const api = {
       });
     },
 
-    async delete(projectId: string, key: string): Promise<{ message: string }> {
-      return apiFetch<{ message: string }>(`/api/projects/${projectId}/env/${encodeURIComponent(key)}`, {
+    async delete(projectId: string, key: string, serviceId?: string): Promise<{ message: string }> {
+      const query = serviceId ? `?service_id=${encodeURIComponent(serviceId)}` : '';
+      return apiFetch<{ message: string }>(`/api/projects/${projectId}/env/${encodeURIComponent(key)}${query}`, {
         method: 'DELETE',
       });
     },
