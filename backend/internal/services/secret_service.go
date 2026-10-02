@@ -2,9 +2,14 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -258,3 +263,197 @@ func (s *SecretService) GetDecryptedEnvMap(ctx context.Context, projectID uuid.U
 
 	return envMap, secretValues, nil
 }
+
+// ComputeEnvConfigHash calculates a deterministic SHA-256 hash of the effective environment configuration
+// (project variables merged with service-specific overrides).
+func (s *SecretService) ComputeEnvConfigHash(ctx context.Context, projectID uuid.UUID, serviceID *uuid.UUID) (*string, error) {
+	if s.db == nil {
+		return nil, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT key, encrypted_value, is_secret, scope, service_id
+		 FROM environment_variables
+		 WHERE project_id = $1 AND (service_id IS NULL OR ($2::uuid IS NOT NULL AND service_id = $2))
+		 ORDER BY CASE WHEN service_id IS NULL THEN 0 ELSE 1 END ASC`,
+		projectID, serviceID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query environment variables for hash: %w", err)
+	}
+	defer rows.Close()
+
+	type varEntry struct {
+		val      string
+		isSecret bool
+		scope    string
+	}
+	effectiveVars := make(map[string]varEntry)
+
+	for rows.Next() {
+		var key, scope string
+		var encVal []byte
+		var isSecret bool
+		var rowServiceID *uuid.UUID
+
+		if err := rows.Scan(&key, &encVal, &isSecret, &scope, &rowServiceID); err != nil {
+			return nil, err
+		}
+
+		dec, err := s.encryptor.Decrypt(encVal)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt %s: %w", key, err)
+		}
+
+		// Service-specific rows will overwrite project-level defaults deterministically due to ordering
+		effectiveVars[key] = varEntry{
+			val:      string(dec),
+			isSecret: isSecret,
+			scope:    scope,
+		}
+	}
+
+	if len(effectiveVars) == 0 {
+		return nil, nil
+	}
+
+	// Deterministic sort by key
+	keys := make([]string, 0, len(effectiveVars))
+	for k := range effectiveVars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var sb strings.Builder
+	for _, k := range keys {
+		entry := effectiveVars[k]
+		sb.WriteString(fmt.Sprintf("%s=%s;scope=%s;secret=%t\n", k, entry.val, entry.scope, entry.isSecret))
+	}
+
+	sum := sha256.Sum256([]byte(sb.String()))
+	hashStr := hex.EncodeToString(sum[:])
+	return &hashStr, nil
+}
+
+// EnvSnapshotEntry represents an individual variable in a deployment's environment snapshot.
+type EnvSnapshotEntry struct {
+	Key      string `json:"key"`
+	Value    string `json:"value"`
+	Scope    string `json:"scope"`
+	IsSecret bool   `json:"is_secret"`
+}
+
+// CreateEnvSnapshot captures all effective environment variables (project variables overridden by service vars),
+// serializes them to JSON, and encrypts the payload using AES-256-GCM.
+// Returns the encrypted snapshot bytes and the deterministic SHA-256 hash.
+func (s *SecretService) CreateEnvSnapshot(ctx context.Context, projectID uuid.UUID, serviceID *uuid.UUID) ([]byte, *string, error) {
+	if s.db == nil || s.encryptor == nil {
+		return nil, nil, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT key, encrypted_value, is_secret, scope, service_id
+		 FROM environment_variables
+		 WHERE project_id = $1 AND (service_id IS NULL OR ($2::uuid IS NOT NULL AND service_id = $2))
+		 ORDER BY CASE WHEN service_id IS NULL THEN 0 ELSE 1 END ASC`,
+		projectID, serviceID,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to query environment variables for snapshot: %w", err)
+	}
+	defer rows.Close()
+
+	effectiveVars := make(map[string]EnvSnapshotEntry)
+	for rows.Next() {
+		var key, scope string
+		var encVal []byte
+		var isSecret bool
+		var rowServiceID *uuid.UUID
+
+		if err := rows.Scan(&key, &encVal, &isSecret, &scope, &rowServiceID); err != nil {
+			return nil, nil, err
+		}
+
+		dec, err := s.encryptor.Decrypt(encVal)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to decrypt %s: %w", key, err)
+		}
+
+		effectiveVars[key] = EnvSnapshotEntry{
+			Key:      key,
+			Value:    string(dec),
+			Scope:    scope,
+			IsSecret: isSecret,
+		}
+	}
+
+	if len(effectiveVars) == 0 {
+		return nil, nil, nil
+	}
+
+	// Deterministic sort by key
+	keys := make([]string, 0, len(effectiveVars))
+	for k := range effectiveVars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var sb strings.Builder
+	entries := make([]EnvSnapshotEntry, 0, len(keys))
+	for _, k := range keys {
+		entry := effectiveVars[k]
+		entries = append(entries, entry)
+		sb.WriteString(fmt.Sprintf("%s=%s;scope=%s;secret=%t\n", k, entry.Value, entry.Scope, entry.IsSecret))
+	}
+
+	sum := sha256.Sum256([]byte(sb.String()))
+	hashStr := hex.EncodeToString(sum[:])
+
+	jsonData, err := json.Marshal(entries)
+	if err != nil {
+		return nil, &hashStr, fmt.Errorf("failed to serialize env snapshot: %w", err)
+	}
+
+	encryptedSnapshot, err := s.encryptor.Encrypt(jsonData)
+	if err != nil {
+		return nil, &hashStr, fmt.Errorf("failed to encrypt env snapshot: %w", err)
+	}
+
+	return encryptedSnapshot, &hashStr, nil
+}
+
+// GetEnvMapFromSnapshot decrypts and parses an AES-256-GCM encrypted snapshot,
+// filtering variables by targetScope ("runtime", "build", or "" for all).
+// Returns plaintext key-value map and slice of secret values for log redaction.
+func (s *SecretService) GetEnvMapFromSnapshot(snapshotBytes []byte, targetScope string) (map[string]string, []string, error) {
+	if len(snapshotBytes) == 0 || s.encryptor == nil {
+		return make(map[string]string), []string{}, nil
+	}
+
+	decrypted, err := s.encryptor.Decrypt(snapshotBytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to decrypt env snapshot: %w", err)
+	}
+
+	var entries []EnvSnapshotEntry
+	if err := json.Unmarshal(decrypted, &entries); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse env snapshot JSON: %w", err)
+	}
+
+	envMap := make(map[string]string)
+	secretValues := make([]string, 0)
+
+	for _, entry := range entries {
+		if targetScope != "" && entry.Scope != models.EnvScopeBoth && entry.Scope != targetScope {
+			continue
+		}
+		envMap[entry.Key] = entry.Value
+		if entry.IsSecret {
+			secretValues = append(secretValues, entry.Value)
+		}
+	}
+
+	return envMap, secretValues, nil
+}
+
+

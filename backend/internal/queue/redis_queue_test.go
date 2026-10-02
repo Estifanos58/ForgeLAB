@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,7 +72,62 @@ func TestDeploymentQueue_EnqueueAndProcess(t *testing.T) {
 	}
 }
 
-func TestDeploymentQueue_CrashRecovery(t *testing.T) {
+func TestDeploymentQueue_PayloadTypeDisambiguation(t *testing.T) {
+	// Plain UUID string must be rejected to prevent release vs service deployment confusion
+	rawUUID := uuid.New().String()
+	_, err := ParseJob(rawUUID)
+	if err == nil {
+		t.Fatalf("expected ParseJob to reject legacy plain UUID, but it succeeded")
+	}
+	if !errors.Is(err, ErrInvalidJobPayload) {
+		t.Errorf("expected ErrInvalidJobPayload, got %v", err)
+	}
+
+	// Invalid JSON must be rejected
+	_, err = ParseJob("{invalid json")
+	if err == nil {
+		t.Fatalf("expected ParseJob to reject malformed JSON")
+	}
+
+	// Unknown job type must be rejected
+	unknownJobJSON := `{"type": "unknown_type", "id": "` + rawUUID + `"}`
+	_, err = ParseJob(unknownJobJSON)
+	if err == nil {
+		t.Fatalf("expected ParseJob to reject unknown job type")
+	}
+
+	// Valid service deployment job
+	svcID := uuid.New()
+	svcJob := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  svcID,
+		ServiceDeploymentID: svcID,
+	}
+	parsedSvc, err := ParseJob(svcJob.Encode())
+	if err != nil {
+		t.Fatalf("failed to parse valid service deployment job: %v", err)
+	}
+	if parsedSvc.Type != JobTypeServiceDeployment || parsedSvc.ID != svcID {
+		t.Errorf("mismatched service job: %+v", parsedSvc)
+	}
+
+	// Valid release deployment job
+	relID := uuid.New()
+	relJob := Job{
+		Type:         JobTypeDeployment,
+		ID:           relID,
+		DeploymentID: &relID,
+	}
+	parsedRel, err := ParseJob(relJob.Encode())
+	if err != nil {
+		t.Fatalf("failed to parse valid release deployment job: %v", err)
+	}
+	if parsedRel.Type != JobTypeDeployment || parsedRel.ID != relID {
+		t.Errorf("mismatched release job: %+v", parsedRel)
+	}
+}
+
+func TestDeploymentQueue_CrashRecovery_WithLease(t *testing.T) {
 	mr, client := setupTestRedis(t)
 	defer mr.Close()
 	defer client.Close()
@@ -81,19 +137,18 @@ func TestDeploymentQueue_CrashRecovery(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Simulate a job left in processing queue due to a sudden crash
-	err := client.LPush(ctx, ProcessingQueueKey, crashedID.String()).Err()
+	// Simulate a typed job left in processing queue due to worker crash (lease expired)
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  crashedID,
+		ServiceDeploymentID: crashedID,
+	}
+	err := client.LPush(ctx, ProcessingQueueKey, job.Encode()).Err()
 	if err != nil {
 		t.Fatalf("failed to seed processing queue: %v", err)
 	}
 
-	// Verify it's in processing
-	_, processing, _, _ := q.GetQueueStats(ctx)
-	if processing != 1 {
-		t.Fatalf("expected 1 job in processing, got %d", processing)
-	}
-
-	// Run crash recovery sweep
+	// Run recovery sweep (no active lease exists, so it's recognized as abandoned)
 	recovered, err := q.RecoverAbandonedJobs(ctx)
 	if err != nil {
 		t.Fatalf("recovery failed: %v", err)
@@ -110,6 +165,189 @@ func TestDeploymentQueue_CrashRecovery(t *testing.T) {
 	if pending != 1 {
 		t.Errorf("expected 1 in pending after recovery, got %d", pending)
 	}
+
+	// Verify attempt was incremented during recovery
+	attempts, err := q.GetAttempts(ctx, crashedID)
+	if err != nil || attempts != 1 {
+		t.Errorf("expected attempts=1, got %d (err: %v)", attempts, err)
+	}
+}
+
+func TestDeploymentQueue_ActiveLeaseNotRecovered(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	activeID := uuid.New()
+	ctx := context.Background()
+
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  activeID,
+		ServiceDeploymentID: activeID,
+	}
+	_ = client.LPush(ctx, ProcessingQueueKey, job.Encode())
+
+	// Simulate an active worker lease
+	leaseKey := JobLeasePrefix + activeID.String()
+	_ = client.Set(ctx, leaseKey, "worker-1", 60*time.Second)
+
+	// Run recovery - active lease must prevent recovery
+	recovered, err := q.RecoverAbandonedJobs(ctx)
+	if err != nil {
+		t.Fatalf("recovery error: %v", err)
+	}
+	if recovered != 0 {
+		t.Errorf("expected 0 jobs recovered while lease is active, got %d", recovered)
+	}
+
+	_, processing, _, _ := q.GetQueueStats(ctx)
+	if processing != 1 {
+		t.Errorf("expected job to remain in processing queue, got %d", processing)
+	}
+}
+
+func TestDeploymentQueue_TerminalJobNeverRetried(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.SetRetryBackoff(10 * time.Millisecond)
+	terminalID := uuid.New()
+
+	// Terminal checker reports this job is terminal
+	q.SetTerminalChecker(func(ctx context.Context, job Job) (bool, error) {
+		if job.ID == terminalID {
+			return true, nil
+		}
+		return false, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var executionAttempts int32
+	dlqDone := make(chan struct{})
+
+	q.StartJobWorker(ctx, func(wCtx context.Context, job Job) error {
+		if job.ID == terminalID {
+			atomic.AddInt32(&executionAttempts, 1)
+			go func() {
+				for i := 0; i < 20; i++ {
+					time.Sleep(50 * time.Millisecond)
+					_, _, dlq, _ := q.GetQueueStats(ctx)
+					if dlq >= 1 {
+						select {
+						case <-dlqDone:
+						default:
+							close(dlqDone)
+						}
+						return
+					}
+				}
+			}()
+			return errors.New("terminal error")
+		}
+		return nil
+	})
+	defer q.Stop()
+
+	if err := q.EnqueueServiceDeployment(ctx, terminalID); err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	select {
+	case <-dlqDone:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for terminal job to move to DLQ")
+	}
+
+	// Must only have executed ONCE — never retried because it's terminal!
+	if attempts := atomic.LoadInt32(&executionAttempts); attempts != 1 {
+		t.Errorf("expected exactly 1 execution attempt for terminal job, got %d", attempts)
+	}
+
+	pending, processing, dlq, _ := q.GetQueueStats(ctx)
+	if pending != 0 || processing != 0 || dlq != 1 {
+		t.Errorf("expected pending=0, processing=0, dlq=1; got pending=%d, processing=%d, dlq=%d", pending, processing, dlq)
+	}
+}
+
+func TestDeploymentQueue_DuplicateExecutionPrevention(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.SetWorkerCount(4)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	duplicateID := uuid.New()
+	var activeConcurrent int32
+	var maxConcurrent int32
+	var totalProcessed int32
+	var mu sync.Mutex
+
+	jobStarted := make(chan struct{})
+	allowFinish := make(chan struct{})
+
+	q.StartJobWorker(ctx, func(wCtx context.Context, job Job) error {
+		if job.ID == duplicateID {
+			curr := atomic.AddInt32(&activeConcurrent, 1)
+			mu.Lock()
+			if curr > maxConcurrent {
+				maxConcurrent = curr
+			}
+			mu.Unlock()
+
+			// Signal that one worker has started
+			select {
+			case <-jobStarted:
+			default:
+				close(jobStarted)
+			}
+
+			// Hold the worker until released
+			select {
+			case <-allowFinish:
+			case <-wCtx.Done():
+			}
+
+			atomic.AddInt32(&activeConcurrent, -1)
+			atomic.AddInt32(&totalProcessed, 1)
+		}
+		return nil
+	})
+	defer q.Stop()
+
+	// Enqueue the SAME job ID twice
+	_ = q.EnqueueServiceDeployment(ctx, duplicateID)
+	_ = q.EnqueueServiceDeployment(ctx, duplicateID)
+
+	select {
+	case <-jobStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for first worker to start")
+	}
+
+	// Give other workers a chance to see if they can concurrently acquire the same job
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	peak := maxConcurrent
+	mu.Unlock()
+
+	if peak > 1 {
+		t.Fatalf("duplicate execution detected: max concurrent executions was %d, expected 1", peak)
+	}
+
+	// Release the worker
+	close(allowFinish)
+	time.Sleep(200 * time.Millisecond)
 }
 
 func TestDeploymentQueue_RetryAndDeadLetterQueue(t *testing.T) {
@@ -118,7 +356,8 @@ func TestDeploymentQueue_RetryAndDeadLetterQueue(t *testing.T) {
 	defer client.Close()
 
 	q := NewDeploymentQueue(client)
-	q.SetMaxRetries(2) // 2 attempts max
+	q.SetMaxRetries(2)
+	q.SetRetryBackoff(50 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -132,9 +371,8 @@ func TestDeploymentQueue_RetryAndDeadLetterQueue(t *testing.T) {
 			curr := atomic.AddInt32(&attempts, 1)
 			if curr >= 2 {
 				go func() {
-					// Wait briefly for DLQ push
 					for i := 0; i < 20; i++ {
-						time.Sleep(100 * time.Millisecond)
+						time.Sleep(50 * time.Millisecond)
 						_, _, dlq, _ := q.GetQueueStats(ctx)
 						if dlq >= 1 {
 							close(dlqDone)
@@ -149,14 +387,13 @@ func TestDeploymentQueue_RetryAndDeadLetterQueue(t *testing.T) {
 	})
 	defer q.Stop()
 
-	// Enqueue failing job
 	if err := q.EnqueueDeployment(ctx, failingID); err != nil {
 		t.Fatalf("failed to enqueue: %v", err)
 	}
 
 	select {
 	case <-dlqDone:
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for job to land in dead letter queue")
 	}
 
@@ -193,7 +430,6 @@ func TestDeploymentQueue_ConcurrentServiceDeployments(t *testing.T) {
 			return errors.New("frontend build syntax error")
 		}
 		if job.ID == backendID {
-			// simulate some work
 			time.Sleep(100 * time.Millisecond)
 			close(backendCompleted)
 			return nil
@@ -202,7 +438,6 @@ func TestDeploymentQueue_ConcurrentServiceDeployments(t *testing.T) {
 	})
 	defer q.Stop()
 
-	// Enqueue both simultaneously
 	if err := q.EnqueueServiceDeployment(ctx, frontendID); err != nil {
 		t.Fatalf("failed to enqueue frontend: %v", err)
 	}
@@ -210,7 +445,6 @@ func TestDeploymentQueue_ConcurrentServiceDeployments(t *testing.T) {
 		t.Fatalf("failed to enqueue backend: %v", err)
 	}
 
-	// Verify backend completes successfully even while frontend fails
 	select {
 	case <-backendCompleted:
 	case <-time.After(3 * time.Second):
@@ -221,6 +455,127 @@ func TestDeploymentQueue_ConcurrentServiceDeployments(t *testing.T) {
 	case <-frontendFailed:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("timed out waiting for frontend deployment to fail")
+	}
+}
+
+func TestDeploymentQueue_IsJobEnqueuedOrActive(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+
+	jobID := uuid.New()
+
+	// Initially not enqueued or active
+	active, err := q.IsJobEnqueuedOrActive(ctx, jobID)
+	if err != nil || active {
+		t.Fatalf("expected false, got %v (err: %v)", active, err)
+	}
+
+	// Enqueue
+	_ = q.EnqueueServiceDeployment(ctx, jobID)
+	active, err = q.IsJobEnqueuedOrActive(ctx, jobID)
+	if err != nil || !active {
+		t.Fatalf("expected true after enqueue, got %v (err: %v)", active, err)
+	}
+
+	// Move to processing
+	_, _ = client.RPopLPush(ctx, DeploymentQueueKey, ProcessingQueueKey).Result()
+	active, err = q.IsJobEnqueuedOrActive(ctx, jobID)
+	if err != nil || !active {
+		t.Fatalf("expected true while in processing, got %v (err: %v)", active, err)
+	}
+
+	// Clear processing, set lease
+	client.Del(ctx, ProcessingQueueKey)
+	leaseKey := JobLeasePrefix + jobID.String()
+	client.Set(ctx, leaseKey, "worker-1", 60*time.Second)
+	active, err = q.IsJobEnqueuedOrActive(ctx, jobID)
+	if err != nil || !active {
+		t.Fatalf("expected true while active lease exists, got %v (err: %v)", active, err)
+	}
+
+	// Clear lease
+	client.Del(ctx, leaseKey)
+	active, err = q.IsJobEnqueuedOrActive(ctx, jobID)
+	if err != nil || active {
+		t.Fatalf("expected false after all cleared, got %v (err: %v)", active, err)
+	}
+}
+
+func TestDeploymentQueue_EnqueueFailure(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	q := NewDeploymentQueue(client)
+	jobID := uuid.New()
+
+	// Close miniredis server to force connection failure
+	mr.Close()
+	client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	err := q.EnqueueServiceDeployment(ctx, jobID)
+	if err == nil {
+		t.Fatalf("expected enqueue to fail immediately on broken Redis connection, but it succeeded")
+	}
+
+	err = q.EnqueueDeployment(ctx, jobID)
+	if err == nil {
+		t.Fatalf("expected release deployment enqueue to fail immediately on broken Redis connection, but it succeeded")
+	}
+}
+
+func TestDeploymentQueue_LeaseExpiryAndRecovery(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.SetLeaseTTL(1 * time.Second) // 1s minimal Redis EXPIRE duration
+	ctx := context.Background()
+
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+
+	// Job is currently in processing queue with an active lease
+	_ = client.LPush(ctx, ProcessingQueueKey, job.Encode())
+	acquired, err := q.acquireLease(ctx, jobID, "worker-test-crash")
+	if err != nil || !acquired {
+		t.Fatalf("failed to acquire test lease: %v", err)
+	}
+
+	// While lease is unexpired: recovery must NOT touch it
+	rec, err := q.RecoverAbandonedJobs(ctx)
+	if err != nil {
+		t.Fatalf("recovery error: %v", err)
+	}
+	if rec != 0 {
+		t.Errorf("expected 0 jobs recovered while lease is alive, got %d", rec)
+	}
+
+	// Advance miniredis clock beyond lease TTL (simulate worker crash without heartbeat)
+	mr.FastForward(2 * time.Second)
+
+	// Now lease has expired! Recovery must recover the abandoned job
+	rec, err = q.RecoverAbandonedJobs(ctx)
+	if err != nil {
+		t.Fatalf("recovery error: %v", err)
+	}
+	if rec != 1 {
+		t.Errorf("expected 1 abandoned job recovered after lease expiry, got %d", rec)
+	}
+
+	// Verify job is back in pending queue
+	pending, processing, _, _ := q.GetQueueStats(ctx)
+	if pending != 1 || processing != 0 {
+		t.Errorf("expected pending=1, processing=0; got pending=%d, processing=%d", pending, processing)
 	}
 }
 

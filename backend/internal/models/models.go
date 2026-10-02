@@ -175,14 +175,18 @@ type ServiceDeployment struct {
 	HealthStrategy  string     `json:"health_strategy,omitempty"`
 	HealthCheckPath *string    `json:"health_check_path,omitempty"`
 	ResourceConfig                             // snapshotted resource limits at deploy time
+	ExecutionMode   string     `json:"execution_mode,omitempty"`
 	SourceRevision  *string    `json:"source_revision,omitempty"`
 	EnvConfigHash   *string    `json:"env_config_hash,omitempty"`
+	EnvSnapshot     []byte     `json:"-"` // encrypted at rest; never exposed in API responses
 	StartedAt       *time.Time `json:"started_at"`
 	BuiltAt         *time.Time `json:"built_at"`
 	DeployedAt      *time.Time `json:"deployed_at"`
 	FinishedAt      *time.Time `json:"finished_at"`
 	DurationMs      *int64     `json:"duration_ms"`
 	FailureReason   *string    `json:"failure_reason"`
+	LeaseAcquiredAt *time.Time `json:"lease_acquired_at,omitempty"`
+	LeaseWorkerID   *string    `json:"lease_worker_id,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 }
 
@@ -216,6 +220,12 @@ const (
 	HealthStrategyHTTP = "http"
 	HealthStrategyTCP  = "tcp"
 	HealthStrategyNone = "none"
+)
+
+// Deployment execution mode constants
+const (
+	ExecutionModeBuild      = "build"
+	ExecutionModeReuseImage = "reuse_image"
 )
 
 // ProjectStatus constants (coarse states for display — derived from service states)

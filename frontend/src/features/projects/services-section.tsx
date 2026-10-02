@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { Project, Service } from '@/lib/api/types';
+import { Project, Service, ServiceDeployment } from '@/lib/api/types';
 import { ServiceCard } from './service-card';
 import { Button } from '@/components/ui/button';
 import {
@@ -28,6 +28,9 @@ interface ServicesSectionProps {
   isDeployingAll?: boolean;
   onServiceAction: (serviceId: string, action: 'start' | 'stop' | 'restart') => void;
   onViewLogs: (serviceId: string) => void;
+  onSelectServiceDeployment?: (serviceDeployment: ServiceDeployment, service: Service) => void;
+  selectedServiceDeploymentId?: string | null;
+  onServiceUpdated?: (updated: Service) => void;
 }
 
 export function ServicesSection({
@@ -41,6 +44,9 @@ export function ServicesSection({
   isDeployingAll = false,
   onServiceAction,
   onViewLogs,
+  onSelectServiceDeployment,
+  selectedServiceDeploymentId,
+  onServiceUpdated,
 }: ServicesSectionProps) {
   const services = project.services || [];
 
@@ -106,6 +112,9 @@ export function ServicesSection({
                   onRollback={onRollbackService}
                   onAction={onServiceAction}
                   onViewLogs={onViewLogs}
+                  onSelectServiceDeployment={onSelectServiceDeployment}
+                  selectedServiceDeploymentId={selectedServiceDeploymentId}
+                  onServiceUpdated={onServiceUpdated}
                 />
               ))}
             </div>
@@ -137,6 +146,9 @@ export function ServicesSection({
                   onRollback={onRollbackService}
                   onAction={onServiceAction}
                   onViewLogs={onViewLogs}
+                  onSelectServiceDeployment={onSelectServiceDeployment}
+                  selectedServiceDeploymentId={selectedServiceDeploymentId}
+                  onServiceUpdated={onServiceUpdated}
                 />
               ))}
             </div>
@@ -168,6 +180,9 @@ export function ServicesSection({
                   onRollback={onRollbackService}
                   onAction={onServiceAction}
                   onViewLogs={onViewLogs}
+                  onSelectServiceDeployment={onSelectServiceDeployment}
+                  selectedServiceDeploymentId={selectedServiceDeploymentId}
+                  onServiceUpdated={onServiceUpdated}
                 />
               ))}
             </div>

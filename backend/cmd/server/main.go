@@ -123,6 +123,7 @@ func main() {
 	projectService.SetServiceService(serviceService)
 	deploymentService := services.NewDeploymentService(pool)
 	secretService := services.NewSecretService(pool, encryptor, projectService)
+	deploymentService.SetSecretService(secretService)
 
 	// Initialize WebSocket Hub
 	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient, cfg.App.AllowedOriginsList()...)
@@ -144,12 +145,14 @@ func main() {
 	)
 	dockerEngine.SetServiceService(serviceService)
 	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
+	dockerEngine.SetMaxConcurrentBuilds(cfg.Docker.MaxConcurrentBuilds)
 	defer dockerEngine.StopAllLogCollectors()
 
 	// Initialize Redis deployment queue & worker
 	var deployQueue *queue.DeploymentQueue
 	if redisClient != nil {
 		deployQueue = queue.NewDeploymentQueue(redisClient)
+		deployQueue.SetWorkerCount(cfg.Docker.QueueWorkerCount)
 		deployQueue.SetTerminalChecker(func(ctx context.Context, job queue.Job) (bool, error) {
 			if job.Type == queue.JobTypeServiceDeployment {
 				sd, err := deploymentService.GetServiceDeployment(ctx, job.ID)
@@ -173,21 +176,33 @@ func main() {
 		defer deployQueue.Stop()
 	}
 
-	// Startup reconciliation for orphaned deployments
-	if reconciled, err := deploymentService.ReconcileOrphanedDeployments(ctx, 30*time.Minute); err != nil {
-		slog.Warn("failed to reconcile orphaned deployments on startup", "error", err)
-	} else if reconciled > 0 {
-		slog.Info("reconciled orphaned deployments on startup", "count", reconciled)
+	// Startup reconciliation for orphaned / missing deployments
+	reconcileFn := func() {
+		if deployQueue != nil {
+			if reconciled, err := deploymentService.ReconcileOrphanedDeploymentsWithQueue(ctx, deployQueue, 10*time.Minute, queue.DefaultMaxRetries); err != nil {
+				slog.Warn("failed to reconcile orphaned deployments", "error", err)
+			} else if reconciled > 0 {
+				slog.Info("reconciled orphaned deployments with queue recovery", "count", reconciled)
+			}
+		} else {
+			if reconciled, err := deploymentService.ReconcileOrphanedDeployments(ctx, 30*time.Minute); err != nil {
+				slog.Warn("failed to reconcile orphaned deployments on startup", "error", err)
+			} else if reconciled > 0 {
+				slog.Info("reconciled orphaned deployments on startup", "count", reconciled)
+			}
+		}
 	}
+
+	reconcileFn()
 	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
+		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_, _ = deploymentService.ReconcileOrphanedDeployments(ctx, 30*time.Minute)
+				reconcileFn()
 			}
 		}
 	}()

@@ -23,12 +23,18 @@ var (
 
 // DeploymentService handles deployment-related business logic.
 type DeploymentService struct {
-	db *pgxpool.Pool
+	db            *pgxpool.Pool
+	secretService *SecretService
 }
 
 // NewDeploymentService creates a new DeploymentService.
 func NewDeploymentService(db *pgxpool.Pool) *DeploymentService {
 	return &DeploymentService{db: db}
+}
+
+// SetSecretService sets the SecretService instance for env hash calculations.
+func (s *DeploymentService) SetSecretService(sec *SecretService) {
+	s.secretService = sec
 }
 
 // CreateDeployment creates a new deployment record for a project transactionally.
@@ -145,27 +151,47 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		rows.Close()
 	}
 
-	for _, s := range svcList {
+	for _, svcItem := range svcList {
 		var svcMaxNumber *int
-		_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", s.ID).Scan(&svcMaxNumber)
+		_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", svcItem.ID).Scan(&svcMaxNumber)
 		svcDeployNum := 1
 		if svcMaxNumber != nil {
 			svcDeployNum = *svcMaxNumber + 1
 		}
 
+		var sourceRevision *string
+		if project.SourceType == models.SourceTypeGitHub && project.Branch != "" {
+			b := project.Branch
+			sourceRevision = &b
+		} else if project.SourceReference != "" {
+			sr := project.SourceReference
+			sourceRevision = &sr
+		} else if project.RepositoryPath != "" {
+			rp := project.RepositoryPath
+			sourceRevision = &rp
+		}
+
+		var envConfigHash *string
+		var envSnapshot []byte
+		if s.secretService != nil {
+			envSnapshot, envConfigHash, _ = s.secretService.CreateEnvSnapshot(ctx, project.ID, &svcItem.ID)
+		}
+
 		svcDeployID := uuid.New()
-		svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, s.Name, svcDeployNum)
+		svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, svcItem.Name, svcDeployNum)
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO service_deployments (
 				id, deployment_id, service_id, deploy_number, status, image_tag, build_strategy,
 				build_command, start_command, runtime_type, dockerfile_path, build_context, internal_port,
 				health_strategy, health_check_path, cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
+				source_revision, env_config_hash, execution_mode, env_snapshot,
 				started_at, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
-			svcDeployID, deployment.ID, s.ID, svcDeployNum, models.DeployStatusQueued, svcTag,
-			s.BuildStrategy, s.BuildCommand, s.StartCommand, s.RuntimeType, s.DockerfilePath, s.BuildContext,
-			s.InternalPort, s.HealthStrategy, s.HealthCheckPath,
-			s.CpuMillicores, s.MemoryMB, s.PidsLimit, s.EphemeralStorageMB,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`,
+			svcDeployID, deployment.ID, svcItem.ID, svcDeployNum, models.DeployStatusQueued, svcTag,
+			svcItem.BuildStrategy, svcItem.BuildCommand, svcItem.StartCommand, svcItem.RuntimeType, svcItem.DockerfilePath, svcItem.BuildContext,
+			svcItem.InternalPort, svcItem.HealthStrategy, svcItem.HealthCheckPath,
+			svcItem.CpuMillicores, svcItem.MemoryMB, svcItem.PidsLimit, svcItem.EphemeralStorageMB,
+			sourceRevision, envConfigHash, models.ExecutionModeBuild, envSnapshot,
 			now, now,
 		); err != nil {
 			return nil, fmt.Errorf("failed to create service deployment record: %w", err)
@@ -174,7 +200,7 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		// current_service_deployment_id must only be set on successful promotion.
 		if _, err := tx.Exec(ctx,
 			"UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
-			models.ServiceStatusDeploying, now, s.ID,
+			models.ServiceStatusDeploying, now, svcItem.ID,
 		); err != nil {
 			return nil, fmt.Errorf("failed to update service deployment status: %w", err)
 		}
@@ -304,6 +330,24 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		resConfig.PidsLimit = 256
 	}
 
+	var sourceRevision *string
+	if project.SourceType == models.SourceTypeGitHub && project.Branch != "" {
+		b := project.Branch
+		sourceRevision = &b
+	} else if project.SourceReference != "" {
+		sr := project.SourceReference
+		sourceRevision = &sr
+	} else if project.RepositoryPath != "" {
+		rp := project.RepositoryPath
+		sourceRevision = &rp
+	}
+
+	var envConfigHash *string
+	var envSnapshot []byte
+	if s.secretService != nil {
+		envSnapshot, envConfigHash, _ = s.secretService.CreateEnvSnapshot(ctx, project.ID, &targetService.ID)
+	}
+
 	svcDeployID := uuid.New()
 	serviceDeployment := &models.ServiceDeployment{
 		ID:              svcDeployID,
@@ -323,6 +367,10 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		HealthStrategy:  healthStrategy,
 		HealthCheckPath: healthCheckPath,
 		ResourceConfig:  resConfig,
+		ExecutionMode:   models.ExecutionModeBuild,
+		SourceRevision:  sourceRevision,
+		EnvConfigHash:   envConfigHash,
+		EnvSnapshot:     envSnapshot,
 		StartedAt:       &now,
 		CreatedAt:       now,
 	}
@@ -333,14 +381,16 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 			build_strategy, build_command, start_command, runtime_type,
 			dockerfile_path, build_context, internal_port, health_strategy, health_check_path,
 			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
+			source_revision, env_config_hash, execution_mode, env_snapshot,
 			started_at, created_at
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`,
 		serviceDeployment.ID, serviceDeployment.DeploymentID, serviceDeployment.ServiceID,
 		serviceDeployment.DeployNumber, serviceDeployment.Status, serviceDeployment.ImageTag,
 		serviceDeployment.BuildStrategy, serviceDeployment.BuildCommand, serviceDeployment.StartCommand,
 		serviceDeployment.RuntimeType, serviceDeployment.DockerfilePath, serviceDeployment.BuildContext,
 		serviceDeployment.InternalPort, serviceDeployment.HealthStrategy, serviceDeployment.HealthCheckPath,
 		resConfig.CpuMillicores, resConfig.MemoryMB, resConfig.PidsLimit, resConfig.EphemeralStorageMB,
+		sourceRevision, envConfigHash, models.ExecutionModeBuild, envSnapshot,
 		serviceDeployment.StartedAt, serviceDeployment.CreatedAt,
 	)
 	if err != nil {
@@ -626,23 +676,45 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		return nil, ErrActiveDeployment
 	}
 
-	// Find the most recent successful deployment for this service with an existing image
+	// Determine the deployment number boundary to ensure we never select the current deployment
+	var beforeDeployNumber int
+	if targetService.CurrentServiceDeploymentID != nil {
+		_ = tx.QueryRow(ctx, "SELECT deploy_number FROM service_deployments WHERE id = $1", *targetService.CurrentServiceDeploymentID).Scan(&beforeDeployNumber)
+	}
+	if beforeDeployNumber <= 0 {
+		_ = tx.QueryRow(ctx, "SELECT COALESCE(MAX(deploy_number), 0) FROM service_deployments WHERE service_id = $1", targetService.ID).Scan(&beforeDeployNumber)
+	}
+	if beforeDeployNumber <= 1 {
+		return nil, ErrNoDeploymentToRollback
+	}
+
+	// Find the most recent successful deployment for this service strictly before the current deployment
 	var prev models.ServiceDeployment
 	err = tx.QueryRow(ctx,
 		`SELECT id, deploy_number, image_tag, internal_port, build_strategy, build_command,
 		        start_command, runtime_type, COALESCE(dockerfile_path, 'Dockerfile'),
-		        COALESCE(build_context, '.'), COALESCE(health_strategy, 'auto'), health_check_path
+		        COALESCE(build_context, '.'), COALESCE(health_strategy, 'auto'), health_check_path,
+		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
+		        image_digest, source_revision, env_config_hash, COALESCE(execution_mode, 'build'), env_snapshot
 		 FROM service_deployments
-		 WHERE service_id = $1 AND status IN ($2, $3) AND image_tag IS NOT NULL
+		 WHERE service_id = $1
+		   AND deploy_number < $2
+		   AND status IN ($3, $4)
+		   AND (image_digest IS NOT NULL OR image_tag IS NOT NULL)
+		   AND ($5::uuid IS NULL OR id != $5)
 		 ORDER BY deploy_number DESC
 		 LIMIT 1`,
 		targetService.ID,
+		beforeDeployNumber,
 		models.DeployStatusRunning,
 		models.DeployStatusStopped,
+		targetService.CurrentServiceDeploymentID,
 	).Scan(
 		&prev.ID, &prev.DeployNumber, &prev.ImageTag, &prev.InternalPort,
 		&prev.BuildStrategy, &prev.BuildCommand, &prev.StartCommand, &prev.RuntimeType,
 		&prev.DockerfilePath, &prev.BuildContext, &prev.HealthStrategy, &prev.HealthCheckPath,
+		&prev.CpuMillicores, &prev.MemoryMB, &prev.PidsLimit, &prev.EphemeralStorageMB,
+		&prev.ImageDigest, &prev.SourceRevision, &prev.EnvConfigHash, &prev.ExecutionMode, &prev.EnvSnapshot,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -658,6 +730,12 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		deployNumber = *maxNumber + 1
 	}
 
+	// Execution mode: reuse existing immutable image whenever available instead of forcing source rebuild
+	executionMode := models.ExecutionModeReuseImage
+	if (prev.ImageDigest == nil || *prev.ImageDigest == "") && (prev.ImageTag == nil || *prev.ImageTag == "") {
+		executionMode = models.ExecutionModeBuild
+	}
+
 	now := time.Now()
 	svcDeployID := uuid.New()
 	serviceDeployment := &models.ServiceDeployment{
@@ -667,6 +745,7 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		ServiceName:     targetService.Name,
 		DeployNumber:    deployNumber,
 		Status:          models.DeployStatusQueued,
+		ExecutionMode:   executionMode,
 		ImageTag:        prev.ImageTag,
 		InternalPort:    prev.InternalPort,
 		BuildStrategy:   prev.BuildStrategy,
@@ -678,6 +757,10 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		HealthStrategy:  prev.HealthStrategy,
 		HealthCheckPath: prev.HealthCheckPath,
 		ResourceConfig:  prev.ResourceConfig,
+		ImageDigest:     prev.ImageDigest,
+		SourceRevision:  prev.SourceRevision,
+		EnvConfigHash:   prev.EnvConfigHash,
+		EnvSnapshot:     prev.EnvSnapshot,
 		StartedAt:       &now,
 		CreatedAt:       now,
 	}
@@ -688,14 +771,17 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 			build_strategy, build_command, start_command, runtime_type,
 			dockerfile_path, build_context, internal_port, health_strategy, health_check_path,
 			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
+			image_digest, source_revision, env_config_hash, execution_mode, env_snapshot,
 			started_at, created_at
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
 		serviceDeployment.ID, serviceDeployment.DeploymentID, serviceDeployment.ServiceID,
 		serviceDeployment.DeployNumber, serviceDeployment.Status, serviceDeployment.ImageTag,
 		serviceDeployment.BuildStrategy, serviceDeployment.BuildCommand, serviceDeployment.StartCommand,
 		serviceDeployment.RuntimeType, serviceDeployment.DockerfilePath, serviceDeployment.BuildContext,
 		serviceDeployment.InternalPort, serviceDeployment.HealthStrategy, serviceDeployment.HealthCheckPath,
 		serviceDeployment.CpuMillicores, serviceDeployment.MemoryMB, serviceDeployment.PidsLimit, serviceDeployment.EphemeralStorageMB,
+		serviceDeployment.ImageDigest, serviceDeployment.SourceRevision, serviceDeployment.EnvConfigHash,
+		serviceDeployment.ExecutionMode, serviceDeployment.EnvSnapshot,
 		serviceDeployment.StartedAt, serviceDeployment.CreatedAt,
 	)
 	if err != nil {
@@ -703,6 +789,7 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 	}
 
 	// Set service to deploying but do NOT update current_service_deployment_id.
+	// current_service_deployment_id must remain preserved until the rollback deployment is promoted.
 	_, err = tx.Exec(ctx,
 		"UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
 		models.ServiceStatusDeploying, now, targetService.ID,
@@ -719,12 +806,20 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		return nil, fmt.Errorf("failed to commit service rollback: %w", err)
 	}
 
+	imgRef := "none"
+	if prev.ImageDigest != nil {
+		imgRef = *prev.ImageDigest
+	} else if prev.ImageTag != nil {
+		imgRef = *prev.ImageTag
+	}
+
 	slog.Info("service rollback deployment created",
 		"service_deployment_id", serviceDeployment.ID,
 		"project_id", project.ID,
 		"service_id", targetService.ID,
 		"deploy_number", deployNumber,
-		"reused_image_tag", *prev.ImageTag,
+		"execution_mode", executionMode,
+		"reused_image_ref", imgRef,
 	)
 
 	return serviceDeployment, nil
@@ -740,6 +835,9 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 		        sd.build_strategy, sd.build_command, sd.start_command, sd.runtime_type,
 		        COALESCE(sd.dockerfile_path, 'Dockerfile'), COALESCE(sd.build_context, '.'),
 		        COALESCE(sd.health_strategy, 'auto'), sd.health_check_path,
+		        sd.cpu_millicores, sd.memory_mb, sd.pids_limit, sd.ephemeral_storage_mb,
+		        sd.image_digest, sd.source_revision, sd.env_config_hash,
+		        COALESCE(sd.execution_mode, 'build'), sd.env_snapshot,
 		        sd.started_at, sd.built_at, sd.deployed_at, sd.finished_at,
 		        sd.duration_ms, sd.failure_reason, sd.created_at
 		 FROM service_deployments sd
@@ -751,6 +849,9 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 		&sd.Status, &sd.ImageTag, &sd.ContainerID, &sd.HostPort, &sd.InternalPort,
 		&sd.BuildStrategy, &sd.BuildCommand, &sd.StartCommand, &sd.RuntimeType,
 		&sd.DockerfilePath, &sd.BuildContext, &sd.HealthStrategy, &sd.HealthCheckPath,
+		&sd.CpuMillicores, &sd.MemoryMB, &sd.PidsLimit, &sd.EphemeralStorageMB,
+		&sd.ImageDigest, &sd.SourceRevision, &sd.EnvConfigHash,
+		&sd.ExecutionMode, &sd.EnvSnapshot,
 		&sd.StartedAt, &sd.BuiltAt, &sd.DeployedAt, &sd.FinishedAt,
 		&sd.DurationMs, &sd.FailureReason, &sd.CreatedAt,
 	)
@@ -777,6 +878,9 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 		        sd.build_strategy, sd.build_command, sd.start_command, sd.runtime_type,
 		        COALESCE(sd.dockerfile_path, 'Dockerfile'), COALESCE(sd.build_context, '.'),
 		        COALESCE(sd.health_strategy, 'auto'), sd.health_check_path,
+		        sd.cpu_millicores, sd.memory_mb, sd.pids_limit, sd.ephemeral_storage_mb,
+		        sd.image_digest, sd.source_revision, sd.env_config_hash,
+		        COALESCE(sd.execution_mode, 'build'), sd.env_snapshot,
 		        sd.started_at, sd.built_at, sd.deployed_at, sd.finished_at,
 		        sd.duration_ms, sd.failure_reason, sd.created_at
 		 FROM service_deployments sd
@@ -800,6 +904,9 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 			&sd.Status, &sd.ImageTag, &sd.ContainerID, &sd.HostPort, &sd.InternalPort,
 			&sd.BuildStrategy, &sd.BuildCommand, &sd.StartCommand, &sd.RuntimeType,
 			&sd.DockerfilePath, &sd.BuildContext, &sd.HealthStrategy, &sd.HealthCheckPath,
+			&sd.CpuMillicores, &sd.MemoryMB, &sd.PidsLimit, &sd.EphemeralStorageMB,
+			&sd.ImageDigest, &sd.SourceRevision, &sd.EnvConfigHash,
+			&sd.ExecutionMode, &sd.EnvSnapshot,
 			&sd.StartedAt, &sd.BuiltAt, &sd.DeployedAt, &sd.FinishedAt,
 			&sd.DurationMs, &sd.FailureReason, &sd.CreatedAt,
 		)
@@ -1003,6 +1110,9 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 		        sd.build_strategy, sd.build_command, sd.start_command, sd.runtime_type,
 		        COALESCE(sd.dockerfile_path, 'Dockerfile'), COALESCE(sd.build_context, '.'),
 		        COALESCE(sd.health_strategy, 'auto'), sd.health_check_path,
+		        sd.cpu_millicores, sd.memory_mb, sd.pids_limit, sd.ephemeral_storage_mb,
+		        sd.image_digest, sd.source_revision, sd.env_config_hash,
+		        COALESCE(sd.execution_mode, 'build'), sd.env_snapshot,
 		        sd.started_at, sd.built_at, sd.deployed_at, sd.finished_at,
 		        sd.duration_ms, sd.failure_reason, sd.created_at
 		 FROM service_deployments sd
@@ -1026,6 +1136,9 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 			&sd.Status, &sd.ImageTag, &sd.ContainerID, &sd.HostPort, &sd.InternalPort,
 			&sd.BuildStrategy, &sd.BuildCommand, &sd.StartCommand, &sd.RuntimeType,
 			&sd.DockerfilePath, &sd.BuildContext, &sd.HealthStrategy, &sd.HealthCheckPath,
+			&sd.CpuMillicores, &sd.MemoryMB, &sd.PidsLimit, &sd.EphemeralStorageMB,
+			&sd.ImageDigest, &sd.SourceRevision, &sd.EnvConfigHash,
+			&sd.ExecutionMode, &sd.EnvSnapshot,
 			&sd.StartedAt, &sd.BuiltAt, &sd.DeployedAt, &sd.FinishedAt,
 			&sd.DurationMs, &sd.FailureReason, &sd.CreatedAt,
 		)
@@ -1234,6 +1347,175 @@ func (s *DeploymentService) GetServiceDeploymentLogsAfter(ctx context.Context, s
 
 // ReconcileOrphanedDeployments finds service deployments stuck in active states for too long
 // and marks them as failed. This prevents permanently-queued records when Redis enqueue fails.
+// DeploymentQueueReconciler abstracts queue queries and enqueueing for reconciliation.
+type DeploymentQueueReconciler interface {
+	IsJobEnqueuedOrActive(ctx context.Context, jobID uuid.UUID) (bool, error)
+	EnqueueServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) error
+	GetAttempts(ctx context.Context, jobID uuid.UUID) (int, error)
+	IncrementAttempts(ctx context.Context, jobID uuid.UUID) (int64, error)
+}
+
+// ReconcileQueuedDeployments reconciles service deployments whose status is 'queued'.
+// If their Redis job is missing:
+// - If attempts < maxRetries, it re-enqueues the job.
+// - If attempts >= maxRetries, it marks the deployment failed.
+func (s *DeploymentService) ReconcileQueuedDeployments(ctx context.Context, q DeploymentQueueReconciler, minAge time.Duration, maxRetries int) (int, error) {
+	if s.db == nil || q == nil {
+		return 0, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, service_id, created_at
+		 FROM service_deployments
+		 WHERE status = $1
+		   AND created_at < NOW() - $2::interval
+		 ORDER BY created_at ASC`,
+		models.DeployStatusQueued, minAge.String(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query queued service deployments: %w", err)
+	}
+	defer rows.Close()
+
+	type queuedItem struct {
+		id        uuid.UUID
+		serviceID uuid.UUID
+		createdAt time.Time
+	}
+	var items []queuedItem
+	for rows.Next() {
+		var it queuedItem
+		if err := rows.Scan(&it.id, &it.serviceID, &it.createdAt); err == nil {
+			items = append(items, it)
+		}
+	}
+
+	reconciled := 0
+	for _, item := range items {
+		activeOrQueued, err := q.IsJobEnqueuedOrActive(ctx, item.id)
+		if err != nil {
+			slog.Warn("reconciliation: error checking job presence in queue", "service_deployment_id", item.id, "error", err)
+			continue
+		}
+		if activeOrQueued {
+			continue
+		}
+
+		// The Redis job is missing!
+		attempts, _ := q.GetAttempts(ctx, item.id)
+		if attempts < maxRetries {
+			if err := q.EnqueueServiceDeployment(ctx, item.id); err != nil {
+				slog.Error("reconciliation: failed to re-enqueue missing queued deployment", "id", item.id, "error", err)
+				continue
+			}
+			_, _ = q.IncrementAttempts(ctx, item.id)
+			slog.Info("re-enqueued missing queued service deployment via reconciliation",
+				"service_deployment_id", item.id, "attempts", attempts+1)
+			reconciled++
+		} else {
+			reason := fmt.Sprintf("Reconciliation: queued deployment was missing from queue and exceeded max recovery attempts (%d)", maxRetries)
+			_ = s.FailServiceDeployment(ctx, item.id, reason)
+			slog.Warn("marked missing queued deployment as failed after exceeding recovery attempts",
+				"service_deployment_id", item.id, "attempts", attempts)
+			reconciled++
+		}
+	}
+
+	return reconciled, nil
+}
+
+// ReconcileOrphanedDeploymentsWithQueue checks active service deployments (cloning, building, starting, health_checking).
+// Instead of blindly failing them after a timeout, it inspects whether a worker holds an active lease:
+// - If an active worker lease exists, the deployment is actively processing and not orphaned.
+// - If no active lease exists and it has been abandoned beyond staleDuration:
+//     - If attempts < maxRetries, it resets status to 'queued' and re-enqueues for recovery.
+//     - If attempts >= maxRetries, it marks the deployment as failed.
+func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Context, q DeploymentQueueReconciler, staleDuration time.Duration, maxRetries int) (int, error) {
+	if s.db == nil {
+		return 0, nil
+	}
+	if q == nil {
+		return s.ReconcileOrphanedDeployments(ctx, staleDuration)
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, service_id, status, created_at, started_at
+		 FROM service_deployments
+		 WHERE status IN ($1, $2, $3, $4)
+		   AND COALESCE(started_at, created_at) < NOW() - $5::interval
+		 ORDER BY created_at ASC`,
+		models.DeployStatusCloning, models.DeployStatusBuilding,
+		models.DeployStatusStarting, models.DeployStatusHealthChecking,
+		staleDuration.String(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query active service deployments: %w", err)
+	}
+	defer rows.Close()
+
+	type activeItem struct {
+		id        uuid.UUID
+		serviceID uuid.UUID
+		status    string
+		createdAt time.Time
+		startedAt *time.Time
+	}
+	var items []activeItem
+	for rows.Next() {
+		var it activeItem
+		if err := rows.Scan(&it.id, &it.serviceID, &it.status, &it.createdAt, &it.startedAt); err == nil {
+			items = append(items, it)
+		}
+	}
+
+	reconciled := 0
+	for _, item := range items {
+		active, err := q.IsJobEnqueuedOrActive(ctx, item.id)
+		if err != nil {
+			slog.Warn("reconciliation: error checking active status in queue", "id", item.id, "error", err)
+			continue
+		}
+		if active {
+			// Worker is heartbeating or job is in queue
+			continue
+		}
+
+		// Abandoned!
+		attempts, _ := q.GetAttempts(ctx, item.id)
+		if attempts < maxRetries {
+			// Recover: reset status to queued and re-enqueue
+			_, err = s.db.Exec(ctx,
+				`UPDATE service_deployments SET status = $2, lease_worker_id = NULL WHERE id = $1`,
+				item.id, models.DeployStatusQueued,
+			)
+			if err != nil {
+				slog.Error("reconciliation: failed to reset abandoned deployment status", "id", item.id, "error", err)
+				continue
+			}
+			if err := q.EnqueueServiceDeployment(ctx, item.id); err != nil {
+				slog.Error("reconciliation: failed to re-enqueue abandoned deployment", "id", item.id, "error", err)
+				continue
+			}
+			_, _ = q.IncrementAttempts(ctx, item.id)
+			slog.Info("re-enqueued abandoned active deployment for recovery",
+				"service_deployment_id", item.id, "previous_status", item.status, "attempts", attempts+1)
+			reconciled++
+		} else {
+			reason := fmt.Sprintf("Reconciliation: abandoned deployment exceeded max recovery attempts (%d)", maxRetries)
+			_ = s.FailServiceDeployment(ctx, item.id, reason)
+			slog.Warn("marked abandoned deployment as failed after exceeding max attempts",
+				"service_deployment_id", item.id, "attempts", attempts)
+			reconciled++
+		}
+	}
+
+	// Also reconcile missing queued deployments
+	queuedRec, _ := s.ReconcileQueuedDeployments(ctx, q, 30*time.Second, maxRetries)
+	return reconciled + queuedRec, nil
+}
+
+// ReconcileOrphanedDeployments finds service deployments stuck in active states for too long
+// and marks them as failed. This fallback is used when no queue is available.
 func (s *DeploymentService) ReconcileOrphanedDeployments(ctx context.Context, staleDuration time.Duration) (int, error) {
 	if s.db == nil {
 		return 0, nil

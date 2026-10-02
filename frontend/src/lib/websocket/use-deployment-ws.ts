@@ -20,6 +20,30 @@ export interface UseDeploymentWSOptions {
   onError?: (err: any) => void;
 }
 
+export function parseWSLogEntry(data: any, channel: string | null): DeploymentLog {
+  const isServiceDeploymentChannel = channel ? channel.startsWith('service-deployment:') : false;
+  const isReleaseDeploymentChannel = channel ? channel.startsWith('deployment:') : false;
+
+  const fallbackReleaseDeploymentId = isReleaseDeploymentChannel
+    ? channel!.replace('deployment:', '').split(':')[0]
+    : null;
+
+  const fallbackServiceDeploymentId = isServiceDeploymentChannel
+    ? channel!.replace('service-deployment:', '')
+    : null;
+
+  return {
+    id: data.id,
+    deployment_id: data.deployment_id || fallbackReleaseDeploymentId || null,
+    service_deployment_id: data.service_deployment_id || fallbackServiceDeploymentId || null,
+    service_id: data.service_id || null,
+    timestamp: data.timestamp || new Date().toISOString(),
+    phase: data.phase || 'runtime',
+    stream: data.stream || 'stdout',
+    message: data.message || '',
+  };
+}
+
 export function useDeploymentWS({
   channel,
   onSubscribed,
@@ -225,15 +249,7 @@ export function useDeploymentWS({
 
             case 'log':
               if (msg.data) {
-                const logEntry: DeploymentLog = {
-                  id: msg.data.id,
-                  deployment_id: msg.data.deployment_id || (channel ? channel.replace('deployment:', '') : ''),
-                  service_id: msg.data.service_id || null,
-                  timestamp: msg.data.timestamp || new Date().toISOString(),
-                  phase: msg.data.phase || 'runtime',
-                  stream: msg.data.stream || 'stdout',
-                  message: msg.data.message || '',
-                };
+                const logEntry: DeploymentLog = parseWSLogEntry(msg.data, channel);
 
                 const seq = typeof msg.sequence === 'number' ? msg.sequence : (typeof logEntry.id === 'number' ? logEntry.id : 0);
                 if (seq > lastSequenceRef.current) {
@@ -248,6 +264,10 @@ export function useDeploymentWS({
                   // Deduplicate: if log ID is already present, do not add duplicate
                   if (logEntry.id !== undefined && logEntry.id !== null) {
                     if (prev.some((existing) => String(existing.id) === String(logEntry.id))) {
+                      return prev;
+                    }
+                  } else {
+                    if (prev.some((existing) => existing.timestamp === logEntry.timestamp && existing.message === logEntry.message)) {
                       return prev;
                     }
                   }

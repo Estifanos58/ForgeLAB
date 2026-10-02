@@ -58,6 +58,75 @@ function mergeLogs(existingLiveLogs, historicalLogs) {
   });
 }
 
+// Helper to simulate parseWSLogEntry implemented in useDeploymentWS
+function parseWSLogEntry(data, channel) {
+  const isServiceDeploymentChannel = channel ? channel.startsWith('service-deployment:') : false;
+  const isReleaseDeploymentChannel = channel ? channel.startsWith('deployment:') : false;
+
+  const fallbackReleaseDeploymentId = isReleaseDeploymentChannel
+    ? channel.replace('deployment:', '').split(':')[0]
+    : null;
+
+  const fallbackServiceDeploymentId = isServiceDeploymentChannel
+    ? channel.replace('service-deployment:', '')
+    : null;
+
+  return {
+    id: data.id,
+    deployment_id: data.deployment_id || fallbackReleaseDeploymentId || null,
+    service_deployment_id: data.service_deployment_id || fallbackServiceDeploymentId || null,
+    service_id: data.service_id || null,
+    timestamp: data.timestamp || new Date().toISOString(),
+    phase: data.phase || 'runtime',
+    stream: data.stream || 'stdout',
+    message: data.message || '',
+  };
+}
+
+// Helper to simulate WebSocket channel resolution from selected log target
+function resolveWSChannel(target) {
+  if (!target) return null;
+  if (target.type === 'release') {
+    return `deployment:${target.deployment.id}`;
+  }
+  if (target.type === 'service') {
+    return `service-deployment:${target.serviceDeployment.id}`;
+  }
+  return null;
+}
+
+// Helper to simulate service deployment resolution on clicking Logs
+function resolveServiceDeployment(service, deploymentList) {
+  if (!deploymentList || deploymentList.length === 0) return null;
+  if (service?.current_service_deployment_id) {
+    const matching = deploymentList.find((d) => d.id === service.current_service_deployment_id);
+    if (matching) return matching;
+  }
+  return deploymentList[0];
+}
+
+// Helper to simulate reload log target reconciliation
+function resolveReloadLogTarget(prevTarget, deployList, projectServices) {
+  if (!prevTarget) {
+    if (deployList && deployList.length > 0) {
+      return { type: 'release', deployment: deployList[0] };
+    }
+    return null;
+  }
+  if (prevTarget.type === 'release') {
+    const matching = deployList?.find((d) => d.id === prevTarget.deployment.id);
+    return { type: 'release', deployment: matching || deployList?.[0] || prevTarget.deployment };
+  }
+  if (prevTarget.type === 'service') {
+    const matchingSvc = projectServices?.find((s) => s.id === prevTarget.serviceDeployment.service_id);
+    return {
+      ...prevTarget,
+      service: matchingSvc || prevTarget.service,
+    };
+  }
+  return null;
+}
+
 test('WebSocket URL resolution — local dev on port 3000', () => {
   const url = resolveWebSocketUrl({
     env: {},
@@ -212,3 +281,216 @@ test('Deployment switching resets active log view', () => {
   assert.equal(activeLogs.length, 0);
   assert.equal(currentChannel, 'deployment:uuid-2');
 });
+
+test('service-deployment:<id> parsing preserves service_deployment_id and never invents deployment_id', () => {
+  const channel = 'service-deployment:sd-uuid-42';
+  const rawData = {
+    id: 101,
+    service_id: 'svc-uuid-1',
+    timestamp: '2026-10-02T10:00:00Z',
+    phase: 'runtime',
+    stream: 'stdout',
+    message: 'Server listening on :3000',
+  };
+
+  const logEntry = parseWSLogEntry(rawData, channel);
+
+  assert.equal(logEntry.id, 101);
+  assert.equal(logEntry.service_deployment_id, 'sd-uuid-42');
+  assert.equal(logEntry.service_id, 'svc-uuid-1');
+  // CRITICAL: Must NEVER invent deployment_id from service-deployment channel string (e.g. "service-sd-uuid-42")
+  assert.equal(logEntry.deployment_id, null);
+  assert.equal(logEntry.message, 'Server listening on :3000');
+});
+
+test('service-deployment:<id> parsing preserves deployment_id when provided by backend release', () => {
+  const channel = 'service-deployment:sd-uuid-42';
+  const rawData = {
+    id: 102,
+    deployment_id: 'rel-uuid-99',
+    service_deployment_id: 'sd-uuid-42',
+    service_id: 'svc-uuid-1',
+    timestamp: '2026-10-02T10:00:01Z',
+    phase: 'build',
+    stream: 'stdout',
+    message: 'Compiling release binary...',
+  };
+
+  const logEntry = parseWSLogEntry(rawData, channel);
+
+  assert.equal(logEntry.id, 102);
+  assert.equal(logEntry.deployment_id, 'rel-uuid-99');
+  assert.equal(logEntry.service_deployment_id, 'sd-uuid-42');
+});
+
+test('deployment:<id> parsing preserves release deployment_id without inventing service_deployment_id', () => {
+  const channel = 'deployment:rel-uuid-88';
+  const rawData = {
+    id: 201,
+    timestamp: '2026-10-02T10:00:00Z',
+    phase: 'startup',
+    stream: 'stdout',
+    message: 'Starting containers...',
+  };
+
+  const logEntry = parseWSLogEntry(rawData, channel);
+
+  assert.equal(logEntry.id, 201);
+  assert.equal(logEntry.deployment_id, 'rel-uuid-88');
+  assert.equal(logEntry.service_deployment_id, null);
+});
+
+test('Independent service deployment safe log merging — deduplication and chronological order', () => {
+  const historical = [
+    { id: 10, service_deployment_id: 'sd-1', timestamp: '2026-10-02T10:00:00Z', message: 'Build started' },
+    { id: 11, service_deployment_id: 'sd-1', timestamp: '2026-10-02T10:00:02Z', message: 'Step 1 complete' },
+  ];
+
+  // In-flight live logs from WS stream
+  const live = [
+    { id: 11, service_deployment_id: 'sd-1', timestamp: '2026-10-02T10:00:02Z', message: 'Step 1 complete' },
+    { id: 12, service_deployment_id: 'sd-1', timestamp: '2026-10-02T10:00:04Z', message: 'Container healthy' },
+  ];
+
+  const merged = mergeLogs(live, historical);
+
+  assert.equal(merged.length, 3);
+  assert.deepEqual(merged.map((l) => l.id), [10, 11, 12]);
+  assert.equal(merged[0].message, 'Build started');
+  assert.equal(merged[2].message, 'Container healthy');
+  assert.equal(merged.every((l) => l.service_deployment_id === 'sd-1'), true);
+});
+
+test('WebSocket channel switching between release and independent service deployment', () => {
+  let target = {
+    type: 'release',
+    deployment: { id: 'rel-100', deploy_number: 1 },
+  };
+  let channel = resolveWSChannel(target);
+  assert.equal(channel, 'deployment:rel-100');
+
+  // Trigger independent service deployment (api.services.deploy)
+  target = {
+    type: 'service',
+    serviceDeployment: { id: 'sd-200', service_id: 'svc-1', deploy_number: 3 },
+  };
+  channel = resolveWSChannel(target);
+  assert.equal(channel, 'service-deployment:sd-200');
+
+  // Switch to another service deployment
+  target = {
+    type: 'service',
+    serviceDeployment: { id: 'sd-300', service_id: 'svc-2', deploy_number: 1 },
+  };
+  channel = resolveWSChannel(target);
+  assert.equal(channel, 'service-deployment:sd-300');
+
+  // Switch back to release deployment
+  target = {
+    type: 'release',
+    deployment: { id: 'rel-101', deploy_number: 2 },
+  };
+  channel = resolveWSChannel(target);
+  assert.equal(channel, 'deployment:rel-101');
+});
+
+test('Clicking Logs on service resolves current_service_deployment_id when present', () => {
+  const service = {
+    id: 'svc-api',
+    name: 'api',
+    current_service_deployment_id: 'sd-current',
+  };
+  const deployments = [
+    { id: 'sd-latest-failed', deploy_number: 4, status: 'failed' },
+    { id: 'sd-current', deploy_number: 3, status: 'running' },
+    { id: 'sd-old', deploy_number: 2, status: 'stopped' },
+  ];
+
+  const resolved = resolveServiceDeployment(service, deployments);
+  assert.equal(resolved.id, 'sd-current');
+  assert.equal(resolved.deploy_number, 3);
+});
+
+test('Clicking Logs on service falls back to latest deployment by deploy_number when current is unset', () => {
+  const service = {
+    id: 'svc-web',
+    name: 'web',
+    current_service_deployment_id: null,
+  };
+  const deployments = [
+    { id: 'sd-latest', deploy_number: 5, status: 'running' },
+    { id: 'sd-prev', deploy_number: 4, status: 'stopped' },
+  ];
+
+  const resolved = resolveServiceDeployment(service, deployments);
+  assert.equal(resolved.id, 'sd-latest');
+  assert.equal(resolved.deploy_number, 5);
+});
+
+test('Clicking service deployment-history entry selects that exact ServiceDeployment', () => {
+  const historyDeployments = [
+    { id: 'sd-5', deploy_number: 5, status: 'running' },
+    { id: 'sd-4', deploy_number: 4, status: 'crashed' },
+    { id: 'sd-3', deploy_number: 3, status: 'failed' },
+  ];
+
+  // User specifically clicks the crashed deployment #4 to inspect failure logs
+  const clicked = historyDeployments.find((d) => d.deploy_number === 4);
+  const target = {
+    type: 'service',
+    serviceDeployment: clicked,
+  };
+
+  assert.equal(target.serviceDeployment.id, 'sd-4');
+  assert.equal(resolveWSChannel(target), 'service-deployment:sd-4');
+});
+
+test('Page reload reconciles and preserves active service deployment log target', () => {
+  const prevTarget = {
+    type: 'service',
+    serviceDeployment: { id: 'sd-current', service_id: 'svc-api', deploy_number: 3 },
+    service: { id: 'svc-api', name: 'api', status: 'deploying' },
+  };
+
+  const updatedDeployList = [
+    { id: 'rel-1', deploy_number: 1 },
+  ];
+  const updatedProjectServices = [
+    { id: 'svc-api', name: 'api', status: 'running' },
+  ];
+
+  const reconciled = resolveReloadLogTarget(prevTarget, updatedDeployList, updatedProjectServices);
+
+  assert.equal(reconciled.type, 'service');
+  assert.equal(reconciled.serviceDeployment.id, 'sd-current');
+  assert.equal(reconciled.service.status, 'running');
+  assert.equal(resolveWSChannel(reconciled), 'service-deployment:sd-current');
+});
+
+test('WebSocket reconnect sends last_sequence for service deployment channels', () => {
+  const channel = 'service-deployment:sd-50';
+  let lastSequence = 0;
+
+  // Live log received with sequence 45
+  const log1 = parseWSLogEntry({ id: 45, message: 'Step A' }, channel);
+  lastSequence = Math.max(lastSequence, log1.id);
+  assert.equal(lastSequence, 45);
+
+  // Live log received with sequence 46
+  const log2 = parseWSLogEntry({ id: 46, message: 'Step B' }, channel);
+  lastSequence = Math.max(lastSequence, log2.id);
+  assert.equal(lastSequence, 46);
+
+  // Connection dropped; build reconnect subscription frame
+  const subFrame = { type: 'subscribe', channel };
+  if (lastSequence > 0) {
+    subFrame.last_sequence = lastSequence;
+  }
+
+  assert.deepEqual(subFrame, {
+    type: 'subscribe',
+    channel: 'service-deployment:sd-50',
+    last_sequence: 46,
+  });
+});
+

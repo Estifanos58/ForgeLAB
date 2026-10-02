@@ -118,6 +118,8 @@ type DockerConfig struct {
 	HostSourceRoot      string
 	ContainerSourceRoot string
 	LocalBuildMode      string
+	MaxConcurrentBuilds int // global cap on concurrent Docker builds/deploys
+	QueueWorkerCount    int // number of queue worker goroutines
 }
 
 // LogConfig holds logging settings.
@@ -194,6 +196,8 @@ func Load() (*Config, error) {
 			HostSourceRoot:      getEnv("FORGELAB_HOST_SOURCE_ROOT", ""),
 			ContainerSourceRoot: getEnv("FORGELAB_CONTAINER_SOURCE_ROOT", "/host-projects"),
 			LocalBuildMode:      getEnv("FORGELAB_LOCAL_BUILD_MODE", "direct"),
+			MaxConcurrentBuilds: parseIntEnv("FORGELAB_MAX_DOCKER_BUILDS", 4),
+			QueueWorkerCount:    parseIntEnv("FORGELAB_QUEUE_WORKERS", 4),
 		},
 		Log: LogConfig{
 			Level:  getEnv("LOG_LEVEL", "debug"),
@@ -229,6 +233,15 @@ func (s ServerConfig) Addr() string {
 func getEnv(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
+	}
+	return fallback
+}
+
+func parseIntEnv(key string, fallback int) int {
+	if value, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			return n
+		}
 	}
 	return fallback
 }

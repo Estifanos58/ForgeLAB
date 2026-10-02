@@ -38,7 +38,8 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 		`SELECT id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
 		        build_strategy, build_candidates, build_command, start_command, dockerfile_path, build_context,
 		        internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
-		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at
+		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
+		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
 		 FROM services WHERE project_id = $1 ORDER BY created_at ASC`,
 		projectID,
 	)
@@ -59,6 +60,7 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 			&svc.PublicExposed, &svc.HealthStrategy, &svc.HealthCheckPath, &svc.HealthCheckEnabled,
 			&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
 			&svc.CreatedAt, &svc.UpdatedAt,
+			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan service: %w", err)
@@ -95,7 +97,8 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 		`SELECT id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
 		        build_strategy, build_candidates, build_command, start_command, dockerfile_path, build_context,
 		        internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
-		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at
+		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
+		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
 		 FROM services WHERE id = $1`,
 		serviceID,
 	).Scan(
@@ -105,6 +108,7 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 		&svc.PublicExposed, &svc.HealthStrategy, &svc.HealthCheckPath, &svc.HealthCheckEnabled,
 		&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
 		&svc.CreatedAt, &svc.UpdatedAt,
+		&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -159,6 +163,16 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 	svc.CreatedAt = now
 	svc.UpdatedAt = now
 
+	if svc.CpuMillicores <= 0 {
+		svc.CpuMillicores = 1000
+	}
+	if svc.MemoryMB <= 0 {
+		svc.MemoryMB = 1024
+	}
+	if svc.PidsLimit <= 0 {
+		svc.PidsLimit = 256
+	}
+
 	candidatesJSON, _ := json.Marshal(svc.BuildCandidates)
 	if len(candidatesJSON) == 0 {
 		candidatesJSON = []byte("[]")
@@ -169,12 +183,14 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 			id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
 			build_strategy, build_candidates, build_command, start_command, dockerfile_path, build_context,
 			internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
-			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at
+			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
+			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $12, $13, $14, $15,
 			$16, $17, $18, $19, $20, $21,
-			$22, $23, $24, $25, $26, $27
+			$22, $23, $24, $25, $26, $27,
+			$28, $29, $30, $31
 		)`,
 		svc.ID, svc.ProjectID, svc.SourceID, svc.Name, svc.Role, svc.SourcePath, svc.RuntimeType,
 		svc.Framework, svc.PackageManager, svc.BuildStrategy, candidatesJSON, svc.BuildCommand,
@@ -182,6 +198,7 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 		svc.PublicExposed, svc.HealthStrategy, svc.HealthCheckPath, svc.HealthCheckEnabled,
 		svc.Status, svc.ContainerID, svc.ImageTag, svc.CurrentServiceDeploymentID,
 		svc.CreatedAt, svc.UpdatedAt,
+		svc.CpuMillicores, svc.MemoryMB, svc.PidsLimit, svc.EphemeralStorageMB,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert service: %w", err)
@@ -204,6 +221,16 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 	svc.CreatedAt = now
 	svc.UpdatedAt = now
 
+	if svc.CpuMillicores <= 0 {
+		svc.CpuMillicores = 1000
+	}
+	if svc.MemoryMB <= 0 {
+		svc.MemoryMB = 1024
+	}
+	if svc.PidsLimit <= 0 {
+		svc.PidsLimit = 256
+	}
+
 	candidatesJSON, _ := json.Marshal(svc.BuildCandidates)
 	if len(candidatesJSON) == 0 {
 		candidatesJSON = []byte("[]")
@@ -214,12 +241,14 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 			id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
 			build_strategy, build_candidates, build_command, start_command, dockerfile_path, build_context,
 			internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
-			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at
+			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
+			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $12, $13, $14, $15,
 			$16, $17, $18, $19, $20, $21,
-			$22, $23, $24, $25, $26, $27
+			$22, $23, $24, $25, $26, $27,
+			$28, $29, $30, $31
 		)`,
 		svc.ID, svc.ProjectID, svc.SourceID, svc.Name, svc.Role, svc.SourcePath, svc.RuntimeType,
 		svc.Framework, svc.PackageManager, svc.BuildStrategy, candidatesJSON, svc.BuildCommand,
@@ -227,6 +256,7 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 		svc.PublicExposed, svc.HealthStrategy, svc.HealthCheckPath, svc.HealthCheckEnabled,
 		svc.Status, svc.ContainerID, svc.ImageTag, svc.CurrentServiceDeploymentID,
 		svc.CreatedAt, svc.UpdatedAt,
+		svc.CpuMillicores, svc.MemoryMB, svc.PidsLimit, svc.EphemeralStorageMB,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert service: %w", err)
@@ -288,7 +318,7 @@ func (s *ServiceService) PromoteServiceDeployment(
 		 host_port = $6,
 		 updated_at = NOW()
 		 WHERE id = $1`,
-		serviceID, models.DeployStatusRunning, serviceDeploymentID, containerID, imageTag, hostPort,
+		serviceID, models.ServiceStatusRunning, serviceDeploymentID, containerID, imageTag, hostPort,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to promote service deployment: %w", err)
@@ -298,6 +328,7 @@ func (s *ServiceService) PromoteServiceDeployment(
 }
 
 // CalculateProjectStatus derives overall project state from individual service coarse statuses.
+// Valid coarse service statuses: ServiceStatusInactive, ServiceStatusDeploying, ServiceStatusRunning, ServiceStatusStopped, ServiceStatusFailed.
 func CalculateProjectStatus(services []*models.Service) string {
 	if len(services) == 0 {
 		return models.ProjectStatusInactive
@@ -306,17 +337,17 @@ func CalculateProjectStatus(services []*models.Service) string {
 	var runningCount, failedCount, stoppedCount, deployingCount, inactiveCount int
 
 	for _, svc := range services {
-		switch {
-		case svc.Status == models.ProjectStatusRunning:
+		switch svc.Status {
+		case models.ServiceStatusRunning:
 			runningCount++
-		case svc.Status == models.ProjectStatusDeploying ||
-			models.IsDeploymentActiveStatus(svc.Status):
-			// Count queued, cloning, building, starting, health_checking as deploying
+		case models.ServiceStatusDeploying:
 			deployingCount++
-		case svc.Status == models.ProjectStatusFailed || svc.Status == models.DeployStatusCrashed:
+		case models.ServiceStatusFailed:
 			failedCount++
-		case svc.Status == models.ProjectStatusStopped:
+		case models.ServiceStatusStopped:
 			stoppedCount++
+		case models.ServiceStatusInactive:
+			inactiveCount++
 		default:
 			inactiveCount++
 		}
@@ -348,10 +379,6 @@ func CalculateProjectStatus(services []*models.Service) string {
 	}
 
 	// 6. Inactive default
-	if inactiveCount == len(services) {
-		return models.ProjectStatusInactive
-	}
-
 	return models.ProjectStatusInactive
 }
 

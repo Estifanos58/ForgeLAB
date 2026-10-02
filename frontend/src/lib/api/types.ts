@@ -98,6 +98,7 @@ export interface ServiceDeployment {
   pids_limit?: number;
   ephemeral_storage_mb?: number | null;
   image_digest?: string | null;
+  execution_mode?: 'build' | 'reuse_image' | null;
   source_revision?: string | null;
   env_config_hash?: string | null;
   started_at?: string | null;
@@ -225,6 +226,11 @@ export interface DeploymentLog {
   stream: 'stdout' | 'stderr' | 'system';
   message: string;
 }
+
+export type LogTarget =
+  | { type: 'release'; deployment: Deployment }
+  | { type: 'service'; serviceDeployment: ServiceDeployment; service?: Service | null };
+
 
 export interface EnvVar {
   id: string;

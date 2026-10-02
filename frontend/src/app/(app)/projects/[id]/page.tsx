@@ -3,7 +3,7 @@
 import React, { useEffect, useState, useCallback, useRef, use } from 'react';
 import Link from 'next/link';
 import { api } from '@/lib/api/client';
-import { Project, Deployment, DeploymentLog, Service } from '@/lib/api/types';
+import { Project, Deployment, DeploymentLog, Service, ServiceDeployment, LogTarget } from '@/lib/api/types';
 import { AppHeader } from '@/components/layout/app-header';
 import { Alert } from '@/components/ui/alert';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -34,7 +34,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
   const [project, setProject] = useState<Project | null>(null);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
-  const [selectedDeployment, setSelectedDeployment] = useState<Deployment | null>(null);
+  const [selectedLogTarget, setSelectedLogTarget] = useState<LogTarget | null>(null);
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
   const [deployingServices, setDeployingServices] = useState<{ [serviceId: string]: boolean }>({});
   const [rollingBackServices, setRollingBackServices] = useState<{ [serviceId: string]: boolean }>({});
@@ -47,8 +47,17 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   // Generation counter to protect against out-of-order historical REST log responses
   const logFetchGenRef = useRef<number>(0);
 
-  // Strictly deployment-scoped channel: switching service scope filters client-side without socket reconnect!
-  const wsChannel = selectedDeployment ? `deployment:${selectedDeployment.id}` : null;
+  // Derived values for compatibility and UI
+  const selectedDeployment = selectedLogTarget?.type === 'release' ? selectedLogTarget.deployment : null;
+  const selectedServiceDeploymentId =
+    selectedLogTarget?.type === 'service' ? selectedLogTarget.serviceDeployment.id : null;
+
+  // Derive WebSocket channel from actual log target: release deployment or specific service deployment
+  const wsChannel = selectedLogTarget
+    ? selectedLogTarget.type === 'release'
+      ? `deployment:${selectedLogTarget.deployment.id}`
+      : `service-deployment:${selectedLogTarget.serviceDeployment.id}`
+    : null;
 
   // Load project and deployments
   const loadData = useCallback(async () => {
@@ -61,14 +70,25 @@ export default function ProjectPage({ params }: ProjectPageProps) {
       setProject(projData);
       setDeployments(deployList);
 
-      // Keep selected deployment synced
-      if (deployList.length > 0) {
-        setSelectedDeployment((prev) => {
-          if (!prev) return deployList[0];
-          const matching = deployList.find((d) => d.id === prev.id);
-          return matching || deployList[0];
-        });
-      }
+      // Keep selected log target synced
+      setSelectedLogTarget((prev) => {
+        if (!prev) {
+          if (deployList.length > 0) {
+            return { type: 'release', deployment: deployList[0] };
+          }
+          return null;
+        }
+        if (prev.type === 'release') {
+          const matching = deployList.find((d) => d.id === prev.deployment.id);
+          return { type: 'release', deployment: matching || deployList[0] || prev.deployment };
+        }
+        // If prev was a service deployment, preserve it and sync parent service
+        const matchingSvc = projData.services?.find((s) => s.id === prev.serviceDeployment.service_id);
+        return {
+          ...prev,
+          service: matchingSvc || prev.service,
+        };
+      });
       setError(null);
     } catch (err: any) {
       setError(err.message || 'Failed to load project details');
@@ -83,28 +103,52 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
   const addHistoricalLogsRef = useRef<(logs: DeploymentLog[]) => void>(() => {});
 
-  // Fetch historical logs with generation guard
-  const fetchHistoricalLogs = useCallback((deploymentId: string) => {
-    const currentGen = ++logFetchGenRef.current;
+  // Fetch historical logs from the correct REST endpoint for service vs release deployments
+  const fetchHistoricalLogs = useCallback(
+    (target: LogTarget) => {
+      const currentGen = ++logFetchGenRef.current;
 
-    api.projects
-      .getLogs(projectId, deploymentId)
-      .then((historyLogs) => {
-        if (currentGen !== logFetchGenRef.current) return;
-        addHistoricalLogsRef.current(historyLogs);
-      })
-      .catch((err) => {
-        if (currentGen !== logFetchGenRef.current) return;
-        console.warn('[ForgeLAB WS] Failed to sync historical logs:', err);
-      });
-  }, [projectId]);
+      const fetchPromise =
+        target.type === 'release'
+          ? api.projects.getLogs(projectId, target.deployment.id)
+          : api.services.getDeploymentLogs(
+              projectId,
+              target.serviceDeployment.service_id,
+              target.serviceDeployment.id
+            );
 
-  // When WebSocket subscribes or reconnects, fetch historical logs for the deployment
-  const handleWSSubscribed = useCallback((channel: string) => {
-    if (!channel.startsWith('deployment:')) return;
-    const deploymentId = channel.replace('deployment:', '');
-    fetchHistoricalLogs(deploymentId);
-  }, [fetchHistoricalLogs]);
+      fetchPromise
+        .then((historyLogs) => {
+          if (currentGen !== logFetchGenRef.current) return;
+          addHistoricalLogsRef.current(historyLogs);
+        })
+        .catch((err) => {
+          if (currentGen !== logFetchGenRef.current) return;
+          console.warn('[ForgeLAB WS] Failed to sync historical logs:', err);
+        });
+    },
+    [projectId]
+  );
+
+  // When WebSocket subscribes or reconnects, fetch historical logs for the active target
+  const handleWSSubscribed = useCallback(
+    (channel: string) => {
+      if (!selectedLogTarget) return;
+
+      if (channel.startsWith('deployment:')) {
+        const depId = channel.replace('deployment:', '').split(':')[0];
+        if (selectedLogTarget.type === 'release' && selectedLogTarget.deployment.id === depId) {
+          fetchHistoricalLogs(selectedLogTarget);
+        }
+      } else if (channel.startsWith('service-deployment:')) {
+        const sdId = channel.replace('service-deployment:', '');
+        if (selectedLogTarget.type === 'service' && selectedLogTarget.serviceDeployment.id === sdId) {
+          fetchHistoricalLogs(selectedLogTarget);
+        }
+      }
+    },
+    [selectedLogTarget, fetchHistoricalLogs]
+  );
 
   // Handle realtime status transitions without unnecessary loadData() churn
   const handleStatusChange = useCallback((data: any) => {
@@ -127,18 +171,30 @@ export default function ProjectPage({ params }: ProjectPageProps) {
         return { ...prev, services: updatedServices };
       });
 
-      setSelectedDeployment((prev) => {
-        if (!prev) return prev;
-        return { ...prev };
+      setSelectedLogTarget((prev) => {
+        if (!prev || prev.type !== 'service' || prev.serviceDeployment.service_id !== data.service_id) {
+          return prev;
+        }
+        return {
+          ...prev,
+          serviceDeployment: {
+            ...prev.serviceDeployment,
+            status: data.new_status,
+            ...(data.host_port ? { host_port: data.host_port } : {}),
+          },
+        };
       });
       return;
     }
 
     // 2. Deployment-level status update
     if (data.deployment_id) {
-      setSelectedDeployment((prev) => {
-        if (!prev || prev.id !== data.deployment_id) return prev;
-        return { ...prev, status: data.new_status };
+      setSelectedLogTarget((prev) => {
+        if (!prev || prev.type !== 'release' || prev.deployment.id !== data.deployment_id) return prev;
+        return {
+          ...prev,
+          deployment: { ...prev.deployment, status: data.new_status },
+        };
       });
 
       // Update project status directly
@@ -160,26 +216,33 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   });
   addHistoricalLogsRef.current = addHistoricalLogs;
 
-  // Sync historical logs when selected deployment changes
+  // Sync historical logs when selected log target changes
+  const targetKey = selectedLogTarget
+    ? selectedLogTarget.type === 'release'
+      ? `release:${selectedLogTarget.deployment.id}`
+      : `service:${selectedLogTarget.serviceDeployment.id}`
+    : null;
+
   useEffect(() => {
-    if (!selectedDeployment) return;
-    fetchHistoricalLogs(selectedDeployment.id);
-  }, [selectedDeployment?.id, fetchHistoricalLogs]);
+    if (!selectedLogTarget) return;
+    fetchHistoricalLogs(selectedLogTarget);
+  }, [targetKey, fetchHistoricalLogs]);
 
   // Fallback REST fetch if offline
   useEffect(() => {
-    if (!selectedDeployment || connectionState === 'subscribed') return;
+    if (!selectedLogTarget || connectionState === 'subscribed') return;
     const timer = setTimeout(() => {
       if (connectionState === 'offline') {
-        fetchHistoricalLogs(selectedDeployment.id);
+        fetchHistoricalLogs(selectedLogTarget);
       }
     }, 2500);
     return () => clearTimeout(timer);
-  }, [selectedDeployment?.id, connectionState, fetchHistoricalLogs]);
+  }, [targetKey, connectionState, fetchHistoricalLogs]);
 
   // Handle immediate deployment creation from lifecycle controls
   const handleDeploymentCreated = useCallback((newDeployment: Deployment) => {
-    setSelectedDeployment(newDeployment);
+    setSelectedLogTarget({ type: 'release', deployment: newDeployment });
+    setSelectedServiceId(null);
     setDeployments((prev) => {
       const exists = prev.some((d) => d.id === newDeployment.id);
       if (exists) return prev.map((d) => (d.id === newDeployment.id ? newDeployment : d));
@@ -204,22 +267,35 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     }
   };
 
-  // Independent single-service deployment action
+  // Independent single-service deployment action: immediately selects returned ServiceDeployment
   const handleDeployService = async (serviceId: string) => {
     setDeployingServices((prev) => ({ ...prev, [serviceId]: true }));
     setError(null);
     try {
-      await api.services.deploy(projectId, serviceId);
+      const newServiceDeployment = await api.services.deploy(projectId, serviceId);
+      const svc = project?.services?.find((s) => s.id === serviceId) || null;
+
+      // Immediately select returned ServiceDeployment as log target -> subscribes to service-deployment:<id>
+      setSelectedLogTarget({
+        type: 'service',
+        serviceDeployment: newServiceDeployment,
+        service: svc,
+      });
+      setSelectedServiceId(serviceId);
+
       // Immediately reflect deploying state on this service without replacing project release
       setProject((prev) => {
         if (!prev || !prev.services) return prev;
         return {
           ...prev,
           status: 'deploying',
-          services: prev.services.map((s) => (s.id === serviceId ? { ...s, status: 'deploying' } : s)),
+          services: prev.services.map((s) =>
+            s.id === serviceId
+              ? { ...s, status: 'deploying', current_service_deployment_id: s.current_service_deployment_id }
+              : s
+          ),
         };
       });
-      setSelectedServiceId(serviceId);
       setActiveTab('logs');
     } catch (err: any) {
       setError(err.message || 'Failed to deploy service');
@@ -228,21 +304,33 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     }
   };
 
-  // Independent service rollback action
+  // Independent service rollback action: selects returned ServiceDeployment
   const handleRollbackService = async (serviceId: string) => {
     setRollingBackServices((prev) => ({ ...prev, [serviceId]: true }));
     setError(null);
     try {
-      await api.services.rollback(projectId, serviceId);
+      const rolledBackDeployment = await api.services.rollback(projectId, serviceId);
+      const svc = project?.services?.find((s) => s.id === serviceId) || null;
+
+      setSelectedLogTarget({
+        type: 'service',
+        serviceDeployment: rolledBackDeployment,
+        service: svc,
+      });
+      setSelectedServiceId(serviceId);
+
       setProject((prev) => {
         if (!prev || !prev.services) return prev;
         return {
           ...prev,
           status: 'deploying',
-          services: prev.services.map((s) => (s.id === serviceId ? { ...s, status: 'deploying' } : s)),
+          services: prev.services.map((s) =>
+            s.id === serviceId
+              ? { ...s, status: 'deploying', current_service_deployment_id: s.current_service_deployment_id }
+              : s
+          ),
         };
       });
-      setSelectedServiceId(serviceId);
       setActiveTab('logs');
     } catch (err: any) {
       setError(err.message || 'Failed to rollback service');
@@ -250,6 +338,77 @@ export default function ProjectPage({ params }: ProjectPageProps) {
       setRollingBackServices((prev) => ({ ...prev, [serviceId]: false }));
     }
   };
+
+  // Clicking Logs on a service: resolve and select its actual current/latest ServiceDeployment
+  const handleViewServiceLogs = useCallback(
+    async (serviceId: string) => {
+      const svc = project?.services?.find((s) => s.id === serviceId) || null;
+      setSelectedServiceId(serviceId);
+      setActiveTab('logs');
+
+      try {
+        const sdList = await api.services.listDeployments(projectId, serviceId);
+        if (sdList && sdList.length > 0) {
+          const targetSd =
+            (svc?.current_service_deployment_id
+              ? sdList.find((d) => d.id === svc.current_service_deployment_id)
+              : null) || sdList[0];
+
+          setSelectedLogTarget({
+            type: 'service',
+            serviceDeployment: targetSd,
+            service: svc,
+          });
+        }
+      } catch (err) {
+        console.warn('[ForgeLAB] Failed to resolve service deployment for logs:', err);
+      }
+    },
+    [projectId, project?.services]
+  );
+
+  // Clicking a deployment-history entry for a service: select that exact ServiceDeployment
+  const handleSelectServiceDeployment = useCallback(
+    (sd: ServiceDeployment, svc?: Service | null) => {
+      const service = svc || project?.services?.find((s) => s.id === sd.service_id) || null;
+      setSelectedLogTarget({
+        type: 'service',
+        serviceDeployment: sd,
+        service,
+      });
+      setSelectedServiceId(sd.service_id);
+      setActiveTab('logs');
+    },
+    [project?.services]
+  );
+
+  // Clicking a release deployment entry
+  const handleSelectReleaseDeployment = useCallback((d: Deployment) => {
+    setSelectedLogTarget({ type: 'release', deployment: d });
+    setSelectedServiceId(null);
+    setActiveTab('logs');
+  }, []);
+
+  // Selecting service scope from log viewer toolbar
+  const handleSelectServiceScope = useCallback(
+    (serviceId: string | null) => {
+      if (serviceId === null) {
+        setSelectedServiceId(null);
+        if (deployments.length > 0) {
+          setSelectedLogTarget((prev) => {
+            if (prev?.type === 'release') return prev;
+            return { type: 'release', deployment: deployments[0] };
+          });
+        }
+      } else {
+        setSelectedServiceId(serviceId);
+        if (selectedLogTarget?.type === 'service' || deployments.length === 0) {
+          handleViewServiceLogs(serviceId);
+        }
+      }
+    },
+    [deployments, selectedLogTarget?.type, handleViewServiceLogs]
+  );
 
   // Service-level lifecycle handler (start/stop/restart)
   const handleServiceAction = async (serviceId: string, action: 'start' | 'stop' | 'restart') => {
@@ -269,6 +428,16 @@ export default function ProjectPage({ params }: ProjectPageProps) {
       setServiceActionLoading((prev) => ({ ...prev, [serviceId]: null }));
     }
   };
+
+  const handleServiceUpdated = useCallback((updated: Service) => {
+    setProject((prev) => {
+      if (!prev || !prev.services) return prev;
+      return {
+        ...prev,
+        services: prev.services.map((s) => (s.id === updated.id ? updated : s)),
+      };
+    });
+  }, []);
 
   if (loading) {
     return (
@@ -410,10 +579,10 @@ export default function ProjectPage({ params }: ProjectPageProps) {
                 onDeployAll={handleDeployAll}
                 isDeployingAll={isDeployingAll}
                 onServiceAction={handleServiceAction}
-                onViewLogs={(svcId) => {
-                  setSelectedServiceId(svcId);
-                  setActiveTab('logs');
-                }}
+                onViewLogs={handleViewServiceLogs}
+                onSelectServiceDeployment={handleSelectServiceDeployment}
+                selectedServiceDeploymentId={selectedServiceDeploymentId}
+                onServiceUpdated={handleServiceUpdated}
               />
 
               {/* Recent Releases Card */}
@@ -433,10 +602,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
                 <DeploymentHistory
                   deployments={deployments.slice(0, 3)}
                   selectedDeploymentId={selectedDeployment?.id || null}
-                  onSelectDeployment={(d) => {
-                    setSelectedDeployment(d);
-                    setActiveTab('logs');
-                  }}
+                  onSelectDeployment={handleSelectReleaseDeployment}
                 />
               </div>
             </div>
@@ -446,10 +612,11 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               <LogsSection
                 deployments={deployments}
                 selectedDeployment={selectedDeployment}
-                onSelectDeployment={(d) => setSelectedDeployment(d)}
+                selectedLogTarget={selectedLogTarget}
+                onSelectDeployment={handleSelectReleaseDeployment}
                 services={services}
                 selectedServiceId={selectedServiceId}
-                onSelectServiceScope={(svcId) => setSelectedServiceId(svcId)}
+                onSelectServiceScope={handleSelectServiceScope}
                 logs={logs}
                 connected={connected}
                 connectionState={connectionState}
@@ -470,7 +637,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               <DeploymentHistory
                 deployments={deployments}
                 selectedDeploymentId={selectedDeployment?.id || null}
-                onSelectDeployment={(d) => setSelectedDeployment(d)}
+                onSelectDeployment={handleSelectReleaseDeployment}
               />
             </div>
 
@@ -478,10 +645,11 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               <LogsSection
                 deployments={deployments}
                 selectedDeployment={selectedDeployment}
-                onSelectDeployment={(d) => setSelectedDeployment(d)}
+                selectedLogTarget={selectedLogTarget}
+                onSelectDeployment={handleSelectReleaseDeployment}
                 services={services}
                 selectedServiceId={selectedServiceId}
-                onSelectServiceScope={(svcId) => setSelectedServiceId(svcId)}
+                onSelectServiceScope={handleSelectServiceScope}
                 logs={logs}
                 connected={connected}
                 connectionState={connectionState}
@@ -497,10 +665,11 @@ export default function ProjectPage({ params }: ProjectPageProps) {
             <LogsSection
               deployments={deployments}
               selectedDeployment={selectedDeployment}
-              onSelectDeployment={(d) => setSelectedDeployment(d)}
+              selectedLogTarget={selectedLogTarget}
+              onSelectDeployment={handleSelectReleaseDeployment}
               services={services}
               selectedServiceId={selectedServiceId}
-              onSelectServiceScope={(svcId) => setSelectedServiceId(svcId)}
+              onSelectServiceScope={handleSelectServiceScope}
               logs={logs}
               connected={connected}
               connectionState={connectionState}
@@ -512,7 +681,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
         {/* Tab 4: Environment Variables & Secrets */}
         {activeTab === 'env' && (
           <div className="max-w-4xl">
-            <EnvManager projectId={project.id} />
+            <EnvManager projectId={project.id} services={services} />
           </div>
         )}
       </main>
