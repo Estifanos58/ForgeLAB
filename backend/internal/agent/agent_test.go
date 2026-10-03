@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAgentServer_Status(t *testing.T) {
@@ -870,6 +872,84 @@ func TestAgentServer_StreamContext_AuthFlowAndTokenIsolation(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK with X-Agent-Session-Token, got %d", resp2.StatusCode)
 	}
+}
+
+func TestAgentServer_ConsumedSession_SourceBoundAccess(t *testing.T) {
+	tempDir1 := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tempDir1, "index.js"), []byte("console.log('service 1');"), 0644)
+	tempDir2 := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tempDir2, "index.js"), []byte("console.log('service 2');"), 0644)
+
+	sm := GetGlobalSessionManager()
+	testUser := uuid.New()
+	agentID := "test-agent-consumed-regression"
+	authSession, err := sm.CreateSession(testUser, agentID, 10*time.Minute)
+	require.NoError(t, err)
+
+	srv := NewAgentServer(AgentServerConfig{
+		AgentID: agentID,
+		Port:    4142,
+	})
+	defer srv.Close()
+
+	// 1. Register source 1 with unconsumed token
+	session1, err := srv.registerDirectory(tempDir1, authSession.Token)
+	require.NoError(t, err)
+	require.NotNil(t, session1)
+
+	// Verify session is bound in sm
+	boundSess, err := sm.VerifyTokenForSource(authSession.Token, session1.SourceID, agentID)
+	require.NoError(t, err)
+	assert.Equal(t, session1.SourceID, *boundSess.SourceID)
+
+	ts := httptest.NewServer(srv.Router())
+	defer ts.Close()
+
+	// 2. Mark session as consumed (simulating project creation)
+	require.NoError(t, sm.MarkConsumed(authSession.ID))
+	require.NoError(t, srv.ConsumeSession(session1.SourceID))
+
+	// 3. Regression test: Same consumed token CAN access its original bound source
+	streamURL1 := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=.", ts.URL, session1.SourceID)
+	req1, _ := http.NewRequest(http.MethodGet, streamURL1, nil)
+	req1.Header.Set("Authorization", "Bearer "+authSession.Token)
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	defer resp1.Body.Close()
+	assert.Equal(t, http.StatusOK, resp1.StatusCode, "consumed session must be allowed to access its original bound source")
+
+	// 4. Regression test: Same consumed token CANNOT select another folder/path
+	selectPayload, _ := json.Marshal(map[string]string{"path": tempDir2})
+	selectReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/agent/select-path", bytes.NewReader(selectPayload))
+	selectReq.Header.Set("Content-Type", "application/json")
+	selectReq.Header.Set("Authorization", "Bearer "+authSession.Token)
+	selectResp, err := http.DefaultClient.Do(selectReq)
+	require.NoError(t, err)
+	defer selectResp.Body.Close()
+	assert.Equal(t, http.StatusUnauthorized, selectResp.StatusCode, "consumed token must NOT be allowed to select new paths")
+
+	// 5. Regression test: Same consumed token CANNOT access or bind to a different source
+	otherSourceID := uuid.New()
+	_, err = sm.VerifyTokenForSource(authSession.Token, otherSourceID, agentID)
+	assert.ErrorIs(t, err, ErrSessionConsumed, "consumed session cannot access a different source")
+
+	_, err = sm.BindSource(authSession.Token, otherSourceID, "other", agentID)
+	assert.ErrorIs(t, err, ErrSessionConsumed, "consumed session cannot bind to another source")
+
+	streamURL2 := fmt.Sprintf("%s/api/agent/sources/%s/stream-context", ts.URL, otherSourceID)
+	req2, _ := http.NewRequest(http.MethodGet, streamURL2, nil)
+	req2.Header.Set("Authorization", "Bearer "+authSession.Token)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	defer resp2.Body.Close()
+	assert.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound}, resp2.StatusCode)
+
+	// 6. Regression test: Expired token is rejected even for the bound source
+	expiredSession, err := sm.CreateSession(testUser, agentID, 10*time.Minute)
+	require.NoError(t, err)
+	expiredSession.ExpiresAt = time.Now().Add(-1 * time.Minute)
+	_, err = sm.VerifyTokenForSource(expiredSession.Token, session1.SourceID, agentID)
+	assert.ErrorIs(t, err, ErrSessionExpired, "expired session must be rejected")
 }
 
 

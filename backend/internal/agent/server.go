@@ -47,27 +47,30 @@ type LocalSourceSession struct {
 }
 
 type AgentServerConfig struct {
-	Port             int
-	AllowedRoots     []string
-	BackendURL       string
-	AllowedOrigins   []string
-	SessionValidator func(token, agentID string) (*AgentSession, error)
-	SessionTTL       time.Duration
+	AgentID                string
+	Port                   int
+	AllowedRoots           []string
+	BackendURL             string
+	AllowedOrigins         []string
+	SessionValidator       func(token, agentID string) (*AgentSession, error)
+	SourceSessionValidator func(token string, sourceID uuid.UUID, agentID string) (*AgentSession, error)
+	SessionTTL             time.Duration
 }
 
 type AgentServer struct {
-	agentID          string
-	port             int
-	backendURL       string
-	allowedOrigins   []string
-	pathValidator    *PathValidator
-	picker           *NativeFolderPicker
-	sessions         map[uuid.UUID]*LocalSourceSession
-	mu               sync.RWMutex
-	dockerClient     *client.Client
-	sessionValidator func(token, agentID string) (*AgentSession, error)
-	sessionTTL       time.Duration
-	stopCleanup      chan struct{}
+	agentID                string
+	port                   int
+	backendURL             string
+	allowedOrigins         []string
+	pathValidator          *PathValidator
+	picker                 *NativeFolderPicker
+	sessions               map[uuid.UUID]*LocalSourceSession
+	mu                     sync.RWMutex
+	dockerClient           *client.Client
+	sessionValidator       func(token, agentID string) (*AgentSession, error)
+	sourceSessionValidator func(token string, sourceID uuid.UUID, agentID string) (*AgentSession, error)
+	sessionTTL             time.Duration
+	stopCleanup            chan struct{}
 }
 
 func NewAgentServer(cfg AgentServerConfig) *AgentServer {
@@ -105,18 +108,24 @@ func NewAgentServer(cfg AgentServerConfig) *AgentServer {
 		ttl = 30 * time.Minute
 	}
 
+	agentID := strings.TrimSpace(cfg.AgentID)
+	if agentID == "" {
+		agentID = uuid.New().String()
+	}
+
 	srv := &AgentServer{
-		agentID:          uuid.New().String(),
+		agentID:          agentID,
 		port:             cfg.Port,
 		backendURL:       cfg.BackendURL,
 		allowedOrigins:   origins,
 		pathValidator:    NewPathValidator(cfg.AllowedRoots),
 		picker:           NewNativeFolderPicker(),
 		sessions:         make(map[uuid.UUID]*LocalSourceSession),
-		dockerClient:     cli,
-		sessionValidator: cfg.SessionValidator,
-		sessionTTL:       ttl,
-		stopCleanup:      make(chan struct{}),
+		dockerClient:           cli,
+		sessionValidator:       cfg.SessionValidator,
+		sourceSessionValidator: cfg.SourceSessionValidator,
+		sessionTTL:             ttl,
+		stopCleanup:            make(chan struct{}),
 	}
 
 	go srv.cleanupLoop(5 * time.Minute)
@@ -178,7 +187,7 @@ func (s *AgentServer) Router() http.Handler {
 	mux.HandleFunc("/api/agent/status", s.handleStatus)
 	mux.HandleFunc("/api/agent/select-folder", s.requireAuth(s.handleSelectFolder))
 	mux.HandleFunc("/api/agent/select-path", s.requireAuth(s.handleSelectPath))
-	mux.HandleFunc("/api/agent/sources/", s.requireAuth(s.handleSourcesRoutes))
+	mux.HandleFunc("/api/agent/sources/", s.requireSourceAuth(s.handleSourcesRoutes))
 
 	return s.corsMiddleware(mux)
 }
@@ -311,6 +320,140 @@ func (s *AgentServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		// Store session in context if needed
 		ctx := context.WithValue(r.Context(), "agent_session", sess)
 		ctx = context.WithValue(ctx, "agent_token", token)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+func (s *AgentServer) validateTokenForSource(ctx context.Context, token string, sourceID uuid.UUID) (*AgentSession, error) {
+	cleanToken := strings.TrimSpace(token)
+	if cleanToken == "" {
+		return nil, errors.New("missing session token")
+	}
+
+	// 1. Custom configured source session validator
+	if s.sourceSessionValidator != nil {
+		return s.sourceSessionValidator(cleanToken, sourceID, s.agentID)
+	}
+
+	// 2. Global session manager (same-host / local runtime)
+	if sm := GetGlobalSessionManager(); sm != nil {
+		if sess, err := sm.VerifyTokenForSource(cleanToken, sourceID, s.agentID); err == nil {
+			return sess, nil
+		} else if !errors.Is(err, ErrSessionNotFound) && s.backendURL == "" && s.sessionValidator == nil {
+			return nil, err
+		}
+	}
+
+	// 3. Fallback to custom sessionValidator if configured (e.g. unit tests without global session manager)
+	if s.sessionValidator != nil {
+		sess, err := s.sessionValidator(cleanToken, s.agentID)
+		if err != nil {
+			return nil, err
+		}
+		if sess.SourceID != nil && *sess.SourceID != sourceID {
+			return nil, fmt.Errorf("%w: session not bound to requested source", ErrUnauthorized)
+		}
+		return sess, nil
+	}
+
+	// 4. Fallback: call backend HTTP verification endpoint with source_id
+	if s.backendURL != "" {
+		validateURL := fmt.Sprintf("%s/api/sources/agent/session/validate", strings.TrimRight(s.backendURL, "/"))
+		payload, _ := json.Marshal(map[string]string{
+			"token":     cleanToken,
+			"source_id": sourceID.String(),
+			"agent_id":  s.agentID,
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, validateURL, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("backend session validation failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			if resp.StatusCode == http.StatusForbidden {
+				return nil, fmt.Errorf("%w: backend rejected session token with status 403", ErrUnauthorized)
+			}
+			return nil, fmt.Errorf("backend rejected session token with status %d", resp.StatusCode)
+		}
+
+		var res struct {
+			Valid     bool      `json:"valid"`
+			SessionID string    `json:"session_id"`
+			UserID    string    `json:"user_id"`
+			AgentID   string    `json:"agent_id"`
+			SourceID  string    `json:"source_id"`
+			ExpiresAt time.Time `json:"expires_at"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			return nil, err
+		}
+		sID, _ := uuid.Parse(res.SessionID)
+		uID, _ := uuid.Parse(res.UserID)
+		sess := &AgentSession{
+			ID:        sID,
+			Token:     cleanToken,
+			UserID:    uID,
+			AgentID:   res.AgentID,
+			ExpiresAt: res.ExpiresAt,
+		}
+		if srcUUID, parseErr := uuid.Parse(res.SourceID); parseErr == nil && srcUUID != uuid.Nil {
+			sess.SourceID = &srcUUID
+		}
+		return sess, nil
+	}
+
+	return nil, ErrSessionNotFound
+}
+
+func (s *AgentServer) requireSourceAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := extractToken(r)
+		if token == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: agent session token is required"})
+			return
+		}
+
+		path := strings.TrimPrefix(r.URL.Path, "/api/agent/sources/")
+		parts := strings.Split(path, "/")
+		if len(parts) == 0 || parts[0] == "" {
+			http.Error(w, "source_id is required", http.StatusBadRequest)
+			return
+		}
+
+		sourceUUID, err := uuid.Parse(parts[0])
+		if err != nil {
+			http.Error(w, "invalid source UUID format", http.StatusBadRequest)
+			return
+		}
+
+		sess, err := s.validateTokenForSource(r.Context(), token, sourceUUID)
+		if err != nil {
+			if errors.Is(err, ErrSessionExpired) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: agent session has expired"})
+				return
+			}
+			if errors.Is(err, ErrUnauthorized) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "unauthorized: " + err.Error()})
+				return
+			}
+			if errors.Is(err, ErrSessionConsumed) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: agent session has already been consumed"})
+				return
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: " + err.Error()})
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "agent_session", sess)
+		ctx = context.WithValue(ctx, "agent_token", token)
+		ctx = context.WithValue(ctx, "agent_source_id", sourceUUID)
 		next(w, r.WithContext(ctx))
 	}
 }
@@ -669,6 +812,11 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 	s.mu.RUnlock()
 
 	if !exists {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "source session not found or expired"})
+		return
+	}
+
+	if time.Now().After(session.ExpiresAt) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "source session not found or expired"})
 		return
 	}

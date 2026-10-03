@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/handlers"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
@@ -577,6 +578,82 @@ func TestSourceHandler_ValidateLocalPath_AsyncPolling(t *testing.T) {
 
 	assert.Equal(t, "ready", pollMap["status"])
 	assert.NotNil(t, pollMap["result"])
+}
+
+func TestSourceHandler_ValidateAgentSession_SourceAwareAuth(t *testing.T) {
+	tempDir := t.TempDir()
+	sourceService := services.NewSourceService(nil, tempDir, nil)
+	handler := handlers.NewSourceHandler(sourceService, nil)
+
+	sm := agent.GetGlobalSessionManager()
+	testUserID := uuid.New()
+	agentID := "test-agent-validate-handler"
+	authSession, err := sm.CreateSession(testUserID, agentID, 10*time.Minute)
+	require.NoError(t, err)
+
+	sourceUUID := uuid.New()
+	_, err = sm.BindSource(authSession.Token, sourceUUID, "my-repo", agentID)
+	require.NoError(t, err)
+
+	// Mark consumed
+	require.NoError(t, sm.MarkConsumed(authSession.ID))
+
+	// 1. Validate with correct source_id -> succeeds even though consumed
+	payload1, _ := json.Marshal(map[string]string{
+		"token":     authSession.Token,
+		"source_id": sourceUUID.String(),
+		"agent_id":  agentID,
+	})
+	req1 := httptest.NewRequest(http.MethodPost, "/api/sources/agent/session/validate", bytes.NewReader(payload1))
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	handler.ValidateAgentSession(rec1, req1)
+	assert.Equal(t, http.StatusOK, rec1.Code)
+
+	var res1 map[string]interface{}
+	err = json.NewDecoder(rec1.Body).Decode(&res1)
+	require.NoError(t, err)
+	assert.Equal(t, true, res1["valid"])
+	assert.Equal(t, sourceUUID.String(), res1["source_id"])
+
+	// 2. Validate with different source_id -> rejected
+	otherSourceUUID := uuid.New()
+	payload2, _ := json.Marshal(map[string]string{
+		"token":     authSession.Token,
+		"source_id": otherSourceUUID.String(),
+		"agent_id":  agentID,
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/api/sources/agent/session/validate", bytes.NewReader(payload2))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	handler.ValidateAgentSession(rec2, req2)
+	assert.Equal(t, http.StatusUnauthorized, rec2.Code)
+
+	// 3. Validate without source_id -> rejected (consumed session)
+	payload3, _ := json.Marshal(map[string]string{
+		"token":    authSession.Token,
+		"agent_id": agentID,
+	})
+	req3 := httptest.NewRequest(http.MethodPost, "/api/sources/agent/session/validate", bytes.NewReader(payload3))
+	req3.Header.Set("Content-Type", "application/json")
+	rec3 := httptest.NewRecorder()
+	handler.ValidateAgentSession(rec3, req3)
+	assert.Equal(t, http.StatusUnauthorized, rec3.Code)
+
+	// 4. Expired token -> rejected
+	expiredSession, err := sm.CreateSession(testUserID, agentID, 10*time.Minute)
+	require.NoError(t, err)
+	expiredSession.ExpiresAt = time.Now().Add(-1 * time.Minute)
+	payload4, _ := json.Marshal(map[string]string{
+		"token":     expiredSession.Token,
+		"source_id": sourceUUID.String(),
+		"agent_id":  agentID,
+	})
+	req4 := httptest.NewRequest(http.MethodPost, "/api/sources/agent/session/validate", bytes.NewReader(payload4))
+	req4.Header.Set("Content-Type", "application/json")
+	rec4 := httptest.NewRecorder()
+	handler.ValidateAgentSession(rec4, req4)
+	assert.Equal(t, http.StatusUnauthorized, rec4.Code)
 }
 
 

@@ -182,16 +182,67 @@ func (sm *SessionManager) BindSource(token string, sourceID uuid.UUID, folderNam
 		return nil, ErrSessionConsumed
 	}
 
+	// Do not allow re-binding to a different source
+	if session.SourceID != nil && *session.SourceID != sourceID {
+		return nil, fmt.Errorf("%w: session already bound to source %s", ErrUnauthorized, session.SourceID.String())
+	}
+
 	// If agentID was not specified during session creation, bind it now; otherwise verify match
-	if session.AgentID != "" && agentID != "" && session.AgentID != agentID {
+	cleanAgentID := strings.TrimSpace(agentID)
+	if session.AgentID != "" && cleanAgentID != "" && session.AgentID != cleanAgentID {
 		return nil, fmt.Errorf("%w: agent ID mismatch", ErrUnauthorized)
 	}
-	if session.AgentID == "" && agentID != "" {
-		session.AgentID = agentID
+	if session.AgentID == "" && cleanAgentID != "" {
+		session.AgentID = cleanAgentID
 	}
 
 	session.SourceID = &sourceID
 	session.FolderName = folderName
+	return session, nil
+}
+
+// VerifyTokenForSource validates that a session token is authorized for a specific bound source.
+// It allows a consumed session ONLY when:
+// 1. token matches,
+// 2. session is not expired,
+// 3. session is already bound to exactly that sourceID,
+// 4. agent ID matches.
+// A consumed token cannot access or bind to any other source.
+func (sm *SessionManager) VerifyTokenForSource(token string, sourceID uuid.UUID, agentID string) (*AgentSession, error) {
+	cleanToken := strings.TrimSpace(token)
+	if cleanToken == "" {
+		return nil, ErrInvalidToken
+	}
+
+	sm.mu.RLock()
+	sessionID, ok := sm.tokens[cleanToken]
+	if !ok {
+		sm.mu.RUnlock()
+		return nil, ErrSessionNotFound
+	}
+	session, exists := sm.sessions[sessionID]
+	sm.mu.RUnlock()
+
+	if !exists {
+		return nil, ErrSessionNotFound
+	}
+
+	if session.IsExpired() {
+		return nil, ErrSessionExpired
+	}
+
+	cleanAgentID := strings.TrimSpace(agentID)
+	if cleanAgentID != "" && session.AgentID != "" && session.AgentID != cleanAgentID {
+		return nil, fmt.Errorf("%w: agent ID mismatch", ErrUnauthorized)
+	}
+
+	if session.SourceID == nil || *session.SourceID != sourceID {
+		if session.Consumed {
+			return nil, ErrSessionConsumed
+		}
+		return nil, fmt.Errorf("%w: session not bound to requested source", ErrUnauthorized)
+	}
+
 	return session, nil
 }
 

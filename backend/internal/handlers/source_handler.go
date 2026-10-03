@@ -557,7 +557,14 @@ func (h *SourceHandler) ValidateAgentSession(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, "invalid source_id format")
 			return
 		}
-		session, err = sm.BindSource(req.Token, sourceUUID, req.FolderName, req.AgentID)
+		// Use source-aware verification (valid for active or consumed sessions bound to this source)
+		session, err = sm.VerifyTokenForSource(req.Token, sourceUUID, req.AgentID)
+		if err != nil {
+			// If not bound yet and session is unconsumed, allow initial binding (e.g. from folder registration)
+			if unconsumedSess, valErr := sm.ValidateToken(req.Token); valErr == nil && unconsumedSess.SourceID == nil {
+				session, err = sm.BindSource(req.Token, sourceUUID, req.FolderName, req.AgentID)
+			}
+		}
 	} else {
 		session, err = sm.ValidateToken(req.Token)
 	}
@@ -565,6 +572,10 @@ func (h *SourceHandler) ValidateAgentSession(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		if errors.Is(err, agent.ErrSessionExpired) {
 			writeError(w, http.StatusUnauthorized, "agent session has expired")
+			return
+		}
+		if errors.Is(err, agent.ErrSessionConsumed) {
+			writeError(w, http.StatusUnauthorized, "agent session has already been consumed")
 			return
 		}
 		if errors.Is(err, agent.ErrUnauthorized) {

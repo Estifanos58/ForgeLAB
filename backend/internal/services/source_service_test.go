@@ -745,4 +745,58 @@ func TestSourceService_AgentSessionToken_EncryptionDecryptionOwnership(t *testin
 	assert.NotContains(t, jsonStr, "EncryptedSessionToken")
 }
 
+func TestSourceService_SaveAndGetSource(t *testing.T) {
+	tempDir := t.TempDir()
+	cryptoKey := "12345678901234567890123456789012"
+	encryptor, err := crypto.NewEncryptor(cryptoKey)
+	require.NoError(t, err)
+
+	svc := services.NewSourceService(nil, tempDir, encryptor)
+	ownerID := uuid.New()
+	intruderID := uuid.New()
+	sourceID := uuid.New()
+
+	rawSecretToken := "my-secret-agent-token-xyz"
+	encrypted, err := svc.EncryptToken(rawSecretToken)
+	require.NoError(t, err)
+
+	src := &models.Source{
+		ID:                    sourceID,
+		OwnerID:               ownerID,
+		SourceType:            models.SourceTypeLocalAgent,
+		SourceReference:       "source-ref-xyz",
+		AgentID:               "agent-123",
+		Fingerprint:           "fp-abc",
+		EncryptedSessionToken: encrypted,
+		Metadata: map[string]interface{}{
+			"folder_name": "my-project",
+		},
+	}
+
+	// 1. SaveSource
+	err = svc.SaveSource(context.Background(), src)
+	require.NoError(t, err)
+
+	// 2. GetSource by owner returns matching record and preserves encrypted token
+	retrieved, err := svc.GetSource(context.Background(), sourceID, ownerID)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, sourceID, retrieved.ID)
+	assert.Equal(t, ownerID, retrieved.OwnerID)
+	assert.Equal(t, models.SourceTypeLocalAgent, retrieved.SourceType)
+	assert.Equal(t, "source-ref-xyz", retrieved.SourceReference)
+	assert.Equal(t, "agent-123", retrieved.AgentID)
+	assert.Equal(t, "fp-abc", retrieved.Fingerprint)
+	assert.Equal(t, encrypted, retrieved.EncryptedSessionToken)
+	assert.Equal(t, "my-project", retrieved.Metadata["folder_name"])
+
+	// 3. GetSource by intruder fails with ErrUnauthorizedSource
+	_, err = svc.GetSource(context.Background(), sourceID, intruderID)
+	assert.ErrorIs(t, err, services.ErrUnauthorizedSource)
+
+	// 4. GetSource for non-existent source fails with ErrSourceDirNotFound
+	_, err = svc.GetSource(context.Background(), uuid.New(), ownerID)
+	assert.ErrorIs(t, err, services.ErrSourceDirNotFound)
+}
+
 
