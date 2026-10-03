@@ -90,22 +90,36 @@ All channels use durable **UUIDv4** strings. Channels are never keyed by project
 
 | Channel Pattern | MVP Implementation Status | Purpose |
 | :--- | :--- | :--- |
-| `deployment:<deployment-uuid>` | **ACTIVELY PRODUCED & CONSUMED** | Realtime build logs, runtime stdout/stderr, and status changes. |
-| `project:<project-uuid>` | **CONTRACT SUPPORTED / NO ACTIVE PRODUCERS** | Project-wide lifecycle events (e.g. deployment queued). |
+| `service-deployment:<service-deployment-uuid>` | **ACTIVELY PRODUCED & CONSUMED** | Realtime service deployment build logs, runtime stdout/stderr, and fine-grained status changes. |
+| `deployment:<deployment-uuid>` | **ACTIVELY PRODUCED & CONSUMED** | Orchestration release logs, status transitions, and child service events. |
+| `deployment:<deployment-uuid>:service:<service-uuid>` | **ACTIVELY PRODUCED & CONSUMED** | Service-scoped build/runtime logs under an orchestration release. |
+| `project:<project-uuid>` | **ACTIVELY PRODUCED & CONSUMED** | Project-wide events: `service_deployment_log`, `service_status_change`, and `project_status`. |
 
 ### Client-to-Server Message Formats
 
 ```typescript
+// Subscribe to a service-deployment channel
+{
+  "type": "subscribe",
+  "channel": "service-deployment:e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b"
+}
+
 // Subscribe to a deployment channel
 {
   "type": "subscribe",
   "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f"
 }
 
-// Unsubscribe from a deployment channel
+// Subscribe to a project channel
+{
+  "type": "subscribe",
+  "channel": "project:a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"
+}
+
+// Unsubscribe from a channel
 {
   "type": "unsubscribe",
-  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f"
+  "channel": "service-deployment:e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b"
 }
 
 // Heartbeat keepalive
@@ -120,7 +134,7 @@ All channels use durable **UUIDv4** strings. Channels are never keyed by project
 // 1. Subscription Confirmed (stream is now live)
 {
   "type": "subscribed",
-  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f"
+  "channel": "service-deployment:e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b"
 }
 
 // 2. Subscription Rejected / Authorization Error
@@ -133,10 +147,12 @@ All channels use durable **UUIDv4** strings. Channels are never keyed by project
 // 3. Live Log Line (Build, Startup, Health, or Runtime) — Contains persistent database ID
 {
   "type": "log",
-  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
+  "channel": "service-deployment:e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
   "data": {
     "id": 12345,                                      // Persisted PostgreSQL deployment_logs.id
     "deployment_id": "c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
+    "service_deployment_id": "e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    "service_id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e",
     "timestamp": "2026-09-28T08:00:05.123456Z",
     "phase": "build",                                 // "source" | "build" | "startup" | "health" | "runtime"
     "stream": "stdout",                               // "stdout" | "stderr" | "system"
@@ -144,20 +160,32 @@ All channels use durable **UUIDv4** strings. Channels are never keyed by project
   }
 }
 
-// 4. Deployment Status Change
+// 4. Service Deployment Status Change (Emitted to service-deployment and project channels)
 {
   "type": "status_change",
-  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
+  "channel": "service-deployment:e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
   "data": {
-    "deployment_id": "c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
-    "project_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
-    "previous_status": "building",
-    "new_status": "starting",
+    "service_deployment_id": "e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    "service_id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e",
+    "service_name": "frontend",
+    "deploy_number": 2,
+    "new_status": "starting",                         // fine-grained deployment phase
+    "service_status": "deploying",                    // coarse service status
     "timestamp": "2026-09-28T08:00:15Z"
   }
 }
 
-// 5. Heartbeat Pong
+// 5. Project Composite Status Change (Emitted to project:<project-uuid>)
+{
+  "type": "project_status",
+  "channel": "project:a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+  "data": {
+    "project_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+    "status": "running"                               // "inactive" | "deploying" | "running" | "partially_running" | "stopped" | "failed"
+  }
+}
+
+// 6. Heartbeat Pong
 {
   "type": "pong"
 }

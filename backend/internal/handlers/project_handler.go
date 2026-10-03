@@ -420,6 +420,9 @@ func (h *ProjectHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 
 	if h.deployQueue != nil {
 		if err := h.deployQueue.EnqueueDeployment(r.Context(), newDeploy.ID); err != nil {
+			reason := "failed to enqueue rollback deployment: " + err.Error()
+			_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), newDeploy.ID, models.DeployStatusFailed, &reason)
+			_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
 			writeError(w, http.StatusInternalServerError, "failed to enqueue rollback deployment")
 			return
 		}

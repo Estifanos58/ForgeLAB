@@ -115,7 +115,7 @@ func main() {
 		cfg.JWT.RefreshTokenExpiry,
 	)
 
-	sourceService := services.NewSourceService(pool, cfg.Docker.SourcesDir)
+	sourceService := services.NewSourceService(pool, cfg.Docker.SourcesDir, encryptor)
 	githubService := services.NewGitHubService(pool, encryptor, cfg.GitHub, redisClient)
 	userService := services.NewUserService(pool, jwtManager)
 	serviceService := services.NewServiceService(pool)

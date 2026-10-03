@@ -849,3 +849,95 @@ Verify that clicking Rollback on an individual service rolls back only that spec
 - **Environment:** —
 - **Notes:** —
 
+---
+
+### Procedure 14: Rollback Fail-Closed Verification When Immutable Image is Missing
+
+#### Purpose
+Verify that when rolling back an individual service or project, if the prior known-good Docker image or digest is not available in the local Docker daemon, the deployment fails closed with status `failed` and does NOT fall back to rebuilding from the current source workspace.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- A service with at least two deployments where Deployment #1 was successful (`running`).
+- Identify the Docker image tag of Deployment #1: `forgelab/<project_id>/<service_name>:1`.
+
+#### Test Procedure
+1. Stop any active containers from Deployment #1 and remove the image from the Docker daemon:
+   ```bash
+   docker rmi -f forgelab/<project_id>/<service_name>:1
+   ```
+2. In the ForgeLAB UI, click **Rollback** on the service card (or execute `POST /api/projects/<id>/services/<service_id>/rollback`).
+3. Monitor the deployment progress via WebSocket or database logs:
+   ```sql
+   SELECT id, status, execution_mode, failure_reason FROM service_deployments WHERE service_id = '<service_id>' ORDER BY deploy_number DESC LIMIT 1;
+   ```
+4. Verify:
+   - `execution_mode` is `reuse_image`.
+   - The deployment status transitions to `failed` (NOT `running`).
+   - `failure_reason` explicitly states: `Rollback failed closed: immutable image '...' is unavailable in Docker daemon...; will not rebuild from current source`.
+   - The deployment engine did NOT attempt to acquire source code or execute `docker build`.
+   - Any currently running healthy container for this service was NOT stopped or destroyed.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### Procedure 15: Local Agent Connected Source Authentication & Deployment
+
+#### Purpose
+Verify the secure local agent credential flow: agent session creation, encrypted persistence in `sources.encrypted_session_token`, ownership verification, authenticated streaming of source files via `Authorization: Bearer <token>`, and fail-closed behavior on missing or expired credentials.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- Host machine running the ForgeLAB local agent:
+  ```bash
+  cd backend && go run cmd/agent/main.go
+  ```
+- Agent is responding to status probe on `http://127.0.0.1:4142/api/agent/status`.
+- Central ForgeLAB control plane running on `http://localhost:8080` (or `http://localhost:3000`).
+
+#### Test Procedure
+1. In the ForgeLAB dashboard, click **New Project** and select **Local Agent**.
+2. Select a local directory containing a Node.js or Go application.
+3. Observe the agent modal:
+   - Agent discovers project and generates session token.
+   - Central backend receives `POST /api/sources/agent/register`.
+   - Database record in `sources` has `encrypted_session_token` populated with non-empty binary ciphertext, while `metadata` has no `token` or `session_token` fields.
+4. Click **Deploy**.
+5. Observe the deployment logs:
+   - The deployment engine decrypts the token via `SourceService.GetDecryptedAgentToken`.
+   - Engine calls `GET /api/agent/sources/<id>/stream-context` sending `Authorization: Bearer <token>`.
+   - Agent returns `200 OK` with `.tar` context stream.
+   - The build proceeds to completion without any `401 Unauthorized` errors.
+6. Verify credential failure protection:
+   - Manually clear `encrypted_session_token` for the source in PostgreSQL:
+     ```sql
+     UPDATE sources SET encrypted_session_token = NULL WHERE id = '<source_id>';
+     ```
+   - Trigger a new deployment for this service.
+   - Verify the deployment fails immediately with: `agent session credential missing or expired; please re-select project folder`.
+   - Verify no unauthenticated HTTP call was made to the agent daemon.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+

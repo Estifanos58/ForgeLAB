@@ -80,9 +80,10 @@ type Source struct {
 	SourceReference string                 `json:"source_reference"`
 	AgentID         string                 `json:"agent_id"`
 	Fingerprint     string                 `json:"fingerprint"`
-	Metadata        map[string]interface{} `json:"metadata"`
-	CreatedAt       time.Time              `json:"created_at"`
-	UpdatedAt       time.Time              `json:"updated_at"`
+	Metadata              map[string]interface{} `json:"metadata"`
+	EncryptedSessionToken []byte                 `json:"-"` // Never serialized in JSON responses
+	CreatedAt             time.Time              `json:"created_at"`
+	UpdatedAt             time.Time              `json:"updated_at"`
 }
 
 // BuildCandidate represents a detected build/start option for a service.

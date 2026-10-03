@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -614,6 +616,7 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 	var verifiedSourceID uuid.UUID
 	var verifiedAgentID string
 	var folderName string = req.FolderName
+	var verifiedToken string
 
 	// If session_id is provided, verify session ownership and bound source/agent IDs
 	if strings.TrimSpace(req.SessionID) != "" {
@@ -645,6 +648,7 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 		// Authoritative IDs come strictly from the verified session.
 		verifiedSourceID = *sess.SourceID
 		verifiedAgentID = sess.AgentID
+		verifiedToken = sess.Token
 		if sess.FolderName != "" {
 			folderName = sess.FolderName
 		}
@@ -667,6 +671,7 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 		}
 		verifiedSourceID = *sess.SourceID
 		verifiedAgentID = sess.AgentID
+		verifiedToken = sess.Token
 		if sess.FolderName != "" {
 			folderName = sess.FolderName
 		}
@@ -684,6 +689,10 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 		verifiedAgentID = req.AgentID
 	}
 
+	if verifiedToken == "" && req.Token != "" {
+		verifiedToken = strings.TrimSpace(req.Token)
+	}
+
 	meta := req.Metadata
 	if meta == nil {
 		meta = make(map[string]interface{})
@@ -692,13 +701,38 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 	delete(meta, "token")
 	meta["folder_name"] = folderName
 
+	// Store verified token encrypted
+	var encryptedToken []byte
+	if verifiedToken != "" && h.sourceService != nil {
+		enc, err := h.sourceService.EncryptToken(verifiedToken)
+		if err != nil {
+			slog.Error("failed to encrypt agent session token", "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to secure agent session credentials")
+			return
+		}
+		encryptedToken = enc
+	}
+
+	// Compute deterministic fingerprint for agent source
+	fingerprint := ""
+	if fp, ok := meta["fingerprint"].(string); ok && fp != "" {
+		fingerprint = fp
+	} else if gitSha, ok := meta["commit_sha"].(string); ok && gitSha != "" {
+		fingerprint = gitSha
+	} else {
+		hSha := sha256.Sum256([]byte(fmt.Sprintf("agent:%s:%s:%s", verifiedAgentID, verifiedSourceID.String(), folderName)))
+		fingerprint = fmt.Sprintf("fp_%s", hex.EncodeToString(hSha[:16]))
+	}
+
 	sourceRecord := &models.Source{
-		ID:              verifiedSourceID,
-		OwnerID:         userID,
-		SourceType:      models.SourceTypeLocalAgent,
-		SourceReference: verifiedSourceID.String(),
-		AgentID:         verifiedAgentID,
-		Metadata:        meta,
+		ID:                    verifiedSourceID,
+		OwnerID:               userID,
+		SourceType:            models.SourceTypeLocalAgent,
+		SourceReference:       verifiedSourceID.String(),
+		AgentID:               verifiedAgentID,
+		Fingerprint:           fingerprint,
+		Metadata:              meta,
+		EncryptedSessionToken: encryptedToken,
 	}
 
 	if h.sourceService != nil {

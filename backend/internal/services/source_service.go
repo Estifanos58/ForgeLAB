@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgelab/backend/internal/analyzer"
+	"github.com/forgelab/backend/internal/crypto"
 	"github.com/forgelab/backend/internal/detector"
 	"github.com/forgelab/backend/internal/models"
 )
@@ -92,20 +93,41 @@ type SourceWorkspaceRecord struct {
 type SourceService struct {
 	db              *pgxpool.Pool
 	sourcesDir      string
+	encryptor       *crypto.Encryptor
 	fallbackOwners  sync.Map
 	fallbackSources sync.Map
+	sourceRecords   sync.Map // In-memory Source cache for tests
 	analysisCache   sync.Map
 }
 
-func NewSourceService(db *pgxpool.Pool, sourcesDir string) *SourceService {
+func NewSourceService(db *pgxpool.Pool, sourcesDir string, encryptor ...*crypto.Encryptor) *SourceService {
 	if sourcesDir == "" {
 		sourcesDir = "./data/sources"
 	}
 	_ = os.MkdirAll(sourcesDir, 0755)
 	_ = os.MkdirAll(filepath.Join(sourcesDir, ".uploads"), 0755)
+
+	var enc *crypto.Encryptor
+	if len(encryptor) > 0 && encryptor[0] != nil {
+		enc = encryptor[0]
+	} else if key := os.Getenv("ENCRYPTION_KEY"); key != "" {
+		enc, _ = crypto.NewEncryptor(key)
+	}
+	if enc == nil {
+		enc, _ = crypto.NewEncryptor("default-forgelab-encryption-key!")
+	}
+
 	return &SourceService{
 		db:         db,
 		sourcesDir: sourcesDir,
+		encryptor:  enc,
+	}
+}
+
+// SetEncryptor configures or overrides the encryptor.
+func (s *SourceService) SetEncryptor(enc *crypto.Encryptor) {
+	if enc != nil {
+		s.encryptor = enc
 	}
 }
 
@@ -1472,11 +1494,55 @@ func getRelativePathFromHeader(header textproto.MIMEHeader, defaultName string) 
 	return defaultName
 }
 
+// EncryptToken encrypts a plaintext token using the service encryptor.
+func (s *SourceService) EncryptToken(token string) ([]byte, error) {
+	if token == "" {
+		return nil, nil
+	}
+	if s.encryptor == nil {
+		return nil, errors.New("encryption service not initialized")
+	}
+	return s.encryptor.Encrypt([]byte(token))
+}
+
+// GetDecryptedAgentToken securely retrieves and decrypts the stored agent session token for a source.
+// It verifies source ownership, ensures credentials exist, and returns an explicit authorization error
+// if the session token is missing, expired, or decryption fails.
+func (s *SourceService) GetDecryptedAgentToken(ctx context.Context, ownerID, sourceID uuid.UUID) (string, error) {
+	if sourceID == uuid.Nil {
+		return "", ErrSourceDirNotFound
+	}
+	src, err := s.GetSource(ctx, sourceID, ownerID)
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve agent source %s: %w", sourceID, err)
+	}
+	if src.OwnerID != ownerID {
+		return "", ErrUnauthorizedSource
+	}
+	if len(src.EncryptedSessionToken) == 0 {
+		return "", errors.New("agent session credential missing or expired; please re-select project folder")
+	}
+	if s.encryptor == nil {
+		return "", errors.New("encryption service not available")
+	}
+	dec, err := s.encryptor.Decrypt(src.EncryptedSessionToken)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt agent session credential: %w", err)
+	}
+	tok := strings.TrimSpace(string(dec))
+	if tok == "" {
+		return "", errors.New("agent session credential is empty; please re-select project folder")
+	}
+	return tok, nil
+}
+
+// GetAgentSessionToken is an alias for GetDecryptedAgentToken.
+func (s *SourceService) GetAgentSessionToken(ctx context.Context, ownerID, sourceID uuid.UUID) (string, error) {
+	return s.GetDecryptedAgentToken(ctx, ownerID, sourceID)
+}
+
 // SaveSource inserts or updates a source record in the sources table.
 func (s *SourceService) SaveSource(ctx context.Context, src *models.Source) error {
-	if s.db == nil {
-		return nil
-	}
 	if src.ID == uuid.Nil {
 		src.ID = uuid.New()
 	}
@@ -1486,47 +1552,66 @@ func (s *SourceService) SaveSource(ctx context.Context, src *models.Source) erro
 	}
 	src.UpdatedAt = now
 
+	// Always store in memory for test compatibility & fast lookup
+	s.sourceRecords.Store(src.ID, src)
+
+	if s.db == nil {
+		return nil
+	}
+
 	metaJSON, _ := json.Marshal(src.Metadata)
 	if len(metaJSON) == 0 {
 		metaJSON = []byte("{}")
 	}
 
 	_, err := s.db.Exec(ctx,
-		`INSERT INTO sources (id, owner_id, source_type, source_reference, agent_id, fingerprint, metadata, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`INSERT INTO sources (id, owner_id, source_type, source_reference, agent_id, fingerprint, metadata, encrypted_session_token, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 ON CONFLICT (id) DO UPDATE SET
 		    source_type = EXCLUDED.source_type,
 		    source_reference = EXCLUDED.source_reference,
 		    agent_id = EXCLUDED.agent_id,
 		    fingerprint = EXCLUDED.fingerprint,
 		    metadata = EXCLUDED.metadata,
+		    encrypted_session_token = COALESCE(EXCLUDED.encrypted_session_token, sources.encrypted_session_token),
 		    updated_at = NOW()`,
-		src.ID, src.OwnerID, src.SourceType, src.SourceReference, src.AgentID, src.Fingerprint, metaJSON, src.CreatedAt, src.UpdatedAt,
+		src.ID, src.OwnerID, src.SourceType, src.SourceReference, src.AgentID, src.Fingerprint, metaJSON, src.EncryptedSessionToken, src.CreatedAt, src.UpdatedAt,
 	)
 	return err
 }
 
 // GetSource retrieves a source record by ID and owner.
 func (s *SourceService) GetSource(ctx context.Context, id, ownerID uuid.UUID) (*models.Source, error) {
-	if s.db == nil {
-		return nil, ErrSourceDirNotFound
-	}
-	src := &models.Source{}
-	var metaJSON []byte
-	err := s.db.QueryRow(ctx,
-		`SELECT id, owner_id, source_type, source_reference, agent_id, fingerprint, metadata, created_at, updated_at
-		 FROM sources WHERE id = $1 AND owner_id = $2`,
-		id, ownerID,
-	).Scan(&src.ID, &src.OwnerID, &src.SourceType, &src.SourceReference, &src.AgentID, &src.Fingerprint, &metaJSON, &src.CreatedAt, &src.UpdatedAt)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrSourceDirNotFound
+	if s.db != nil {
+		src := &models.Source{}
+		var metaJSON []byte
+		err := s.db.QueryRow(ctx,
+			`SELECT id, owner_id, source_type, source_reference, agent_id, fingerprint, metadata, encrypted_session_token, created_at, updated_at
+			 FROM sources WHERE id = $1 AND owner_id = $2`,
+			id, ownerID,
+		).Scan(&src.ID, &src.OwnerID, &src.SourceType, &src.SourceReference, &src.AgentID, &src.Fingerprint, &metaJSON, &src.EncryptedSessionToken, &src.CreatedAt, &src.UpdatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrSourceDirNotFound
+			}
+			return nil, err
 		}
-		return nil, err
+		if len(metaJSON) > 0 {
+			_ = json.Unmarshal(metaJSON, &src.Metadata)
+		}
+		s.sourceRecords.Store(src.ID, src)
+		return src, nil
 	}
-	if len(metaJSON) > 0 {
-		_ = json.Unmarshal(metaJSON, &src.Metadata)
+
+	// Fallback for tests running without database connection
+	if val, ok := s.sourceRecords.Load(id); ok {
+		src := val.(*models.Source)
+		if src.OwnerID != ownerID {
+			return nil, ErrUnauthorizedSource
+		}
+		return src, nil
 	}
-	return src, nil
+
+	return nil, ErrSourceDirNotFound
 }
 

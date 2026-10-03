@@ -683,14 +683,18 @@ Common status codes:
 ### `POST /api/projects/{id}/services/{serviceId}/rollback`
 - **Authentication:** Required (Bearer JWT)
 - **Authorization:** Checks project ownership and service association.
-- **Side Effects:**
-  - Finds the most recent successful prior deployment for this service.
-  - Creates a new `ServiceDeployment` record referencing the prior known-good image tag.
-  - Enqueues the service deployment job in Redis.
+- **Execution Mode:** `reuse_image` (strictly reuses prior known-good Docker image).
+- **Side Effects & Invariants:**
+  - Finds the most recent successful prior deployment for this service strictly preceding the current deployment.
+  - Validates that the prior deployment contains an immutable image tag or image digest.
+  - **Fail-Closed Guarantee:** If the prior deployment lacks an image reference, or if the Docker daemon cannot verify the immutable image tag/digest, the rollback **fails closed** (`400 Bad Request` or runtime `failed` status) and does NOT silently rebuild from current source.
+  - Creates a new `ServiceDeployment` record with `execution_mode: "reuse_image"`, `image_tag`, and snapshotted configuration from the prior known-good release.
+  - Enqueues the service deployment job in Redis. If queue enqueue fails, the record is immediately marked `failed` to prevent dangling queued states.
 - **Success Response:** `201 Created` (Returns created rollback ServiceDeployment object).
 - **Error Responses:**
-  - `400 Bad Request`: No previous successful deployment found for this service.
+  - `400 Bad Request`: No previous successful deployment found, or prior deployment has no immutable image to reuse.
   - `409 Conflict`: A deployment is already in progress for this service.
+  - `500 Internal Server Error`: Enqueue failure (record marked failed).
 
 ---
 
@@ -824,6 +828,93 @@ Common status codes:
     "message": "source workspace deleted successfully"
   }
   ```
+
+---
+
+### `POST /api/sources/agent/register`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Purpose:** Registers an active local agent session as an authenticated source.
+- **Request Body:**
+  ```json
+  {
+    "agent_id": "laptop-macos",
+    "token": "sess_tok_991823ab",
+    "source_reference": "2b682ad9-91c8-45a8-a007-8ebf77ce3969",
+    "fingerprint": "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3",
+    "metadata": {
+      "folder_name": "my-express-app",
+      "services_count": 1
+    }
+  }
+  ```
+- **Security & Storage Invariants:**
+  - The backend verifies the session token against the agent session manager or validator.
+  - The verified token is encrypted using AES-256-GCM and stored in `sources.encrypted_session_token`.
+  - The plain session token is strictly removed from metadata, logs, WebSocket events, and HTTP response bodies.
+  - The encrypted credential is only accessible to the source owner during deployment execution.
+- **Success Response:** `201 Created`
+  ```json
+  {
+    "id": "2b682ad9-91c8-45a8-a007-8ebf77ce3969",
+    "owner_id": "c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
+    "source_type": "local_agent",
+    "source_reference": "2b682ad9-91c8-45a8-a007-8ebf77ce3969",
+    "agent_id": "laptop-macos",
+    "fingerprint": "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3",
+    "metadata": {
+      "folder_name": "my-express-app",
+      "services_count": 1
+    },
+    "created_at": "2026-10-01T12:00:00Z",
+    "updated_at": "2026-10-01T12:00:00Z"
+  }
+  ```
+- **Error Responses:**
+  - `400 Bad Request`: Missing agent ID, source reference, or session token.
+  - `401 Unauthorized`: Unauthenticated user or agent rejected the session token.
+
+---
+
+### `POST /api/sources/agent/session/validate`
+- **Authentication:** None / Internal Agent Auth
+- **Purpose:** Allows local agent instances to validate session tokens against the central control plane.
+- **Request Body:**
+  ```json
+  {
+    "token": "sess_tok_991823ab",
+    "agent_id": "laptop-macos"
+  }
+  ```
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "valid": true,
+    "session_id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+    "user_id": "c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
+    "agent_id": "laptop-macos",
+    "expires_at": "2026-10-01T14:00:00Z"
+  }
+  ```
+
+---
+
+### Local Agent Daemon: `GET /api/agent/sources/{id}/stream-context`
+- **Daemon URL:** `http://localhost:4142` (Configurable via `FORGELAB_AGENT_URL`)
+- **Authentication:** Required via HTTP header:
+  - `Authorization: Bearer <session_token>` OR
+  - `X-Agent-Session-Token: <session_token>`
+  - *Query parameter tokens (`?token=...`) are explicitly rejected to prevent secret exposure in URL logs.*
+- **Query Parameters:**
+  - `service_path`: Relative subdirectory within the registered source (default: `.`)
+  - `runtime`: Detected runtime (e.g. `nodejs`, `python`, `go`)
+  - `port`: Suggested container port
+  - `start_cmd`: Optional custom startup command
+- **Purpose:** Streams a `.tar` archive of the service directory directly into the Docker build context pipe, pruning files according to `.dockerignore`.
+- **Success Response:** `200 OK` (`Content-Type: application/x-tar`, raw streamed tar archive).
+- **Error Responses:**
+  - `401 Unauthorized`: Missing or invalid session token.
+  - `403 Forbidden`: Token does not match the bound source session.
+  - `404 Not Found`: Session expired or agent was restarted.
 
 ---
 

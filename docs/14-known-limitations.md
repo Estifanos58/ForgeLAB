@@ -55,43 +55,22 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Resolution:** Resolved by making Redis the authoritative event distribution bus. When Redis is configured, `PublishEvent()` publishes exclusively to Redis (`forgelab:pubsub:<channel>`), and the Redis pub/sub listener (`listenRedisPubSub()`) delivers to local connected subscribers via `broadcastLocally()`. This ensures each subscriber receives events exactly once without duplicate delivery. If Redis is unconfigured or in tests, direct local delivery is used as a fallback.
 - **Single-Event Framing & Persistent IDs:** Additionally resolved WebSocket batching issues by framing each queued event as an individual WebSocket TextMessage frame, and persisting database log IDs before emitting log events.
 
-### 2. Project-Level Channel Has No Active Producers
-- **Location:** `backend/internal/websocket/hub.go:L347-L349`
-- **Behavior:** The Hub implements subscription handling and authorization for `project:<uuid>` channels. However, grep analysis reveals that `PublishEvent` is **never called** for project channels in any backend service.
-- **Impact:** Subscribing to `project:<uuid>` will succeed but will never receive any events.
-- **Guidance:** Future work should either emit project lifecycle events (e.g. `deployment_created`, `project_status_updated`) to `project:<uuid>` or remove the unused channel type.
+### 2. Project-Level Channel Producers (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:** The deployment engine actively publishes `service_deployment_log`, `service_status_change`, and `project_status` events to `project:<uuid>` channels on the WebSocket Hub. Subscribing clients receive project-wide status transitions and log activity without polling.
 
-### 3. Missing Frontend Token Refresh Loop
-- **Location:** `frontend/src/lib/api.ts`
-- **Behavior:** The frontend stores the access token in `localStorage`. Access tokens expire after 15 minutes (`JWT_ACCESS_TOKEN_EXPIRY`). When the access token expires, API calls return `401 Unauthorized`, causing the frontend to immediately redirect the user to `/login`.
-- **Impact:** Active users are logged out every 15 minutes, even though a valid 7-day refresh token exists in the database and cookies.
-- **Guidance:** Implement an HTTP response interceptor in `api.ts` that catches 401 responses, calls `POST /api/auth/refresh`, updates `localStorage`, and retries the failed request before redirecting to `/login`.
+### 3. Frontend Token Refresh & Session Persistence (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`frontend/src/lib/api/client.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/lib/api/client.ts), [`frontend/src/proxy.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/proxy.ts)
+- **Resolution:** Authentication is backend-owned via HttpOnly cookies (`forgelab_access_token` and `forgelab_refresh_token`). The frontend client (`apiClient`) intercepts 401 responses, executes an atomic token refresh via `/api/auth/refresh`, and seamlessly retries the original request with circuit-breaker protection against infinite loops.
 
-### 4. Docker Compose Development Stack Issues
+### 4. Docker Compose Networking & Rewrite Alignment (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`frontend/next.config.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.ts), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml)
+- **Resolution:** `next.config.ts` dynamically configures rewrite destinations using `${process.env.BACKEND_INTERNAL_URL || 'http://backend:8080'}/api/:path*`, allowing transparent proxying between containers on the internal Docker Compose bridge network.
 
-The following issues affect the fully containerized Compose environment (`docker compose up --build`), which requires reconciliation before it can be treated as a verified end-to-end development environment:
-
-#### a. Host Repository Inaccessibility in Containerized Backend (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml) (`backend` service volumes)
-- **Behavior & Resolution:** The backend service mounts `${FORGELAB_HOST_SOURCE_ROOT:-./}:/host-projects:ro` as a read-only volume. `PathValidator` translates configured host roots (`FORGELAB_HOST_SOURCE_ROOT`) to container paths (`FORGELAB_CONTAINER_SOURCE_ROOT=/host-projects`). Direct local directory deployments read directly from this mount without copying.
-- **Guidance:** See [docs/11-development-environment.md](11-development-environment.md). Ensure `FORGELAB_HOST_SOURCE_ROOT` in `.env` is configured to the parent directory containing projects when running ForgeLAB via Docker Compose.
-
-#### b. Frontend/Backend Container Networking & Rewrite Mismatch
-- **Location:** [`frontend/next.config.js:L9-L14`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.js#L9-L14), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml) (`frontend` service)
-- **Behavior:** The Next.js configuration defines rewrites targeting `http://localhost:8080/api/:path*`:
-  ```javascript
-  {
-    source: '/api/:path*',
-    destination: 'http://localhost:8080/api/:path*',
-  }
-  ```
-- **Impact:** Inside the `forgelab-frontend` container, `localhost:8080` resolves to the frontend container's loopback interface, **not** the `forgelab-backend` container (which resides at `http://backend:8080` on the internal Compose network). Consequently, proxy rewrites fail when both services are run inside Compose containers.
-- **Guidance:** Future implementation must reconcile frontend/backend networking (for example, by supporting an environment variable such as `BACKEND_INTERNAL_URL` for server-side Next.js rewrites or introducing a unified gateway). Do not claim the fully containerized stack is physically verified end-to-end until this networking reconciliation is implemented and tested.
-
-#### c. Compose Environment Isolation from Host `.env`
-- **Location:** [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml) (`backend` service environment block)
-- **Behavior:** `docker-compose.yml` specifies explicit static environment variables and does not declare `env_file: .env`.
-- **Impact:** Variables configured in the host `.env` file (such as `FORGELAB_ALLOWED_SOURCE_ROOTS`) are **not** automatically injected into the backend container during `docker compose up`. Host `.env` values only apply when running the backend directly on the host.
+### 5. Platform-Dependent Ephemeral Storage Quotas
+- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/models/models.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/models/models.go)
+- **Behavior:** CPU millicores (`NanoCPUs`), Memory MB (`Memory`), and PIDs limit (`PidsLimit`) are strictly enforced via Docker SDK `container.Resources`. However, container rootfs ephemeral storage quotas (`ephemeral_storage_mb`) require underlying filesystem storage driver support (e.g. Linux Docker Engine with `overlay2` or `zfs` backing filesystem with project quotas enabled).
+- **Limitation:** On Windows and macOS Docker Desktop environments, container rootfs size quotas are not supported by the underlying storage driver. Ephemeral storage limits are persisted in `service_deployments.ephemeral_storage_mb` for auditing and future enforcement, but strict disk quotas are platform-dependent.
 
 ---
 

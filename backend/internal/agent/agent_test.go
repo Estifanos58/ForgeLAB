@@ -758,3 +758,118 @@ func TestAgentServer_Lifecycle_ConsumedSession(t *testing.T) {
 	}
 }
 
+func TestAgentServer_StreamContext_AuthFlowAndTokenIsolation(t *testing.T) {
+	tempDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tempDir, "server.js"), []byte("console.log('hi');"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, "package.json"), []byte(`{"name":"test"}`), 0644)
+
+	validToken := "secure-agent-session-token-9988"
+	testUser := uuid.New()
+	authSession := &AgentSession{
+		ID:        uuid.New(),
+		Token:     validToken,
+		UserID:    testUser,
+		AgentID:   "test-agent-auth",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+	}
+
+	srv := NewAgentServer(AgentServerConfig{
+		Port: 4142,
+		SessionValidator: func(token, agentID string) (*AgentSession, error) {
+			if token == validToken {
+				return authSession, nil
+			}
+			return nil, ErrSessionNotFound
+		},
+	})
+	defer srv.Close()
+
+	session, err := srv.registerDirectory(tempDir, validToken)
+	if err != nil {
+		t.Fatalf("failed to register directory: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.Router())
+	defer ts.Close()
+
+	streamURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context", ts.URL, session.SourceID)
+
+	// 1. Unauthenticated request without headers must be rejected with 401 Unauthorized
+	unauthReq, _ := http.NewRequest(http.MethodGet, streamURL, nil)
+	resp, err := http.DefaultClient.Do(unauthReq)
+	if err != nil {
+		t.Fatalf("unauthenticated request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for missing auth header, got %d", resp.StatusCode)
+	}
+
+	// 2. Query param only (?token=...) without Authorization header must NOT authenticate (prevents URL token leakage)
+	queryReq, _ := http.NewRequest(http.MethodGet, streamURL+"?token="+validToken, nil)
+	resp, err = http.DefaultClient.Do(queryReq)
+	if err != nil {
+		t.Fatalf("query-param request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized when token passed via query param only, got %d", resp.StatusCode)
+	}
+
+	// 3. Invalid token in Authorization header must be rejected with 401 Unauthorized
+	badTokenReq, _ := http.NewRequest(http.MethodGet, streamURL, nil)
+	badTokenReq.Header.Set("Authorization", "Bearer invalid-token-xyz")
+	resp, err = http.DefaultClient.Do(badTokenReq)
+	if err != nil {
+		t.Fatalf("bad token request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 401 or 403 for bad token, got %d", resp.StatusCode)
+	}
+
+	// 4. Valid token via Authorization: Bearer must succeed with 200 OK and stream valid tarball
+	bearerReq, _ := http.NewRequest(http.MethodGet, streamURL, nil)
+	bearerReq.Header.Set("Authorization", "Bearer "+validToken)
+	resp, err = http.DefaultClient.Do(bearerReq)
+	if err != nil {
+		t.Fatalf("bearer request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK with Bearer token, got %d", resp.StatusCode)
+	}
+
+	tr := tar.NewReader(resp.Body)
+	var foundPackageJSON bool
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar read error: %v", err)
+		}
+		if hdr.Name == "package.json" {
+			foundPackageJSON = true
+		}
+	}
+	if !foundPackageJSON {
+		t.Errorf("expected package.json in tar stream")
+	}
+
+	// 5. Valid token via X-Agent-Session-Token header must also succeed with 200 OK
+	customHeaderReq, _ := http.NewRequest(http.MethodGet, streamURL, nil)
+	customHeaderReq.Header.Set("X-Agent-Session-Token", validToken)
+	resp2, err := http.DefaultClient.Do(customHeaderReq)
+	if err != nil {
+		t.Fatalf("custom header request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK with X-Agent-Session-Token, got %d", resp2.StatusCode)
+	}
+}
+
+

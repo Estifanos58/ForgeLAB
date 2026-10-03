@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -19,6 +20,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/forgelab/backend/internal/crypto"
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/services"
 )
 
@@ -659,6 +662,87 @@ func TestSourceService_GetSourceStatus_ReadyAndOwnership(t *testing.T) {
 	// Non-existent source gets ErrSourceDirNotFound
 	_, err = svc.GetSourceStatus(context.Background(), ownerID, uuid.New())
 	assert.ErrorIs(t, err, services.ErrSourceDirNotFound)
+}
+
+func TestSourceService_AgentSessionToken_EncryptionDecryptionOwnership(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab-agent-token-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	// 32-byte key for AES-256
+	cryptoKey := "12345678901234567890123456789012"
+	encryptor, err := crypto.NewEncryptor(cryptoKey)
+	require.NoError(t, err)
+
+	svc := services.NewSourceService(nil, tempDir, encryptor)
+	ownerID := uuid.New()
+	intruderID := uuid.New()
+	sourceID := uuid.New()
+
+	rawSecretToken := "super-secret-agent-session-token-12345"
+
+	// 1. Verify EncryptToken
+	encrypted, err := svc.EncryptToken(rawSecretToken)
+	require.NoError(t, err)
+	assert.NotEmpty(t, encrypted)
+	assert.NotEqual(t, []byte(rawSecretToken), encrypted)
+
+	// 2. Save source with encrypted token
+	src := &models.Source{
+		ID:                    sourceID,
+		OwnerID:               ownerID,
+		SourceType:            models.SourceTypeLocalAgent,
+		SourceReference:       "agent-source-ref-123",
+		AgentID:               "test-agent-id",
+		Fingerprint:           "abc123sha",
+		EncryptedSessionToken: encrypted,
+		Metadata: map[string]interface{}{
+			"agent_id": "test-agent-id",
+		},
+	}
+	err = svc.SaveSource(context.Background(), src)
+	require.NoError(t, err)
+
+	// 3. Owner can securely decrypt token
+	decrypted, err := svc.GetDecryptedAgentToken(context.Background(), ownerID, sourceID)
+	require.NoError(t, err)
+	assert.Equal(t, rawSecretToken, decrypted)
+
+	// Also verify alias GetAgentSessionToken
+	decryptedAlias, err := svc.GetAgentSessionToken(context.Background(), ownerID, sourceID)
+	require.NoError(t, err)
+	assert.Equal(t, rawSecretToken, decryptedAlias)
+
+	// 4. Intruder is rejected with ErrUnauthorizedSource
+	_, err = svc.GetDecryptedAgentToken(context.Background(), intruderID, sourceID)
+	assert.ErrorIs(t, err, services.ErrUnauthorizedSource)
+
+	// 5. Non-existent source returns ErrSourceDirNotFound
+	_, err = svc.GetDecryptedAgentToken(context.Background(), ownerID, uuid.New())
+	assert.ErrorIs(t, err, services.ErrSourceDirNotFound)
+
+	// 6. Source without encrypted token fails with descriptive error
+	unencryptedSourceID := uuid.New()
+	unencryptedSrc := &models.Source{
+		ID:              unencryptedSourceID,
+		OwnerID:         ownerID,
+		SourceType:      models.SourceTypeLocalAgent,
+		SourceReference: "unencrypted-ref",
+	}
+	err = svc.SaveSource(context.Background(), unencryptedSrc)
+	require.NoError(t, err)
+
+	_, err = svc.GetDecryptedAgentToken(context.Background(), ownerID, unencryptedSourceID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "agent session credential missing or expired")
+
+	// 7. Verify JSON serialization never includes EncryptedSessionToken or raw secrets
+	jsonBytes, err := json.Marshal(src)
+	require.NoError(t, err)
+	jsonStr := string(jsonBytes)
+	assert.NotContains(t, jsonStr, rawSecretToken)
+	assert.NotContains(t, jsonStr, "encrypted_session_token")
+	assert.NotContains(t, jsonStr, "EncryptedSessionToken")
 }
 
 

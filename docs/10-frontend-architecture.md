@@ -149,13 +149,20 @@ When running in Docker Compose:
 
 ## 5. State Synchronization & Realtime Pipeline
 
-- **REST is Authoritative for History:** PostgreSQL via REST endpoints (`/api/projects`, `/api/deployments/:id/logs`) is the authoritative source for project state, deployment state machine transitions, and persistent build logs.
-- **WebSocket Streams Live Events with Persistent IDs:** Realtime log lines and state-change notifications stream over WebSocket channel `deployment:<uuid>`. Each log event contains the persisted database ID (`id`), enabling reliable client-side deduplication.
-- **Immediate Deployment Selection:** When a new deployment is triggered via `LifecycleControls`, the returned `Deployment` object is immediately set as the active deployment (`setSelectedDeployment(newDeployment)`). The WebSocket subscription switches to `deployment:<newDeployment.id>` without waiting for a later list reload.
-- **Unified Log Merge Strategy:** Rather than blindly clearing logs upon REST response completion, `useDeploymentWS` safely merges historical REST logs and live WebSocket logs, deduplicating records by stable database ID and sorting chronologically.
+- **REST is Authoritative for History:** PostgreSQL via REST endpoints (`/api/projects`, `/api/deployments/:id/logs`, `/api/projects/:id/services/:sid/deployments/:did/logs`) is the authoritative source for project state, deployment state machine transitions, and persistent build logs.
+- **WebSocket Streams Live Events with Persistent IDs:** Realtime log lines and state-change notifications stream over WebSocket channels (`service-deployment:<uuid>`, `deployment:<uuid>`, `deployment:<uuid>:service:<uuid>`, and `project:<uuid>`). Each log event contains the persisted database ID (`id`), enabling reliable client-side deduplication.
+- **Service Deployment Subscriptions:** The operational console subscribes directly to the active service deployment channel (`service-deployment:<uuid>`) for per-service execution logs, or the parent deployment channel for multi-service release orchestration.
+- **Immediate Deployment Selection:** When a new deployment or rollback is triggered via `LifecycleControls`, the returned deployment record is immediately set as the active deployment (`setSelectedDeployment(newDeployment)`). The WebSocket subscription switches to `service-deployment:<id>` without waiting for a later list reload.
+- **Unified Log Merge Strategy:** Rather than blindly clearing logs upon REST response completion, `useDeploymentWS` safely merges historical REST logs and live WebSocket logs, deduplicating records by stable database ID and sorting chronologically. In-flight streaming logs are never erased.
 - **Stable Socket Lifecycle & Explicit Connection States:** Callbacks (`onStatusChange`, `onLog`, `onError`) are preserved across renders using React refs. The WebSocket lifecycle depends only on the active channel. Connection state transitions through `connecting` → `connected` → `subscribing` → `subscribed` (or `reconnecting` / `offline`).
 - **Resilient Reconnection:** Sockets automatically reconnect with exponential backoff (1s, 2s, 4s, 8s, 16s, max 30s) upon unexpected disconnection, re-subscribing to the active deployment channel.
-- **Event-Driven Refresh:** When a `status_change` frame arrives via WebSocket, the console automatically re-syncs project configuration, container state, and deployment history via REST.
+- **Event-Driven Refresh:** When a `status_change` frame arrives via WebSocket, the console automatically re-syncs service status, container IDs, host ports, and deployment history via REST.
+
+### Local Agent Import Architecture
+- **Agent Discovery:** The frontend modal (`LocalAgentModal.tsx`) checks whether the ForgeLAB agent is active on `http://127.0.0.1:4142/api/agent/status`.
+- **Directory Picker & Session:** Triggers the native OS folder picker via the agent daemon, receiving a session ID and cryptographic session token.
+- **Secure Registration:** Registers the session with the central backend via `POST /api/sources/agent/register`.
+- **Token Security:** The backend encrypts the token using AES-256-GCM and stores it in `sources.encrypted_session_token`. The frontend only retains the opaque `source_id`, ensuring secret agent tokens are never stored in client-side state, `localStorage`, or URL query parameters.
 
 ---
 

@@ -427,8 +427,23 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Execution path: reusing existing immutable image '%s' (image ID: %s). Skipping source cloning and image build.", candidateImage, idShort))
 				_ = e.dockerClient.ImageTag(ctx, candidateImage, svcTag)
 			} else {
+				// If explicitly in reuse_image mode (rollback), fail closed; do not silently rebuild from current source!
+				if serviceDeploy.ExecutionMode == models.ExecutionModeReuseImage {
+					reason := fmt.Sprintf("Rollback failed closed: immutable image '%s' is unavailable in Docker daemon (%v); will not rebuild from current source", candidateImage, err)
+					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+					emitStatus(models.DeployStatusFailed, nil, &reason)
+					return errors.New(reason)
+				}
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Stored immutable image '%s' not cached in Docker daemon (%v). Falling back to source build pipeline.", candidateImage, err))
 			}
+		} else if serviceDeploy.ExecutionMode == models.ExecutionModeReuseImage {
+			reason := "Rollback failed closed: no immutable image digest or tag is available for reuse"
+			if candidateImage != "" && e.dockerClient == nil {
+				reason = fmt.Sprintf("Rollback failed closed: Docker daemon client unavailable to verify image '%s'", candidateImage)
+			}
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
 		}
 	}
 
@@ -458,12 +473,21 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			agentToken := ""
 			if e.sourceService != nil {
 				if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
-					if src, err := e.sourceService.GetSource(ctx, project.OwnerID, srcUUID); err == nil && src != nil && src.Metadata != nil {
-						if tok, ok := src.Metadata["session_token"].(string); ok {
-							agentToken = tok
-						}
+					tok, err := e.sourceService.GetDecryptedAgentToken(ctx, project.OwnerID, srcUUID)
+					if err != nil {
+						reason := fmt.Sprintf("Local agent authorization failed: %v", err)
+						emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+						emitStatus(models.DeployStatusFailed, nil, &reason)
+						return errors.New(reason)
 					}
+					agentToken = tok
 				}
+			}
+			if agentToken == "" {
+				reason := "Local agent session credential missing or expired; please re-select project folder"
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
 			}
 			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s",
 				baseURL,
@@ -473,19 +497,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				service.InternalPort,
 				url.QueryEscape(service.StartCommand),
 			)
-			if agentToken != "" {
-				agentURL += "&token=" + url.QueryEscape(agentToken)
-			}
 			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-			if reqErr == nil && agentToken != "" {
-				req.Header.Set("Authorization", "Bearer "+agentToken)
-			}
 			if reqErr != nil {
 				reason := fmt.Sprintf("Failed to request agent stream context: %v", reqErr)
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 				emitStatus(models.DeployStatusFailed, nil, &reason)
 				return errors.New(reason)
 			}
+			req.Header.Set("Authorization", "Bearer "+agentToken)
+			req.Header.Set("X-Agent-Session-Token", agentToken)
 			resp, httpErr := http.DefaultClient.Do(req)
 			if httpErr != nil || resp.StatusCode != http.StatusOK {
 				reason := "Failed to stream source from local agent"
@@ -493,7 +513,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					reason = httpErr.Error()
 				} else if resp != nil {
 					resp.Body.Close()
-					if resp.StatusCode == http.StatusNotFound {
+					if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+						reason = "Local agent session authorization rejected (401/403). Please re-select the project folder."
+					} else if resp.StatusCode == http.StatusNotFound {
 						reason = "Local agent source session expired or agent restarted. Please re-select the project folder."
 					} else {
 						reason = fmt.Sprintf("agent returned status %d", resp.StatusCode)

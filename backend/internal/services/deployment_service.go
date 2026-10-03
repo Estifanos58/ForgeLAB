@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -35,6 +37,52 @@ func NewDeploymentService(db *pgxpool.Pool) *DeploymentService {
 // SetSecretService sets the SecretService instance for env hash calculations.
 func (s *DeploymentService) SetSecretService(sec *SecretService) {
 	s.secretService = sec
+}
+
+// resolveSourceRevision computes an immutable source revision:
+// - GitHub commit SHA if available, otherwise branch
+// - For local/agent/upload sources: deterministic source fingerprint from sources table or computed SHA
+func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *models.Project, commitSHA *string) *string {
+	if project.SourceType == models.SourceTypeGitHub {
+		if commitSHA != nil && *commitSHA != "" {
+			return commitSHA
+		}
+		if project.Branch != "" {
+			b := project.Branch
+			return &b
+		}
+	}
+
+	// For local_agent, local_upload, or local_directory: check if source has an immutable fingerprint
+	if s.db != nil {
+		var srcID uuid.UUID
+		if project.SourceID != nil && *project.SourceID != uuid.Nil {
+			srcID = *project.SourceID
+		} else if parsed, err := uuid.Parse(project.SourceReference); err == nil {
+			srcID = parsed
+		}
+		if srcID != uuid.Nil {
+			var fingerprint string
+			err := s.db.QueryRow(ctx, "SELECT fingerprint FROM sources WHERE id = $1", srcID).Scan(&fingerprint)
+			if err == nil && strings.TrimSpace(fingerprint) != "" {
+				fp := strings.TrimSpace(fingerprint)
+				return &fp
+			}
+		}
+	}
+
+	// Fallback to deterministic fingerprint of source reference
+	ref := project.SourceReference
+	if ref == "" {
+		ref = project.RepositoryPath
+	}
+	if ref != "" {
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%s", project.SourceType, ref)))
+		fp := fmt.Sprintf("fp_%s", hex.EncodeToString(h[:16]))
+		return &fp
+	}
+
+	return nil
 }
 
 // CreateDeployment creates a new deployment record for a project transactionally.
@@ -159,17 +207,7 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 			svcDeployNum = *svcMaxNumber + 1
 		}
 
-		var sourceRevision *string
-		if project.SourceType == models.SourceTypeGitHub && project.Branch != "" {
-			b := project.Branch
-			sourceRevision = &b
-		} else if project.SourceReference != "" {
-			sr := project.SourceReference
-			sourceRevision = &sr
-		} else if project.RepositoryPath != "" {
-			rp := project.RepositoryPath
-			sourceRevision = &rp
-		}
+		sourceRevision := s.resolveSourceRevision(ctx, project, nil)
 
 		var envConfigHash *string
 		var envSnapshot []byte
@@ -330,17 +368,7 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		resConfig.PidsLimit = 256
 	}
 
-	var sourceRevision *string
-	if project.SourceType == models.SourceTypeGitHub && project.Branch != "" {
-		b := project.Branch
-		sourceRevision = &b
-	} else if project.SourceReference != "" {
-		sr := project.SourceReference
-		sourceRevision = &sr
-	} else if project.RepositoryPath != "" {
-		rp := project.RepositoryPath
-		sourceRevision = &rp
-	}
+	sourceRevision := s.resolveSourceRevision(ctx, project, nil)
 
 	var envConfigHash *string
 	var envSnapshot []byte
@@ -730,11 +758,11 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		deployNumber = *maxNumber + 1
 	}
 
-	// Execution mode: reuse existing immutable image whenever available instead of forcing source rebuild
-	executionMode := models.ExecutionModeReuseImage
+	// Execution mode: reuse existing immutable image; fail closed if unavailable
 	if (prev.ImageDigest == nil || *prev.ImageDigest == "") && (prev.ImageTag == nil || *prev.ImageTag == "") {
-		executionMode = models.ExecutionModeBuild
+		return nil, errors.New("cannot rollback: prior deployment has no immutable image or digest to reuse")
 	}
+	executionMode := models.ExecutionModeReuseImage
 
 	now := time.Now()
 	svcDeployID := uuid.New()
