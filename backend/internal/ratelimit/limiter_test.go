@@ -162,3 +162,48 @@ func TestLimiter_AuthenticatedUserRateLimiting(t *testing.T) {
 		t.Fatalf("expected 429 for authenticated user from different IP, got %d", rec2.Code)
 	}
 }
+
+func TestExtractClientIP_TrustedProxies(t *testing.T) {
+	trustedProxies := []string{"127.0.0.1", "10.0.0.0/8", "172.16.0.1"}
+
+	t.Run("untrusted remote peer ignores X-Forwarded-For and X-Real-IP", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "203.0.113.195:4321"
+		req.Header.Set("X-Forwarded-For", "198.51.100.1")
+		req.Header.Set("X-Real-IP", "198.51.100.2")
+
+		// Without trusted proxy configuration
+		ip := ExtractClientIP(req)
+		if ip != "203.0.113.195" {
+			t.Fatalf("expected direct IP 203.0.113.195, got %s", ip)
+		}
+
+		// With trusted proxy configuration that doesn't match RemoteAddr
+		ipWithTrusted := ExtractClientIP(req, trustedProxies)
+		if ipWithTrusted != "203.0.113.195" {
+			t.Fatalf("expected untrusted peer to be ignored, got %s", ipWithTrusted)
+		}
+	})
+
+	t.Run("trusted proxy IP extracts X-Forwarded-For client IP", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("X-Forwarded-For", "198.51.100.42, 127.0.0.1")
+
+		ip := ExtractClientIP(req, trustedProxies)
+		if ip != "198.51.100.42" {
+			t.Fatalf("expected forwarded IP 198.51.100.42 from trusted proxy, got %s", ip)
+		}
+	})
+
+	t.Run("trusted CIDR proxy extracts X-Real-IP", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "10.1.2.3:54321"
+		req.Header.Set("X-Real-IP", "198.51.100.99")
+
+		ip := ExtractClientIP(req, trustedProxies)
+		if ip != "198.51.100.99" {
+			t.Fatalf("expected real IP 198.51.100.99 from CIDR trusted proxy, got %s", ip)
+		}
+	})
+}

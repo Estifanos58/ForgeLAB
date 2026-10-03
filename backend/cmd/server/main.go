@@ -208,8 +208,8 @@ func main() {
 		}
 	}()
 
-	// Rate Limiting
-	rateLimiter := ratelimit.NewLimiter(redisClient, cfg.RateLimit.Enabled)
+	// Rate Limiting (Fixed-Window Counter with Trusted Proxy validation)
+	rateLimiter := ratelimit.NewLimiter(redisClient, cfg.RateLimit.Enabled, cfg.RateLimit.TrustedProxies...)
 	wsHub.SetRateLimiter(rateLimiter, cfg.RateLimit.WSSubscriptionLimit)
 
 	// Initialize handlers

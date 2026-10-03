@@ -691,8 +691,8 @@ func (h *ProjectHandler) CancelDeployment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Cancel deployment in database
-	err = h.deploymentService.CancelDeployment(r.Context(), deploymentID)
+	// Cancel deployment in database (scoped atomically to project)
+	err = h.deploymentService.CancelDeployment(r.Context(), projectID, deploymentID)
 	if err != nil {
 		if errors.Is(err, services.ErrDeploymentNotFound) {
 			writeError(w, http.StatusNotFound, "deployment not found")

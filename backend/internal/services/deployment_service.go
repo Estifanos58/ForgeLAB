@@ -1682,8 +1682,9 @@ func (s *DeploymentService) FailServiceDeployment(ctx context.Context, serviceDe
 }
 
 // CancelServiceDeployment safely cancels a queued or in-progress service deployment.
+// It verifies atomically that the service deployment belongs to the specified service and project.
 // It fails if the deployment is already running (promoted) or already in a terminal state.
-func (s *DeploymentService) CancelServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) error {
+func (s *DeploymentService) CancelServiceDeployment(ctx context.Context, projectID, serviceID, serviceDeploymentID uuid.UUID) error {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -1691,8 +1692,14 @@ func (s *DeploymentService) CancelServiceDeployment(ctx context.Context, service
 	defer tx.Rollback(ctx)
 
 	var currentStatus string
-	var serviceID uuid.UUID
-	err = tx.QueryRow(ctx, "SELECT status, service_id FROM service_deployments WHERE id = $1 FOR UPDATE", serviceDeploymentID).Scan(&currentStatus, &serviceID)
+	var verifiedServiceID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT sd.status, sd.service_id
+		FROM service_deployments sd
+		JOIN services s ON sd.service_id = s.id
+		WHERE sd.id = $1 AND sd.service_id = $2 AND s.project_id = $3
+		FOR UPDATE OF sd
+	`, serviceDeploymentID, serviceID, projectID).Scan(&currentStatus, &verifiedServiceID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrDeploymentNotFound
@@ -1747,8 +1754,9 @@ func (s *DeploymentService) CancelServiceDeployment(ctx context.Context, service
 }
 
 // CancelDeployment safely cancels a queued or in-progress project deployment.
+// It verifies atomically that the deployment belongs to the specified project.
 // It fails if the deployment is already running (promoted) or already in a terminal state.
-func (s *DeploymentService) CancelDeployment(ctx context.Context, deploymentID uuid.UUID) error {
+func (s *DeploymentService) CancelDeployment(ctx context.Context, projectID, deploymentID uuid.UUID) error {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -1756,8 +1764,13 @@ func (s *DeploymentService) CancelDeployment(ctx context.Context, deploymentID u
 	defer tx.Rollback(ctx)
 
 	var currentStatus string
-	var projectID uuid.UUID
-	err = tx.QueryRow(ctx, "SELECT status, project_id FROM deployments WHERE id = $1 FOR UPDATE", deploymentID).Scan(&currentStatus, &projectID)
+	var verifiedProjectID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT status, project_id
+		FROM deployments
+		WHERE id = $1 AND project_id = $2
+		FOR UPDATE
+	`, deploymentID, projectID).Scan(&currentStatus, &verifiedProjectID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrDeploymentNotFound

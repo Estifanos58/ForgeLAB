@@ -201,7 +201,7 @@ func (s *SourceService) GetSourcePath(ctx context.Context, ownerID, sourceID uui
 
 	// Fallback for tests running without database connection
 	if val, ok := s.fallbackSources.Load(sourceID); ok {
-		rec := val.(*SourceWorkspaceRecord)
+		rec := *(val.(*SourceWorkspaceRecord))
 		if rec.OwnerID != ownerID {
 			return "", ErrUnauthorizedSource
 		}
@@ -303,7 +303,7 @@ func (s *SourceService) GetSourceStatus(ctx context.Context, ownerID, sourceID u
 
 	// Fallback for tests running without database connection
 	if val, ok := s.fallbackSources.Load(sourceID); ok {
-		rec := val.(*SourceWorkspaceRecord)
+		rec := *(val.(*SourceWorkspaceRecord))
 		if rec.OwnerID != ownerID {
 			return nil, ErrUnauthorizedSource
 		}
@@ -390,7 +390,7 @@ func (s *SourceService) DeleteSource(ctx context.Context, ownerID, sourceID uuid
 	} else {
 		// Fallback for tests running without database connection: verify in-memory ownership
 		if val, ok := s.fallbackSources.Load(sourceID); ok {
-			rec := val.(*SourceWorkspaceRecord)
+			rec := *(val.(*SourceWorkspaceRecord))
 			if rec.OwnerID != ownerID {
 				return ErrUnauthorizedSource
 			}
@@ -898,16 +898,17 @@ func (s *SourceService) updateSourceState(ctx context.Context, sourceID uuid.UUI
 	}
 
 	if val, ok := s.fallbackSources.Load(sourceID); ok {
-		rec := val.(*SourceWorkspaceRecord)
-		rec.Status = status
-		rec.Phase = phase
-		rec.Runtime = runtime
-		rec.Framework = framework
-		rec.Detection = detection
-		rec.Analysis = analysis
-		rec.Error = errMsg
-		rec.UpdatedAt = time.Now()
-		s.fallbackSources.Store(sourceID, rec)
+		old := val.(*SourceWorkspaceRecord)
+		copied := *old
+		copied.Status = status
+		copied.Phase = phase
+		copied.Runtime = runtime
+		copied.Framework = framework
+		copied.Detection = detection
+		copied.Analysis = analysis
+		copied.Error = errMsg
+		copied.UpdatedAt = time.Now()
+		s.fallbackSources.Store(sourceID, &copied)
 	}
 }
 

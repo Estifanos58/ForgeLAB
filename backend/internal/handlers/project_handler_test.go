@@ -103,4 +103,12 @@ func TestProjectHandler_CancelDeployment_Validation(t *testing.T) {
 		handler.CancelDeployment(rec, req)
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
+
+	t.Run("400 Bad Request on invalid deployment ID", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/"+uuid.New().String()+"/deployments/invalid-uuid/cancel", nil)
+		req = req.WithContext(withTestUser(req.Context(), uuid.New()))
+		rec := httptest.NewRecorder()
+		handler.CancelDeployment(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
 }

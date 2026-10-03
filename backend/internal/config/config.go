@@ -31,6 +31,7 @@ type RateLimitConfig struct {
 	DeployLimit         int // requests per minute
 	WSConnLimit         int // requests per minute
 	WSSubscriptionLimit int // requests per minute
+	TrustedProxies      []string
 }
 
 // AppConfig holds application, CORS, and cookie settings.
@@ -237,6 +238,7 @@ func Load() (*Config, error) {
 			DeployLimit:         parseIntEnv("RATE_LIMIT_DEPLOY_PER_MINUTE", 60),
 			WSConnLimit:         parseIntEnv("RATE_LIMIT_WS_CONN_PER_MINUTE", 120),
 			WSSubscriptionLimit: parseIntEnv("RATE_LIMIT_WS_SUB_PER_MINUTE", 120),
+			TrustedProxies:      parseStringSlice(getEnv("RATE_LIMIT_TRUSTED_PROXIES", "")),
 		},
 	}
 
@@ -262,4 +264,18 @@ func parseIntEnv(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func parseStringSlice(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var res []string
+	for _, p := range strings.Split(s, ",") {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			res = append(res, trimmed)
+		}
+	}
+	return res
 }

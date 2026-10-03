@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -332,6 +333,23 @@ func TestEngine_LocalAgent_Deployment_AuthenticatesAfterProjectCreation(t *testi
 // 6. Local agent subprocess verifies consumed token for exact source via backend HTTP
 // 7. /stream-context returns 200 OK and streams project tarball
 // 8. Security boundaries verified (different source rejected, new path selection rejected)
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 func TestEngine_LocalAgent_TwoProcessDeploymentRegression(t *testing.T) {
 	// 0. Locate or build the forgelab-agent executable
 	agentExeName := "forgelab-agent"
@@ -489,7 +507,7 @@ func TestEngine_LocalAgent_TwoProcessDeploymentRegression(t *testing.T) {
 	defer cancel()
 
 	agentCmd := exec.CommandContext(ctx, agentExePath, "-port", fmt.Sprint(agentPort), "-backend", backendServer.URL)
-	var agentOutput bytes.Buffer
+	var agentOutput safeBuffer
 	agentCmd.Stdout = &agentOutput
 	agentCmd.Stderr = &agentOutput
 

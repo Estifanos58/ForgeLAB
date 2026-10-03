@@ -278,6 +278,19 @@ func (q *DeploymentQueue) releaseLease(ctx context.Context, jobID uuid.UUID, lea
 	_, _ = releaseLeaseScript.Run(ctx, q.client, []string{leaseKey}, leaseToken).Result()
 }
 
+// IsLeaseOwner checks if the given leaseToken currently owns the job lease.
+func (q *DeploymentQueue) IsLeaseOwner(ctx context.Context, jobID uuid.UUID, leaseToken string) (bool, error) {
+	leaseKey := JobLeasePrefix + jobID.String()
+	val, err := q.client.Get(ctx, leaseKey).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return false, nil
+		}
+		return false, err
+	}
+	return val == leaseToken, nil
+}
+
 // HasActiveLease returns true if an active, non-expired worker lease exists for the job.
 func (q *DeploymentQueue) HasActiveLease(ctx context.Context, jobID uuid.UUID) (bool, error) {
 	leaseKey := JobLeasePrefix + jobID.String()
@@ -559,11 +572,32 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 					slog.Info("processing deployment job", "worker", workerName, "job_id", job.ID, "job_type", job.Type)
 					execErr := handler(jobCtx, job)
 
-					// Immediately remove from processing queue
+					// Stop heartbeat ticker immediately
+					cancelHb()
+
+					// Lease fencing check: Worker must verify it still owns the exact lease token.
+					// An old worker that lost its lease must not:
+					// - remove the replacement worker's processing entry
+					// - increment retry attempts
+					// - requeue the job
+					// - move the job to DLQ
+					// - change job state
+					stillOwner, verifyErr := q.IsLeaseOwner(context.Background(), job.ID, leaseToken)
+					if verifyErr != nil || !stillOwner {
+						slog.Warn("worker lost lease; skipping processing cleanup, retry, and state mutations to protect replacement worker",
+							"worker", workerName,
+							"job_id", job.ID,
+							"lease_token", leaseToken,
+							"verify_err", verifyErr,
+						)
+						cancelJob()
+						continue
+					}
+
+					// Safely remove from processing queue
 					q.client.LRem(context.Background(), ProcessingQueueKey, 1, itemStr)
 
-					// Stop heartbeat and release lease (safe: only if leaseToken still matches)
-					cancelHb()
+					// Release lease (safe: only if leaseToken still matches)
 					q.releaseLease(context.Background(), job.ID, leaseToken)
 					cancelJob()
 

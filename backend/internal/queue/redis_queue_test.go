@@ -714,3 +714,162 @@ func TestDeploymentQueue_JobStateIndexing(t *testing.T) {
 	// Release
 	q.releaseLease(ctx, jobID, token)
 }
+
+func TestDeploymentQueue_Fencing_StaleWorkerCannotMutateJob(t *testing.T) {
+	runScenario := func(t *testing.T, aFails bool) {
+		mr, client := setupTestRedis(t)
+		defer mr.Close()
+		defer client.Close()
+
+		q := NewDeploymentQueue(client)
+		q.SetWorkerCount(1)
+		q.SetLeaseTTL(1 * time.Second)
+		q.SetHeartbeatInterval(10 * time.Second) // Long heartbeat so Worker A doesn't auto-renew
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		jobID := uuid.New()
+		job := Job{
+			Type:                JobTypeServiceDeployment,
+			ID:                  jobID,
+			ServiceDeploymentID: jobID,
+		}
+
+		startedA := make(chan struct{})
+		continueA := make(chan struct{})
+		finishedA := make(chan struct{})
+
+		// Handler for Worker A: pauses in the middle of execution
+		q.StartJobWorker(ctx, func(wCtx context.Context, j Job) error {
+			if j.ID == jobID {
+				close(startedA)
+				<-continueA
+				defer close(finishedA)
+				if aFails {
+					return errors.New("worker A failed late after lease expiration")
+				}
+				return nil
+			}
+			return nil
+		})
+		defer q.Stop()
+
+		// 1. Enqueue job
+		if err := q.EnqueueServiceDeployment(ctx, jobID); err != nil {
+			t.Fatalf("failed to enqueue: %v", err)
+		}
+
+		// 2. Wait for Worker A to acquire lease and start execution
+		select {
+		case <-startedA:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for Worker A to start")
+		}
+
+		leaseKey := JobLeasePrefix + jobID.String()
+		tokenA, err := client.Get(ctx, leaseKey).Result()
+		if err != nil || tokenA == "" {
+			t.Fatalf("expected Worker A to hold lease token, got %v, err=%v", tokenA, err)
+		}
+
+		// 3. Worker A loses its lease (simulate lease TTL expiring due to hang/partition)
+		mr.FastForward(2 * time.Second)
+
+		// Verify lease expired in Redis
+		hasLease, _ := q.HasActiveLease(ctx, jobID)
+		if hasLease {
+			t.Fatalf("expected lease to have expired")
+		}
+
+		// 4. Recovery requeues the abandoned job from processing queue to pending queue
+		rec, err := q.RecoverAbandonedJobs(ctx)
+		if err != nil {
+			t.Fatalf("failed to recover abandoned job: %v", err)
+		}
+		if rec != 1 {
+			t.Fatalf("expected 1 recovered job, got %d", rec)
+		}
+
+		// Verify job is back in pending queue
+		pendingCount, err := client.LLen(ctx, DeploymentQueueKey).Result()
+		if err != nil || pendingCount != 1 {
+			t.Fatalf("expected pending queue len 1, got %d", pendingCount)
+		}
+
+		// 5. Worker B acquires the lease and starts processing
+		tokenB, acquiredB, err := q.acquireLease(ctx, jobID, "worker-B")
+		if err != nil || !acquiredB {
+			t.Fatalf("worker-B failed to acquire lease: %v", err)
+		}
+		if tokenB == "" || tokenB == tokenA {
+			t.Fatalf("expected unique lease token for worker-B, got %v", tokenB)
+		}
+
+		// Put Worker B's execution into processing queue (simulating pop & process by worker B)
+		client.LRem(ctx, DeploymentQueueKey, 1, job.Encode())
+		client.LPush(ctx, ProcessingQueueKey, job.Encode())
+
+		attemptsBeforeA, _ := client.Get(ctx, JobAttemptsPrefix+jobID.String()).Result()
+
+		// 6. Worker A finishes late!
+		close(continueA)
+
+		select {
+		case <-finishedA:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for Worker A to finish")
+		}
+
+		// Grace period for any asynchronous operations
+		time.Sleep(50 * time.Millisecond)
+
+		// 7. VERIFY INVARIANTS:
+		// - Worker B remains the sole lease owner
+		currentLeaseToken, err := client.Get(ctx, leaseKey).Result()
+		if err != nil {
+			t.Fatalf("expected active lease for worker-B, got err: %v", err)
+		}
+		if currentLeaseToken != tokenB {
+			t.Fatalf("expected worker-B to remain lease owner (%s), but got %s", tokenB, currentLeaseToken)
+		}
+
+		// - Worker A did NOT remove Worker B's processing entry
+		procLen, err := client.LLen(ctx, ProcessingQueueKey).Result()
+		if err != nil || procLen != 1 {
+			t.Fatalf("expected processing queue to retain worker-B entry (len 1), got %d (err: %v)", procLen, err)
+		}
+
+		// - Worker A did NOT modify retry attempts (neither incremented on error nor deleted on success)
+		attemptsAfterA, _ := client.Get(ctx, JobAttemptsPrefix+jobID.String()).Result()
+		if attemptsAfterA != attemptsBeforeA {
+			t.Fatalf("expected attempts to not be modified by stale worker A; before=%q, after=%q", attemptsBeforeA, attemptsAfterA)
+		}
+
+		// - Worker A did NOT requeue the job into pending queue
+		pendingAfter, err := client.LLen(ctx, DeploymentQueueKey).Result()
+		if err != nil || pendingAfter != 0 {
+			t.Fatalf("expected pending queue to remain 0, got %d", pendingAfter)
+		}
+
+		// - Worker A did NOT move the job to dead-letter queue
+		dlqAfter, err := client.LLen(ctx, DeadLetterQueueKey).Result()
+		if err != nil || dlqAfter != 0 {
+			t.Fatalf("expected dead letter queue to remain 0, got %d", dlqAfter)
+		}
+
+		// - Worker A did NOT change job state from processing
+		stateAfter, err := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+		if err != nil || stateAfter != JobStateProcessing {
+			t.Fatalf("expected job state to remain processing for worker-B, got %v (err: %v)", stateAfter, err)
+		}
+	}
+
+	t.Run("Worker A finishes late with error", func(t *testing.T) {
+		runScenario(t, true)
+	})
+
+	t.Run("Worker A finishes late with success", func(t *testing.T) {
+		runScenario(t, false)
+	})
+}
