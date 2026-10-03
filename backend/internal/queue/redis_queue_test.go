@@ -63,7 +63,15 @@ func TestDeploymentQueue_EnqueueAndProcess(t *testing.T) {
 	}
 
 	// Verify processing queue is empty after clean completion
-	pending, processing, dlq, err := q.GetQueueStats(ctx)
+	var pending, processing, dlq int64
+	var err error
+	for i := 0; i < 25; i++ {
+		pending, processing, dlq, err = q.GetQueueStats(ctx)
+		if err == nil && pending == 0 && processing == 0 && dlq == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -546,7 +554,7 @@ func TestDeploymentQueue_LeaseExpiryAndRecovery(t *testing.T) {
 
 	// Job is currently in processing queue with an active lease
 	_ = client.LPush(ctx, ProcessingQueueKey, job.Encode())
-	acquired, err := q.acquireLease(ctx, jobID, "worker-test-crash")
+	_, acquired, err := q.acquireLease(ctx, jobID, "worker-test-crash")
 	if err != nil || !acquired {
 		t.Fatalf("failed to acquire test lease: %v", err)
 	}
@@ -579,3 +587,130 @@ func TestDeploymentQueue_LeaseExpiryAndRecovery(t *testing.T) {
 	}
 }
 
+func TestDeploymentQueue_LeaseOwnershipSafety(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.SetLeaseTTL(2 * time.Second)
+	ctx := context.Background()
+
+	jobID := uuid.New()
+
+	// 1. Worker 1 acquires lease
+	token1, acquired, err := q.acquireLease(ctx, jobID, "worker-1")
+	if err != nil || !acquired {
+		t.Fatalf("worker-1 failed to acquire lease: %v", err)
+	}
+	if token1 == "" {
+		t.Fatalf("expected non-empty lease token for worker-1")
+	}
+
+	// 2. Worker 2 attempts to acquire lease while worker-1 is active -> MUST FAIL
+	token2, acquired2, err := q.acquireLease(ctx, jobID, "worker-2")
+	if err != nil {
+		t.Fatalf("worker-2 unexpected error: %v", err)
+	}
+	if acquired2 || token2 != "" {
+		t.Fatalf("worker-2 should not acquire active lease")
+	}
+
+	// 3. Worker 1 extends its lease with token1 -> MUST SUCCEED
+	if err := q.extendLease(ctx, jobID, token1); err != nil {
+		t.Fatalf("worker-1 failed to extend lease: %v", err)
+	}
+
+	// 4. An imposter with wrong token attempts to extend -> MUST FAIL with ErrLeaseLost
+	err = q.extendLease(ctx, jobID, "imposter-token")
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost for imposter extension, got %v", err)
+	}
+
+	// 5. Worker 1's lease expires (simulate worker-1 hung or crashed)
+	mr.FastForward(3 * time.Second)
+
+	// 6. Replacement worker-3 acquires lease with new token
+	token3, acquired3, err := q.acquireLease(ctx, jobID, "worker-3")
+	if err != nil || !acquired3 {
+		t.Fatalf("worker-3 failed to acquire expired lease: %v", err)
+	}
+
+	// 7. Expired worker-1 wakes up and attempts to extend its OLD lease -> MUST FAIL with ErrLeaseLost
+	err = q.extendLease(ctx, jobID, token1)
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost for expired worker-1, got %v", err)
+	}
+
+	// 8. Expired worker-1 attempts to release its OLD lease -> MUST NOT delete worker-3's lease!
+	q.releaseLease(ctx, jobID, token1)
+
+	// Verify worker-3 still holds an active lease!
+	hasActive, err := q.HasActiveLease(ctx, jobID)
+	if err != nil || !hasActive {
+		t.Fatalf("expected worker-3's lease to remain intact after worker-1 release attempt, got active=%v, err=%v", hasActive, err)
+	}
+
+	// 9. Worker 3 extends its lease -> MUST SUCCEED
+	if err := q.extendLease(ctx, jobID, token3); err != nil {
+		t.Fatalf("worker-3 failed to extend lease: %v", err)
+	}
+
+	// 10. Worker 3 releases with its valid token -> MUST SUCCEED
+	q.releaseLease(ctx, jobID, token3)
+
+	hasActiveAfterRelease, err := q.HasActiveLease(ctx, jobID)
+	if err != nil || hasActiveAfterRelease {
+		t.Fatalf("expected lease to be released by worker-3, got active=%v", hasActiveAfterRelease)
+	}
+}
+
+func TestDeploymentQueue_JobStateIndexing(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+
+	// Initially not enqueued
+	inQueue, err := q.IsJobInQueue(ctx, jobID)
+	if err != nil || inQueue {
+		t.Fatalf("expected not in queue, got %v", inQueue)
+	}
+
+	// Enqueue -> state set to pending (O(1))
+	if err := q.EnqueueServiceDeployment(ctx, jobID); err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	state, err := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if err != nil || state != JobStatePending {
+		t.Fatalf("expected state pending, got %v, err: %v", state, err)
+	}
+
+	inQueue, err = q.IsJobInQueue(ctx, jobID)
+	if err != nil || !inQueue {
+		t.Fatalf("expected in queue, got %v", inQueue)
+	}
+
+	// Acquire lease -> state set to processing (O(1))
+	token, acquired, err := q.acquireLease(ctx, jobID, "worker-1")
+	if err != nil || !acquired {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+
+	state, err = client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if err != nil || state != JobStateProcessing {
+		t.Fatalf("expected state processing, got %v, err: %v", state, err)
+	}
+
+	inProc, err := q.IsJobInProcessing(ctx, jobID)
+	if err != nil || !inProc {
+		t.Fatalf("expected in processing, got %v", inProc)
+	}
+
+	// Release
+	q.releaseLease(ctx, jobID, token)
+}

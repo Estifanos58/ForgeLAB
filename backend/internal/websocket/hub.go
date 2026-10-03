@@ -16,6 +16,7 @@ import (
 
 	"github.com/forgelab/backend/internal/auth"
 	"github.com/forgelab/backend/internal/models"
+	"github.com/forgelab/backend/internal/ratelimit"
 )
 
 type Client struct {
@@ -39,7 +40,7 @@ type ClientMessage struct {
 }
 
 type EventMessage struct {
-	Type     string      `json:"type"`               // subscribed | error | log | status_change | project_event | pong
+	Type     string      `json:"type"` // subscribed | error | log | status_change | project_event | pong
 	Channel  string      `json:"channel,omitempty"`
 	Sequence int64       `json:"sequence,omitempty"` // reliable event sequence
 	Code     string      `json:"code,omitempty"`
@@ -89,6 +90,8 @@ type Hub struct {
 	serviceService           ServiceResolver
 	redisClient              *redis.Client
 	allowedOrigins           []string
+	rateLimiter              *ratelimit.Limiter
+	subscriptionLimit        int
 	ctx                      context.Context
 	cancel                   context.CancelFunc
 }
@@ -115,6 +118,14 @@ func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deplo
 		go h.listenRedisPubSub()
 	}
 	return h
+}
+
+// SetRateLimiter configures rate limiting for subscription messages.
+func (h *Hub) SetRateLimiter(limiter *ratelimit.Limiter, subscriptionLimit int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rateLimiter = limiter
+	h.subscriptionLimit = subscriptionLimit
 }
 
 // SetServiceDeploymentResolver sets the resolver used for service-deployment channel authorization and replay.
@@ -551,6 +562,19 @@ func (c *Client) handleSubscribe(channel string, lastSequence ...int64) {
 	}
 	slog.Info("ws subscription requested", "user_id", c.userID, "channel", channel, "last_sequence", lastSeq)
 
+	// Enforce subscription rate limit
+	if c.hub.rateLimiter != nil && c.hub.subscriptionLimit > 0 {
+		allowed, retryAfter, _ := c.hub.rateLimiter.Allow(context.Background(), "ws_sub", "user:"+c.userID.String(), c.hub.subscriptionLimit, 1*time.Minute)
+		if !allowed {
+			slog.Warn("ws subscription rate limited", "user_id", c.userID, "channel", channel, "retry_after", retryAfter)
+			retrySec := int(retryAfter.Seconds())
+			if retrySec <= 0 {
+				retrySec = 1
+			}
+			c.sendError("RATE_LIMITED", fmt.Sprintf("subscription rate limit exceeded, please retry after %d seconds", retrySec))
+			return
+		}
+	}
 
 	if channel == "" {
 		slog.Warn("ws subscription rejected", "user_id", c.userID, "channel", channel, "reason", "channel is required")
@@ -792,4 +816,3 @@ func (c *Client) sendError(code, message string) {
 		Message: message,
 	})
 }
-

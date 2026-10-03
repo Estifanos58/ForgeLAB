@@ -217,4 +217,3 @@ func TestStreamBuildContext_LargeDirectorySimulation(t *testing.T) {
 		t.Errorf("streaming large directory took too long: %v", elapsed)
 	}
 }
-

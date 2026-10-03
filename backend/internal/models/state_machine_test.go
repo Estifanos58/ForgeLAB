@@ -199,11 +199,11 @@ func TestServiceRollbackInvariants(t *testing.T) {
 	// Mock deployment 2 (current running deployment)
 	tag2 := "forgelab/proj/frontend:2"
 	deploy2 := models.ServiceDeployment{
-		DeployNumber:   2,
-		Status:         models.DeployStatusRunning,
-		ImageTag:       &tag2,
-		InternalPort:   3000,
-		ExecutionMode:  models.ExecutionModeBuild,
+		DeployNumber:  2,
+		Status:        models.DeployStatusRunning,
+		ImageTag:      &tag2,
+		InternalPort:  3000,
+		ExecutionMode: models.ExecutionModeBuild,
 		ResourceConfig: models.ResourceConfig{
 			CpuMillicores: 500,
 			MemoryMB:      512,
@@ -295,4 +295,45 @@ func TestServiceRollbackInvariants(t *testing.T) {
 	}
 }
 
+func TestDeploymentCancellationAndSuperseding_Invariants(t *testing.T) {
+	// Invariant 1: Queued deployment can transition to Failed (used when superseded or cancelled)
+	if err := models.ValidateStateTransition(models.DeployStatusQueued, models.DeployStatusFailed); err != nil {
+		t.Errorf("expected queued -> failed to be a valid transition, got %v", err)
+	}
 
+	// Invariant 2: In-progress deployments can transition to Failed when cancelled
+	inProgressStatuses := []string{
+		models.DeployStatusCloning,
+		models.DeployStatusBuilding,
+		models.DeployStatusStarting,
+		models.DeployStatusHealthChecking,
+	}
+	for _, st := range inProgressStatuses {
+		if err := models.ValidateStateTransition(st, models.DeployStatusFailed); err != nil {
+			t.Errorf("expected %s -> failed to be valid for cancellation, got %v", st, err)
+		}
+	}
+
+	// Invariant 3: Terminal states classification
+	terminalStatuses := []string{
+		models.DeployStatusRunning,
+		models.DeployStatusStopped,
+		models.DeployStatusCrashed,
+		models.DeployStatusFailed,
+	}
+	for _, st := range terminalStatuses {
+		if !models.IsDeploymentTerminalStatus(st) {
+			t.Errorf("expected %s to be terminal status", st)
+		}
+	}
+
+	// Invariant 4: Active/in-progress states classification
+	for _, st := range inProgressStatuses {
+		if !models.IsDeploymentActiveStatus(st) {
+			t.Errorf("expected %s to be active status", st)
+		}
+	}
+	if !models.IsDeploymentActiveStatus(models.DeployStatusQueued) {
+		t.Errorf("expected queued to be active status")
+	}
+}

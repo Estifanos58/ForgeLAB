@@ -1113,7 +1113,7 @@ func (s *SourceService) IngestTarGz(ctx context.Context, ownerID uuid.UUID, r io
 		}
 
 		switch header.Typeflag {
-			case tar.TypeDir:
+		case tar.TypeDir:
 			_ = os.MkdirAll(destPath, 0755)
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
@@ -1614,4 +1614,3 @@ func (s *SourceService) GetSource(ctx context.Context, id, ownerID uuid.UUID) (*
 
 	return nil, ErrSourceDirNotFound
 }
-

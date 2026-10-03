@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-
 	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -973,4 +972,3 @@ func TestWebSocketLogEventsNotDroppedOnBurst(t *testing.T) {
 		}
 	}
 }
-

@@ -95,7 +95,7 @@ A developer gives ForgeLAB a project repository, and ForgeLAB manages the result
 
 ### Non-Negotiable Constraints
 1. **Self-hosted and local-first.** The core project runs on local infrastructure with $0 development cost.
-2. **Single control-plane architecture for MVP.** Backend Go binary + PostgreSQL 16 + Redis 7 + Docker Engine + Next.js 14 frontend.
+2. **Single control-plane architecture for MVP.** Backend Go binary + PostgreSQL 16 + Redis 7 + Docker Engine + Next.js 16.3.6 LTS + React 19 frontend.
 3. **No premature distributed systems.** Worker separation, multi-node scheduling, and service meshes are earned by real operational needs.
 
 ---

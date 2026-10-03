@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend:
+    name: Backend CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+
+      - name: Check Formatting (gofmt)
+        run: |
+          cd backend
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following Go files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run Go Vet
+        run: |
+          cd backend
+          go vet ./...
+
+      - name: Run Backend Tests
+        run: |
+          cd backend
+          go test -v -race ./...
+
+  frontend:
+    name: Frontend CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Run Lint
+        run: |
+          cd frontend
+          npm run lint
+
+      - name: Run Frontend Tests
+        run: |
+          cd frontend
+          npm test
+
+      - name: Build Production Frontend
+        run: |
+          cd frontend
+          npm run build
+
+  compose-smoke:
+    name: Docker Compose Smoke & Migration Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Environment
+        run: |
+          cp .env.example .env
+
+      - name: Start Backing Services
+        run: |
+          docker compose up -d postgres redis
+
+      - name: Wait for PostgreSQL & Redis Readiness
+        run: |
+          timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U forgelab -d forgelab; do sleep 2; done'
+          timeout 30 bash -c 'until docker compose exec -T redis redis-cli ping; do sleep 2; done'
+
+      - name: Validate Database Migration
+        run: |
+          docker compose run --rm migrate
+
+      - name: Build and Start Backend & Frontend
+        run: |
+          docker compose up -d --build backend frontend
+
+      - name: Validate Health & Readiness
+        run: |
+          timeout 60 bash -c 'until curl -sf http://localhost:8080/health; do sleep 2; done'
+          timeout 30 bash -c 'until curl -sf http://localhost:8080/ready; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:3000; do sleep 2; done'
+
+      - name: Compose Teardown
+        if: always()
+        run: |
+          docker compose down -v

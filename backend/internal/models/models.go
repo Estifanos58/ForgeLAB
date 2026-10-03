@@ -74,12 +74,12 @@ type Project struct {
 
 // Source represents an abstracted code origin (local agent session, archive upload, or GitHub repo).
 type Source struct {
-	ID              uuid.UUID              `json:"id"`
-	OwnerID         uuid.UUID              `json:"owner_id"`
-	SourceType      string                 `json:"source_type"` // "local_agent", "local_upload", "github", "local_directory"
-	SourceReference string                 `json:"source_reference"`
-	AgentID         string                 `json:"agent_id"`
-	Fingerprint     string                 `json:"fingerprint"`
+	ID                    uuid.UUID              `json:"id"`
+	OwnerID               uuid.UUID              `json:"owner_id"`
+	SourceType            string                 `json:"source_type"` // "local_agent", "local_upload", "github", "local_directory"
+	SourceReference       string                 `json:"source_reference"`
+	AgentID               string                 `json:"agent_id"`
+	Fingerprint           string                 `json:"fingerprint"`
 	Metadata              map[string]interface{} `json:"metadata"`
 	EncryptedSessionToken []byte                 `json:"-"` // Never serialized in JSON responses
 	CreatedAt             time.Time              `json:"created_at"`
@@ -175,7 +175,7 @@ type ServiceDeployment struct {
 	BuildContext    string     `json:"build_context,omitempty"`
 	HealthStrategy  string     `json:"health_strategy,omitempty"`
 	HealthCheckPath *string    `json:"health_check_path,omitempty"`
-	ResourceConfig                             // snapshotted resource limits at deploy time
+	ResourceConfig             // snapshotted resource limits at deploy time
 	ExecutionMode   string     `json:"execution_mode,omitempty"`
 	SourceRevision  *string    `json:"source_revision,omitempty"`
 	EnvConfigHash   *string    `json:"env_config_hash,omitempty"`

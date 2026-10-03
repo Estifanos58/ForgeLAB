@@ -11,7 +11,7 @@ import (
 
 var (
 	ErrPathNotExist           = errors.New("directory does not exist")
-	ErrPathNotDirectory        = errors.New("path is not a directory")
+	ErrPathNotDirectory       = errors.New("path is not a directory")
 	ErrPathOutsideAllowedRoot = errors.New("path is outside allowed root directories")
 	ErrRestrictedSystemPath   = errors.New("access to system root directory is restricted")
 	ErrSymlinkEscape          = errors.New("symlink escapes parent directory")

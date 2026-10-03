@@ -160,13 +160,15 @@ All user application containers created by ForgeLAB enforce these constraints:
 
 | Constraint | MVP Status | Implementation |
 | :--- | :--- | :--- |
-| **No Privileged Mode** | ENFORCED | `Privileged: false` (default in container.HostConfig) |
-| **No Host Network** | ENFORCED | Binds container port to dynamic host port on `0.0.0.0` |
-| **No Docker Socket Mount** | ENFORCED | `/var/run/docker.sock` is **never** mounted in user containers |
-| **No Host Root Mounts** | ENFORCED | User containers mount no host volumes; files exist in image layer |
+| **No Privileged Mode** | ENFORCED | `Privileged: false` strictly enforced via `ValidateAndBuildSecureHostConfig` |
+| **No-New-Privileges** | ENFORCED | `SecurityOpt: ["no-new-privileges:true"]` enforced on all deployed containers |
+| **Capability Dropping** | ENFORCED | `CapDrop: ["ALL"]` enforced to prevent kernel privilege escalation |
+| **No Host Network** | ENFORCED | Host networking rejected; binds container port to dynamic host port on `0.0.0.0` |
+| **No Docker Socket Mount** | ENFORCED | `/var/run/docker.sock` and named pipes are strictly rejected with security violation |
+| **No Host Root/Sensitive Mounts** | ENFORCED | User containers cannot mount `/proc`, `/sys`, `/dev`, `/etc`, `/root`, or host roots |
 | **Restart Policy (Docker Engine)** | ENFORCED | `RestartPolicy: unless-stopped` (Docker daemon restarts container on crash) |
+| **Resource Quotas (CPU/RAM/PIDs)** | ENFORCED | `ValidateAndBuildSecureHostConfig` clamps `NanoCPUs`, `Memory`, and `PidsLimit` in `HostConfig.Resources` |
 | **Continuous Self-Healing** | NOT IMPLEMENTED | Platform-level health polling, crash-loop detection, and auto-rollback deferred |
-| **Resource Quotas (CPU/RAM)** | DEFERRED | Future Docker `HostConfig.Resources` limit enforcement |
 | **Read-Only Root Filesystem** | DEFERRED | Future hardening option for stateless containers |
 
 > **Note on Self-Healing vs Docker Restart Policy:** User containers run with Docker's `unless-stopped` restart policy (`IMPLEMENTED`), allowing the Docker engine itself to restart crashed containers. However, ForgeLAB does **not** implement platform-level continuous health monitoring, crash diagnosis, crash-loop analysis, automated rollback, or re-promotion (`NOT IMPLEMENTED`). Docker's restart policy must not be confused with platform-level self-healing.

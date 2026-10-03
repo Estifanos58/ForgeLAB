@@ -66,30 +66,30 @@ func (s *ProjectService) SetServiceService(ss *ServiceService) {
 }
 
 type CreateServiceInput struct {
-	Name            string                   `json:"name"`
-	Role            string                   `json:"role"`
-	SourcePath      string                   `json:"source_path"`
-	Runtime         string                   `json:"runtime"`
-	RuntimeType     string                   `json:"runtime_type"`
-	Framework       string                   `json:"framework"`
-	PackageManager  string                   `json:"package_manager"`
-	BuildStrategy   string                   `json:"build_strategy"`
-	BuildCandidates []models.BuildCandidate   `json:"build_candidates"`
-	BuildCommand    string                   `json:"build_command"`
-	StartCommand    string                   `json:"start_command"`
-	DockerfilePath  string                   `json:"dockerfile_path"`
-	BuildContext    string                   `json:"build_context"`
-	InternalPort    int                      `json:"internal_port"`
-	HostPort        *int                     `json:"host_port"`
-	PublicExposed   bool                     `json:"public_exposed"`
-	HealthStrategy  string                   `json:"health_strategy"`
-	HealthCheckPath *string                  `json:"health_check_path"`
+	Name            string                  `json:"name"`
+	Role            string                  `json:"role"`
+	SourcePath      string                  `json:"source_path"`
+	Runtime         string                  `json:"runtime"`
+	RuntimeType     string                  `json:"runtime_type"`
+	Framework       string                  `json:"framework"`
+	PackageManager  string                  `json:"package_manager"`
+	BuildStrategy   string                  `json:"build_strategy"`
+	BuildCandidates []models.BuildCandidate `json:"build_candidates"`
+	BuildCommand    string                  `json:"build_command"`
+	StartCommand    string                  `json:"start_command"`
+	DockerfilePath  string                  `json:"dockerfile_path"`
+	BuildContext    string                  `json:"build_context"`
+	InternalPort    int                     `json:"internal_port"`
+	HostPort        *int                    `json:"host_port"`
+	PublicExposed   bool                    `json:"public_exposed"`
+	HealthStrategy  string                  `json:"health_strategy"`
+	HealthCheckPath *string                 `json:"health_check_path"`
 }
 
 // CreateProjectInput holds the data needed to create a project.
 type CreateProjectInput struct {
 	Name            string               `json:"name"`
-	SourceType      string               `json:"source_type"` // "local", "local_directory", "local_upload", "local_agent", "github"
+	SourceType      string               `json:"source_type"`      // "local", "local_directory", "local_upload", "local_agent", "github"
 	SourceReference string               `json:"source_reference"` // repo "owner/repo", upload source_id, or agent source_id
 	AgentID         string               `json:"agent_id"`
 	RepositoryPath  string               `json:"repository_path"` // legacy/optional host path
@@ -414,52 +414,52 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			}
 
 			svc := &models.Service{
-				ID:                  uuid.New(),
-				ProjectID:           project.ID,
-				SourceID:            project.SourceID,
-				Name:                svcName,
-				Role:                svcRole,
-				SourcePath:          svcSourcePath,
-				RuntimeType:         rt,
-				Framework:           svcIn.Framework,
-				PackageManager:      svcIn.PackageManager,
-				BuildStrategy:       svcStrat,
-				BuildCandidates:     svcIn.BuildCandidates,
-				BuildCommand:        strings.TrimSpace(svcIn.BuildCommand),
-				StartCommand:        strings.TrimSpace(svcIn.StartCommand),
-				DockerfilePath:      dfPath,
-				BuildContext:        bCtx,
-				InternalPort:        svcPort,
-				HostPort:            svcIn.HostPort,
-				PublicExposed:       svcIn.PublicExposed,
-				HealthStrategy:      svcHealthStrat,
-				HealthCheckPath:     &svcHealthPath,
-				HealthCheckEnabled:  true,
-				Status:              models.ProjectStatusInactive,
+				ID:                 uuid.New(),
+				ProjectID:          project.ID,
+				SourceID:           project.SourceID,
+				Name:               svcName,
+				Role:               svcRole,
+				SourcePath:         svcSourcePath,
+				RuntimeType:        rt,
+				Framework:          svcIn.Framework,
+				PackageManager:     svcIn.PackageManager,
+				BuildStrategy:      svcStrat,
+				BuildCandidates:    svcIn.BuildCandidates,
+				BuildCommand:       strings.TrimSpace(svcIn.BuildCommand),
+				StartCommand:       strings.TrimSpace(svcIn.StartCommand),
+				DockerfilePath:     dfPath,
+				BuildContext:       bCtx,
+				InternalPort:       svcPort,
+				HostPort:           svcIn.HostPort,
+				PublicExposed:      svcIn.PublicExposed,
+				HealthStrategy:     svcHealthStrat,
+				HealthCheckPath:    &svcHealthPath,
+				HealthCheckEnabled: true,
+				Status:             models.ProjectStatusInactive,
 			}
 			servicesToCreate = append(servicesToCreate, svc)
 		}
 	} else {
 		// Single service fallback ensuring every project is modeled with at least 1 service
 		svc := &models.Service{
-			ID:                  uuid.New(),
-			ProjectID:           project.ID,
-			SourceID:            project.SourceID,
-			Name:                project.Name,
-			Role:                models.RoleOther,
-			SourcePath:          project.BuildContext,
-			RuntimeType:         project.RuntimeType,
-			BuildStrategy:       project.BuildStrategy,
-			BuildCommand:        project.BuildCommand,
-			StartCommand:        project.StartCommand,
-			DockerfilePath:      project.DockerfilePath,
-			BuildContext:        project.BuildContext,
-			InternalPort:        project.InternalPort,
-			PublicExposed:       true,
-			HealthStrategy:      project.HealthStrategy,
-			HealthCheckPath:     project.HealthCheckPath,
-			HealthCheckEnabled:  project.HealthCheckEnabled,
-			Status:              project.Status,
+			ID:                 uuid.New(),
+			ProjectID:          project.ID,
+			SourceID:           project.SourceID,
+			Name:               project.Name,
+			Role:               models.RoleOther,
+			SourcePath:         project.BuildContext,
+			RuntimeType:        project.RuntimeType,
+			BuildStrategy:      project.BuildStrategy,
+			BuildCommand:       project.BuildCommand,
+			StartCommand:       project.StartCommand,
+			DockerfilePath:     project.DockerfilePath,
+			BuildContext:       project.BuildContext,
+			InternalPort:       project.InternalPort,
+			PublicExposed:      true,
+			HealthStrategy:     project.HealthStrategy,
+			HealthCheckPath:    project.HealthCheckPath,
+			HealthCheckEnabled: project.HealthCheckEnabled,
+			Status:             project.Status,
 		}
 		servicesToCreate = append(servicesToCreate, svc)
 	}

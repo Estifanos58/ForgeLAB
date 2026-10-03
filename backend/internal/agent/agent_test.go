@@ -951,5 +951,3 @@ func TestAgentServer_ConsumedSession_SourceBoundAccess(t *testing.T) {
 	_, err = sm.VerifyTokenForSource(expiredSession.Token, session1.SourceID, agentID)
 	assert.ErrorIs(t, err, ErrSessionExpired, "expired session must be rejected")
 }
-
-

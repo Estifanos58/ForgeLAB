@@ -798,5 +798,3 @@ func TestSourceService_SaveAndGetSource(t *testing.T) {
 	_, err = svc.GetSource(context.Background(), uuid.New(), ownerID)
 	assert.ErrorIs(t, err, services.ErrSourceDirNotFound)
 }
-
-

@@ -20,6 +20,17 @@ type Config struct {
 	App        AppConfig
 	Google     OAuthConfig
 	GitHub     OAuthConfig
+	RateLimit  RateLimitConfig
+}
+
+// RateLimitConfig holds throttling limits for sensitive API endpoints and WebSockets.
+type RateLimitConfig struct {
+	Enabled             bool
+	AuthLimit           int // requests per minute
+	SourceLimit         int // requests per minute
+	DeployLimit         int // requests per minute
+	WSConnLimit         int // requests per minute
+	WSSubscriptionLimit int // requests per minute
 }
 
 // AppConfig holds application, CORS, and cookie settings.
@@ -58,7 +69,6 @@ func (a AppConfig) AllowedOriginsList() []string {
 	}
 	return result
 }
-
 
 // OAuthConfig holds OAuth provider settings.
 type OAuthConfig struct {
@@ -219,6 +229,14 @@ func Load() (*Config, error) {
 			ClientSecret:    getEnv("GITHUB_CLIENT_SECRET", ""),
 			RedirectURL:     getEnv("GITHUB_REDIRECT_URL", "http://localhost:3000/api/auth/github/callback"),
 			RepoRedirectURL: getEnv("GITHUB_REPO_REDIRECT_URL", getEnv("FRONTEND_URL", "http://localhost:3000")+"/api/integrations/github/callback"),
+		},
+		RateLimit: RateLimitConfig{
+			Enabled:             getEnv("RATE_LIMIT_ENABLED", "true") != "false",
+			AuthLimit:           parseIntEnv("RATE_LIMIT_AUTH_PER_MINUTE", 30),
+			SourceLimit:         parseIntEnv("RATE_LIMIT_SOURCE_PER_MINUTE", 60),
+			DeployLimit:         parseIntEnv("RATE_LIMIT_DEPLOY_PER_MINUTE", 60),
+			WSConnLimit:         parseIntEnv("RATE_LIMIT_WS_CONN_PER_MINUTE", 120),
+			WSSubscriptionLimit: parseIntEnv("RATE_LIMIT_WS_SUB_PER_MINUTE", 120),
 		},
 	}
 

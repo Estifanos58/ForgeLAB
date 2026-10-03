@@ -44,10 +44,10 @@ func (s *AgentSession) IsExpired() bool {
 
 // SessionManager manages active agent sessions in a thread-safe manner
 type SessionManager struct {
-	mu           sync.RWMutex
-	sessions     map[uuid.UUID]*AgentSession
-	tokens       map[string]uuid.UUID // token -> session_id
-	stopCleanup  chan struct{}
+	mu          sync.RWMutex
+	sessions    map[uuid.UUID]*AgentSession
+	tokens      map[string]uuid.UUID // token -> session_id
+	stopCleanup chan struct{}
 }
 
 var (

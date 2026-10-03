@@ -132,7 +132,7 @@ To maintain engineering truth, this roadmap strictly distinguishes:
 ---
 
 ## Phase 8: Operational Frontend Console ✅ [IMPLEMENTED]
-> Next.js 14 web application
+> Next.js 16.3.6 LTS + React 19 web application
 
 - [x] User authentication pages (`/login`, `/register`)
 - [x] Dashboard with project listing and creation modal (`/dashboard`)

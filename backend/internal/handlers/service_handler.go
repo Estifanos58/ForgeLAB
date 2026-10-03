@@ -10,7 +10,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/docker"
-	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/queue"
 	"github.com/forgelab/backend/internal/services"
 )
@@ -207,11 +206,6 @@ func (h *ServiceHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	if svc.ProjectID != projectID {
 		writeError(w, http.StatusBadRequest, "service does not belong to project")
-		return
-	}
-
-	if svc.Status == models.ProjectStatusDeploying {
-		writeError(w, http.StatusConflict, "this service is already deploying")
 		return
 	}
 
@@ -573,3 +567,83 @@ func (h *ServiceHandler) UpdateResources(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, svc)
 }
 
+// CancelDeployment handles POST /api/projects/{id}/services/{serviceId}/deployments/{deploymentId}/cancel
+func (h *ServiceHandler) CancelDeployment(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service ID")
+		return
+	}
+
+	deploymentID, err := uuid.Parse(chi.URLParam(r, "deploymentId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid deployment ID")
+		return
+	}
+
+	// Verify project ownership
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	// Verify service belongs to project
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "service not found")
+		return
+	}
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
+		return
+	}
+
+	// Cancel service deployment in database
+	err = h.deploymentService.CancelServiceDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, services.ErrDeploymentNotFound) {
+			writeError(w, http.StatusNotFound, "deployment not found")
+			return
+		}
+		if errors.Is(err, services.ErrCannotCancelRunningDeployment) {
+			writeError(w, http.StatusConflict, "cannot cancel a deployment that is already running")
+			return
+		}
+		if errors.Is(err, services.ErrDeploymentAlreadyTerminal) {
+			writeError(w, http.StatusBadRequest, "deployment is already in a terminal state")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to cancel deployment: "+err.Error())
+		return
+	}
+
+	// Cancel active container/build execution if currently in-flight
+	if h.dockerEngine != nil {
+		h.dockerEngine.CancelActiveDeployment(deploymentID)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "service deployment cancelled successfully",
+	})
+}

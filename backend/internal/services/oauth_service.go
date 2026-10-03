@@ -38,11 +38,11 @@ type OAuthUserInfo struct {
 
 // OAuthService handles Google and GitHub OAuth 2.0 flows.
 type OAuthService struct {
-	googleCfg    config.OAuthConfig
-	githubCfg    config.OAuthConfig
-	redis        *redis.Client
-	httpClient   *http.Client
-	fallbackMem  sync.Map
+	googleCfg   config.OAuthConfig
+	githubCfg   config.OAuthConfig
+	redis       *redis.Client
+	httpClient  *http.Client
+	fallbackMem sync.Map
 }
 
 type memoryState struct {

@@ -295,7 +295,7 @@ func TestEngine_BuildImage_LocalAgentStreamedTarArchive_RemainsOpenDuringBuildRe
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = fmt.Fprintf(w, `{"stream":"Successfully built 123456\n"}` + "\n")
+			_, _ = fmt.Fprintf(w, `{"stream":"Successfully built 123456\n"}`+"\n")
 			return
 		}
 		http.NotFound(w, r)
@@ -375,7 +375,7 @@ func TestEngine_BuildImage_StructuredCleanup_OnError(t *testing.T) {
 		mockDockerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = fmt.Fprintf(w, `{"error":"Dockerfile parse error: unknown instruction FOO"}` + "\n")
+			_, _ = fmt.Fprintf(w, `{"error":"Dockerfile parse error: unknown instruction FOO"}`+"\n")
 		}))
 		defer mockDockerServer.Close()
 
@@ -447,16 +447,16 @@ func TestEngine_ExecuteServiceDeployment_LocalAgent_BuildLifecycle(t *testing.T)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			flusher, ok := w.(http.Flusher)
-			_, _ = fmt.Fprintf(w, `{"stream":"Building ccms-backend in ForgeLAB\n"}` + "\n")
+			_, _ = fmt.Fprintf(w, `{"stream":"Building ccms-backend in ForgeLAB\n"}`+"\n")
 			if ok {
 				flusher.Flush()
 			}
 			time.Sleep(20 * time.Millisecond)
-			_, _ = fmt.Fprintf(w, `{"stream":"Successfully built feedbeef1234\n"}` + "\n")
+			_, _ = fmt.Fprintf(w, `{"stream":"Successfully built feedbeef1234\n"}`+"\n")
 			if ok {
 				flusher.Flush()
 			}
-			_, _ = fmt.Fprintf(w, `{"aux":{"ID":"sha256:feedbeef1234"}}` + "\n")
+			_, _ = fmt.Fprintf(w, `{"aux":{"ID":"sha256:feedbeef1234"}}`+"\n")
 		case r.Method == http.MethodGet && (r.URL.Path == "/v1.41/images/json" || len(r.URL.Path) > 15 && r.URL.Path[:15] == "/v1.41/images/"):
 			// ImageInspectWithRaw
 			w.Header().Set("Content-Type", "application/json")

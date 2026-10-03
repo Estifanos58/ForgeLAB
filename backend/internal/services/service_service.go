@@ -405,4 +405,3 @@ func (s *ServiceService) UpdateServiceResources(ctx context.Context, serviceID u
 	slog.Info("service resources updated", "service_id", serviceID, "cpu", cfg.CpuMillicores, "mem", cfg.MemoryMB, "pids", cfg.PidsLimit)
 	return nil
 }
-

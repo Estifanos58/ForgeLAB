@@ -455,5 +455,3 @@ func (s *SecretService) GetEnvMapFromSnapshot(snapshotBytes []byte, targetScope 
 
 	return envMap, secretValues, nil
 }
-
-

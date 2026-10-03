@@ -78,11 +78,11 @@ func NewGitHubService(
 	redisClient *redis.Client,
 ) *GitHubService {
 	return &GitHubService{
-		db:          db,
-		encryptor:   encryptor,
-		githubCfg:   githubCfg,
-		redis:       redisClient,
-		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		db:         db,
+		encryptor:  encryptor,
+		githubCfg:  githubCfg,
+		redis:      redisClient,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 

@@ -16,12 +16,12 @@ import (
 )
 
 var (
-	ErrUserExists       = errors.New("user with this email already exists")
-	ErrUserNotFound     = errors.New("user not found")
-	ErrInvalidPassword  = errors.New("invalid password")
-	ErrTokenRevoked     = errors.New("refresh token has been revoked")
-	ErrTokenExpired     = errors.New("refresh token has expired")
-	ErrTokenNotFound    = errors.New("refresh token not found")
+	ErrUserExists      = errors.New("user with this email already exists")
+	ErrUserNotFound    = errors.New("user not found")
+	ErrInvalidPassword = errors.New("invalid password")
+	ErrTokenRevoked    = errors.New("refresh token has been revoked")
+	ErrTokenExpired    = errors.New("refresh token has expired")
+	ErrTokenNotFound   = errors.New("refresh token not found")
 )
 
 // UserService handles user-related business logic.

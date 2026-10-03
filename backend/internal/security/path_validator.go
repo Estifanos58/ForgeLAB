@@ -10,11 +10,11 @@ import (
 
 var (
 	ErrPathNotExist         = errors.New("the selected directory does not exist or is not accessible from the backend environment")
-	ErrPathNotDirectory    = errors.New("the selected path is not a directory")
-	ErrPathNotAllowed      = errors.New("this directory is outside the configured ForgeLAB source roots")
+	ErrPathNotDirectory     = errors.New("the selected path is not a directory")
+	ErrPathNotAllowed       = errors.New("this directory is outside the configured ForgeLAB source roots")
 	ErrRestrictedSystemPath = errors.New("access to system directory is forbidden")
-	ErrDockerfileNotFound  = errors.New("configured Dockerfile does not exist in build context")
-	ErrNoBuildFiles        = errors.New("the project contains no usable build files")
+	ErrDockerfileNotFound   = errors.New("configured Dockerfile does not exist in build context")
+	ErrNoBuildFiles         = errors.New("the project contains no usable build files")
 )
 
 // PathValidator validates local repository paths and build contexts.

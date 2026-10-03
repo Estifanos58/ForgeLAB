@@ -655,7 +655,3 @@ func TestSourceHandler_ValidateAgentSession_SourceAwareAuth(t *testing.T) {
 	handler.ValidateAgentSession(rec4, req4)
 	assert.Equal(t, http.StatusUnauthorized, rec4.Code)
 }
-
-
-
-

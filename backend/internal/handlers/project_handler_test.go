@@ -85,3 +85,22 @@ func TestProjectHandler_Create_ErrorMappings(t *testing.T) {
 		assert.Contains(t, errRes["error"], "local source requires uploaded files or valid host repository path")
 	})
 }
+
+func TestProjectHandler_CancelDeployment_Validation(t *testing.T) {
+	handler := handlers.NewProjectHandler(nil, nil, nil, nil)
+
+	t.Run("401 Unauthorized without auth", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/123/deployments/456/cancel", nil)
+		rec := httptest.NewRecorder()
+		handler.CancelDeployment(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("400 Bad Request on invalid project ID", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/invalid-uuid/deployments/456/cancel", nil)
+		req = req.WithContext(withTestUser(req.Context(), uuid.New()))
+		rec := httptest.NewRecorder()
+		handler.CancelDeployment(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+}

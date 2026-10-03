@@ -6,14 +6,18 @@ ForgeLAB is a single control-plane application deployment platform built in Go. 
 
 ## Architecture Overview
 
-- **Backend Control Plane**: Go (REST API via `chi` + WebSockets via `gorilla/websocket`)
-- **Database**: PostgreSQL 16 (Durable records for users, identities, projects, deployments, secrets, github integrations, and logs)
-- **Work Queue & Pub/Sub**: Redis 7 (`LPUSH` / `BRPOP` queue + Pub/Sub event bridge)
-- **Runtime Engine**: Docker Engine SDK (Direct container image build and execution)
-- **Source Ingestion**: Direct local-directory deployment (`POST /api/sources/local/validate`), optional archive upload (`/api/sources/upload`), & authorized GitHub repository import (`/api/integrations/github`)
-- **Build Strategy**: Automatic heuristic multi-stage container build generation & Dockerfile build strategy
+- **Backend Control Plane**: Go (REST API via `chi` + WebSockets via `gorilla/websocket` with Redis Pub/Sub)
+- **Database**: PostgreSQL 16 (Durable records for users, identities, projects, services, service deployments, secrets, github integrations, and logs)
+- **Service-First Architecture**: Projects compose multiple autonomous services with independent deployment pipelines (`POST /api/projects/{id}/services/{serviceId}/deploy`), rollbacks, and log streams
+- **Work Queue & Lease Ownership**: Redis 7 (`LPUSH` / `BRPOP` queue with cryptographically unique execution lease tokens, Lua atomic renewal/recovery, and O(1) state indexing)
+- **Runtime Engine & Sandboxing**: Docker Engine SDK with strict trust boundary enforcement (no-new-privileges, capability drop `ALL`, rejection of `/var/run/docker.sock` and sensitive mounts, enforced CPU/RAM/PID resource limits)
+- **Health & Readiness**: Lightweight `/health` liveness probe and deep dependency `/ready` check (probing PostgreSQL, Redis, and Docker Engine concurrently with 0 secret leakage)
+- **Rate Limiting**: Configurable sliding-window throttling (`ratelimit`) backed by Redis/in-memory for authentication, uploads, deployments, and WebSockets returning HTTP 429
+- **Deployment Lifecycle**: Cancellation for queued/in-progress builds, atomic superseding of obsolete queued builds, and strict non-regression invariant for healthy containers
+- **Source Ingestion**: Local Agent CLI (`cmd/agent`) streaming local directories securely without browser uploads, optional archive upload fallback (`/api/sources/upload`), & authorized GitHub repository import (`/api/integrations/github`)
+- **Build Strategy**: Automatic heuristic multi-stage container build generation & custom Dockerfile build strategy
 - **Host Port Range**: Dynamic port allocation in the range **`10000–60000`** with dynamic container internal port mapping
-- **Frontend**: Next.js 16.3.6 LTS + React 19 + TypeScript + Tailwind CSS (Developer infrastructure operational console)
+- **Frontend**: Next.js 16.3.6 LTS + React 19 + TypeScript + Tailwind CSS (Operational developer console)
 - **Deployment Safety Invariant**: Failed releases never terminate or replace the previous running deployment.
 
 ---
@@ -123,8 +127,10 @@ ForgeLAB/
 │   ├── 13-decisions.md
 │   ├── 14-known-limitations.md
 │   └── 15-github-integration.md
+├── .github/workflows/       # GitHub Actions CI (gofmt, vet, test, npm build/lint, smoke, migration)
 ├── backend/                 # Go control-plane application
 │   ├── cmd/server/          # API server & embedded deployment worker entrypoint
+│   ├── cmd/agent/           # Local agent CLI for streaming local host source trees
 │   ├── cmd/migrate/         # SQL migration CLI tool
 │   ├── Dockerfile           # Multi-stage Go backend Dockerfile
 │   ├── internal/            # Core business logic & services
@@ -132,19 +138,20 @@ ForgeLAB/
 │   │   ├── config/          # Environment configuration loader
 │   │   ├── crypto/          # AES-256-GCM encryption for secrets
 │   │   ├── database/        # PostgreSQL connection pool (pgx)
-│   │   ├── docker/          # Docker Engine build & container runner
-│   │   ├── handlers/        # REST HTTP request handlers
+│   │   ├── docker/          # Docker Engine build, container runner & trust boundary
+│   │   ├── handlers/        # REST HTTP request handlers (including /health & /ready)
 │   │   ├── logging/         # Log persistence & secret redactor
 │   │   ├── middleware/      # Auth, CORS, logger, & JSON middleware
 │   │   ├── models/          # Data models & state machine transitions
 │   │   ├── network/         # Dynamic host port allocator (10000-60000)
-│   │   ├── queue/           # Redis worker queue (LPUSH/BRPOP)
+│   │   ├── queue/           # Redis worker queue with lease ownership safety
+│   │   ├── ratelimit/       # Sliding-window rate limiting with in-memory fallback
 │   │   ├── security/        # Host path validator & boundary defense
-│   │   ├── services/        # User, Project, Deployment, & Secret services
-│   │   └── websocket/       # WebSocket Hub, client manager, & Redis PubSub
+│   │   ├── services/        # User, Project, Service, Deployment, & Secret services
+│   │   └── websocket/       # WebSocket Hub, rate limiter, & Redis PubSub
 │   └── migrations/          # PostgreSQL schema migrations
-├── frontend/                # Next.js 14 + TypeScript web application
-│   ├── src/app/             # Pages (Login, Register, Dashboard, Project details)
+├── frontend/                # Next.js 16.3.6 LTS + React 19 + TypeScript web application
+│   ├── src/app/             # Pages (Login, Register, Dashboard, Project & Service views)
 │   ├── src/lib/             # Typed API client & WebSocket hook
 │   └── Dockerfile           # Next.js container Dockerfile
 ├── docker-compose.yml       # Local dev container stack

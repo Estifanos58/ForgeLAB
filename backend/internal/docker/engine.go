@@ -34,21 +34,22 @@ import (
 )
 
 type Engine struct {
-	dockerClient       *client.Client
-	projectService     *services.ProjectService
-	deploymentService  *services.DeploymentService
-	secretService      *services.SecretService
-	sourceService      *services.SourceService
-	githubService      *services.GitHubService
-	serviceService     *services.ServiceService
-	portManager        *network.PortManager
-	pathValidator      *security.PathValidator
-	wsHub              *ws.Hub
+	dockerClient        *client.Client
+	projectService      *services.ProjectService
+	deploymentService   *services.DeploymentService
+	secretService       *services.SecretService
+	sourceService       *services.SourceService
+	githubService       *services.GitHubService
+	serviceService      *services.ServiceService
+	portManager         *network.PortManager
+	pathValidator       *security.PathValidator
+	wsHub               *ws.Hub
 	workDir             string
 	localBuildMode      string
 	maxConcurrentBuilds int
 	buildSemaphore      chan struct{}
 	activeLogCollectors sync.Map // map[string]context.CancelFunc — tracks running log collector goroutines
+	activeCancels       sync.Map // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
 }
 
 func NewEngine(
@@ -69,14 +70,14 @@ func NewEngine(
 	_ = os.MkdirAll(workDir, 0755)
 
 	return &Engine{
-		dockerClient:      dockerClient,
-		projectService:    projectService,
-		deploymentService: deploymentService,
-		secretService:     secretService,
-		sourceService:     sourceService,
-		githubService:     githubService,
-		serviceService:    services.NewServiceService(nil),
-		portManager:       portManager,
+		dockerClient:        dockerClient,
+		projectService:      projectService,
+		deploymentService:   deploymentService,
+		secretService:       secretService,
+		sourceService:       sourceService,
+		githubService:       githubService,
+		serviceService:      services.NewServiceService(nil),
+		portManager:         portManager,
 		pathValidator:       pathValidator,
 		wsHub:               wsHub,
 		workDir:             workDir,
@@ -97,6 +98,27 @@ func (e *Engine) SetMaxConcurrentBuilds(n int) {
 // GetMaxConcurrentBuilds returns the current global Docker build concurrency limit.
 func (e *Engine) GetMaxConcurrentBuilds() int {
 	return e.maxConcurrentBuilds
+}
+
+// RegisterActiveCancel registers a cancellation function for an active deployment execution.
+func (e *Engine) RegisterActiveCancel(deploymentID uuid.UUID, cancel context.CancelFunc) {
+	e.activeCancels.Store(deploymentID, cancel)
+}
+
+// UnregisterActiveCancel removes the cancellation function for a deployment.
+func (e *Engine) UnregisterActiveCancel(deploymentID uuid.UUID) {
+	e.activeCancels.Delete(deploymentID)
+}
+
+// CancelActiveDeployment cancels the context of an actively executing deployment if present.
+func (e *Engine) CancelActiveDeployment(deploymentID uuid.UUID) bool {
+	if val, ok := e.activeCancels.Load(deploymentID); ok {
+		if cancel, isFunc := val.(context.CancelFunc); isFunc {
+			cancel()
+			return true
+		}
+	}
+	return false
 }
 
 // acquireBuildSlot acquires a slot under the global Docker build concurrency limit.
@@ -256,7 +278,18 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		return fmt.Errorf("failed to get service deployment %s: %w", serviceDeploymentID, err)
 	}
 
-	service, err := e.serviceService.GetService(ctx, serviceDeploy.ServiceID)
+	// Stale / superseded deployment check: if already terminal (e.g. superseded while in queue or cancelled), do not run!
+	if models.IsDeploymentTerminalStatus(serviceDeploy.Status) {
+		slog.Info("service deployment already in terminal state; skipping execution", "service_deployment_id", serviceDeploymentID, "status", serviceDeploy.Status)
+		return nil
+	}
+
+	execCtx, execCancel := context.WithCancel(ctx)
+	defer execCancel()
+	e.RegisterActiveCancel(serviceDeploymentID, execCancel)
+	defer e.UnregisterActiveCancel(serviceDeploymentID)
+
+	service, err := e.serviceService.GetService(execCtx, serviceDeploy.ServiceID)
 	if err != nil {
 		return fmt.Errorf("failed to get service %s: %w", serviceDeploy.ServiceID, err)
 	}
@@ -737,28 +770,22 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		targetPidsLimit = service.PidsLimit
 	}
 
-	cpuNano := int64(targetCpuMillicores) * 1_000_000 // millicores -> nanocores
-	memBytes := int64(targetMemoryMB) * 1024 * 1024    // MB -> bytes
-	pidsLimit := int64(targetPidsLimit)
-	if cpuNano <= 0 {
-		cpuNano = 1_000_000_000
-	}
-	if memBytes <= 0 {
-		memBytes = 1024 * 1024 * 1024
-	}
-	if pidsLimit <= 0 {
-		pidsLimit = 256
-	}
-	hostConfig := &container.HostConfig{
-		PortBindings: portBindings,
-		RestartPolicy: container.RestartPolicy{
-			Name: "unless-stopped",
-		},
-		Resources: container.Resources{
-			Memory:    memBytes,
-			NanoCPUs:  cpuNano,
-			PidsLimit: &pidsLimit,
-		},
+	hostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
+		PortBindings:        portBindings,
+		TargetCpuMillicores: targetCpuMillicores,
+		TargetMemoryMB:      targetMemoryMB,
+		TargetPidsLimit:     targetPidsLimit,
+		Binds:               nil,
+		NetworkMode:         "",
+	})
+	if err != nil {
+		if hostPort != nil {
+			e.portManager.ReleasePort(*hostPort)
+		}
+		reason := fmt.Sprintf("Failed to validate container security configuration for '%s': %v", service.Name, err)
+		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
 	}
 
 	netConfig := &dockernetwork.NetworkingConfig{
@@ -894,7 +921,18 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		return fmt.Errorf("failed to get deployment %s: %w", deploymentID, err)
 	}
 
-	project, err := e.getProjectByID(ctx, deployment.ProjectID)
+	// Stale / superseded deployment check: if already terminal, do not run!
+	if models.IsDeploymentTerminalStatus(deployment.Status) {
+		slog.Info("deployment already in terminal state; skipping execution", "deployment_id", deploymentID, "status", deployment.Status)
+		return nil
+	}
+
+	execCtx, execCancel := context.WithCancel(ctx)
+	defer execCancel()
+	e.RegisterActiveCancel(deploymentID, execCancel)
+	defer e.UnregisterActiveCancel(deploymentID)
+
+	project, err := e.getProjectByID(execCtx, deployment.ProjectID)
 	if err != nil {
 		return fmt.Errorf("failed to get project %s: %w", deployment.ProjectID, err)
 	}
@@ -1236,8 +1274,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		},
 	}
 
-	pidsLimit := int64(256)
-	hostConfig := &container.HostConfig{
+	hostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
 		PortBindings: nat.PortMap{
 			nat.Port(targetPortStr): []nat.PortBinding{
 				{
@@ -1246,14 +1283,18 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				},
 			},
 		},
-		RestartPolicy: container.RestartPolicy{
-			Name: "unless-stopped",
-		},
-		Resources: container.Resources{
-			Memory:    1024 * 1024 * 1024,
-			NanoCPUs:  1_000_000_000,
-			PidsLimit: &pidsLimit,
-		},
+		TargetCpuMillicores: 1000,
+		TargetMemoryMB:      1024,
+		TargetPidsLimit:     256,
+		Binds:               nil,
+		NetworkMode:         "",
+	})
+	if err != nil {
+		e.portManager.ReleasePort(allocatedPort)
+		reason := fmt.Sprintf("Failed to validate container security configuration: %v", err)
+		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+		updateStatus(models.DeployStatusFailed, &reason)
+		return errors.New(reason)
 	}
 
 	containerName := fmt.Sprintf("forgelab-%s-%d", project.Slug, deployment.DeployNumber)
@@ -1334,7 +1375,6 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Deployment #%d is now RUNNING and live on port %d!", deployment.DeployNumber, allocatedPort))
 	return nil
 }
-
 
 // stripDockerTimestamp strips the RFC3339/RFC3339Nano timestamp prefix added by Docker's log streaming.
 func stripDockerTimestamp(line string) string {

@@ -22,7 +22,7 @@
 | :--- | :--- | :--- | :--- |
 | **Docker Engine & Compose** | Docker 24+, Compose v2+ | Specified in `docker-compose.yml` | Multi-container infrastructure & application container runtime |
 | **Go** | Go 1.21+ | Specified in `backend/go.mod: go 1.21` | Backend compilation, migration tool, and host-run execution |
-| **Node.js** | Node.js 18+ (20+ recommended) | Specified in `frontend/package.json` | Frontend Next.js 14 web development |
+| **Node.js** | Node.js 18+ (20+ recommended) | Specified in `frontend/package.json` | Frontend Next.js 16.3.6 LTS + React 19 web development |
 
 ---
 

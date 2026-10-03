@@ -19,8 +19,10 @@ import (
 )
 
 var (
-	ErrDeploymentNotFound     = errors.New("deployment not found")
-	ErrNoDeploymentToRollback = errors.New("no previous deployment to rollback to")
+	ErrDeploymentNotFound            = errors.New("deployment not found")
+	ErrNoDeploymentToRollback        = errors.New("no previous deployment to rollback to")
+	ErrCannotCancelRunningDeployment = errors.New("cannot cancel a deployment that is already running")
+	ErrDeploymentAlreadyTerminal     = errors.New("deployment is already in a terminal state")
 )
 
 // DeploymentService handles deployment-related business logic.
@@ -103,22 +105,46 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	}
 
 	// Check for existing active deployment
-	var activeCount int
+	// If an existing deployment is still in 'queued' state, the newer deployment supersedes it.
+	var activeID *uuid.UUID
+	var activeStatus *string
 	err = tx.QueryRow(ctx,
-		`SELECT COUNT(*) FROM deployments 
-		 WHERE project_id = $1 AND status IN ($2, $3, $4, $5, $6)`,
+		`SELECT id, status FROM deployments 
+		 WHERE project_id = $1 AND status IN ($2, $3, $4, $5, $6)
+		 ORDER BY created_at DESC LIMIT 1`,
 		project.ID,
 		models.DeployStatusQueued,
 		models.DeployStatusCloning,
 		models.DeployStatusBuilding,
 		models.DeployStatusStarting,
 		models.DeployStatusHealthChecking,
-	).Scan(&activeCount)
-	if err != nil {
+	).Scan(&activeID, &activeStatus)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("failed to check active deployments: %w", err)
 	}
-	if activeCount > 0 {
-		return nil, ErrActiveDeployment
+
+	if activeID != nil && activeStatus != nil {
+		if *activeStatus == models.DeployStatusQueued {
+			supersedeReason := "Superseded by newer deployment"
+			now := time.Now()
+			_, err = tx.Exec(ctx,
+				`UPDATE deployments
+				 SET status = $1, failure_reason = $2, finished_at = $3
+				 WHERE id = $4 AND status = $5`,
+				models.DeployStatusFailed, supersedeReason, now, *activeID, models.DeployStatusQueued,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to supersede queued deployment: %w", err)
+			}
+			_, _ = tx.Exec(ctx,
+				`INSERT INTO deployment_logs (id, deployment_id, service_id, timestamp, phase, stream, message)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+				uuid.New(), *activeID, nil, now, models.LogPhaseStartup, models.LogStreamSystem, "Deployment superseded by newer queued deployment",
+			)
+			slog.Info("superseded queued deployment", "deployment_id", *activeID, "project_id", project.ID)
+		} else {
+			return nil, ErrActiveDeployment
+		}
 	}
 
 	// Get next deploy number safely inside locked transaction
@@ -283,22 +309,49 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	}
 
 	// Enforce active deployment check strictly per service_id (Frontend does not block Backend!)
-	var activeCount int
+	// If an existing deployment for this service is still in 'queued' state, the newer deployment supersedes it.
+	// If an existing deployment has already started executing (cloning, building, starting, health_checking),
+	// reject with ErrActiveDeployment to protect in-flight progress.
+	var activeID *uuid.UUID
+	var activeStatus *string
 	err = tx.QueryRow(ctx,
-		`SELECT COUNT(*) FROM service_deployments 
-		 WHERE service_id = $1 AND status IN ($2, $3, $4, $5, $6)`,
+		`SELECT id, status FROM service_deployments 
+		 WHERE service_id = $1 AND status IN ($2, $3, $4, $5, $6)
+		 ORDER BY created_at DESC LIMIT 1`,
 		targetService.ID,
 		models.DeployStatusQueued,
 		models.DeployStatusCloning,
 		models.DeployStatusBuilding,
 		models.DeployStatusStarting,
 		models.DeployStatusHealthChecking,
-	).Scan(&activeCount)
-	if err != nil {
+	).Scan(&activeID, &activeStatus)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("failed to check active service deployments: %w", err)
 	}
-	if activeCount > 0 {
-		return nil, ErrActiveDeployment
+
+	if activeID != nil && activeStatus != nil {
+		if *activeStatus == models.DeployStatusQueued {
+			supersedeReason := "Superseded by newer deployment"
+			now := time.Now()
+			_, err = tx.Exec(ctx,
+				`UPDATE service_deployments
+				 SET status = $1, failure_reason = $2, finished_at = $3,
+				     duration_ms = EXTRACT(EPOCH FROM ($3 - COALESCE(started_at, created_at))) * 1000
+				 WHERE id = $4 AND status = $5`,
+				models.DeployStatusFailed, supersedeReason, now, *activeID, models.DeployStatusQueued,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to supersede queued service deployment: %w", err)
+			}
+			_, _ = tx.Exec(ctx,
+				`INSERT INTO deployment_logs (id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				uuid.New(), nil, *activeID, targetService.ID, now, models.LogPhaseStartup, models.LogStreamSystem, "Deployment superseded by newer queued deployment",
+			)
+			slog.Info("superseded queued service deployment", "service_deployment_id", *activeID, "service_id", targetService.ID)
+		} else {
+			return nil, ErrActiveDeployment
+		}
 	}
 
 	// Get next service deploy number safely inside locked transaction
@@ -1456,8 +1509,8 @@ func (s *DeploymentService) ReconcileQueuedDeployments(ctx context.Context, q De
 // Instead of blindly failing them after a timeout, it inspects whether a worker holds an active lease:
 // - If an active worker lease exists, the deployment is actively processing and not orphaned.
 // - If no active lease exists and it has been abandoned beyond staleDuration:
-//     - If attempts < maxRetries, it resets status to 'queued' and re-enqueues for recovery.
-//     - If attempts >= maxRetries, it marks the deployment as failed.
+//   - If attempts < maxRetries, it resets status to 'queued' and re-enqueues for recovery.
+//   - If attempts >= maxRetries, it marks the deployment as failed.
 func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Context, q DeploymentQueueReconciler, staleDuration time.Duration, maxRetries int) (int, error) {
 	if s.db == nil {
 		return 0, nil
@@ -1628,3 +1681,141 @@ func (s *DeploymentService) FailServiceDeployment(ctx context.Context, serviceDe
 	return tx.Commit(ctx)
 }
 
+// CancelServiceDeployment safely cancels a queued or in-progress service deployment.
+// It fails if the deployment is already running (promoted) or already in a terminal state.
+func (s *DeploymentService) CancelServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var currentStatus string
+	var serviceID uuid.UUID
+	err = tx.QueryRow(ctx, "SELECT status, service_id FROM service_deployments WHERE id = $1 FOR UPDATE", serviceDeploymentID).Scan(&currentStatus, &serviceID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrDeploymentNotFound
+		}
+		return fmt.Errorf("failed to fetch service deployment: %w", err)
+	}
+
+	if currentStatus == models.DeployStatusRunning {
+		return ErrCannotCancelRunningDeployment
+	}
+
+	if models.IsDeploymentTerminalStatus(currentStatus) {
+		return ErrDeploymentAlreadyTerminal
+	}
+
+	now := time.Now()
+	reason := "Deployment cancelled by user"
+	_, err = tx.Exec(ctx,
+		`UPDATE service_deployments SET
+		 status = $2, failure_reason = $3, finished_at = $4,
+		 duration_ms = EXTRACT(EPOCH FROM ($4 - COALESCE(started_at, created_at))) * 1000
+		 WHERE id = $1`,
+		serviceDeploymentID, models.DeployStatusFailed, reason, now,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to cancel service deployment: %w", err)
+	}
+
+	// Restore service status if appropriate
+	var prevRunningID *uuid.UUID
+	_ = tx.QueryRow(ctx,
+		`SELECT id FROM service_deployments WHERE service_id = $1 AND status = $2 AND id != $3 ORDER BY deploy_number DESC LIMIT 1`,
+		serviceID, models.DeployStatusRunning, serviceDeploymentID,
+	).Scan(&prevRunningID)
+
+	if prevRunningID != nil {
+		_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ServiceStatusRunning, now, serviceID)
+	} else {
+		_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ServiceStatusFailed, now, serviceID)
+	}
+
+	// Log the cancellation
+	_, _ = tx.Exec(ctx,
+		`INSERT INTO deployment_logs (id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		uuid.New(), nil, serviceDeploymentID, serviceID, now, models.LogPhaseStartup, models.LogStreamSystem, reason,
+	)
+
+	return tx.Commit(ctx)
+}
+
+// CancelDeployment safely cancels a queued or in-progress project deployment.
+// It fails if the deployment is already running (promoted) or already in a terminal state.
+func (s *DeploymentService) CancelDeployment(ctx context.Context, deploymentID uuid.UUID) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var currentStatus string
+	var projectID uuid.UUID
+	err = tx.QueryRow(ctx, "SELECT status, project_id FROM deployments WHERE id = $1 FOR UPDATE", deploymentID).Scan(&currentStatus, &projectID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrDeploymentNotFound
+		}
+		return fmt.Errorf("failed to fetch deployment: %w", err)
+	}
+
+	if currentStatus == models.DeployStatusRunning {
+		return ErrCannotCancelRunningDeployment
+	}
+
+	if models.IsDeploymentTerminalStatus(currentStatus) {
+		return ErrDeploymentAlreadyTerminal
+	}
+
+	now := time.Now()
+	reason := "Deployment cancelled by user"
+	_, err = tx.Exec(ctx,
+		`UPDATE deployments SET
+		 status = $2, failure_reason = $3, finished_at = $4
+		 WHERE id = $1`,
+		deploymentID, models.DeployStatusFailed, reason, now,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to cancel deployment: %w", err)
+	}
+
+	// Also mark any child service_deployments as failed if active
+	_, _ = tx.Exec(ctx,
+		`UPDATE service_deployments SET
+		 status = $2, failure_reason = $3, finished_at = $4,
+		 duration_ms = EXTRACT(EPOCH FROM ($4 - COALESCE(started_at, created_at))) * 1000
+		 WHERE deployment_id = $1 AND status NOT IN ($5, $6, $7, $8)`,
+		deploymentID, models.DeployStatusFailed, reason, now,
+		models.DeployStatusRunning, models.DeployStatusStopped, models.DeployStatusCrashed, models.DeployStatusFailed,
+	)
+
+	// Update project status
+	var prevRunningID *uuid.UUID
+	_ = tx.QueryRow(ctx,
+		`SELECT id FROM deployments WHERE project_id = $1 AND status = $2 AND id != $3 ORDER BY deploy_number DESC LIMIT 1`,
+		projectID, models.DeployStatusRunning, deploymentID,
+	).Scan(&prevRunningID)
+
+	if prevRunningID != nil {
+		_, _ = tx.Exec(ctx, "UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ProjectStatusRunning, now, projectID)
+	} else {
+		_, _ = tx.Exec(ctx, "UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ProjectStatusFailed, now, projectID)
+	}
+
+	// Log the cancellation
+	_, _ = tx.Exec(ctx,
+		`INSERT INTO deployment_logs (id, deployment_id, service_id, timestamp, phase, stream, message)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		uuid.New(), deploymentID, nil, now, models.LogPhaseStartup, models.LogStreamSystem, reason,
+	)
+
+	return tx.Commit(ctx)
+}

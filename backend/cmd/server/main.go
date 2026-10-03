@@ -25,6 +25,7 @@ import (
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/network"
 	"github.com/forgelab/backend/internal/queue"
+	"github.com/forgelab/backend/internal/ratelimit"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
 	ws "github.com/forgelab/backend/internal/websocket"
@@ -207,6 +208,10 @@ func main() {
 		}
 	}()
 
+	// Rate Limiting
+	rateLimiter := ratelimit.NewLimiter(redisClient, cfg.RateLimit.Enabled)
+	wsHub.SetRateLimiter(rateLimiter, cfg.RateLimit.WSSubscriptionLimit)
+
 	// Initialize handlers
 	oauthService := services.NewOAuthService(cfg.Google, cfg.GitHub, redisClient)
 	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
@@ -215,6 +220,7 @@ func main() {
 	envHandler := handlers.NewEnvHandler(secretService)
 	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
+	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
 
 	// Setup router
 	r := chi.NewRouter()
@@ -226,14 +232,19 @@ func main() {
 	r.Use(middleware.CORS(cfg.App.CORSAllowedOrigins))
 	r.Use(chimiddleware.Recoverer)
 
-	// Health check (unauthenticated)
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status": "ok", "service": "forgelab"}`))
-	})
+	// Health and readiness checks (unauthenticated)
+	r.Get("/health", healthHandler.Liveness)
+	r.Get("/ready", healthHandler.Readiness)
+	r.Get("/health/ready", healthHandler.Readiness)
+
+	// Throttles for sensitive endpoints
+	authThrottle := ratelimit.Middleware(rateLimiter, "auth", cfg.RateLimit.AuthLimit, time.Minute)
+	sourceThrottle := ratelimit.Middleware(rateLimiter, "source", cfg.RateLimit.SourceLimit, time.Minute)
+	deployThrottle := ratelimit.Middleware(rateLimiter, "deploy", cfg.RateLimit.DeployLimit, time.Minute)
+	wsConnThrottle := ratelimit.Middleware(rateLimiter, "ws_conn", cfg.RateLimit.WSConnLimit, time.Minute)
 
 	// WebSocket endpoint
-	r.Get("/api/ws", wsHub.ServeWS)
+	r.With(wsConnThrottle).Get("/api/ws", wsHub.ServeWS)
 
 	// API routes
 	r.Route("/api", func(r chi.Router) {
@@ -247,9 +258,9 @@ func main() {
 
 		// Auth routes (public)
 		r.Route("/auth", func(r chi.Router) {
-			r.Post("/register", authHandler.Register)
-			r.Post("/login", authHandler.Login)
-			r.Post("/refresh", authHandler.Refresh)
+			r.With(authThrottle).Post("/register", authHandler.Register)
+			r.With(authThrottle).Post("/login", authHandler.Login)
+			r.With(authThrottle).Post("/refresh", authHandler.Refresh)
 			r.Post("/logout", authHandler.Logout)
 
 			// OAuth routes (public)
@@ -271,10 +282,10 @@ func main() {
 
 			// Source Management & Uploads
 			r.Route("/sources", func(r chi.Router) {
-				r.Post("/upload", sourceHandler.Upload)
+				r.With(sourceThrottle).Post("/upload", sourceHandler.Upload)
 				r.Post("/agent/session", sourceHandler.CreateAgentSession)
 				r.Post("/agent/register", sourceHandler.RegisterAgentSource)
-				r.Post("/local/validate", sourceHandler.ValidateLocalPath)
+				r.With(sourceThrottle).Post("/local/validate", sourceHandler.ValidateLocalPath)
 				r.Get("/local/validate/{sessionId}", sourceHandler.GetLocalValidationStatus)
 				r.Get("/{id}", sourceHandler.GetStatus)
 				r.Delete("/{id}", sourceHandler.Delete)
@@ -304,10 +315,11 @@ func main() {
 
 				// Service Lifecycle Controls & Listing
 				r.Get("/{id}/services", serviceHandler.List)
-				r.Post("/{id}/services/{serviceId}/deploy", serviceHandler.Deploy)
-				r.Post("/{id}/services/{serviceId}/rollback", serviceHandler.Rollback)
+				r.With(deployThrottle).Post("/{id}/services/{serviceId}/deploy", serviceHandler.Deploy)
+				r.With(deployThrottle).Post("/{id}/services/{serviceId}/rollback", serviceHandler.Rollback)
 				r.Get("/{id}/services/{serviceId}/deployments", serviceHandler.ListDeployments)
 				r.Get("/{id}/services/{serviceId}/deployments/{deploymentId}", serviceHandler.GetDeployment)
+				r.Post("/{id}/services/{serviceId}/deployments/{deploymentId}/cancel", serviceHandler.CancelDeployment)
 				r.Get("/{id}/services/{serviceId}/deployments/{deploymentId}/logs", serviceHandler.GetLogs)
 				r.Post("/{id}/services/{serviceId}/stop", serviceHandler.Stop)
 				r.Post("/{id}/services/{serviceId}/start", serviceHandler.Start)
@@ -318,7 +330,7 @@ func main() {
 				r.Post("/{id}/stop", projectHandler.Stop)
 				r.Post("/{id}/start", projectHandler.Start)
 				r.Post("/{id}/restart", projectHandler.Restart)
-				r.Post("/{id}/rollback", projectHandler.Rollback)
+				r.With(deployThrottle).Post("/{id}/rollback", projectHandler.Rollback)
 
 				// Environment Variables / Secrets
 				r.Get("/{id}/env", envHandler.List)
@@ -326,9 +338,10 @@ func main() {
 				r.Delete("/{id}/env/{key}", envHandler.Delete)
 
 				// Deployments
-				r.Post("/{id}/deployments", projectHandler.Deploy)
+				r.With(deployThrottle).Post("/{id}/deployments", projectHandler.Deploy)
 				r.Get("/{id}/deployments", projectHandler.ListDeployments)
 				r.Get("/{id}/deployments/{deploymentId}", projectHandler.GetDeployment)
+				r.Post("/{id}/deployments/{deploymentId}/cancel", projectHandler.CancelDeployment)
 				r.Get("/{id}/deployments/{deploymentId}/services", projectHandler.ListServiceDeployments)
 				r.Get("/{id}/deployments/{deploymentId}/logs", projectHandler.GetDeploymentLogs)
 			})
