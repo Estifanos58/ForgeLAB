@@ -15,11 +15,24 @@ import (
 	"github.com/forgelab/backend/internal/agent"
 )
 
+var (
+	Version   = "1.0.0"
+	CommitSHA = "dev"
+	BuildTime = "unknown"
+)
+
 func main() {
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	port := flag.Int("port", 4142, "Local agent listening port")
 	backendURL := flag.String("backend", "http://localhost:8080", "ForgeLAB backend URL")
+	agentIDFlag := flag.String("agent-id", "", "Unique agent identifier")
 	allowedRootsFlag := flag.String("allowed-roots", "", "Comma-separated list of allowed source directory roots")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("forgelab-agent v%s (commit: %s, built: %s)\n", Version, CommitSHA, BuildTime)
+		return
+	}
 
 	var allowedRoots []string
 	if *allowedRootsFlag != "" {
@@ -36,7 +49,15 @@ func main() {
 		}
 	}
 
+	agentID := strings.TrimSpace(*agentIDFlag)
+	if agentID == "" {
+		agentID = os.Getenv("FORGELAB_AGENT_ID")
+	}
+
 	server := agent.NewAgentServer(agent.AgentServerConfig{
+		AgentID:      agentID,
+		Version:      Version,
+		CommitSHA:    CommitSHA,
 		Port:         *port,
 		AllowedRoots: allowedRoots,
 		BackendURL:   *backendURL,
@@ -56,7 +77,8 @@ func main() {
 
 	go func() {
 		fmt.Printf("====================================================\n")
-		fmt.Printf("   ForgeLAB Local Agent v1.0.0\n")
+		fmt.Printf("   ForgeLAB Local Agent v%s (commit: %s, built: %s)\n", Version, CommitSHA, BuildTime)
+		fmt.Printf("   Agent ID: %s\n", server.AgentID())
 		fmt.Printf("   Ready on http://%s\n", addr)
 		fmt.Printf("   Connected backend: %s\n", *backendURL)
 		fmt.Printf("====================================================\n")

@@ -512,13 +512,47 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				if httpErr != nil {
 					reason = httpErr.Error()
 				} else if resp != nil {
+					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 					resp.Body.Close()
+
+					var errData struct {
+						Error  string `json:"error"`
+						Reason string `json:"reason"`
+					}
+					_ = json.Unmarshal(bodyBytes, &errData)
+
+					diagReason := errData.Reason
+					if diagReason == "" {
+						diagReason = errData.Error
+					}
+					if diagReason == "" && len(bodyBytes) > 0 {
+						diagReason = strings.TrimSpace(string(bodyBytes))
+					}
+
+					slog.Warn("local agent stream context request rejected",
+						"status", resp.StatusCode,
+						"reason", diagReason,
+						"source_id", project.SourceReference,
+					)
+
 					if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-						reason = "Local agent session authorization rejected (401/403). Please re-select the project folder."
+						if diagReason != "" {
+							reason = fmt.Sprintf("Local agent session authorization rejected (%d: %s). Please re-select the project folder.", resp.StatusCode, diagReason)
+						} else {
+							reason = fmt.Sprintf("Local agent session authorization rejected (%d). Please re-select the project folder.", resp.StatusCode)
+						}
 					} else if resp.StatusCode == http.StatusNotFound {
-						reason = "Local agent source session expired or agent restarted. Please re-select the project folder."
+						if diagReason != "" {
+							reason = fmt.Sprintf("Local agent source session not found (%s). Please re-select the project folder.", diagReason)
+						} else {
+							reason = "Local agent source session expired or agent restarted. Please re-select the project folder."
+						}
 					} else {
-						reason = fmt.Sprintf("agent returned status %d", resp.StatusCode)
+						if diagReason != "" {
+							reason = fmt.Sprintf("agent returned status %d: %s", resp.StatusCode, diagReason)
+						} else {
+							reason = fmt.Sprintf("agent returned status %d", resp.StatusCode)
+						}
 					}
 				}
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)

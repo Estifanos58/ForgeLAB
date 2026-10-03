@@ -48,6 +48,8 @@ type LocalSourceSession struct {
 
 type AgentServerConfig struct {
 	AgentID                string
+	Version                string
+	CommitSHA              string
 	Port                   int
 	AllowedRoots           []string
 	BackendURL             string
@@ -59,6 +61,8 @@ type AgentServerConfig struct {
 
 type AgentServer struct {
 	agentID                string
+	version                string
+	commitSHA              string
 	port                   int
 	backendURL             string
 	allowedOrigins         []string
@@ -113,14 +117,25 @@ func NewAgentServer(cfg AgentServerConfig) *AgentServer {
 		agentID = uuid.New().String()
 	}
 
+	version := strings.TrimSpace(cfg.Version)
+	if version == "" {
+		version = "1.0.0"
+	}
+	commitSHA := strings.TrimSpace(cfg.CommitSHA)
+	if commitSHA == "" {
+		commitSHA = "dev"
+	}
+
 	srv := &AgentServer{
-		agentID:          agentID,
-		port:             cfg.Port,
-		backendURL:       cfg.BackendURL,
-		allowedOrigins:   origins,
-		pathValidator:    NewPathValidator(cfg.AllowedRoots),
-		picker:           NewNativeFolderPicker(),
-		sessions:         make(map[uuid.UUID]*LocalSourceSession),
+		agentID:                agentID,
+		version:                version,
+		commitSHA:              commitSHA,
+		port:                   cfg.Port,
+		backendURL:             cfg.BackendURL,
+		allowedOrigins:         origins,
+		pathValidator:          NewPathValidator(cfg.AllowedRoots),
+		picker:                 NewNativeFolderPicker(),
+		sessions:               make(map[uuid.UUID]*LocalSourceSession),
 		dockerClient:           cli,
 		sessionValidator:       cfg.SessionValidator,
 		sourceSessionValidator: cfg.SourceSessionValidator,
@@ -276,7 +291,37 @@ func (s *AgentServer) validateToken(ctx context.Context, token string) (*AgentSe
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("backend rejected session token with status %d", resp.StatusCode)
+			var errPayload struct {
+				Error  string `json:"error"`
+				Reason string `json:"reason"`
+			}
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+			_ = json.Unmarshal(bodyBytes, &errPayload)
+			errMsg := errPayload.Reason
+			if errMsg == "" {
+				errMsg = errPayload.Error
+			}
+			if errMsg == "" {
+				errMsg = strings.TrimSpace(string(bodyBytes))
+			}
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("status %d", resp.StatusCode)
+			}
+
+			lower := strings.ToLower(errMsg)
+			if strings.Contains(lower, "expired") {
+				return nil, fmt.Errorf("%w: %s", ErrSessionExpired, errMsg)
+			}
+			if strings.Contains(lower, "consumed") {
+				return nil, fmt.Errorf("%w: %s", ErrSessionConsumed, errMsg)
+			}
+			if strings.Contains(lower, "agent id mismatch") || strings.Contains(lower, "agent mismatch") || resp.StatusCode == http.StatusForbidden {
+				return nil, fmt.Errorf("%w: %s", ErrUnauthorized, errMsg)
+			}
+			if strings.Contains(lower, "not found") {
+				return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, errMsg)
+			}
+			return nil, fmt.Errorf("backend session validation rejected (%d): %s", resp.StatusCode, errMsg)
 		}
 
 		var res struct {
@@ -307,13 +352,47 @@ func (s *AgentServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := extractToken(r)
 		if token == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: agent session token is required"})
+			slog.Warn("agent authorization rejected: token missing",
+				"path", r.URL.Path,
+				"agent_id", s.agentID,
+			)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{
+				"error":  "unauthorized: agent session token is required",
+				"reason": "token missing",
+			})
 			return
 		}
 
 		sess, err := s.validateToken(r.Context(), token)
 		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: " + err.Error()})
+			diagReason := "backend validation rejected"
+			statusCode := http.StatusUnauthorized
+
+			if errors.Is(err, ErrSessionExpired) {
+				diagReason = "token expired"
+				statusCode = http.StatusUnauthorized
+			} else if errors.Is(err, ErrSessionConsumed) {
+				diagReason = "consumed session"
+				statusCode = http.StatusUnauthorized
+			} else if errors.Is(err, ErrUnauthorized) {
+				diagReason = "agent mismatch"
+				statusCode = http.StatusForbidden
+			} else if errors.Is(err, ErrSessionNotFound) {
+				diagReason = "session not found"
+				statusCode = http.StatusUnauthorized
+			}
+
+			slog.Warn("agent authorization rejected",
+				"path", r.URL.Path,
+				"agent_id", s.agentID,
+				"reason", diagReason,
+				"detail", err.Error(),
+			)
+
+			writeJSON(w, statusCode, map[string]string{
+				"error":  "unauthorized: " + err.Error(),
+				"reason": diagReason,
+			})
 			return
 		}
 
@@ -377,10 +456,37 @@ func (s *AgentServer) validateTokenForSource(ctx context.Context, token string, 
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			if resp.StatusCode == http.StatusForbidden {
-				return nil, fmt.Errorf("%w: backend rejected session token with status 403", ErrUnauthorized)
+			var errPayload struct {
+				Error  string `json:"error"`
+				Reason string `json:"reason"`
 			}
-			return nil, fmt.Errorf("backend rejected session token with status %d", resp.StatusCode)
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+			_ = json.Unmarshal(bodyBytes, &errPayload)
+			errMsg := errPayload.Reason
+			if errMsg == "" {
+				errMsg = errPayload.Error
+			}
+			if errMsg == "" {
+				errMsg = strings.TrimSpace(string(bodyBytes))
+			}
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("status %d", resp.StatusCode)
+			}
+
+			lower := strings.ToLower(errMsg)
+			if strings.Contains(lower, "expired") {
+				return nil, fmt.Errorf("%w: %s", ErrSessionExpired, errMsg)
+			}
+			if strings.Contains(lower, "consumed") {
+				return nil, fmt.Errorf("%w: %s", ErrSessionConsumed, errMsg)
+			}
+			if strings.Contains(lower, "agent id mismatch") || strings.Contains(lower, "agent mismatch") || strings.Contains(lower, "not bound to requested source") || strings.Contains(lower, "source mismatch") || resp.StatusCode == http.StatusForbidden {
+				return nil, fmt.Errorf("%w: %s", ErrUnauthorized, errMsg)
+			}
+			if strings.Contains(lower, "not found") {
+				return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, errMsg)
+			}
+			return nil, fmt.Errorf("backend validation rejected (%d): %s", resp.StatusCode, errMsg)
 		}
 
 		var res struct {
@@ -416,7 +522,14 @@ func (s *AgentServer) requireSourceAuth(next http.HandlerFunc) http.HandlerFunc 
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := extractToken(r)
 		if token == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: agent session token is required"})
+			slog.Warn("agent source authorization rejected: token missing",
+				"path", r.URL.Path,
+				"agent_id", s.agentID,
+			)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{
+				"error":  "unauthorized: agent session token is required",
+				"reason": "token missing",
+			})
 			return
 		}
 
@@ -435,19 +548,41 @@ func (s *AgentServer) requireSourceAuth(next http.HandlerFunc) http.HandlerFunc 
 
 		sess, err := s.validateTokenForSource(r.Context(), token, sourceUUID)
 		if err != nil {
+			diagReason := "backend validation rejected"
+			statusCode := http.StatusUnauthorized
+
 			if errors.Is(err, ErrSessionExpired) {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: agent session has expired"})
-				return
+				diagReason = "token expired"
+				statusCode = http.StatusUnauthorized
+			} else if errors.Is(err, ErrSessionConsumed) {
+				diagReason = "consumed session"
+				statusCode = http.StatusUnauthorized
+			} else if errors.Is(err, ErrUnauthorized) {
+				statusCode = http.StatusForbidden
+				lower := strings.ToLower(err.Error())
+				if strings.Contains(lower, "agent id mismatch") || strings.Contains(lower, "agent mismatch") {
+					diagReason = "agent mismatch"
+				} else if strings.Contains(lower, "not bound to requested source") || strings.Contains(lower, "source mismatch") {
+					diagReason = "source mismatch"
+				} else {
+					diagReason = "source mismatch"
+				}
+			} else if errors.Is(err, ErrSessionNotFound) {
+				diagReason = "session not found"
+				statusCode = http.StatusUnauthorized
 			}
-			if errors.Is(err, ErrUnauthorized) {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": "unauthorized: " + err.Error()})
-				return
-			}
-			if errors.Is(err, ErrSessionConsumed) {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: agent session has already been consumed"})
-				return
-			}
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: " + err.Error()})
+
+			slog.Warn("agent source authorization rejected",
+				"source_id", sourceUUID.String(),
+				"agent_id", s.agentID,
+				"reason", diagReason,
+				"detail", err.Error(),
+			)
+
+			writeJSON(w, statusCode, map[string]string{
+				"error":  fmt.Sprintf("unauthorized: %s", err.Error()),
+				"reason": diagReason,
+			})
 			return
 		}
 
@@ -480,7 +615,8 @@ func (s *AgentServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":           "online",
 		"agent_id":         s.agentID,
-		"version":          "1.0.0",
+		"version":          s.version,
+		"commit":           s.commitSHA,
 		"os":               runtime.GOOS,
 		"arch":             runtime.GOARCH,
 		"docker_available": dockerAvailable,
@@ -557,24 +693,24 @@ func (s *AgentServer) notifyBackendSession(token string, sourceID uuid.UUID, fol
 	if s.backendURL == "" {
 		return
 	}
-	go func() {
-		validateURL := fmt.Sprintf("%s/api/sources/agent/session/validate", strings.TrimRight(s.backendURL, "/"))
-		payload, _ := json.Marshal(map[string]string{
-			"token":       token,
-			"source_id":   sourceID.String(),
-			"agent_id":    s.agentID,
-			"folder_name": folderName,
-		})
-		req, err := http.NewRequest(http.MethodPost, validateURL, bytes.NewReader(payload))
-		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
-			client := &http.Client{Timeout: 3 * time.Second}
-			resp, err := client.Do(req)
-			if err == nil {
-				resp.Body.Close()
-			}
+	validateURL := fmt.Sprintf("%s/api/sources/agent/session/validate", strings.TrimRight(s.backendURL, "/"))
+	payload, _ := json.Marshal(map[string]string{
+		"token":       token,
+		"source_id":   sourceID.String(),
+		"agent_id":    s.agentID,
+		"folder_name": folderName,
+	})
+	req, err := http.NewRequest(http.MethodPost, validateURL, bytes.NewReader(payload))
+	if err == nil {
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Warn("failed to notify backend session binding", "error", err, "backend", s.backendURL)
+		} else {
+			resp.Body.Close()
 		}
-	}()
+	}
 }
 
 // ConsumeSession marks a local source session as consumed by a created project
@@ -812,19 +948,40 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 	s.mu.RUnlock()
 
 	if !exists {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "source session not found or expired"})
+		slog.Warn("agent source session not found in local memory",
+			"source_id", sourceUUID.String(),
+			"agent_id", s.agentID,
+		)
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":  "source session not found or expired",
+			"reason": "session not found",
+		})
 		return
 	}
 
 	if time.Now().After(session.ExpiresAt) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "source session not found or expired"})
+		slog.Warn("agent source session expired in local memory",
+			"source_id", sourceUUID.String(),
+			"agent_id", s.agentID,
+		)
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":  "source session not found or expired",
+			"reason": "token expired",
+		})
 		return
 	}
 
 	// Verify token match
 	token, _ := r.Context().Value("agent_token").(string)
 	if session.Token != "" && token != "" && session.Token != token {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden: token does not match source session"})
+		slog.Warn("agent source session token mismatch",
+			"source_id", sourceUUID.String(),
+			"agent_id", s.agentID,
+		)
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":  "forbidden: token does not match source session",
+			"reason": "source mismatch",
+		})
 		return
 	}
 

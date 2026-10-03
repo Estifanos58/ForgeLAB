@@ -567,9 +567,20 @@ func (h *SourceHandler) ValidateAgentSession(w http.ResponseWriter, r *http.Requ
 		}
 	} else {
 		session, err = sm.ValidateToken(req.Token)
+		if err == nil {
+			cleanReqAgentID := strings.TrimSpace(req.AgentID)
+			if session.AgentID != "" && (cleanReqAgentID == "" || session.AgentID != cleanReqAgentID) {
+				writeError(w, http.StatusForbidden, "unauthorized session access: agent ID mismatch")
+				return
+			}
+		}
 	}
 
 	if err != nil {
+		if errors.Is(err, agent.ErrSessionNotFound) {
+			writeError(w, http.StatusUnauthorized, "agent session not found")
+			return
+		}
 		if errors.Is(err, agent.ErrSessionExpired) {
 			writeError(w, http.StatusUnauthorized, "agent session has expired")
 			return

@@ -189,7 +189,7 @@ func (sm *SessionManager) BindSource(token string, sourceID uuid.UUID, folderNam
 
 	// If agentID was not specified during session creation, bind it now; otherwise verify match
 	cleanAgentID := strings.TrimSpace(agentID)
-	if session.AgentID != "" && cleanAgentID != "" && session.AgentID != cleanAgentID {
+	if session.AgentID != "" && (cleanAgentID == "" || session.AgentID != cleanAgentID) {
 		return nil, fmt.Errorf("%w: agent ID mismatch", ErrUnauthorized)
 	}
 	if session.AgentID == "" && cleanAgentID != "" {
@@ -232,7 +232,7 @@ func (sm *SessionManager) VerifyTokenForSource(token string, sourceID uuid.UUID,
 	}
 
 	cleanAgentID := strings.TrimSpace(agentID)
-	if cleanAgentID != "" && session.AgentID != "" && session.AgentID != cleanAgentID {
+	if session.AgentID != "" && (cleanAgentID == "" || session.AgentID != cleanAgentID) {
 		return nil, fmt.Errorf("%w: agent ID mismatch", ErrUnauthorized)
 	}
 
