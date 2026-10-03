@@ -614,32 +614,21 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d build-time arguments (runtime-only secrets safely excluded).", len(buildArgs)))
 		}
 
-		buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
-		buildResponse, err := e.dockerClient.ImageBuild(buildCtx, tarArchive, types.ImageBuildOptions{
+		buildOpts := types.ImageBuildOptions{
 			Tags:       []string{svcTag},
 			Dockerfile: relDockerPath,
 			BuildArgs:  buildArgs,
 			Remove:     true,
-		})
-		tarArchive.Close()
-		buildCancel()
-		if err != nil {
-			reason := fmt.Sprintf("Docker build failed: %v", err)
-			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-			emitStatus(models.DeployStatusFailed, nil, &reason)
-			return errors.New(reason)
 		}
 
-		if err := e.parseDockerStream(buildResponse.Body, func(msg string) {
+		if err := e.buildImage(ctx, tarArchive, buildOpts, func(msg string) {
 			emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 		}); err != nil {
-			buildResponse.Body.Close()
-			reason := fmt.Sprintf("Docker build error: %v", err)
+			reason := err.Error()
 			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 			emitStatus(models.DeployStatusFailed, nil, &reason)
 			return errors.New(reason)
 		}
-		buildResponse.Body.Close()
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Docker image '%s' built successfully.", svcTag))
 
 		// Inspect image to record immutable digest for rollback / reproducibility
@@ -1182,9 +1171,6 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		},
 	})
 
-	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
-	defer buildCancel()
-
 	buildArgs := make(map[string]*string)
 	if e.secretService != nil {
 		buildEnv, _, _ := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeBuild)
@@ -1194,32 +1180,21 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		}
 	}
 
-	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, tarStream, types.ImageBuildOptions{
+	buildOpts := types.ImageBuildOptions{
 		Tags:       []string{*deployment.ImageTag},
 		Dockerfile: relDockerPath,
 		BuildArgs:  buildArgs,
 		Remove:     true,
-	})
-	if err != nil {
-		tarStream.Close()
-		reason := fmt.Sprintf("Docker build failed: %v", err)
-		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
 	}
 
-	if err := e.parseDockerStream(buildResponse.Body, func(msg string) {
+	if err := e.buildImage(ctx, tarStream, buildOpts, func(msg string) {
 		emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 	}); err != nil {
-		buildResponse.Body.Close()
-		tarStream.Close()
-		reason := fmt.Sprintf("Build error: %v", err)
+		reason := err.Error()
 		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 		updateStatus(models.DeployStatusFailed, &reason)
 		return errors.New(reason)
 	}
-	buildResponse.Body.Close()
-	tarStream.Close()
 
 	updateStatus(models.DeployStatusStarting, nil)
 	allocatedPort, err := e.portManager.AllocatePort()
@@ -1603,6 +1578,47 @@ func (e *Engine) CleanUpProjectContainers(ctx context.Context, projectID uuid.UU
 			_ = e.dockerClient.ContainerRemove(ctx, *d.ContainerID, container.RemoveOptions{Force: true})
 		}
 	}
+}
+
+// buildImage builds a Docker image from the given tar archive and options with proper resource lifecycle:
+// 1. Creates a 15-minute build context.
+// 2. Invokes ImageBuild with the active build context while tarArchive is open.
+// 3. If ImageBuild fails, returns error with structured cleanup.
+// 4. Reads the entire build response body via parseDockerStream while build context is active.
+// 5. Closes buildResponse.Body.
+// 6. Closes the source tarArchive.
+// 7. Cancels build context.
+// Defer-based cleanup guarantees response body, source stream, and build context
+// are closed/cancelled exactly once across all success and error paths.
+func (e *Engine) buildImage(
+	ctx context.Context,
+	tarArchive io.ReadCloser,
+	options types.ImageBuildOptions,
+	onLogLine func(string),
+) error {
+	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer buildCancel()
+
+	if tarArchive != nil {
+		defer tarArchive.Close()
+	}
+
+	var buildReader io.Reader = tarArchive
+	if tarArchive != nil {
+		buildReader = io.NopCloser(tarArchive)
+	}
+
+	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, buildReader, options)
+	if err != nil {
+		return fmt.Errorf("Docker build failed: %w", err)
+	}
+	defer buildResponse.Body.Close()
+
+	if err := e.parseDockerStream(buildResponse.Body, onLogLine); err != nil {
+		return fmt.Errorf("Docker build error: %w", err)
+	}
+
+	return nil
 }
 
 func (e *Engine) parseDockerStream(r io.Reader, onLogLine func(string)) error {
