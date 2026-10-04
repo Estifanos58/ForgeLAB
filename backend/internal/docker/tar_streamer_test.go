@@ -217,3 +217,79 @@ func TestStreamBuildContext_LargeDirectorySimulation(t *testing.T) {
 		t.Errorf("streaming large directory took too long: %v", elapsed)
 	}
 }
+
+func TestStreamBuildContext_Limits(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab_limits_test_")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	_ = os.WriteFile(filepath.Join(tempDir, "file1.txt"), []byte("12345"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, "file2.txt"), []byte("67890"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, "file3.txt"), []byte("abcde"), 0644)
+
+	t.Run("ExceedMaxFiles", func(t *testing.T) {
+		stream := docker.StreamBuildContext(context.Background(), docker.TarStreamerOptions{
+			BuildContextDir: tempDir,
+			MaxFiles:        2, // limit is 2, but directory has 3 files
+		})
+		defer stream.Close()
+
+		tr := tar.NewReader(stream)
+		var readErr error
+		for {
+			_, err := tr.Next()
+			if err != nil {
+				readErr = err
+				break
+			}
+		}
+		if readErr == nil || !strings.Contains(readErr.Error(), "limit: 2 files exceeded") {
+			t.Fatalf("expected ErrBuildContextTooManyFiles, got: %v", readErr)
+		}
+	})
+
+	t.Run("ExceedMaxFileSize", func(t *testing.T) {
+		stream := docker.StreamBuildContext(context.Background(), docker.TarStreamerOptions{
+			BuildContextDir: tempDir,
+			MaxFileSize:     4, // files are 5 bytes
+		})
+		defer stream.Close()
+
+		tr := tar.NewReader(stream)
+		var readErr error
+		for {
+			_, err := tr.Next()
+			if err != nil {
+				readErr = err
+				break
+			}
+		}
+		if readErr == nil || !strings.Contains(readErr.Error(), "exceeds limit 4 bytes") {
+			t.Fatalf("expected ErrBuildContextFileTooLarge, got: %v", readErr)
+		}
+	})
+
+	t.Run("ExceedMaxTotalBytes", func(t *testing.T) {
+		stream := docker.StreamBuildContext(context.Background(), docker.TarStreamerOptions{
+			BuildContextDir: tempDir,
+			MaxTotalBytes:   8, // total is 15 bytes
+		})
+		defer stream.Close()
+
+		tr := tar.NewReader(stream)
+		var readErr error
+		for {
+			_, err := tr.Next()
+			if err != nil {
+				readErr = err
+				break
+			}
+		}
+		if readErr == nil || !strings.Contains(readErr.Error(), "total context size") {
+			t.Fatalf("expected ErrBuildContextTooLarge, got: %v", readErr)
+		}
+	})
+}
+

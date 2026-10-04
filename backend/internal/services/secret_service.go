@@ -64,6 +64,25 @@ func (s *SecretService) SetEnvVar(ctx context.Context, projectID, ownerID uuid.U
 		return nil, err
 	}
 
+	trimmedKey := strings.TrimSpace(input.Key)
+	if trimmedKey == "" || len(trimmedKey) > 255 {
+		return nil, errors.New("environment variable key must be between 1 and 255 characters")
+	}
+	for i, r := range trimmedKey {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '_' && (i == 0 || (r < '0' || r > '9')) {
+			return nil, errors.New("environment variable key must begin with a letter or underscore and contain only alphanumeric characters and underscores")
+		}
+	}
+	input.Key = trimmedKey
+
+	if input.ServiceID != nil {
+		var serviceExists bool
+		err := s.db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM services WHERE id = $1 AND project_id = $2)", *input.ServiceID, projectID).Scan(&serviceExists)
+		if err != nil || !serviceExists {
+			return nil, errors.New("service does not belong to specified project")
+		}
+	}
+
 	encryptedVal, err := s.encryptor.Encrypt([]byte(input.Value))
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt environment variable: %w", err)
@@ -454,4 +473,81 @@ func (s *SecretService) GetEnvMapFromSnapshot(snapshotBytes []byte, targetScope 
 	}
 
 	return envMap, secretValues, nil
+}
+
+// GetBuildVariables separates variables for build time into non-secret build arguments and secret variables.
+// Non-secret variables can be passed as BuildArgs; secret variables must NEVER be passed as BuildArgs.
+func (s *SecretService) GetBuildVariables(ctx context.Context, projectID uuid.UUID, serviceID *uuid.UUID, snapshotBytes []byte) (map[string]string, map[string]string, []string, error) {
+	normalArgs := make(map[string]string)
+	secretVars := make(map[string]string)
+	allSecretValues := make([]string, 0)
+
+	if len(snapshotBytes) > 0 && s.encryptor != nil {
+		decrypted, err := s.encryptor.Decrypt(snapshotBytes)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to decrypt env snapshot: %w", err)
+		}
+		var entries []EnvSnapshotEntry
+		if err := json.Unmarshal(decrypted, &entries); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to parse env snapshot JSON: %w", err)
+		}
+		for _, entry := range entries {
+			if entry.IsSecret {
+				allSecretValues = append(allSecretValues, entry.Value)
+			}
+			if entry.Scope != models.EnvScopeBoth && entry.Scope != models.EnvScopeBuild {
+				continue
+			}
+			if entry.IsSecret {
+				secretVars[entry.Key] = entry.Value
+			} else {
+				normalArgs[entry.Key] = entry.Value
+			}
+		}
+		return normalArgs, secretVars, allSecretValues, nil
+	}
+
+	if s.db == nil || s.encryptor == nil {
+		return normalArgs, secretVars, allSecretValues, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT key, encrypted_value, is_secret, scope, service_id
+		 FROM environment_variables
+		 WHERE project_id = $1 AND (service_id IS NULL OR ($2::uuid IS NOT NULL AND service_id = $2))
+		 ORDER BY CASE WHEN service_id IS NULL THEN 0 ELSE 1 END ASC`,
+		projectID, serviceID,
+	)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to query environment variables for build: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var key, scope string
+		var encVal []byte
+		var isSecret bool
+		var rowServiceID *uuid.UUID
+		if err := rows.Scan(&key, &encVal, &isSecret, &scope, &rowServiceID); err != nil {
+			return nil, nil, nil, err
+		}
+		dec, err := s.encryptor.Decrypt(encVal)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to decrypt %s: %w", key, err)
+		}
+		val := string(dec)
+		if isSecret {
+			allSecretValues = append(allSecretValues, val)
+		}
+		if scope != models.EnvScopeBoth && scope != models.EnvScopeBuild {
+			continue
+		}
+		if isSecret {
+			secretVars[key] = val
+		} else {
+			normalArgs[key] = val
+		}
+	}
+
+	return normalArgs, secretVars, allSecretValues, nil
 }

@@ -132,7 +132,7 @@ The status classifications strictly follow these definitions:
 | **Docker Trust Boundary Enforcement** | IMPLEMENTED | NOT RECORDED | Reject `/var/run/docker.sock` and sensitive mounts, `CapDrop: [ALL]`, `no-new-privileges: true`, reject host network |
 | **Redis Job Lease Ownership** | IMPLEMENTED | NOT RECORDED | Unique lease owner tokens (`workerID:uuid`), Lua atomic renewal/release/recovery, O(1) state indexing, zero list scans |
 | **Deep Dependency Readiness Check** | IMPLEMENTED | NOT RECORDED | `/ready` and `/health/ready` probe PostgreSQL, Redis, and Docker Engine concurrently with 0 secret exposure; `/health` remains lightweight liveness |
-| **API & WebSocket Rate Limiting** | IMPLEMENTED | NOT RECORDED | Redis/in-memory sliding window throttling on `/auth/*`, `/sources/*`, deploy/rollback, and WebSocket connect/subscribe returning HTTP 429 |
+| **API & WebSocket Rate Limiting** | IMPLEMENTED | NOT RECORDED | Redis/in-memory fixed-window counter throttling with trusted reverse proxy validation on `/auth/*`, `/sources/*`, deploy/rollback, and WebSocket connect/subscribe returning HTTP 429 |
 | **Deployment Cancellation & Superseding** | IMPLEMENTED | NOT RECORDED | User cancellation of queued/in-progress deployments; newer service deployments atomically supersede obsolete queued deployments |
 | **Automated Multi-Stage CI Pipeline** | IMPLEMENTED | NOT RECORDED | GitHub Actions (`.github/workflows/ci.yml`) covering backend vet/fmt/test, frontend lint/test/build, compose smoke, and migrations |
 | **Role-Based Access Control (RBAC)**| NOT IMPLEMENTED | — | Single owner model active; teams/roles deferred |

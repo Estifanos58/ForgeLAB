@@ -177,8 +177,17 @@ func main() {
 		defer deployQueue.Stop()
 	}
 
-	// Startup reconciliation for orphaned / missing deployments
+	// Startup reconciliation for Docker containers and orphaned / missing deployments
 	reconcileFn := func() {
+		// Reconcile Docker containers and host port bindings
+		if err := dockerEngine.ReconcileDaemonContainers(ctx); err != nil {
+			slog.Warn("failed to reconcile daemon containers", "error", err)
+		}
+		// Prune dangling build workspaces and images
+		if err := dockerEngine.PruneDanglingResources(ctx, 2*time.Hour); err != nil {
+			slog.Warn("failed to prune dangling build resources", "error", err)
+		}
+
 		if deployQueue != nil {
 			if reconciled, err := deploymentService.ReconcileOrphanedDeploymentsWithQueue(ctx, deployQueue, 10*time.Minute, queue.DefaultMaxRetries); err != nil {
 				slog.Warn("failed to reconcile orphaned deployments", "error", err)
@@ -194,8 +203,10 @@ func main() {
 		}
 	}
 
-	reconcileFn()
+	// Launch reconciliation in background so HTTP server begins listening immediately
 	go func() {
+		reconcileFn()
+
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -218,7 +229,7 @@ func main() {
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
 	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, deploymentService, dockerEngine, deployQueue)
 	envHandler := handlers.NewEnvHandler(secretService)
-	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL)
+	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
 
@@ -229,6 +240,7 @@ func main() {
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(middleware.RequestLogger)
+	r.Use(middleware.MaxBodySize(10*1024*1024, 105*1024*1024))
 	r.Use(middleware.CORS(cfg.App.CORSAllowedOrigins))
 	r.Use(chimiddleware.Recoverer)
 

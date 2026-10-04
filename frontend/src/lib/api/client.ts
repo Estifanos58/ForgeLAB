@@ -187,8 +187,8 @@ export const api = {
       });
     },
 
-    async refresh(): Promise<{ tokens: { access_token: string; refresh_token: string } }> {
-      return apiFetch<{ tokens: { access_token: string; refresh_token: string } }>('/api/auth/refresh', {
+    async refresh(): Promise<{ expires_in: number }> {
+      return apiFetch<{ expires_in: number }>('/api/auth/refresh', {
         method: 'POST',
       });
     },

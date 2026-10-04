@@ -375,3 +375,34 @@ The architecture is designed so these future capabilities can be added without r
 | Resource limits | Docker container config already has CPU/memory options |
 | Custom domains | Caddy API integration layer |
 | Audit logging | Insert audit records at service boundaries |
+
+---
+
+## Hardening & Security Architecture Specifications
+
+### 1. Redis Queue Atomicity & Lease-Fencing
+All mutations involving job lease tokens, attempt counters, dead-letter queues (DLQ), and processing set removals are implemented via atomic Lua scripts in `backend/internal/queue/redis_queue.go`. A worker holding an expired or mismatched lease token cannot alter queue state or evict replacement workers, eliminating lease-fencing races under concurrent timeouts.
+
+### 2. Rate Limiting Model
+Rate limiting operates via a **Fixed-Window Counter** with Redis backing (and in-memory fallback). Reverse proxy client-IP extraction strictly enforces trusted proxy allowlists (`RATE_LIMIT_TRUSTED_PROXIES`), stripping untrusted forwarded headers at ingress to prevent spoofing.
+
+### 3. Deployment Rollback Immutability
+Rollbacks operate under `execution_mode = "reuse_image"`. The control plane reuses the immutable image referenced by `image_digest` or `image_tag` and snapshotted environment configuration without recloning or rebuilding from current repository source. If the target image is absent in Docker daemon, the rollback fails closed.
+
+### 4. Build Secrets Isolation
+Variables flagged `is_secret = true` are isolated from Docker `BuildArgs` and image layer history (`docker history`). Only non-secret build arguments are provided to the build context. Secret values are passed directly into the active log redactor and encrypted at rest with AES-256-GCM.
+
+### 5. Docker Runtime Isolation & Authoritative Quotas
+Container configuration is validated through authoritative unified boundaries in `trust_boundary.go`:
+- CPU limits: 100m to 16,000m (nanocpus enforced).
+- Memory limits: 64MB to 32,768MB.
+- PIDs limits: 16 to 4,096.
+- Defense-in-depth isolation: `CapDrop: ["ALL"]`, `SecurityOpt: ["no-new-privileges:true"]`, `Tmpfs: {"/tmp": "rw,noexec,nosuid,size=64m"}`, `LogConfig: {"max-size": "10m", "max-file": "3"}`.
+- Host mounts are restricted strictly to configured allowlist prefixes; sensitive mounts (`/var/run/docker.sock`, `/etc`, `/proc`, `/sys`) are unconditionally rejected.
+
+### 6. Daemon Container & Port Reconciliation
+On backend startup, the engine queries the Docker daemon to reconcile container status against DB records:
+- Detects containers that exited or crashed while ForgeLAB was offline and updates service/deployment states.
+- Cleans up orphaned ForgeLAB containers whose project or deployment has reached a terminal state.
+- Synchronizes the in-memory `PortManager` with currently bound host ports to eliminate allocation collisions.
+

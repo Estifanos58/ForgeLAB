@@ -141,3 +141,64 @@ func TestPathValidatorHostToContainerMapping(t *testing.T) {
 		t.Errorf("expected error for escaping host root, got %v", err)
 	}
 }
+
+func TestPathValidatorValidateServiceBuildPaths(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab_service_path_")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	repoDir := filepath.Join(tempDir, "repo")
+	svcDir := filepath.Join(repoDir, "services", "api")
+	_ = os.MkdirAll(svcDir, 0755)
+	_ = os.WriteFile(filepath.Join(svcDir, "Dockerfile"), []byte("FROM alpine"), 0644)
+	_ = os.WriteFile(filepath.Join(svcDir, "main.go"), []byte("package main"), 0644)
+
+	validator := security.NewPathValidator([]string{repoDir})
+
+	t.Run("ValidServicePaths", func(t *testing.T) {
+		ctxDir, relDF, err := validator.ValidateServiceBuildPaths(repoDir, "services/api", ".", "Dockerfile", false)
+		if err != nil {
+			t.Fatalf("expected valid paths, got: %v", err)
+		}
+		if ctxDir != svcDir {
+			t.Errorf("expected contextDir %s, got %s", svcDir, ctxDir)
+		}
+		if relDF != "Dockerfile" {
+			t.Errorf("expected relDF 'Dockerfile', got %s", relDF)
+		}
+	})
+
+	t.Run("TraversalInServicePath", func(t *testing.T) {
+		_, _, err := validator.ValidateServiceBuildPaths(repoDir, "../escape", ".", "Dockerfile", false)
+		if err == nil {
+			t.Fatalf("expected error for traversal service path, got nil")
+		}
+	})
+
+	t.Run("AbsoluteServicePathOutside", func(t *testing.T) {
+		outsideDir, _ := os.MkdirTemp("", "outside_")
+		defer os.RemoveAll(outsideDir)
+
+		_, _, err := validator.ValidateServiceBuildPaths(repoDir, outsideDir, ".", "Dockerfile", false)
+		if err == nil {
+			t.Fatalf("expected error for outside service path, got nil")
+		}
+	})
+
+	t.Run("BuildContextEscapingRepo", func(t *testing.T) {
+		_, _, err := validator.ValidateServiceBuildPaths(repoDir, "services/api", "../../", "Dockerfile", false)
+		if err == nil {
+			t.Fatalf("expected error for escaping build context, got nil")
+		}
+	})
+
+	t.Run("DockerfileEscapingBuildContext", func(t *testing.T) {
+		_, _, err := validator.ValidateServiceBuildPaths(repoDir, "services/api", ".", "../other/Dockerfile", false)
+		if err == nil {
+			t.Fatalf("expected error for escaping dockerfile, got nil")
+		}
+	})
+}
+

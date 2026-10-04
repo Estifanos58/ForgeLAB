@@ -19,6 +19,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	dockernetwork "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
@@ -307,21 +308,20 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	redactor := logging.NewLogRedactor()
 	var runtimeEnvMap map[string]string
-	var buildEnvMap map[string]string
+	var normalBuildArgs map[string]string
+	var secretBuildVars map[string]string
 
-	if len(serviceDeploy.EnvSnapshot) > 0 && e.secretService != nil {
-		runtimeEnvMap, _, _ = e.secretService.GetEnvMapFromSnapshot(serviceDeploy.EnvSnapshot, models.EnvScopeRuntime)
-		buildEnvMap, _, _ = e.secretService.GetEnvMapFromSnapshot(serviceDeploy.EnvSnapshot, models.EnvScopeBuild)
-		_, allSecrets, _ := e.secretService.GetEnvMapFromSnapshot(serviceDeploy.EnvSnapshot, "")
-		if len(allSecrets) > 0 {
-			redactor.SetSecrets(allSecrets)
+	if e.secretService != nil {
+		if len(serviceDeploy.EnvSnapshot) > 0 {
+			runtimeEnvMap, _, _ = e.secretService.GetEnvMapFromSnapshot(serviceDeploy.EnvSnapshot, models.EnvScopeRuntime)
+		} else {
+			runtimeEnvMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, &service.ID, models.EnvScopeRuntime)
 		}
-	} else if e.secretService != nil {
-		runtimeEnvMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, &service.ID, models.EnvScopeRuntime)
-		buildEnvMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, &service.ID, models.EnvScopeBuild)
-		_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID, &service.ID, "")
+		normalArgs, secretVars, allSecrets, err := e.secretService.GetBuildVariables(ctx, project.ID, &service.ID, serviceDeploy.EnvSnapshot)
 		if err == nil {
-			redactor.SetSecrets(secrets)
+			normalBuildArgs = normalArgs
+			secretBuildVars = secretVars
+			redactor.SetSecrets(allSecrets)
 		}
 	}
 
@@ -596,28 +596,32 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			if service.BuildStrategy == models.BuildStrategyAuto {
 				relDockerPath = "Dockerfile.forgelab"
 			}
-		} else {
-			svcContextDir := filepath.Join(buildSourceDir, service.SourcePath)
-			if _, err := os.Stat(svcContextDir); err != nil {
-				svcContextDir = buildSourceDir
+			// Validate build paths against canonical project root using PathValidator
+			isAuto := service.BuildStrategy == models.BuildStrategyAuto
+			svcContextDir, resolvedDockerPath, valErr := e.pathValidator.ValidateServiceBuildPaths(
+				buildSourceDir,
+				service.SourcePath,
+				service.BuildContext,
+				service.DockerfilePath,
+				isAuto,
+			)
+			if valErr != nil {
+				reason := fmt.Sprintf("Path isolation security violation: %v", valErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
 			}
+			relDockerPath = resolvedDockerPath
 
 			var virtualFiles map[string][]byte
-			if service.BuildStrategy == models.BuildStrategyAuto {
+			if isAuto {
 				intPort := service.InternalPort
 				if intPort <= 0 {
 					intPort = 8080
 				}
 				generatedContent := detector.GenerateDockerfile(service.RuntimeType, intPort, service.StartCommand)
-				relDockerPath = "Dockerfile.forgelab"
 				virtualFiles = map[string][]byte{
 					"Dockerfile.forgelab": []byte(generatedContent),
-				}
-			} else {
-				if service.DockerfilePath != "" {
-					relDockerPath = service.DockerfilePath
-				} else {
-					relDockerPath = "Dockerfile"
 				}
 			}
 
@@ -639,12 +643,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Building Docker image '%s'...", svcTag))
 
 		buildArgs := make(map[string]*string)
-		for k, v := range buildEnvMap {
+		for k, v := range normalBuildArgs {
 			val := v
 			buildArgs[k] = &val
 		}
 		if len(buildArgs) > 0 {
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d build-time arguments (runtime-only secrets safely excluded).", len(buildArgs)))
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d non-secret build arguments (build secrets isolated from BuildArgs/image history).", len(buildArgs)))
+		}
+		if len(secretBuildVars) > 0 {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Isolated %d build secrets from Docker BuildArgs and image history.", len(secretBuildVars)))
 		}
 
 		buildOpts := types.ImageBuildOptions{
@@ -1114,124 +1121,203 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		}
 	}
 
+	var normalBuildArgs map[string]string
+	var secretBuildVars map[string]string
+
 	if e.secretService != nil {
-		_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, "")
+		normalArgs, secretVars, allSecrets, err := e.secretService.GetBuildVariables(ctx, project.ID, nil, deployment.EnvSnapshot)
 		if err == nil {
-			redactor.SetSecrets(secrets)
+			normalBuildArgs = normalArgs
+			secretBuildVars = secretVars
+			redactor.SetSecrets(allSecrets)
+		} else {
+			_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, "")
+			if err == nil {
+				redactor.SetSecrets(secrets)
+			}
 		}
 	}
 
-	updateStatus(models.DeployStatusCloning, nil)
-	buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, deployment.ID.String(), emitLog)
-	if cleanupDir != "" {
-		defer func() {
-			_ = os.RemoveAll(cleanupDir)
-		}()
+	runImage := ""
+	if deployment.ImageTag != nil {
+		runImage = *deployment.ImageTag
 	}
-	if err != nil {
-		reason := fmt.Sprintf("Source resolution failed: %v", err)
-		emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
-	}
+	reusingExistingImage := false
 
-	updateStatus(models.DeployStatusBuilding, nil)
-	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Preparing build for image '%s'...", *deployment.ImageTag))
+	// Check if configured to reuse an existing immutable image (e.g. rollback)
+	if deployment.ExecutionMode == models.ExecutionModeReuseImage || (deployment.ImageDigest != nil && *deployment.ImageDigest != "") {
+		candidateImage := ""
+		if deployment.ImageDigest != nil && *deployment.ImageDigest != "" {
+			candidateImage = *deployment.ImageDigest
+		} else if deployment.ImageTag != nil && *deployment.ImageTag != "" {
+			candidateImage = *deployment.ImageTag
+		}
 
-	buildContextDir := filepath.Join(buildSourceDir, project.BuildContext)
-	if _, err := os.Stat(buildContextDir); err != nil {
-		reason := fmt.Sprintf("Build context directory '%s' does not exist in source", project.BuildContext)
-		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
-	}
-
-	buildStrategy := deployment.BuildStrategy
-	if buildStrategy == "" {
-		buildStrategy = project.BuildStrategy
-	}
-	if buildStrategy == "" {
-		buildStrategy = models.BuildStrategyAuto
-	}
-
-	dockerfilePath := project.DockerfilePath
-	if dockerfilePath == "" {
-		dockerfilePath = "Dockerfile"
-	}
-
-	actualDockerPath := filepath.Join(buildContextDir, dockerfilePath)
-	hasExistingDockerfile := false
-	if _, err := os.Stat(actualDockerPath); err == nil {
-		hasExistingDockerfile = true
-	}
-
-	relDockerPath := dockerfilePath
-	var virtualFiles map[string][]byte
-
-	if buildStrategy == models.BuildStrategyDockerfile || (buildStrategy == models.BuildStrategyAuto && hasExistingDockerfile) {
-		if !hasExistingDockerfile {
-			reason := fmt.Sprintf("Dockerfile '%s' not found in build context", dockerfilePath)
+		if candidateImage != "" && e.dockerClient != nil {
+			if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, candidateImage); err == nil {
+				reusingExistingImage = true
+				runImage = candidateImage
+				idShort := inspect.ID
+				if len(idShort) > 12 {
+					idShort = idShort[:12]
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Execution path: reusing existing immutable image '%s' (image ID: %s). Skipping source cloning and image build.", candidateImage, idShort))
+				if deployment.ImageTag != nil && *deployment.ImageTag != "" && candidateImage != *deployment.ImageTag {
+					_ = e.dockerClient.ImageTag(ctx, candidateImage, *deployment.ImageTag)
+				}
+			} else {
+				if deployment.ExecutionMode == models.ExecutionModeReuseImage {
+					reason := fmt.Sprintf("Rollback failed closed: immutable image '%s' is unavailable in Docker daemon (%v); will not rebuild from current source", candidateImage, err)
+					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+					updateStatus(models.DeployStatusFailed, &reason)
+					return errors.New(reason)
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Stored immutable image '%s' not cached in Docker daemon (%v). Falling back to source build pipeline.", candidateImage, err))
+			}
+		} else if deployment.ExecutionMode == models.ExecutionModeReuseImage {
+			reason := "Rollback failed closed: no immutable image digest or tag is available for reuse"
 			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 			updateStatus(models.DeployStatusFailed, &reason)
 			return errors.New(reason)
 		}
-		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Using Dockerfile at '%s'", dockerfilePath))
-	} else {
-		port := deployment.InternalPort
-		if port == 0 {
-			port = project.InternalPort
-		}
-		if port == 0 {
-			port = 8080
-		}
-		startCmd := deployment.StartCommand
-		if startCmd == "" {
-			startCmd = project.StartCommand
-		}
-		dockerfileContent := detector.GenerateDockerfile(deployment.RuntimeType, port, startCmd)
-		relDockerPath = "Dockerfile.forgelab"
-		virtualFiles = map[string][]byte{
-			"Dockerfile.forgelab": []byte(dockerfileContent),
-		}
 	}
 
-	matcher, _ := LoadDockerignore(buildContextDir)
-	if matcher == nil {
-		matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
-	}
+	if !reusingExistingImage {
+		updateStatus(models.DeployStatusCloning, nil)
+		buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, deployment.ID.String(), emitLog)
+		if cleanupDir != "" {
+			defer func() {
+				_ = os.RemoveAll(cleanupDir)
+			}()
+		}
+		if err != nil {
+			reason := fmt.Sprintf("Source resolution failed: %v", err)
+			emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
 
-	tarStream := StreamBuildContext(ctx, TarStreamerOptions{
-		BuildContextDir: buildContextDir,
-		Matcher:         matcher,
-		VirtualFiles:    virtualFiles,
-		EmitLog: func(phase, stream, msg string) {
-			emitLog(phase, stream, msg)
-		},
-	})
+		updateStatus(models.DeployStatusBuilding, nil)
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Preparing build for image '%s'...", *deployment.ImageTag))
 
-	buildArgs := make(map[string]*string)
-	if e.secretService != nil {
-		buildEnv, _, _ := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeBuild)
-		for k, v := range buildEnv {
+		buildStrategy := deployment.BuildStrategy
+		if buildStrategy == "" {
+			buildStrategy = project.BuildStrategy
+		}
+		if buildStrategy == "" {
+			buildStrategy = models.BuildStrategyAuto
+		}
+		isAuto := buildStrategy == models.BuildStrategyAuto
+
+		buildContextDir, resolvedDockerPath, valErr := e.pathValidator.ValidateServiceBuildPaths(
+			buildSourceDir,
+			project.BuildContext,
+			project.BuildContext,
+			project.DockerfilePath,
+			isAuto,
+		)
+		if valErr != nil {
+			reason := fmt.Sprintf("Path isolation security violation: %v", valErr)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+
+		dockerfilePath := project.DockerfilePath
+		if dockerfilePath == "" {
+			dockerfilePath = "Dockerfile"
+		}
+
+		actualDockerPath := filepath.Join(buildContextDir, dockerfilePath)
+		hasExistingDockerfile := false
+		if _, err := os.Stat(actualDockerPath); err == nil {
+			hasExistingDockerfile = true
+		}
+
+		relDockerPath := resolvedDockerPath
+		var virtualFiles map[string][]byte
+
+		if buildStrategy == models.BuildStrategyDockerfile || (buildStrategy == models.BuildStrategyAuto && hasExistingDockerfile) {
+			if !hasExistingDockerfile {
+				reason := fmt.Sprintf("Dockerfile '%s' not found in build context", dockerfilePath)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Using Dockerfile at '%s'", dockerfilePath))
+		} else {
+			port := deployment.InternalPort
+			if port == 0 {
+				port = project.InternalPort
+			}
+			if port == 0 {
+				port = 8080
+			}
+			startCmd := deployment.StartCommand
+			if startCmd == "" {
+				startCmd = project.StartCommand
+			}
+			dockerfileContent := detector.GenerateDockerfile(deployment.RuntimeType, port, startCmd)
+			relDockerPath = "Dockerfile.forgelab"
+			virtualFiles = map[string][]byte{
+				"Dockerfile.forgelab": []byte(dockerfileContent),
+			}
+		}
+
+		matcher, _ := LoadDockerignore(buildContextDir)
+		if matcher == nil {
+			matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
+		}
+
+		tarStream := StreamBuildContext(ctx, TarStreamerOptions{
+			BuildContextDir: buildContextDir,
+			Matcher:         matcher,
+			VirtualFiles:    virtualFiles,
+			EmitLog: func(phase, stream, msg string) {
+				emitLog(phase, stream, msg)
+			},
+		})
+
+		buildArgs := make(map[string]*string)
+		for k, v := range normalBuildArgs {
 			val := v
 			buildArgs[k] = &val
 		}
-	}
+		if len(buildArgs) > 0 {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d non-secret build arguments (build secrets isolated from BuildArgs/image history).", len(buildArgs)))
+		}
+		if len(secretBuildVars) > 0 {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Isolated %d build secrets from Docker BuildArgs and image history.", len(secretBuildVars)))
+		}
 
-	buildOpts := types.ImageBuildOptions{
-		Tags:       []string{*deployment.ImageTag},
-		Dockerfile: relDockerPath,
-		BuildArgs:  buildArgs,
-		Remove:     true,
-	}
+		buildOpts := types.ImageBuildOptions{
+			Tags:       []string{*deployment.ImageTag},
+			Dockerfile: relDockerPath,
+			BuildArgs:  buildArgs,
+			Remove:     true,
+		}
 
-	if err := e.buildImage(ctx, tarStream, buildOpts, func(msg string) {
-		emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
-	}); err != nil {
-		reason := err.Error()
-		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
+		if err := e.buildImage(ctx, tarStream, buildOpts, func(msg string) {
+			emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
+		}); err != nil {
+			reason := err.Error()
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+
+		if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, *deployment.ImageTag); err == nil {
+			var digest string
+			if len(inspect.RepoDigests) > 0 {
+				digest = inspect.RepoDigests[0]
+			} else if inspect.ID != "" {
+				digest = inspect.ID
+			}
+			if digest != "" && e.deploymentService != nil {
+				_ = e.deploymentService.UpdateDeploymentImageDigest(ctx, deployment.ID, digest)
+			}
+		}
+		runImage = *deployment.ImageTag
 	}
 
 	updateStatus(models.DeployStatusStarting, nil)
@@ -1263,7 +1349,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	envSlice = append(envSlice, fmt.Sprintf("PORT=%d", intPort))
 
 	containerConfig := &container.Config{
-		Image: *deployment.ImageTag,
+		Image: runImage,
 		Env:   envSlice,
 		ExposedPorts: nat.PortSet{
 			nat.Port(targetPortStr): struct{}{},
@@ -1607,17 +1693,229 @@ func (e *Engine) RestartService(ctx context.Context, projectID, serviceID, owner
 
 // CleanUpProjectContainers stops and removes all containers associated with a project before deletion.
 func (e *Engine) CleanUpProjectContainers(ctx context.Context, projectID uuid.UUID) {
-	deployments, err := e.deploymentService.ListDeployments(ctx, projectID)
-	if err != nil {
+	if e.dockerClient == nil {
 		return
 	}
 
-	for _, d := range deployments {
-		if d.ContainerID != nil && *d.ContainerID != "" {
-			_ = e.dockerClient.ContainerStop(ctx, *d.ContainerID, container.StopOptions{})
-			_ = e.dockerClient.ContainerRemove(ctx, *d.ContainerID, container.RemoveOptions{Force: true})
+	// 1. Clean up legacy single-container deployment containers
+	deployments, err := e.deploymentService.ListDeployments(ctx, projectID)
+	if err == nil {
+		for _, d := range deployments {
+			if d.ContainerID != nil && *d.ContainerID != "" {
+				_ = e.dockerClient.ContainerStop(ctx, *d.ContainerID, container.StopOptions{})
+				_ = e.dockerClient.ContainerRemove(ctx, *d.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+			}
 		}
 	}
+
+	// 2. Clean up multi-service containers
+	if e.serviceService != nil {
+		svcs, _ := e.serviceService.ListServices(ctx, projectID)
+		for _, svc := range svcs {
+			if svc.ContainerID != nil && *svc.ContainerID != "" {
+				_ = e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{})
+				_ = e.dockerClient.ContainerRemove(ctx, *svc.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+			}
+		}
+	}
+}
+
+// ReconcileDaemonContainers reconciles DB container state against Docker daemon state on startup:
+// 1. Detects containers stopped/crashed while backend was offline and marks services/projects as crashed/stopped.
+// 2. Cleans up orphaned ForgeLAB containers whose project or deployment is terminated.
+// 3. Syncs active host port allocations with the in-memory port manager.
+func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
+	if e.dockerClient == nil {
+		return nil
+	}
+
+	containers, err := e.dockerClient.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return fmt.Errorf("failed to list docker containers for reconciliation: %w", err)
+	}
+
+	containerMap := make(map[string]types.Container, len(containers))
+	var runningPorts []int
+
+	for _, c := range containers {
+		containerMap[c.ID] = c
+		// Match short ID prefix as well
+		if len(c.ID) > 12 {
+			containerMap[c.ID[:12]] = c
+		}
+
+		if c.State == "running" {
+			for _, p := range c.Ports {
+				if p.PublicPort > 0 {
+					runningPorts = append(runningPorts, int(p.PublicPort))
+				}
+			}
+		}
+	}
+
+	// 1. Sync port allocations with active running containers
+	if e.portManager != nil {
+		e.portManager.ReconcileUsedPorts(runningPorts)
+		slog.Info("reconciled host port manager with running containers", "active_ports_count", len(runningPorts))
+	}
+
+	// Track IDs of containers that are legitimately active in the database
+	legitimateContainers := make(map[string]bool)
+
+	// 2. Reconcile active multi-service configurations
+	if e.serviceService != nil {
+		services, err := e.serviceService.ListActiveServices(ctx)
+		if err != nil {
+			slog.Warn("reconciliation: failed to list active services", "error", err)
+		} else {
+			for _, svc := range services {
+				if svc.ContainerID == nil || *svc.ContainerID == "" {
+					if svc.Status == models.ServiceStatusRunning {
+						_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil)
+						slog.Info("reconciliation: service has no container, marked stopped", "service_id", svc.ID)
+					}
+					continue
+				}
+
+				cID := *svc.ContainerID
+				dockCont, exists := containerMap[cID]
+				if !exists {
+					// Container disappeared while offline
+					_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+					if svc.CurrentServiceDeploymentID != nil {
+						_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, "Container disappeared from Docker daemon while backend was offline")
+					}
+					slog.Warn("reconciliation: service container missing, marked failed", "service_id", svc.ID, "container_id", cID)
+				} else if dockCont.State != "running" {
+					// Container is dead or exited
+					_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+					if svc.CurrentServiceDeploymentID != nil {
+						_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, fmt.Sprintf("Container stopped with state '%s' while backend was offline", dockCont.State))
+					}
+					slog.Warn("reconciliation: service container exited, marked failed", "service_id", svc.ID, "state", dockCont.State)
+				} else {
+					// Legitimately running
+					legitimateContainers[dockCont.ID] = true
+					if len(dockCont.ID) > 12 {
+						legitimateContainers[dockCont.ID[:12]] = true
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Reconcile active legacy single-container deployments
+	if e.deploymentService != nil {
+		deployments, err := e.deploymentService.ListActiveDeployments(ctx)
+		if err != nil {
+			slog.Warn("reconciliation: failed to list active deployments", "error", err)
+		} else {
+			for _, d := range deployments {
+				if d.ContainerID == nil || *d.ContainerID == "" {
+					continue
+				}
+				cID := *d.ContainerID
+				dockCont, exists := containerMap[cID]
+				if !exists || dockCont.State != "running" {
+					stateMsg := "missing"
+					if exists {
+						stateMsg = dockCont.State
+					}
+					reason := fmt.Sprintf("Container %s while backend was offline", stateMsg)
+					_ = e.deploymentService.UpdateDeploymentStatus(ctx, d.ID, models.DeployStatusFailed, &reason)
+					if e.projectService != nil {
+						_ = e.projectService.UpdateProjectStatus(ctx, d.ProjectID, models.ProjectStatusStopped)
+					}
+					slog.Warn("reconciliation: legacy deployment container dead/missing", "deployment_id", d.ID, "container_id", cID)
+				} else {
+					legitimateContainers[dockCont.ID] = true
+					if len(dockCont.ID) > 12 {
+						legitimateContainers[dockCont.ID[:12]] = true
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Clean up orphaned ForgeLAB application containers
+	orphansCleaned := 0
+	stopTimeout := 5
+	for _, c := range containers {
+		// NEVER touch Docker Compose infrastructure containers (backend, frontend, postgres, redis, migrate)!
+		if _, isCompose := c.Labels["com.docker.compose.project"]; isCompose {
+			continue
+		}
+		if _, isComposeService := c.Labels["com.docker.compose.service"]; isComposeService {
+			continue
+		}
+
+		// Only consider application containers provisioned by ForgeLAB engine
+		_, hasProjectLabel := c.Labels["forgelab.project_id"]
+		_, hasDeploymentLabel := c.Labels["forgelab.deployment_id"]
+		_, hasServiceDeploymentLabel := c.Labels["forgelab.service_deployment_id"]
+
+		if !hasProjectLabel && !hasDeploymentLabel && !hasServiceDeploymentLabel {
+			continue
+		}
+
+		if !legitimateContainers[c.ID] {
+			cShort := c.ID
+			if len(cShort) > 12 {
+				cShort = cShort[:12]
+			}
+			slog.Info("reconciliation: removing orphaned container", "container_id", cShort, "labels", c.Labels)
+			_ = e.dockerClient.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &stopTimeout})
+			_ = e.dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+			orphansCleaned++
+		}
+	}
+
+	if orphansCleaned > 0 {
+		slog.Info("reconciliation completed: cleaned up orphaned containers", "count", orphansCleaned)
+	}
+
+	return nil
+}
+
+// PruneDanglingResources removes expired build workspaces and dangling Docker images to bound storage growth.
+func (e *Engine) PruneDanglingResources(ctx context.Context, maxBuildAge time.Duration) error {
+	if maxBuildAge <= 0 {
+		maxBuildAge = 2 * time.Hour
+	}
+
+	// 1. Prune old build directories in workDir
+	if e.workDir != "" {
+		entries, err := os.ReadDir(e.workDir)
+		if err == nil {
+			now := time.Now()
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				info, err := entry.Info()
+				if err != nil {
+					continue
+				}
+				if now.Sub(info.ModTime()) > maxBuildAge {
+					dirPath := filepath.Join(e.workDir, entry.Name())
+					_ = os.RemoveAll(dirPath)
+					slog.Info("pruned expired build directory", "path", dirPath, "age", now.Sub(info.ModTime()).String())
+				}
+			}
+		}
+	}
+
+	// 2. Prune dangling Docker images
+	if e.dockerClient != nil {
+		pruneFilters := filters.NewArgs()
+		pruneFilters.Add("dangling", "true")
+		report, err := e.dockerClient.ImagesPrune(ctx, pruneFilters)
+		if err == nil && len(report.ImagesDeleted) > 0 {
+			slog.Info("pruned dangling docker images", "count", len(report.ImagesDeleted), "space_reclaimed_bytes", report.SpaceReclaimed)
+		}
+	}
+
+	return nil
 }
 
 // buildImage builds a Docker image from the given tar archive and options with proper resource lifecycle:

@@ -178,6 +178,17 @@ func Load() (*Config, error) {
 		if strings.Contains(dbURL, "forgelab_dev_password") {
 			return nil, fmt.Errorf("production configuration error: default development database password (forgelab_dev_password) is not allowed in production mode")
 		}
+		if getEnv("COOKIE_SECURE", "false") != "true" {
+			return nil, fmt.Errorf("production configuration error: COOKIE_SECURE must be true in production mode to enforce secure HttpOnly cookies")
+		}
+		logLevel := strings.ToLower(getEnv("LOG_LEVEL", "info"))
+		if logLevel == "debug" {
+			return nil, fmt.Errorf("production configuration error: LOG_LEVEL cannot be 'debug' in production mode to prevent sensitive data leakage")
+		}
+		trustedProxies := parseStringSlice(getEnv("RATE_LIMIT_TRUSTED_PROXIES", ""))
+		if len(trustedProxies) == 0 {
+			return nil, fmt.Errorf("production configuration error: RATE_LIMIT_TRUSTED_PROXIES must be configured with at least one trusted reverse proxy IP/CIDR in production mode")
+		}
 	}
 
 	cfg := &Config{

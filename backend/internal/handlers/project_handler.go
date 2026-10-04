@@ -386,36 +386,18 @@ func (h *ProjectHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	currentDeploy, err := h.deploymentService.GetDeployment(r.Context(), *project.CurrentDeploymentID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to fetch current deployment")
-		return
-	}
-
-	prevDeploy, err := h.deploymentService.GetPreviousSuccessfulDeployment(r.Context(), projectID, currentDeploy.DeployNumber)
+	newDeploy, err := h.deploymentService.RollbackDeployment(r.Context(), project)
 	if err != nil {
 		if errors.Is(err, services.ErrNoDeploymentToRollback) {
 			writeError(w, http.StatusBadRequest, "no previous successful deployment available to rollback to")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to query rollback target deployment")
-		return
-	}
-
-	// Rollback creates a NEW deployment record using the prior image tag
-	newDeploy, err := h.deploymentService.CreateDeployment(r.Context(), project)
-	if err != nil {
 		if errors.Is(err, services.ErrActiveDeployment) {
 			writeError(w, http.StatusConflict, "a deployment is already in progress")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to create rollback deployment")
+		writeError(w, http.StatusInternalServerError, "failed to create rollback deployment: "+err.Error())
 		return
-	}
-
-	// Override image_tag to use prior deployment's known-good image
-	if prevDeploy.ImageTag != nil {
-		newDeploy.ImageTag = prevDeploy.ImageTag
 	}
 
 	if h.deployQueue != nil {

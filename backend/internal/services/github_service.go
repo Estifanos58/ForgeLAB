@@ -127,28 +127,56 @@ func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHu
 	}, nil
 }
 
+type GitHubRepoStateRecord struct {
+	UserID  string    `json:"user_id"`
+	Nonce   string    `json:"nonce"`
+	Expires time.Time `json:"expires"`
+}
+
+var consumeGitHubRepoStateScript = redis.NewScript(`
+	local val = redis.call('GET', KEYS[1])
+	if val then
+		redis.call('DEL', KEYS[1])
+	end
+	return val
+`)
+
 // GetConnectURL initiates repository-permission authorization flow.
-func (s *GitHubService) GetConnectURL(ctx context.Context, userID uuid.UUID) (string, error) {
+func (s *GitHubService) GetConnectURL(ctx context.Context, userID uuid.UUID) (authURL string, nonce string, err error) {
 	if !s.githubCfg.IsConfigured() {
-		return "", ErrProviderNotConfigured
+		return "", "", ErrProviderNotConfigured
 	}
 
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("failed to generate random state: %w", err)
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return "", "", fmt.Errorf("failed to generate random state: %w", err)
 	}
-	state := hex.EncodeToString(b)
+	state := hex.EncodeToString(stateBytes)
+
+	nonceBytes := make([]byte, 32)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return "", "", fmt.Errorf("failed to generate random nonce: %w", err)
+	}
+	nonce = hex.EncodeToString(nonceBytes)
+
+	record := GitHubRepoStateRecord{
+		UserID:  userID.String(),
+		Nonce:   nonce,
+		Expires: time.Now().Add(15 * time.Minute),
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return "", "", err
+	}
+
 	key := "forgelab:github_repo_state:" + state
 
 	if s.redis != nil {
-		if err := s.redis.Set(ctx, key, userID.String(), 15*time.Minute).Err(); err != nil {
-			return "", fmt.Errorf("failed to store github repo state in redis: %w", err)
+		if err := s.redis.Set(ctx, key, string(payload), 15*time.Minute).Err(); err != nil {
+			return "", "", fmt.Errorf("failed to store github repo state in redis: %w", err)
 		}
 	} else {
-		s.fallbackMem.Store(key, memoryState{
-			provider: userID.String(),
-			expires:  time.Now().Add(15 * time.Minute),
-		})
+		s.fallbackMem.Store(key, record)
 	}
 
 	params := url.Values{}
@@ -161,38 +189,53 @@ func (s *GitHubService) GetConnectURL(ctx context.Context, userID uuid.UUID) (st
 	params.Set("scope", "repo,read:user")
 	params.Set("state", state)
 
-	return "https://github.com/login/oauth/authorize?" + params.Encode(), nil
+	return "https://github.com/login/oauth/authorize?" + params.Encode(), nonce, nil
 }
 
 // HandleCallback completes repository-permission authorization flow.
-func (s *GitHubService) HandleCallback(ctx context.Context, code, state string) (uuid.UUID, error) {
+func (s *GitHubService) HandleCallback(ctx context.Context, code, state, nonce string) (uuid.UUID, error) {
 	if !s.githubCfg.IsConfigured() {
 		return uuid.Nil, ErrProviderNotConfigured
 	}
+	if state == "" || nonce == "" {
+		return uuid.Nil, ErrInvalidOAuthState
+	}
 
 	key := "forgelab:github_repo_state:" + state
-	var userIDStr string
+	var record GitHubRepoStateRecord
 
 	if s.redis != nil {
-		val, err := s.redis.Get(ctx, key).Result()
+		res, err := consumeGitHubRepoStateScript.Run(ctx, s.redis, []string{key}).Result()
 		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				return uuid.Nil, ErrInvalidOAuthState
+			}
+			return uuid.Nil, fmt.Errorf("failed to query github repo state: %w", err)
+		}
+		rawStr, ok := res.(string)
+		if !ok || rawStr == "" {
 			return uuid.Nil, ErrInvalidOAuthState
 		}
-		_ = s.redis.Del(ctx, key)
-		userIDStr = val
+		if err := json.Unmarshal([]byte(rawStr), &record); err != nil {
+			return uuid.Nil, ErrInvalidOAuthState
+		}
 	} else {
 		raw, ok := s.fallbackMem.LoadAndDelete(key)
 		if !ok {
 			return uuid.Nil, ErrInvalidOAuthState
 		}
-		ms, ok := raw.(memoryState)
-		if !ok || time.Now().After(ms.expires) {
+		rec, ok := raw.(GitHubRepoStateRecord)
+		if !ok || time.Now().After(rec.Expires) {
 			return uuid.Nil, ErrInvalidOAuthState
 		}
-		userIDStr = ms.provider
+		record = rec
 	}
 
-	userID, err := uuid.Parse(userIDStr)
+	if record.Nonce != nonce {
+		return uuid.Nil, ErrInvalidOAuthState
+	}
+
+	userID, err := uuid.Parse(record.UserID)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("invalid user id in state: %w", err)
 	}

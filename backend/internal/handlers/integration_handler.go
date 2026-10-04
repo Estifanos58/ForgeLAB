@@ -16,12 +16,18 @@ import (
 type IntegrationHandler struct {
 	githubService *services.GitHubService
 	frontendURL   string
+	cookieSecure  bool
 }
 
-func NewIntegrationHandler(githubService *services.GitHubService, frontendURL string) *IntegrationHandler {
+func NewIntegrationHandler(githubService *services.GitHubService, frontendURL string, cookieSecure ...bool) *IntegrationHandler {
+	secure := false
+	if len(cookieSecure) > 0 {
+		secure = cookieSecure[0]
+	}
 	return &IntegrationHandler{
 		githubService: githubService,
 		frontendURL:   frontendURL,
+		cookieSecure:  secure,
 	}
 }
 
@@ -50,7 +56,7 @@ func (h *IntegrationHandler) ConnectGitHub(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	authURL, err := h.githubService.GetConnectURL(r.Context(), userID)
+	authURL, nonce, err := h.githubService.GetConnectURL(r.Context(), userID)
 	if err != nil {
 		if errors.Is(err, services.ErrProviderNotConfigured) {
 			writeError(w, http.StatusServiceUnavailable, "github oauth is not configured on the server")
@@ -59,6 +65,8 @@ func (h *IntegrationHandler) ConnectGitHub(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, "failed to generate github authorization url")
 		return
 	}
+
+	h.setOAuthNonceCookie(w, nonce)
 
 	if r.Method == http.MethodGet {
 		http.Redirect(w, r, authURL, http.StatusFound)
@@ -80,7 +88,13 @@ func (h *IntegrationHandler) GitHubCallback(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	_, err := h.githubService.HandleCallback(r.Context(), code, state)
+	nonce := h.getAndClearOAuthNonceCookie(w, r)
+	if nonce == "" {
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=missing_or_expired_oauth_nonce", http.StatusFound)
+		return
+	}
+
+	_, err := h.githubService.HandleCallback(r.Context(), code, state, nonce)
 	if err != nil {
 		msg := url.QueryEscape("Failed to authorize GitHub repository access: " + err.Error())
 		http.Redirect(w, r, h.frontendURL+"/dashboard?error="+msg, http.StatusFound)
@@ -88,6 +102,35 @@ func (h *IntegrationHandler) GitHubCallback(w http.ResponseWriter, r *http.Reque
 	}
 
 	http.Redirect(w, r, h.frontendURL+"/dashboard?github_connected=true", http.StatusFound)
+}
+
+func (h *IntegrationHandler) setOAuthNonceCookie(w http.ResponseWriter, nonce string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_oauth_nonce_repo",
+		Value:    nonce,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   900,
+	})
+}
+
+func (h *IntegrationHandler) getAndClearOAuthNonceCookie(w http.ResponseWriter, r *http.Request) string {
+	nonce := ""
+	if cookie, err := r.Cookie("forgelab_oauth_nonce_repo"); err == nil {
+		nonce = cookie.Value
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_oauth_nonce_repo",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	return nonce
 }
 
 // DisconnectGitHub handles POST /api/integrations/github/disconnect

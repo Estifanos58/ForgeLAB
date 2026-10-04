@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -60,6 +61,8 @@ type AuthTokens struct {
 
 // Register creates a new user account.
 func (s *UserService) Register(ctx context.Context, input RegisterInput) (*models.User, *AuthTokens, error) {
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+
 	// Check if user already exists
 	var exists bool
 	err := s.db.QueryRow(ctx,
@@ -110,6 +113,8 @@ func (s *UserService) Register(ctx context.Context, input RegisterInput) (*model
 
 // Login authenticates a user and returns tokens.
 func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User, *AuthTokens, error) {
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+
 	// Find user by email
 	user := &models.User{}
 	var passwordHash *string
@@ -246,7 +251,7 @@ func (s *UserService) generateTokens(ctx context.Context, user *models.User) (*A
 	return &AuthTokens{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
-		ExpiresIn:    int(s.jwtManager.RefreshTokenExpiry().Seconds()),
+		ExpiresIn:    int(s.jwtManager.AccessTokenExpiry().Seconds()),
 	}, nil
 }
 
@@ -274,6 +279,8 @@ func (s *UserService) FindOrCreateOAuthUser(
 	displayName string,
 	emailVerified bool,
 ) (*models.User, *AuthTokens, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+
 	// 1. Check if external identity already exists
 	var userID uuid.UUID
 	err := s.db.QueryRow(ctx,

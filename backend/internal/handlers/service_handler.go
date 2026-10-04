@@ -534,28 +534,29 @@ func (h *ServiceHandler) UpdateResources(w http.ResponseWriter, r *http.Request)
 
 	cfg := svc.ResourceConfig
 	if input.CpuMillicores != nil {
-		if *input.CpuMillicores < 100 || *input.CpuMillicores > 64000 {
-			writeError(w, http.StatusBadRequest, "cpu_millicores must be between 100 and 64000 (0.1 to 64 cores)")
+		if *input.CpuMillicores < 100 || *input.CpuMillicores > 16000 {
+			writeError(w, http.StatusBadRequest, "cpu_millicores must be between 100 and 16000 (0.1 to 16 cores)")
 			return
 		}
 		cfg.CpuMillicores = *input.CpuMillicores
 	}
 	if input.MemoryMB != nil {
-		if *input.MemoryMB < 64 || *input.MemoryMB > 524288 {
-			writeError(w, http.StatusBadRequest, "memory_mb must be between 64 and 524288 (64MB to 512GB)")
+		if *input.MemoryMB < 64 || *input.MemoryMB > 32768 {
+			writeError(w, http.StatusBadRequest, "memory_mb must be between 64 and 32768 (64MB to 32GB)")
 			return
 		}
 		cfg.MemoryMB = *input.MemoryMB
 	}
 	if input.PidsLimit != nil {
-		if *input.PidsLimit < 16 || *input.PidsLimit > 32768 {
-			writeError(w, http.StatusBadRequest, "pids_limit must be between 16 and 32768")
+		if *input.PidsLimit < 16 || *input.PidsLimit > 4096 {
+			writeError(w, http.StatusBadRequest, "pids_limit must be between 16 and 4096")
 			return
 		}
 		cfg.PidsLimit = *input.PidsLimit
 	}
-	if input.EphemeralStorageMB != nil {
-		cfg.EphemeralStorageMB = input.EphemeralStorageMB
+	if input.EphemeralStorageMB != nil && *input.EphemeralStorageMB > 0 {
+		writeError(w, http.StatusBadRequest, "ephemeral_storage_mb is not supported on this host environment; remove or leave empty")
+		return
 	}
 
 	if err := h.serviceService.UpdateServiceResources(r.Context(), serviceID, cfg); err != nil {

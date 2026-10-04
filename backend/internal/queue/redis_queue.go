@@ -61,21 +61,155 @@ var (
 		end
 	`)
 
+	// finalizeSuccessScript atomically removes the job from processing queue, deletes the lease,
+	// deletes attempts, and clears state ONLY IF the caller holds the matching lease token.
+	// KEYS[1]: leaseKey, KEYS[2]: processingQueueKey, KEYS[3]: attemptsKey, KEYS[4]: stateKey
+	// ARGV[1]: leaseToken, ARGV[2]: itemStr
+	finalizeSuccessScript = redis.NewScript(`
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			redis.call("LREM", KEYS[2], 1, ARGV[2])
+			redis.call("DEL", KEYS[1])
+			redis.call("DEL", KEYS[3])
+			redis.call("DEL", KEYS[4])
+			return 1
+		else
+			return 0
+		end
+	`)
+
+	// failAndRequeueScript atomically removes the job from processing queue, deletes the lease,
+	// increments attempts, sets state to pending, and pushes to deployment queue
+	// ONLY IF the caller holds the matching lease token.
+	// KEYS[1]: leaseKey, KEYS[2]: processingQueueKey, KEYS[3]: deploymentQueueKey, KEYS[4]: attemptsKey, KEYS[5]: stateKey
+	// ARGV[1]: leaseToken, ARGV[2]: itemStr, ARGV[3]: statePending ("pending")
+	failAndRequeueScript = redis.NewScript(`
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			redis.call("LREM", KEYS[2], 1, ARGV[2])
+			redis.call("DEL", KEYS[1])
+			local att = redis.call("INCR", KEYS[4])
+			redis.call("EXPIRE", KEYS[4], 86400)
+			redis.call("SET", KEYS[5], ARGV[3], "EX", 86400)
+			redis.call("LPUSH", KEYS[3], ARGV[2])
+			return att
+		else
+			return -1
+		end
+	`)
+
+	// failToDLQScript atomically removes the job from processing queue, deletes the lease,
+	// increments attempts, sets state to dead_letter, and pushes to DLQ
+	// ONLY IF the caller holds the matching lease token.
+	// KEYS[1]: leaseKey, KEYS[2]: processingQueueKey, KEYS[3]: dlqKey, KEYS[4]: attemptsKey, KEYS[5]: stateKey
+	// ARGV[1]: leaseToken, ARGV[2]: itemStr, ARGV[3]: stateDLQ ("dead_letter")
+	failToDLQScript = redis.NewScript(`
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			redis.call("LREM", KEYS[2], 1, ARGV[2])
+			redis.call("DEL", KEYS[1])
+			local att = redis.call("INCR", KEYS[4])
+			redis.call("EXPIRE", KEYS[4], 86400)
+			redis.call("SET", KEYS[5], ARGV[3], "EX", 86400)
+			redis.call("LPUSH", KEYS[3], ARGV[2])
+			return att
+		else
+			return -1
+		end
+	`)
+
+	// terminalCleanupScript atomically removes the job from processing queue, deletes the lease,
+	// and clears state ONLY IF the caller holds the matching lease token.
+	// If KEYS[4] (dlqKey) is provided, it pushes itemStr to DLQ.
+	// KEYS[1]: leaseKey, KEYS[2]: processingQueueKey, KEYS[3]: stateKey, [KEYS[4]: dlqKey]
+	// ARGV[1]: leaseToken, ARGV[2]: itemStr
+	terminalCleanupScript = redis.NewScript(`
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			redis.call("LREM", KEYS[2], 1, ARGV[2])
+			redis.call("DEL", KEYS[1])
+			redis.call("DEL", KEYS[3])
+			if #KEYS >= 4 and KEYS[4] ~= "" then
+				redis.call("LPUSH", KEYS[4], ARGV[2])
+			end
+			return 1
+		else
+			return 0
+		end
+	`)
+
+	// lremProcessingWithLeaseScript atomically removes the item from processing queue
+	// ONLY IF the caller holds the matching lease token.
+	// KEYS[1]: leaseKey, KEYS[2]: processingQueueKey
+	// ARGV[1]: leaseToken, ARGV[2]: itemStr
+	lremProcessingWithLeaseScript = redis.NewScript(`
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("LREM", KEYS[2], 1, ARGV[2])
+		else
+			return -1
+		end
+	`)
+
 	// atomicRecoverScript atomically moves an abandoned job from processing queue to target queue (pending or DLQ)
-	// only if its lease key does NOT exist (i.e. expired or orphaned).
+	// or performs terminal cleanup only if its lease key does NOT exist (i.e. expired or orphaned)
+	// and the job is actually present in the processing queue.
+	// KEYS[1]: processingQueueKey, KEYS[2]: deploymentQueueKey, KEYS[3]: leaseKey, KEYS[4]: attemptsKey, KEYS[5]: stateKey, KEYS[6]: dlqKey
+	// ARGV[1]: itemStr, ARGV[2]: mode ("terminal" or "retry"), ARGV[3]: maxRetries
+	// Returns:
+	//   0: lease still active OR item not found in processing queue (concurrency/duplicate safe)
+	//   1: re-enqueued to pending queue
+	//   2: moved to DLQ (attempts >= maxRetries)
+	//   3: terminal cleanup (removed from processing, state deleted)
 	atomicRecoverScript = redis.NewScript(`
 		if redis.call("EXISTS", KEYS[3]) == 1 then
 			return 0
 		end
 		local rem = redis.call("LREM", KEYS[1], 1, ARGV[1])
 		if rem > 0 then
-			redis.call("LPUSH", KEYS[2], ARGV[1])
-			if ARGV[2] ~= "" then
-				redis.call("SET", KEYS[4], ARGV[2], "EX", 86400)
+			if ARGV[2] == "terminal" then
+				redis.call("DEL", KEYS[5])
+				return 3
 			end
-			return 1
+			local att = redis.call("INCR", KEYS[4])
+			redis.call("EXPIRE", KEYS[4], 86400)
+			local maxRetries = tonumber(ARGV[3])
+			if att >= maxRetries then
+				redis.call("LPUSH", KEYS[6], ARGV[1])
+				redis.call("SET", KEYS[5], "dead_letter", "EX", 86400)
+				return 2
+			else
+				redis.call("LPUSH", KEYS[2], ARGV[1])
+				redis.call("SET", KEYS[5], "pending", "EX", 86400)
+				return 1
+			end
 		end
 		return 0
+	`)
+
+	// acquireLeaseScript atomically acquires a job lease (SET NX PX) and sets the job state to
+	// "processing" in a single atomic operation. This prevents the race where the worker crashes
+	// between acquiring the lease and setting the state.
+	// KEYS[1]: leaseKey, KEYS[2]: stateKey
+	// ARGV[1]: token, ARGV[2]: leaseTTL (ms), ARGV[3]: stateProcessing ("processing"), ARGV[4]: stateTTL (seconds)
+	// Returns 1 if acquired, 0 if already held.
+	acquireLeaseScript = redis.NewScript(`
+		local ok = redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2])
+		if ok then
+			redis.call("SET", KEYS[2], ARGV[3], "EX", ARGV[4])
+			return 1
+		else
+			return 0
+		end
+	`)
+
+	// corruptToDLQScript atomically removes a corrupt/untyped payload from the processing queue
+	// and pushes it to the dead-letter queue. This prevents the race where two concurrent recovery
+	// sweeps or workers could both remove the same item.
+	// KEYS[1]: processingQueueKey, KEYS[2]: dlqKey
+	// ARGV[1]: itemStr
+	// Returns the number of items removed (0 or 1).
+	corruptToDLQScript = redis.NewScript(`
+		local rem = redis.call("LREM", KEYS[1], 1, ARGV[1])
+		if rem > 0 then
+			redis.call("LPUSH", KEYS[2], ARGV[1])
+		end
+		return rem
 	`)
 )
 
@@ -236,23 +370,27 @@ func (q *DeploymentQueue) EnqueueDeployment(ctx context.Context, deploymentID uu
 	return nil
 }
 
-// acquireLease attempts to acquire an exclusive execution lease for a job.
+// acquireLease atomically acquires an exclusive execution lease for a job AND sets its
+// state to "processing" in a single Lua script. This prevents the race where a worker
+// crashes between acquiring the lease and setting the state index.
 // Returns a unique execution lease token if acquired.
 func (q *DeploymentQueue) acquireLease(ctx context.Context, jobID uuid.UUID, workerID string) (string, bool, error) {
-	leaseKey := JobLeasePrefix + jobID.String()
+	keyID := jobID.String()
+	leaseKey := JobLeasePrefix + keyID
+	stateKey := JobStatePrefix + keyID
 	token := fmt.Sprintf("%s:%s", workerID, uuid.New().String())
 
-	// Atomically set lease key if not exists (SET NX EX)
-	acquired, err := q.client.SetNX(ctx, leaseKey, token, q.leaseTTL).Result()
+	res, err := acquireLeaseScript.Run(ctx, q.client,
+		[]string{leaseKey, stateKey},
+		token, q.leaseTTL.Milliseconds(), JobStateProcessing, int64(24*time.Hour/time.Second),
+	).Result()
 	if err != nil {
-		return "", false, err
+		return "", false, fmt.Errorf("failed to execute acquire lease script: %w", err)
 	}
-	if !acquired {
+	acquired, ok := res.(int64)
+	if !ok || acquired == 0 {
 		return "", false, nil
 	}
-
-	// Update state index
-	_ = q.client.Set(ctx, JobStatePrefix+jobID.String(), JobStateProcessing, 24*time.Hour).Err()
 
 	return token, true, nil
 }
@@ -276,6 +414,138 @@ func (q *DeploymentQueue) extendLease(ctx context.Context, jobID uuid.UUID, leas
 func (q *DeploymentQueue) releaseLease(ctx context.Context, jobID uuid.UUID, leaseToken string) {
 	leaseKey := JobLeasePrefix + jobID.String()
 	_, _ = releaseLeaseScript.Run(ctx, q.client, []string{leaseKey}, leaseToken).Result()
+}
+
+// FinalizeSuccess atomically removes the job from the processing queue, deletes the lease,
+// deletes attempts, and clears the state index only if caller holds the matching lease token.
+func (q *DeploymentQueue) FinalizeSuccess(ctx context.Context, jobID uuid.UUID, leaseToken, itemStr string) (bool, error) {
+	keyID := jobID.String()
+	leaseKey := JobLeasePrefix + keyID
+	attemptsKey := JobAttemptsPrefix + keyID
+	stateKey := JobStatePrefix + keyID
+
+	res, err := finalizeSuccessScript.Run(ctx, q.client,
+		[]string{leaseKey, ProcessingQueueKey, attemptsKey, stateKey},
+		leaseToken, itemStr,
+	).Result()
+	if err != nil {
+		return false, fmt.Errorf("failed to execute finalize success script: %w", err)
+	}
+	val, ok := res.(int64)
+	return ok && val == 1, nil
+}
+
+// FailAndRequeue atomically removes the job from processing queue, deletes the lease,
+// increments attempts, sets state to pending, and re-enqueues into the deployment queue
+// only if caller holds the matching lease token. Returns (newAttempts, success, error).
+func (q *DeploymentQueue) FailAndRequeue(ctx context.Context, jobID uuid.UUID, leaseToken, itemStr string) (int64, bool, error) {
+	keyID := jobID.String()
+	leaseKey := JobLeasePrefix + keyID
+	attemptsKey := JobAttemptsPrefix + keyID
+	stateKey := JobStatePrefix + keyID
+
+	res, err := failAndRequeueScript.Run(ctx, q.client,
+		[]string{leaseKey, ProcessingQueueKey, DeploymentQueueKey, attemptsKey, stateKey},
+		leaseToken, itemStr, JobStatePending,
+	).Result()
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to execute fail and requeue script: %w", err)
+	}
+	attempts, ok := res.(int64)
+	if !ok || attempts < 0 {
+		return 0, false, nil
+	}
+	return attempts, true, nil
+}
+
+// FailToDLQ atomically removes the job from processing queue, deletes the lease,
+// increments attempts, sets state to dead_letter, and transfers to dead-letter queue
+// only if caller holds the matching lease token. Returns (newAttempts, success, error).
+func (q *DeploymentQueue) FailToDLQ(ctx context.Context, jobID uuid.UUID, leaseToken, itemStr string) (int64, bool, error) {
+	keyID := jobID.String()
+	leaseKey := JobLeasePrefix + keyID
+	attemptsKey := JobAttemptsPrefix + keyID
+	stateKey := JobStatePrefix + keyID
+
+	res, err := failToDLQScript.Run(ctx, q.client,
+		[]string{leaseKey, ProcessingQueueKey, DeadLetterQueueKey, attemptsKey, stateKey},
+		leaseToken, itemStr, JobStateDLQ,
+	).Result()
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to execute fail to DLQ script: %w", err)
+	}
+	attempts, ok := res.(int64)
+	if !ok || attempts < 0 {
+		return 0, false, nil
+	}
+	return attempts, true, nil
+}
+
+// TerminalCleanup atomically removes the job from processing queue, deletes the lease,
+// and deletes state only if caller holds the matching lease token. If moveToDLQ is true, pushes to DLQ.
+func (q *DeploymentQueue) TerminalCleanup(ctx context.Context, jobID uuid.UUID, leaseToken, itemStr string, moveToDLQ bool) (bool, error) {
+	keyID := jobID.String()
+	leaseKey := JobLeasePrefix + keyID
+	stateKey := JobStatePrefix + keyID
+
+	keys := []string{leaseKey, ProcessingQueueKey, stateKey}
+	if moveToDLQ {
+		keys = append(keys, DeadLetterQueueKey)
+	}
+
+	res, err := terminalCleanupScript.Run(ctx, q.client,
+		keys,
+		leaseToken, itemStr,
+	).Result()
+	if err != nil {
+		return false, fmt.Errorf("failed to execute terminal cleanup script: %w", err)
+	}
+	val, ok := res.(int64)
+	return ok && val == 1, nil
+}
+
+// LRemProcessingWithLease atomically removes item from processing queue only if leaseToken matches.
+func (q *DeploymentQueue) LRemProcessingWithLease(ctx context.Context, jobID uuid.UUID, leaseToken, itemStr string) (int64, error) {
+	leaseKey := JobLeasePrefix + jobID.String()
+	res, err := lremProcessingWithLeaseScript.Run(ctx, q.client,
+		[]string{leaseKey, ProcessingQueueKey},
+		leaseToken, itemStr,
+	).Result()
+	if err != nil {
+		return 0, err
+	}
+	rem, ok := res.(int64)
+	if !ok || rem < 0 {
+		return 0, ErrLeaseLost
+	}
+	return rem, nil
+}
+
+// RecoverJobAtomic executes the atomic recovery script for an abandoned or orphaned job.
+// Returns 0: not recovered (lease exists or not in processing queue), 1: re-enqueued, 2: DLQ, 3: terminal cleanup.
+func (q *DeploymentQueue) RecoverJobAtomic(ctx context.Context, itemStr string, jobID uuid.UUID, maxRetries int, isTerminal bool) (int, error) {
+	keyID := jobID.String()
+	leaseKey := JobLeasePrefix + keyID
+	attemptsKey := JobAttemptsPrefix + keyID
+	stateKey := JobStatePrefix + keyID
+
+	mode := "retry"
+	if isTerminal {
+		mode = "terminal"
+	}
+
+	res, err := atomicRecoverScript.Run(ctx, q.client,
+		[]string{ProcessingQueueKey, DeploymentQueueKey, leaseKey, attemptsKey, stateKey, DeadLetterQueueKey},
+		itemStr, mode, strconv.Itoa(maxRetries),
+	).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to execute atomic recovery script: %w", err)
+	}
+	code, ok := res.(int64)
+	if !ok {
+		return 0, fmt.Errorf("unexpected return from atomic recovery script: %v", res)
+	}
+	return int(code), nil
 }
 
 // IsLeaseOwner checks if the given leaseToken currently owns the job lease.
@@ -414,65 +684,40 @@ func (q *DeploymentQueue) RecoverAbandonedJobs(ctx context.Context) (int, error)
 	for _, item := range items {
 		job, err := ParseJob(item)
 		if err != nil {
-			// Corrupt / untyped payload in processing queue -> move to DLQ
-			q.client.LRem(ctx, ProcessingQueueKey, 1, item)
-			q.client.LPush(ctx, DeadLetterQueueKey, item)
+			// Corrupt / untyped payload in processing queue -> atomically move to DLQ
+			_, _ = corruptToDLQScript.Run(ctx, q.client,
+				[]string{ProcessingQueueKey, DeadLetterQueueKey},
+				item,
+			).Result()
 			continue
 		}
 
-		keyID := job.ID.String()
-		leaseKey := JobLeasePrefix + keyID
-		stateKey := JobStatePrefix + keyID
-
-		// 1. Check if worker still holds an active lease
-		hasLease, err := q.client.Exists(ctx, leaseKey).Result()
-		if err == nil && hasLease > 0 {
-			// Worker is alive and heartbeating. Not abandoned.
-			continue
-		}
-
-		// 2. Worker is dead or abandoned. Check if job already reached terminal state.
+		// Check if job already reached terminal state
+		isTerminal := false
 		if q.terminalChecker != nil {
 			checkCtx, checkCancel := context.WithTimeout(ctx, 5*time.Second)
 			term, termErr := q.terminalChecker(checkCtx, job)
 			checkCancel()
 			if termErr == nil && term {
-				slog.Info("abandoned job is already in terminal state; discarding without retry",
-					"job_id", job.ID, "type", job.Type)
-				q.client.LRem(ctx, ProcessingQueueKey, 1, item)
-				q.client.Del(ctx, stateKey)
-				continue
+				isTerminal = true
 			}
 		}
 
-		// 3. Check attempt count
-		attemptsStr, _ := q.client.Get(ctx, JobAttemptsPrefix+keyID).Result()
-		attempts, _ := strconv.Atoi(attemptsStr)
-
-		if attempts >= q.maxRetries {
-			// Atomically transfer to DLQ only if lease is still absent
-			res, err := atomicRecoverScript.Run(ctx, q.client,
-				[]string{ProcessingQueueKey, DeadLetterQueueKey, leaseKey, stateKey},
-				item, JobStateDLQ,
-			).Result()
-			if err == nil && res.(int64) == 1 {
-				slog.Warn("abandoned job exceeded max retries, moved to DLQ", "job_id", job.ID, "attempts", attempts)
-			}
-		} else {
-			// Increment attempt on recovery to bound recovery cycles
-			q.client.Incr(ctx, JobAttemptsPrefix+keyID)
-			q.client.Expire(ctx, JobAttemptsPrefix+keyID, 24*time.Hour)
-
-			// Atomically transfer back to deployment queue only if lease is still absent
-			res, err := atomicRecoverScript.Run(ctx, q.client,
-				[]string{ProcessingQueueKey, DeploymentQueueKey, leaseKey, stateKey},
-				item, JobStatePending,
-			).Result()
-			if err == nil && res.(int64) == 1 {
-				slog.Info("re-enqueued recoverable orphaned deployment job with expired lease",
-					"job_id", job.ID, "attempts", attempts+1)
-				recovered++
-			}
+		// Atomically check lease absence, check/increment attempts, and move job
+		res, recErr := q.RecoverJobAtomic(ctx, item, job.ID, q.maxRetries, isTerminal)
+		if recErr != nil {
+			slog.Error("failed to recover abandoned job", "job_id", job.ID, "error", recErr)
+			continue
+		}
+		if res == 1 {
+			slog.Info("re-enqueued recoverable orphaned deployment job with expired lease",
+				"job_id", job.ID)
+			recovered++
+		} else if res == 2 {
+			slog.Warn("abandoned job exceeded max retries, moved to DLQ", "job_id", job.ID)
+		} else if res == 3 {
+			slog.Info("abandoned job is already in terminal state; cleaned up from processing queue",
+				"job_id", job.ID, "type", job.Type)
 		}
 	}
 
@@ -526,21 +771,26 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 					job, err := ParseJob(itemStr)
 					if err != nil {
 						slog.Error("invalid job payload in queue, moving to DLQ", "val", itemStr, "error", err)
-						q.client.LRem(context.Background(), ProcessingQueueKey, 1, itemStr)
-						_ = q.client.LPush(context.Background(), DeadLetterQueueKey, itemStr)
+						// Atomic LREM + LPUSH to prevent double-move by concurrent workers
+						_, _ = corruptToDLQScript.Run(context.Background(), q.client,
+							[]string{ProcessingQueueKey, DeadLetterQueueKey},
+							itemStr,
+						).Result()
 						continue
 					}
 
-					// Update state index
-					_ = q.client.Set(context.Background(), JobStatePrefix+job.ID.String(), JobStateProcessing, 24*time.Hour).Err()
-
-					// Acquire execution lease with unique ownership token
+					// Acquire execution lease with unique ownership token.
+					// acquireLease atomically sets both the lease key and state to "processing".
 					leaseToken, acquired, err := q.acquireLease(workerCtx, job.ID, workerName)
 					if err != nil {
 						slog.Error("failed to check job idempotency / acquire lease", "job_id", job.ID, "error", err)
 						continue
 					}
 					if !acquired {
+						// Another worker owns this job. Remove our copy from processing queue,
+						// but only remove ONE entry to avoid stealing the other worker's entry.
+						// This is safe: BRPopLPush added one entry, we remove that one entry.
+						// The other worker's entry (also added by BRPopLPush) remains.
 						slog.Warn("skipping duplicate deployment job with active lease", "job_id", job.ID)
 						q.client.LRem(context.Background(), ProcessingQueueKey, 1, itemStr)
 						continue
@@ -574,47 +824,20 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 
 					// Stop heartbeat ticker immediately
 					cancelHb()
-
-					// Lease fencing check: Worker must verify it still owns the exact lease token.
-					// An old worker that lost its lease must not:
-					// - remove the replacement worker's processing entry
-					// - increment retry attempts
-					// - requeue the job
-					// - move the job to DLQ
-					// - change job state
-					stillOwner, verifyErr := q.IsLeaseOwner(context.Background(), job.ID, leaseToken)
-					if verifyErr != nil || !stillOwner {
-						slog.Warn("worker lost lease; skipping processing cleanup, retry, and state mutations to protect replacement worker",
-							"worker", workerName,
-							"job_id", job.ID,
-							"lease_token", leaseToken,
-							"verify_err", verifyErr,
-						)
-						cancelJob()
-						continue
-					}
-
-					// Safely remove from processing queue
-					q.client.LRem(context.Background(), ProcessingQueueKey, 1, itemStr)
-
-					// Release lease (safe: only if leaseToken still matches)
-					q.releaseLease(context.Background(), job.ID, leaseToken)
 					cancelJob()
 
-					keyID := job.ID.String()
+					// Atomic lease-fenced mutations:
+					// Every state change (requeue, DLQ, finalization, terminal cleanup) is an atomic
+					// Lua script that verifies lease ownership before performing any mutation.
+					// If the worker lost its lease to another worker or expiration, the script safely aborts (no-op).
 					if execErr != nil {
-						attempts, _ := q.client.Incr(context.Background(), JobAttemptsPrefix+keyID).Result()
-						q.client.Expire(context.Background(), JobAttemptsPrefix+keyID, 24*time.Hour)
-
 						slog.Error("deployment job execution failed",
 							"job_id", job.ID,
 							"job_type", job.Type,
 							"error", execErr,
-							"attempt", attempts,
-							"max_retries", q.maxRetries,
 						)
 
-						// Check if job is in a terminal state: NEVER blindly retry a terminal ServiceDeployment!
+						// Check if job is in a terminal state: NEVER retry a terminal ServiceDeployment!
 						isTerminal := false
 						if q.terminalChecker != nil {
 							checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -625,34 +848,53 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 							}
 						}
 
-						if !isTerminal && int(attempts) < q.maxRetries {
-							slog.Warn("re-queueing failed deployment for retry",
-								"job_id", job.ID,
-								"attempt", attempts,
-								"backoff", q.retryBackoff,
-							)
-							time.Sleep(q.retryBackoff)
-							_ = q.client.Set(context.Background(), JobStatePrefix+keyID, JobStatePending, 24*time.Hour).Err()
-							_ = q.client.LPush(context.Background(), DeploymentQueueKey, itemStr)
+						if isTerminal {
+							slog.Info("deployment job is already in terminal state; performing atomic terminal cleanup",
+								"job_id", job.ID, "worker", workerName)
+							ok, err := q.TerminalCleanup(context.Background(), job.ID, leaseToken, itemStr, true)
+							if err != nil || !ok {
+								slog.Warn("worker lost lease; skipped terminal cleanup to protect replacement worker",
+									"worker", workerName, "job_id", job.ID, "err", err)
+							}
 						} else {
-							if isTerminal {
-								slog.Info("deployment job is already in terminal state; skipping retry",
+							// Check current attempts to decide whether next attempt exceeds maxRetries
+							attempts, _ := q.GetAttempts(context.Background(), job.ID)
+							if attempts+1 < q.maxRetries {
+								slog.Warn("re-queueing failed deployment for retry",
 									"job_id", job.ID,
-									"attempts", attempts,
+									"current_attempts", attempts,
+									"backoff", q.retryBackoff,
 								)
-								_ = q.client.Del(context.Background(), JobStatePrefix+keyID).Err()
+								time.Sleep(q.retryBackoff)
+								newAtt, ok, err := q.FailAndRequeue(context.Background(), job.ID, leaseToken, itemStr)
+								if err != nil || !ok {
+									slog.Warn("worker lost lease; aborted requeue to protect replacement worker",
+										"worker", workerName, "job_id", job.ID, "err", err)
+								} else {
+									slog.Info("re-queued failed deployment job", "job_id", job.ID, "new_attempts", newAtt)
+								}
 							} else {
 								slog.Error("deployment job exceeded max retry attempts; moving to dead-letter queue",
 									"job_id", job.ID,
-									"attempts", attempts,
+									"current_attempts", attempts,
 								)
-								_ = q.client.Set(context.Background(), JobStatePrefix+keyID, JobStateDLQ, 24*time.Hour).Err()
+								newAtt, ok, err := q.FailToDLQ(context.Background(), job.ID, leaseToken, itemStr)
+								if err != nil || !ok {
+									slog.Warn("worker lost lease; aborted DLQ transfer to protect replacement worker",
+										"worker", workerName, "job_id", job.ID, "err", err)
+								} else {
+									slog.Info("transferred failed deployment to DLQ", "job_id", job.ID, "final_attempts", newAtt)
+								}
 							}
-							_ = q.client.LPush(context.Background(), DeadLetterQueueKey, itemStr)
 						}
 					} else {
-						slog.Info("deployment job completed successfully", "worker", workerName, "job_id", job.ID)
-						q.client.Del(context.Background(), JobAttemptsPrefix+keyID, JobStatePrefix+keyID)
+						slog.Info("deployment job completed successfully; performing atomic finalization",
+							"worker", workerName, "job_id", job.ID)
+						ok, err := q.FinalizeSuccess(context.Background(), job.ID, leaseToken, itemStr)
+						if err != nil || !ok {
+							slog.Warn("worker lost lease; aborted finalization to protect replacement worker",
+								"worker", workerName, "job_id", job.ID, "err", err)
+						}
 					}
 				}
 			}

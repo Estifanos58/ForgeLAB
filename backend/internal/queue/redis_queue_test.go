@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -872,4 +873,554 @@ func TestDeploymentQueue_Fencing_StaleWorkerCannotMutateJob(t *testing.T) {
 	t.Run("Worker A finishes late with success", func(t *testing.T) {
 		runScenario(t, false)
 	})
+}
+
+func TestDeploymentQueue_StaleWorkerAttemptsFinalization(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+
+	// 1. Worker A acquires lease
+	tokenA, acquiredA, err := q.acquireLease(ctx, jobID, "worker-A")
+	if err != nil || !acquiredA {
+		t.Fatalf("failed to acquire lease for worker A: %v", err)
+	}
+
+	// Put job in processing queue
+	if err := client.LPush(ctx, ProcessingQueueKey, itemStr).Err(); err != nil {
+		t.Fatalf("failed to push to processing queue: %v", err)
+	}
+
+	// 2. Simulate Worker A loses lease (lease expires) and Worker B acquires lease
+	leaseKey := JobLeasePrefix + jobID.String()
+	client.Del(ctx, leaseKey)
+
+	tokenB, acquiredB, err := q.acquireLease(ctx, jobID, "worker-B")
+	if err != nil || !acquiredB {
+		t.Fatalf("failed to acquire lease for worker B: %v", err)
+	}
+
+	// 3. Stale Worker A attempts atomic finalization using tokenA
+	ok, err := q.FinalizeSuccess(ctx, jobID, tokenA, itemStr)
+	if err != nil {
+		t.Fatalf("unexpected error during stale finalization: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected stale finalization to return false, but got true")
+	}
+
+	// 4. Verify Worker B's state is completely uncorrupted
+	currentLease, err := client.Get(ctx, leaseKey).Result()
+	if err != nil || currentLease != tokenB {
+		t.Fatalf("expected lease to belong to worker B (%s), got %s", tokenB, currentLease)
+	}
+
+	procLen, err := client.LLen(ctx, ProcessingQueueKey).Result()
+	if err != nil || procLen != 1 {
+		t.Fatalf("expected processing queue to retain entry (len 1), got %d", procLen)
+	}
+
+	state, err := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if err != nil || state != JobStateProcessing {
+		t.Fatalf("expected state to remain processing, got %s", state)
+	}
+}
+
+func TestDeploymentQueue_StaleWorkerAttemptsRequeueAndDLQ(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+
+	// 1. Worker A acquires lease
+	tokenA, acquiredA, err := q.acquireLease(ctx, jobID, "worker-A")
+	if err != nil || !acquiredA {
+		t.Fatalf("failed to acquire lease for worker A: %v", err)
+	}
+
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+
+	// 2. Worker B acquires lease after A expires
+	leaseKey := JobLeasePrefix + jobID.String()
+	client.Del(ctx, leaseKey)
+
+	tokenB, acquiredB, err := q.acquireLease(ctx, jobID, "worker-B")
+	if err != nil || !acquiredB {
+		t.Fatalf("failed to acquire lease for worker B: %v", err)
+	}
+
+	// 3. Stale Worker A attempts FailAndRequeue using tokenA
+	newAtt, ok, err := q.FailAndRequeue(ctx, jobID, tokenA, itemStr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok || newAtt > 0 {
+		t.Fatalf("expected stale requeue to fail, got ok=%v, newAtt=%d", ok, newAtt)
+	}
+
+	pendingLen, _ := client.LLen(ctx, DeploymentQueueKey).Result()
+	if pendingLen != 0 {
+		t.Fatalf("expected pending queue to remain 0, got %d", pendingLen)
+	}
+
+	// 4. Stale Worker A attempts FailToDLQ using tokenA
+	dlqAtt, ok, err := q.FailToDLQ(ctx, jobID, tokenA, itemStr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok || dlqAtt > 0 {
+		t.Fatalf("expected stale DLQ transition to fail, got ok=%v, dlqAtt=%d", ok, dlqAtt)
+	}
+
+	dlqLen, _ := client.LLen(ctx, DeadLetterQueueKey).Result()
+	if dlqLen != 0 {
+		t.Fatalf("expected DLQ to remain 0, got %d", dlqLen)
+	}
+
+	// Verify Worker B's lease is still intact
+	currentLease, _ := client.Get(ctx, leaseKey).Result()
+	if currentLease != tokenB {
+		t.Fatalf("expected lease to remain tokenB (%s), got %s", tokenB, currentLease)
+	}
+}
+
+func TestDeploymentQueue_StaleWorkerAttemptsLREM(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+
+	// Worker A acquires lease
+	tokenA, _, _ := q.acquireLease(ctx, jobID, "worker-A")
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+
+	// Lease transferred to Worker B
+	leaseKey := JobLeasePrefix + jobID.String()
+	client.Del(ctx, leaseKey)
+	tokenB, _, _ := q.acquireLease(ctx, jobID, "worker-B")
+
+	// Stale Worker A attempts LREM with lease verification
+	rem, err := q.LRemProcessingWithLease(ctx, jobID, tokenA, itemStr)
+	if err == nil || !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost from stale LREM, got rem=%d, err=%v", rem, err)
+	}
+
+	// Verify processing queue entry was NOT removed
+	procLen, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 1 {
+		t.Fatalf("expected processing queue len 1, got %d", procLen)
+	}
+
+	// Worker B's LREM with valid token succeeds
+	remB, err := q.LRemProcessingWithLease(ctx, jobID, tokenB, itemStr)
+	if err != nil || remB != 1 {
+		t.Fatalf("expected worker B LREM to remove 1 item, got rem=%d, err=%v", remB, err)
+	}
+
+	procLenAfter, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLenAfter != 0 {
+		t.Fatalf("expected processing queue len 0, got %d", procLenAfter)
+	}
+}
+
+func TestDeploymentQueue_RecoveryRacingWithLeaseAcquisition(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+
+	// Job is in processing queue with NO lease (abandoned)
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+
+	// Worker B acquires lease right before recovery runs
+	tokenB, acquired, err := q.acquireLease(ctx, jobID, "worker-B")
+	if err != nil || !acquired {
+		t.Fatalf("failed to acquire lease for worker B: %v", err)
+	}
+
+	// Recovery attempts to recover the job
+	rec, err := q.RecoverAbandonedJobs(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error during recovery: %v", err)
+	}
+	if rec != 0 {
+		t.Fatalf("expected 0 recovered jobs because worker B holds active lease, got %d", rec)
+	}
+
+	// Verify job remained in processing queue for worker B
+	procLen, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 1 {
+		t.Fatalf("expected processing queue to retain worker B's job, got %d", procLen)
+	}
+
+	// Verify pending queue is empty
+	pendingLen, _ := client.LLen(ctx, DeploymentQueueKey).Result()
+	if pendingLen != 0 {
+		t.Fatalf("expected pending queue to remain 0, got %d", pendingLen)
+	}
+
+	_ = tokenB
+}
+
+func TestDeploymentQueue_DuplicateRecoveryAttempts(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+
+	// Seed 1 abandoned job in processing queue
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+
+	// Run 2 concurrent recovery sweeps
+	var wg sync.WaitGroup
+	var recCount1, recCount2 int
+	var err1, err2 error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		recCount1, err1 = q.RecoverAbandonedJobs(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		recCount2, err2 = q.RecoverAbandonedJobs(ctx)
+	}()
+	wg.Wait()
+
+	if err1 != nil || err2 != nil {
+		t.Fatalf("recovery error: err1=%v, err2=%v", err1, err2)
+	}
+
+	totalRecovered := recCount1 + recCount2
+	if totalRecovered != 1 {
+		t.Fatalf("expected exactly 1 recovery between concurrent sweeps, got rec1=%d, rec2=%d (total=%d)",
+			recCount1, recCount2, totalRecovered)
+	}
+
+	// Verify job was re-enqueued exactly once
+	pendingLen, _ := client.LLen(ctx, DeploymentQueueKey).Result()
+	if pendingLen != 1 {
+		t.Fatalf("expected exactly 1 pending job in queue, got %d", pendingLen)
+	}
+
+	// Verify attempts counter was incremented exactly once
+	attempts, _ := q.GetAttempts(ctx, jobID)
+	if attempts != 1 {
+		t.Fatalf("expected attempt count 1, got %d", attempts)
+	}
+}
+
+func TestDeploymentQueue_AcquireLeaseAtomicStateSet(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+
+	// State should not exist before acquiring lease
+	_, err := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if !errors.Is(err, redis.Nil) {
+		t.Fatalf("expected no state before lease acquisition, got err=%v", err)
+	}
+
+	// Acquire lease — state should be set atomically
+	token, acquired, err := q.acquireLease(ctx, jobID, "worker-1")
+	if err != nil || !acquired {
+		t.Fatalf("failed to acquire lease: acquired=%v, err=%v", acquired, err)
+	}
+	if token == "" {
+		t.Fatalf("expected non-empty lease token")
+	}
+
+	// Both lease and state must exist after atomic acquisition
+	leaseVal, err := client.Get(ctx, JobLeasePrefix+jobID.String()).Result()
+	if err != nil || leaseVal != token {
+		t.Fatalf("expected lease token %q, got %q (err=%v)", token, leaseVal, err)
+	}
+
+	stateVal, err := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if err != nil || stateVal != JobStateProcessing {
+		t.Fatalf("expected state %q, got %q (err=%v)", JobStateProcessing, stateVal, err)
+	}
+
+	// Second attempt to acquire must fail AND must NOT overwrite state
+	client.Set(ctx, JobStatePrefix+jobID.String(), "custom_state_check", 24*time.Hour)
+	_, acquired2, err := q.acquireLease(ctx, jobID, "worker-2")
+	if err != nil || acquired2 {
+		t.Fatalf("expected second acquire to fail, got acquired=%v, err=%v", acquired2, err)
+	}
+
+	// State must remain unchanged (NOT overwritten to "processing" by failed acquire)
+	stateAfter, _ := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if stateAfter != "custom_state_check" {
+		t.Fatalf("expected state to remain 'custom_state_check', got %q", stateAfter)
+	}
+}
+
+func TestDeploymentQueue_ConcurrentAcquireLease(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+
+	const numWorkers = 10
+	var wg sync.WaitGroup
+	var successCount int32
+	tokens := make([]string, numWorkers)
+
+	wg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			workerName := fmt.Sprintf("worker-%d", idx)
+			token, acquired, err := q.acquireLease(ctx, jobID, workerName)
+			if err != nil {
+				return
+			}
+			if acquired {
+				atomic.AddInt32(&successCount, 1)
+				tokens[idx] = token
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Exactly one worker must win
+	if count := atomic.LoadInt32(&successCount); count != 1 {
+		t.Fatalf("expected exactly 1 successful lease acquisition, got %d", count)
+	}
+
+	// State must be processing
+	state, err := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if err != nil || state != JobStateProcessing {
+		t.Fatalf("expected state processing, got %q (err=%v)", state, err)
+	}
+
+	// Lease must contain exactly the winner's token
+	leaseVal, err := client.Get(ctx, JobLeasePrefix+jobID.String()).Result()
+	if err != nil {
+		t.Fatalf("unexpected error reading lease: %v", err)
+	}
+	found := false
+	for _, tok := range tokens {
+		if tok != "" && tok == leaseVal {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("lease value %q does not match any winning token", leaseVal)
+	}
+}
+
+func TestDeploymentQueue_CorruptPayloadAtomicDLQMove(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+
+	corruptItem := "not-valid-json-at-all"
+
+	// Place ONE corrupt item in processing queue
+	client.LPush(ctx, ProcessingQueueKey, corruptItem)
+
+	// Run two concurrent recovery sweeps
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		q.RecoverAbandonedJobs(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		q.RecoverAbandonedJobs(ctx)
+	}()
+	wg.Wait()
+
+	// Processing queue must be empty
+	procLen, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 0 {
+		t.Fatalf("expected processing queue to be empty, got %d", procLen)
+	}
+
+	// DLQ must contain exactly 1 entry (not 2 from double-move)
+	dlqLen, _ := client.LLen(ctx, DeadLetterQueueKey).Result()
+	if dlqLen != 1 {
+		t.Fatalf("expected exactly 1 item in DLQ after concurrent recovery, got %d", dlqLen)
+	}
+
+	// Verify the DLQ item is the correct corrupt payload
+	dlqItem, _ := client.LPop(ctx, DeadLetterQueueKey).Result()
+	if dlqItem != corruptItem {
+		t.Fatalf("expected DLQ item %q, got %q", corruptItem, dlqItem)
+	}
+}
+
+func TestDeploymentQueue_StaleWorkerTerminalCleanupBlocked(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+
+	// 1. Worker A acquires lease and puts job in processing queue
+	tokenA, acquiredA, err := q.acquireLease(ctx, jobID, "worker-A")
+	if err != nil || !acquiredA {
+		t.Fatalf("failed to acquire lease for worker A: %v", err)
+	}
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+
+	// 2. Worker A's lease expires, worker B acquires
+	leaseKey := JobLeasePrefix + jobID.String()
+	client.Del(ctx, leaseKey)
+
+	tokenB, acquiredB, err := q.acquireLease(ctx, jobID, "worker-B")
+	if err != nil || !acquiredB {
+		t.Fatalf("failed to acquire lease for worker B: %v", err)
+	}
+
+	// 3. Stale Worker A attempts TerminalCleanup with its old token
+	ok, err := q.TerminalCleanup(ctx, jobID, tokenA, itemStr, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected stale terminal cleanup to return false, got true")
+	}
+
+	// 4. Verify Worker B's state is completely intact
+	currentLease, _ := client.Get(ctx, leaseKey).Result()
+	if currentLease != tokenB {
+		t.Fatalf("expected lease to belong to worker B (%s), got %s", tokenB, currentLease)
+	}
+
+	procLen, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 1 {
+		t.Fatalf("expected processing queue len 1, got %d", procLen)
+	}
+
+	dlqLen, _ := client.LLen(ctx, DeadLetterQueueKey).Result()
+	if dlqLen != 0 {
+		t.Fatalf("expected DLQ to remain empty, got %d", dlqLen)
+	}
+
+	state, _ := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if state != JobStateProcessing {
+		t.Fatalf("expected state to remain processing, got %s", state)
+	}
+
+	// 5. Worker B's TerminalCleanup with valid token must succeed
+	ok2, err := q.TerminalCleanup(ctx, jobID, tokenB, itemStr, false)
+	if err != nil || !ok2 {
+		t.Fatalf("expected worker B terminal cleanup to succeed, got ok=%v, err=%v", ok2, err)
+	}
+
+	procLenAfter, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLenAfter != 0 {
+		t.Fatalf("expected processing queue to be empty after cleanup, got %d", procLenAfter)
+	}
+}
+
+func TestDeploymentQueue_AtomicRecoveryIgnoresActiveLeaseRace(t *testing.T) {
+	// Tests the TOCTOU race between checking lease absence and recovering:
+	// If a new worker acquires a lease between recovery's EXISTS check and LREM,
+	// the atomic script must refuse to recover (return 0).
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+
+	// Job is in processing queue with no lease initially
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+
+	// Now simulate a worker acquiring the lease just before recovery runs
+	_, acquired, err := q.acquireLease(ctx, jobID, "worker-fast")
+	if err != nil || !acquired {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+
+	// Recovery MUST NOT touch the job because the lease is now active
+	code, err := q.RecoverJobAtomic(ctx, itemStr, jobID, 3, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("expected recovery code 0 (lease active), got %d", code)
+	}
+
+	// Job must still be in processing queue
+	procLen, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 1 {
+		t.Fatalf("expected job to remain in processing queue, got %d", procLen)
+	}
 }

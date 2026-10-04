@@ -12,19 +12,23 @@ async function handleProxy(request: NextRequest) {
   const search = request.nextUrl.search;
   const targetUrl = `${backendBase}${pathname}${search}`;
 
-  // Forward incoming headers, excluding hop-by-hop headers
+  // Forward incoming headers, excluding hop-by-hop headers and untrusted client forwarding headers
   const forwardedHeaders = new Headers();
   request.headers.forEach((value, key) => {
     const lowerKey = key.toLowerCase();
     if (
-      lowerKey !== 'host' &&
-      lowerKey !== 'connection' &&
-      lowerKey !== 'keep-alive' &&
-      lowerKey !== 'transfer-encoding' &&
-      lowerKey !== 'upgrade'
+      lowerKey === 'host' ||
+      lowerKey === 'connection' ||
+      lowerKey === 'keep-alive' ||
+      lowerKey === 'transfer-encoding' ||
+      lowerKey === 'upgrade' ||
+      lowerKey.startsWith('x-forwarded-') ||
+      lowerKey === 'x-real-ip' ||
+      lowerKey === 'forwarded'
     ) {
-      forwardedHeaders.set(key, value);
+      return; // Strip hop-by-hop and client-supplied forwarding headers
     }
+    forwardedHeaders.set(key, value);
   });
 
   // Explicitly ensure Cookie and Authorization are preserved
@@ -37,11 +41,15 @@ async function handleProxy(request: NextRequest) {
     forwardedHeaders.set('authorization', authHeader);
   }
 
-  // Preserve client IP and proxy headers
-  const clientIp = request.headers.get('x-forwarded-for') || (request as any).ip || '127.0.0.1';
+  // Derive actual client IP from trusted request environment (not untrusted client header)
+  const clientIp = (request as any).ip || (request as any).socket?.remoteAddress || '127.0.0.1';
+  const proto = request.nextUrl.protocol.replace(':', '') || 'http';
+  const host = request.headers.get('host') || 'localhost:3000';
+
   forwardedHeaders.set('x-forwarded-for', clientIp);
-  forwardedHeaders.set('x-forwarded-proto', request.nextUrl.protocol.replace(':', ''));
-  forwardedHeaders.set('x-forwarded-host', request.headers.get('host') || 'localhost:3000');
+  forwardedHeaders.set('x-forwarded-proto', proto);
+  forwardedHeaders.set('x-forwarded-host', host);
+  forwardedHeaders.set('forwarded', `for=${clientIp};proto=${proto};host=${host}`);
 
   // Handle body
   const isBodyAllowed = request.method !== 'GET' && request.method !== 'HEAD';

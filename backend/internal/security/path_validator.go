@@ -260,3 +260,154 @@ func (v *PathValidator) ValidateBuildContextAndDockerfile(sourcePath, buildConte
 
 	return canonicalCtx, canonicalDockerfile, nil
 }
+
+// ValidateServiceBuildPaths validates service SourcePath, BuildContext, and DockerfilePath against canonical source root.
+// It strictly rejects absolute paths outside source root, .. traversal, symlink escapes,
+// build contexts outside repo, and Dockerfiles outside the build context.
+func (v *PathValidator) ValidateServiceBuildPaths(
+	canonicalSourceRoot string,
+	serviceSourcePath string,
+	buildContext string,
+	dockerfilePath string,
+	isAutoBuild bool,
+) (resolvedContextDir string, relDockerPath string, err error) {
+	// 1. Validate canonicalSourceRoot
+	cleanRoot, err := filepath.Abs(canonicalSourceRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid source root path: %w", err)
+	}
+	cleanRoot, err = filepath.EvalSymlinks(cleanRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("source root does not exist: %w", err)
+	}
+	cleanRoot = filepath.Clean(cleanRoot)
+
+	// 2. Validate serviceSourcePath within cleanRoot
+	cleanSourcePath := strings.TrimSpace(serviceSourcePath)
+	if cleanSourcePath == "" {
+		cleanSourcePath = "."
+	}
+
+	// Reject absolute paths that attempt to reference outside cleanRoot
+	if filepath.IsAbs(cleanSourcePath) {
+		absSource, err := filepath.EvalSymlinks(filepath.Clean(cleanSourcePath))
+		if err != nil {
+			return "", "", fmt.Errorf("service source path does not exist: %w", err)
+		}
+		rel, err := filepath.Rel(cleanRoot, absSource)
+		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+			return "", "", errors.New("service source path is an absolute path outside repository boundary")
+		}
+		cleanSourcePath = rel
+	}
+
+	targetServiceDir := filepath.Join(cleanRoot, cleanSourcePath)
+	absServiceDir, err := filepath.Abs(targetServiceDir)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid service source directory: %w", err)
+	}
+	canonicalServiceDir, err := filepath.EvalSymlinks(absServiceDir)
+	if err != nil {
+		return "", "", fmt.Errorf("service source path does not exist: %w", err)
+	}
+	canonicalServiceDir = filepath.Clean(canonicalServiceDir)
+
+	// Ensure canonicalServiceDir is within cleanRoot
+	relService, err := filepath.Rel(cleanRoot, canonicalServiceDir)
+	if err != nil || strings.HasPrefix(relService, "..") {
+		return "", "", errors.New("service source path escapes repository boundary")
+	}
+
+	// 3. Validate buildContext
+	cleanBuildContext := strings.TrimSpace(buildContext)
+	if cleanBuildContext == "" {
+		cleanBuildContext = "."
+	}
+
+	var targetContextDir string
+	if filepath.IsAbs(cleanBuildContext) {
+		absCtx, err := filepath.EvalSymlinks(filepath.Clean(cleanBuildContext))
+		if err != nil {
+			return "", "", fmt.Errorf("build context path does not exist: %w", err)
+		}
+		rel, err := filepath.Rel(cleanRoot, absCtx)
+		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+			return "", "", errors.New("build context is an absolute path outside repository boundary")
+		}
+		targetContextDir = absCtx
+	} else {
+		// Resolve relative to service dir first, fallback to source root
+		cand1 := filepath.Join(canonicalServiceDir, cleanBuildContext)
+		cand2 := filepath.Join(cleanRoot, cleanBuildContext)
+		if _, err := os.Stat(cand1); err == nil {
+			targetContextDir = cand1
+		} else {
+			targetContextDir = cand2
+		}
+	}
+
+	absContextDir, err := filepath.Abs(targetContextDir)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid build context path: %w", err)
+	}
+	canonicalContextDir, err := filepath.EvalSymlinks(absContextDir)
+	if err != nil {
+		return "", "", fmt.Errorf("build context directory does not exist: %w", err)
+	}
+	canonicalContextDir = filepath.Clean(canonicalContextDir)
+
+	// Ensure canonicalContextDir does not escape cleanRoot
+	relContext, err := filepath.Rel(cleanRoot, canonicalContextDir)
+	if err != nil || strings.HasPrefix(relContext, "..") {
+		return "", "", errors.New("build context escapes repository boundary")
+	}
+
+	// 4. Validate DockerfilePath
+	cleanDockerfilePath := strings.TrimSpace(dockerfilePath)
+	if isAutoBuild {
+		return canonicalContextDir, "Dockerfile.forgelab", nil
+	}
+
+	if cleanDockerfilePath == "" {
+		cleanDockerfilePath = "Dockerfile"
+	}
+
+	if filepath.IsAbs(cleanDockerfilePath) {
+		absDF, err := filepath.EvalSymlinks(filepath.Clean(cleanDockerfilePath))
+		if err != nil {
+			return "", "", ErrDockerfileNotFound
+		}
+		rel, err := filepath.Rel(canonicalContextDir, absDF)
+		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+			return "", "", errors.New("dockerfile escapes build context boundary")
+		}
+		cleanDockerfilePath = filepath.ToSlash(rel)
+	}
+
+	targetDF := filepath.Join(canonicalContextDir, cleanDockerfilePath)
+	absDF, err := filepath.Abs(targetDF)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid dockerfile path: %w", err)
+	}
+	canonicalDF, err := filepath.EvalSymlinks(absDF)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", "", ErrDockerfileNotFound
+		}
+		return "", "", fmt.Errorf("dockerfile path error: %w", err)
+	}
+	canonicalDF = filepath.Clean(canonicalDF)
+
+	// Ensure canonicalDF is inside canonicalContextDir
+	relDF, err := filepath.Rel(canonicalContextDir, canonicalDF)
+	if err != nil || strings.HasPrefix(relDF, "..") {
+		return "", "", errors.New("dockerfile escapes build context boundary")
+	}
+
+	dfInfo, err := os.Stat(canonicalDF)
+	if err != nil || dfInfo.IsDir() {
+		return "", "", ErrDockerfileNotFound
+	}
+
+	return canonicalContextDir, filepath.ToSlash(relDF), nil
+}

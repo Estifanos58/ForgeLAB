@@ -68,8 +68,8 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 
 	h.setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"user":   user,
-		"tokens": tokens,
+		"user":       user,
+		"expires_in": tokens.ExpiresIn,
 	})
 }
 
@@ -98,8 +98,8 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	h.setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"user":   user,
-		"tokens": tokens,
+		"user":       user,
+		"expires_in": tokens.ExpiresIn,
 	})
 }
 
@@ -136,7 +136,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	h.setAuthCookies(w, tokens)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"tokens": tokens,
+		"expires_in": tokens.ExpiresIn,
 	})
 }
 
@@ -181,7 +181,7 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 
 // GoogleLogin handles GET /api/auth/google
 func (h *AuthHandler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
-	authURL, err := h.oauthService.GetGoogleAuthURL(r.Context())
+	authURL, nonce, err := h.oauthService.GetGoogleAuthURL(r.Context())
 	if err != nil {
 		if errors.Is(err, services.ErrProviderNotConfigured) {
 			writeError(w, http.StatusBadRequest, "Google authentication is not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
@@ -190,6 +190,7 @@ func (h *AuthHandler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to initiate Google authentication")
 		return
 	}
+	h.setOAuthNonceCookie(w, nonce)
 	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
 }
 
@@ -208,7 +209,13 @@ func (h *AuthHandler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userInfo, err := h.oauthService.HandleGoogleCallback(r.Context(), code, state)
+	nonce := h.getAndClearOAuthNonceCookie(w, r)
+	if nonce == "" {
+		h.redirectWithError(w, r, "OAuth session expired or CSRF nonce missing. Please try again.")
+		return
+	}
+
+	userInfo, err := h.oauthService.HandleGoogleCallback(r.Context(), code, state, nonce)
 	if err != nil {
 		slog.Error("google oauth callback failed", "error", err)
 		if errors.Is(err, services.ErrInvalidOAuthState) {
@@ -243,7 +250,7 @@ func (h *AuthHandler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
 
 // GitHubLogin handles GET /api/auth/github
 func (h *AuthHandler) GitHubLogin(w http.ResponseWriter, r *http.Request) {
-	authURL, err := h.oauthService.GetGitHubAuthURL(r.Context())
+	authURL, nonce, err := h.oauthService.GetGitHubAuthURL(r.Context())
 	if err != nil {
 		if errors.Is(err, services.ErrProviderNotConfigured) {
 			writeError(w, http.StatusBadRequest, "GitHub authentication is not configured. Please set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.")
@@ -252,6 +259,7 @@ func (h *AuthHandler) GitHubLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to initiate GitHub authentication")
 		return
 	}
+	h.setOAuthNonceCookie(w, nonce)
 	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
 }
 
@@ -270,7 +278,13 @@ func (h *AuthHandler) GitHubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userInfo, err := h.oauthService.HandleGitHubCallback(r.Context(), code, state)
+	nonce := h.getAndClearOAuthNonceCookie(w, r)
+	if nonce == "" {
+		h.redirectWithError(w, r, "OAuth session expired or CSRF nonce missing. Please try again.")
+		return
+	}
+
+	userInfo, err := h.oauthService.HandleGitHubCallback(r.Context(), code, state, nonce)
 	if err != nil {
 		slog.Error("github oauth callback failed", "error", err)
 		if errors.Is(err, services.ErrInvalidOAuthState) {
@@ -301,6 +315,35 @@ func (h *AuthHandler) GitHubCallback(w http.ResponseWriter, r *http.Request) {
 
 	h.setAuthCookies(w, tokens)
 	http.Redirect(w, r, h.frontendURL+"/dashboard", http.StatusTemporaryRedirect)
+}
+
+func (h *AuthHandler) setOAuthNonceCookie(w http.ResponseWriter, nonce string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_oauth_nonce",
+		Value:    nonce,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   600,
+	})
+}
+
+func (h *AuthHandler) getAndClearOAuthNonceCookie(w http.ResponseWriter, r *http.Request) string {
+	nonce := ""
+	if cookie, err := r.Cookie("forgelab_oauth_nonce"); err == nil {
+		nonce = cookie.Value
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_oauth_nonce",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	return nonce
 }
 
 func (h *AuthHandler) redirectWithError(w http.ResponseWriter, r *http.Request, errMsg string) {

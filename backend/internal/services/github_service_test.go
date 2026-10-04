@@ -24,9 +24,10 @@ func TestGitHubService_GetConnectURL_UsesRepositoryCallback(t *testing.T) {
 	svc := services.NewGitHubService(nil, nil, ghCfg, nil)
 	userID := uuid.New()
 
-	authURL, err := svc.GetConnectURL(context.Background(), userID)
+	authURL, nonce, err := svc.GetConnectURL(context.Background(), userID)
 	require.NoError(t, err)
 	require.NotEmpty(t, authURL)
+	require.NotEmpty(t, nonce)
 
 	parsedURL, err := url.Parse(authURL)
 	require.NoError(t, err)
@@ -52,9 +53,10 @@ func TestOAuthService_GetGitHubAuthURL_UsesSignInCallback(t *testing.T) {
 
 	oauthSvc := services.NewOAuthService(googleCfg, ghCfg, nil)
 
-	authURL, err := oauthSvc.GetGitHubAuthURL(context.Background())
+	authURL, nonce, err := oauthSvc.GetGitHubAuthURL(context.Background())
 	require.NoError(t, err)
 	require.NotEmpty(t, authURL)
+	require.NotEmpty(t, nonce)
 
 	parsedURL, err := url.Parse(authURL)
 	require.NoError(t, err)

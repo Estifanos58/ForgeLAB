@@ -104,6 +104,11 @@ func (m *JWTManager) GenerateRefreshToken() string {
 	return uuid.New().String() + "-" + uuid.New().String()
 }
 
+// AccessTokenExpiry returns the configured access token expiry duration.
+func (m *JWTManager) AccessTokenExpiry() time.Duration {
+	return m.accessTokenExpiry
+}
+
 // RefreshTokenExpiry returns the configured refresh token expiry duration.
 func (m *JWTManager) RefreshTokenExpiry() time.Duration {
 	return m.refreshTokenExpiry

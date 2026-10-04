@@ -178,20 +178,28 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		RuntimeType:    project.RuntimeType,
 		InternalPort:   project.InternalPort,
 		HealthStrategy: project.HealthStrategy,
+		ExecutionMode:  models.ExecutionModeBuild,
 		StartedAt:      &now,
 		CreatedAt:      now,
+	}
+
+	if s.secretService != nil {
+		envSnap, envHash, _ := s.secretService.CreateEnvSnapshot(ctx, project.ID, nil)
+		deployment.EnvSnapshot = envSnap
+		deployment.EnvConfigHash = envHash
 	}
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO deployments (
 			id, project_id, deploy_number, status, branch, image_tag,
 			build_strategy, build_command, start_command, runtime_type, internal_port, health_strategy,
-			started_at, created_at
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+			execution_mode, env_config_hash, env_snapshot, started_at, created_at
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
 		deployment.ID, deployment.ProjectID, deployment.DeployNumber,
 		deployment.Status, deployment.Branch, deployment.ImageTag,
 		deployment.BuildStrategy, deployment.BuildCommand, deployment.StartCommand,
 		deployment.RuntimeType, deployment.InternalPort, deployment.HealthStrategy,
+		deployment.ExecutionMode, deployment.EnvConfigHash, deployment.EnvSnapshot,
 		deployment.StartedAt, deployment.CreatedAt,
 	)
 	if err != nil {
@@ -633,6 +641,7 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, deploymentID uuid
 		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
 		 image_tag, container_id, source_revision, build_strategy, build_command,
 		 start_command, runtime_type, internal_port, health_strategy,
+		 COALESCE(execution_mode, 'build'), image_digest, env_config_hash, env_snapshot,
 		 started_at, built_at, deployed_at, finished_at, duration_ms, failure_reason, created_at
 		 FROM deployments WHERE id = $1`,
 		deploymentID,
@@ -640,6 +649,7 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, deploymentID uuid
 		&d.ID, &d.ProjectID, &d.DeployNumber, &d.Status, &d.CommitSHA, &d.Branch,
 		&d.ImageTag, &d.ContainerID, &d.SourceRevision, &d.BuildStrategy, &d.BuildCommand,
 		&d.StartCommand, &d.RuntimeType, &d.InternalPort, &d.HealthStrategy,
+		&d.ExecutionMode, &d.ImageDigest, &d.EnvConfigHash, &d.EnvSnapshot,
 		&d.StartedAt, &d.BuiltAt, &d.DeployedAt, &d.FinishedAt, &d.DurationMs, &d.FailureReason, &d.CreatedAt,
 	)
 	if err != nil {
@@ -655,15 +665,29 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, deploymentID uuid
 	return d, nil
 }
 
-// ListDeployments retrieves all deployments for a project.
-func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.UUID) ([]*models.Deployment, error) {
+// ListDeployments retrieves all deployments for a project with bounded pagination.
+func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.UUID, pagination ...int) ([]*models.Deployment, error) {
+	limit := 50
+	offset := 0
+	if len(pagination) > 0 && pagination[0] > 0 {
+		limit = pagination[0]
+		if limit > 200 {
+			limit = 200
+		}
+	}
+	if len(pagination) > 1 && pagination[1] >= 0 {
+		offset = pagination[1]
+	}
+
 	rows, err := s.db.Query(ctx,
 		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
 		 image_tag, container_id, source_revision, build_strategy, build_command,
 		 start_command, runtime_type, internal_port, health_strategy,
+		 COALESCE(execution_mode, 'build'), image_digest, env_config_hash, env_snapshot,
 		 started_at, built_at, deployed_at, finished_at, duration_ms, failure_reason, created_at
-		 FROM deployments WHERE project_id = $1 ORDER BY deploy_number DESC`,
-		projectID,
+		 FROM deployments WHERE project_id = $1 ORDER BY deploy_number DESC
+		 LIMIT $2 OFFSET $3`,
+		projectID, limit, offset,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list deployments: %w", err)
@@ -677,6 +701,7 @@ func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.
 			&d.ID, &d.ProjectID, &d.DeployNumber, &d.Status, &d.CommitSHA, &d.Branch,
 			&d.ImageTag, &d.ContainerID, &d.SourceRevision, &d.BuildStrategy, &d.BuildCommand,
 			&d.StartCommand, &d.RuntimeType, &d.InternalPort, &d.HealthStrategy,
+			&d.ExecutionMode, &d.ImageDigest, &d.EnvConfigHash, &d.EnvSnapshot,
 			&d.StartedAt, &d.BuiltAt, &d.DeployedAt, &d.FinishedAt, &d.DurationMs, &d.FailureReason, &d.CreatedAt,
 		)
 		if err != nil {
@@ -692,6 +717,48 @@ func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.
 	return deployments, nil
 }
 
+// ListActiveDeployments retrieves all deployments that are currently active or have an associated container.
+func (s *DeploymentService) ListActiveDeployments(ctx context.Context) ([]*models.Deployment, error) {
+	if s.db == nil {
+		return []*models.Deployment{}, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
+		 image_tag, container_id, source_revision, build_strategy, build_command,
+		 start_command, runtime_type, internal_port, health_strategy,
+		 COALESCE(execution_mode, 'build'), image_digest, env_config_hash, env_snapshot,
+		 started_at, built_at, deployed_at, finished_at, duration_ms, failure_reason, created_at
+		 FROM deployments WHERE status IN ('running', 'cloning', 'building', 'starting', 'health_checking') OR container_id IS NOT NULL
+		 ORDER BY created_at DESC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active deployments: %w", err)
+	}
+	defer rows.Close()
+
+	var deployments []*models.Deployment
+	for rows.Next() {
+		d := &models.Deployment{}
+		err := rows.Scan(
+			&d.ID, &d.ProjectID, &d.DeployNumber, &d.Status, &d.CommitSHA, &d.Branch,
+			&d.ImageTag, &d.ContainerID, &d.SourceRevision, &d.BuildStrategy, &d.BuildCommand,
+			&d.StartCommand, &d.RuntimeType, &d.InternalPort, &d.HealthStrategy,
+			&d.ExecutionMode, &d.ImageDigest, &d.EnvConfigHash, &d.EnvSnapshot,
+			&d.StartedAt, &d.BuiltAt, &d.DeployedAt, &d.FinishedAt, &d.DurationMs, &d.FailureReason, &d.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan active deployment: %w", err)
+		}
+		deployments = append(deployments, d)
+	}
+
+	if deployments == nil {
+		deployments = []*models.Deployment{}
+	}
+	return deployments, rows.Err()
+}
+
 // GetPreviousSuccessfulDeployment finds the most recent RUNNING or STOPPED deployment
 // before the given deployment for rollback purposes.
 func (s *DeploymentService) GetPreviousSuccessfulDeployment(ctx context.Context, projectID uuid.UUID, beforeDeployNumber int) (*models.Deployment, error) {
@@ -699,12 +766,14 @@ func (s *DeploymentService) GetPreviousSuccessfulDeployment(ctx context.Context,
 	err := s.db.QueryRow(ctx,
 		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
 		 image_tag, container_id, started_at, built_at, deployed_at,
-		 finished_at, duration_ms, failure_reason, created_at
+		 finished_at, duration_ms, failure_reason, created_at,
+		 COALESCE(execution_mode, 'build'), image_digest, env_config_hash, env_snapshot,
+		 source_revision, build_strategy, build_command, start_command, runtime_type, internal_port, health_strategy
 		 FROM deployments
 		 WHERE project_id = $1
 		   AND deploy_number < $2
 		   AND status IN ($3, $4)
-		   AND image_tag IS NOT NULL
+		   AND (image_digest IS NOT NULL OR image_tag IS NOT NULL)
 		 ORDER BY deploy_number DESC
 		 LIMIT 1`,
 		projectID, beforeDeployNumber,
@@ -713,6 +782,8 @@ func (s *DeploymentService) GetPreviousSuccessfulDeployment(ctx context.Context,
 		&d.ID, &d.ProjectID, &d.DeployNumber, &d.Status, &d.CommitSHA,
 		&d.Branch, &d.ImageTag, &d.ContainerID, &d.StartedAt, &d.BuiltAt,
 		&d.DeployedAt, &d.FinishedAt, &d.DurationMs, &d.FailureReason, &d.CreatedAt,
+		&d.ExecutionMode, &d.ImageDigest, &d.EnvConfigHash, &d.EnvSnapshot,
+		&d.SourceRevision, &d.BuildStrategy, &d.BuildCommand, &d.StartCommand, &d.RuntimeType, &d.InternalPort, &d.HealthStrategy,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -906,6 +977,282 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 	return serviceDeployment, nil
 }
 
+// RollbackDeployment rolls back an entire project release to its previous successful deployment release.
+func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *models.Project) (*models.Deployment, error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock the project row FOR UPDATE
+	var lockedProjectID uuid.UUID
+	err = tx.QueryRow(ctx, "SELECT id FROM projects WHERE id = $1 FOR UPDATE", project.ID).Scan(&lockedProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lock project row: %w", err)
+	}
+
+	// Verify no active deployments exist for this project
+	var activeCount int
+	err = tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM deployments 
+		 WHERE project_id = $1 AND status IN ($2, $3, $4, $5, $6)`,
+		project.ID,
+		models.DeployStatusQueued,
+		models.DeployStatusCloning,
+		models.DeployStatusBuilding,
+		models.DeployStatusStarting,
+		models.DeployStatusHealthChecking,
+	).Scan(&activeCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check active deployments: %w", err)
+	}
+	if activeCount > 0 {
+		return nil, ErrActiveDeployment
+	}
+
+	// Determine the deployment number boundary strictly before the current deployment
+	var beforeDeployNumber int
+	if project.CurrentDeploymentID != nil {
+		_ = tx.QueryRow(ctx, "SELECT deploy_number FROM deployments WHERE id = $1", *project.CurrentDeploymentID).Scan(&beforeDeployNumber)
+	}
+	if beforeDeployNumber <= 0 {
+		_ = tx.QueryRow(ctx, "SELECT COALESCE(MAX(deploy_number), 0) FROM deployments WHERE project_id = $1", project.ID).Scan(&beforeDeployNumber)
+	}
+	if beforeDeployNumber <= 1 {
+		return nil, ErrNoDeploymentToRollback
+	}
+
+	// Find the most recent successful deployment for this project strictly before beforeDeployNumber
+	var prev models.Deployment
+	err = tx.QueryRow(ctx,
+		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
+		        image_tag, container_id, started_at, built_at, deployed_at,
+		        finished_at, duration_ms, failure_reason, created_at,
+		        COALESCE(execution_mode, 'build'), image_digest, env_config_hash, env_snapshot,
+		        source_revision, build_strategy, build_command, start_command, runtime_type, internal_port, health_strategy
+		 FROM deployments
+		 WHERE project_id = $1
+		   AND deploy_number < $2
+		   AND status IN ($3, $4)
+		   AND (image_digest IS NOT NULL OR image_tag IS NOT NULL)
+		   AND ($5::uuid IS NULL OR id != $5)
+		 ORDER BY deploy_number DESC
+		 LIMIT 1`,
+		project.ID,
+		beforeDeployNumber,
+		models.DeployStatusRunning,
+		models.DeployStatusStopped,
+		project.CurrentDeploymentID,
+	).Scan(
+		&prev.ID, &prev.ProjectID, &prev.DeployNumber, &prev.Status, &prev.CommitSHA,
+		&prev.Branch, &prev.ImageTag, &prev.ContainerID, &prev.StartedAt, &prev.BuiltAt,
+		&prev.DeployedAt, &prev.FinishedAt, &prev.DurationMs, &prev.FailureReason, &prev.CreatedAt,
+		&prev.ExecutionMode, &prev.ImageDigest, &prev.EnvConfigHash, &prev.EnvSnapshot,
+		&prev.SourceRevision, &prev.BuildStrategy, &prev.BuildCommand, &prev.StartCommand, &prev.RuntimeType, &prev.InternalPort, &prev.HealthStrategy,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNoDeploymentToRollback
+		}
+		return nil, fmt.Errorf("failed to find previous deployment: %w", err)
+	}
+
+	// Fetch any services for the project
+	rows, err := tx.Query(ctx,
+		`SELECT id, name, role, build_strategy, build_command, start_command, runtime_type, internal_port,
+		        COALESCE(dockerfile_path, 'Dockerfile'), COALESCE(build_context, '.'),
+		        COALESCE(health_strategy, 'auto'), health_check_path,
+		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
+		 FROM services WHERE project_id = $1`,
+		project.ID,
+	)
+	var svcList []models.Service
+	if err == nil {
+		for rows.Next() {
+			var s models.Service
+			if err := rows.Scan(
+				&s.ID, &s.Name, &s.Role, &s.BuildStrategy, &s.BuildCommand, &s.StartCommand, &s.RuntimeType,
+				&s.InternalPort, &s.DockerfilePath, &s.BuildContext, &s.HealthStrategy, &s.HealthCheckPath,
+				&s.CpuMillicores, &s.MemoryMB, &s.PidsLimit, &s.EphemeralStorageMB,
+			); err == nil {
+				svcList = append(svcList, s)
+			}
+		}
+		rows.Close()
+	}
+
+	// In single-container legacy mode, require immutable image or tag
+	if len(svcList) == 0 {
+		if (prev.ImageDigest == nil || *prev.ImageDigest == "") && (prev.ImageTag == nil || *prev.ImageTag == "") {
+			return nil, errors.New("cannot rollback: prior deployment has no immutable image or digest to reuse")
+		}
+	}
+
+	var maxNumber *int
+	_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM deployments WHERE project_id = $1", project.ID).Scan(&maxNumber)
+	deployNumber := 1
+	if maxNumber != nil {
+		deployNumber = *maxNumber + 1
+	}
+
+	now := time.Now()
+	newDeployID := uuid.New()
+	newDeploy := &models.Deployment{
+		ID:             newDeployID,
+		ProjectID:      project.ID,
+		DeployNumber:   deployNumber,
+		Status:         models.DeployStatusQueued,
+		Branch:         prev.Branch,
+		ExecutionMode:  models.ExecutionModeReuseImage,
+		ImageDigest:    prev.ImageDigest,
+		ImageTag:       prev.ImageTag,
+		SourceRevision: prev.SourceRevision,
+		EnvConfigHash:  prev.EnvConfigHash,
+		EnvSnapshot:    prev.EnvSnapshot,
+		BuildStrategy:  prev.BuildStrategy,
+		BuildCommand:   prev.BuildCommand,
+		StartCommand:   prev.StartCommand,
+		RuntimeType:    prev.RuntimeType,
+		InternalPort:   prev.InternalPort,
+		HealthStrategy: prev.HealthStrategy,
+		StartedAt:      &now,
+		CreatedAt:      now,
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO deployments (
+			id, project_id, deploy_number, status, branch, image_tag,
+			build_strategy, build_command, start_command, runtime_type, internal_port, health_strategy,
+			execution_mode, image_digest, env_config_hash, env_snapshot, source_revision,
+			started_at, created_at
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+		newDeploy.ID, newDeploy.ProjectID, newDeploy.DeployNumber,
+		newDeploy.Status, newDeploy.Branch, newDeploy.ImageTag,
+		newDeploy.BuildStrategy, newDeploy.BuildCommand, newDeploy.StartCommand,
+		newDeploy.RuntimeType, newDeploy.InternalPort, newDeploy.HealthStrategy,
+		newDeploy.ExecutionMode, newDeploy.ImageDigest, newDeploy.EnvConfigHash, newDeploy.EnvSnapshot, newDeploy.SourceRevision,
+		newDeploy.StartedAt, newDeploy.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert rollback deployment: %w", err)
+	}
+
+	// For multi-service projects, create rollback service deployment for each service
+	for _, svcItem := range svcList {
+		var prevSvc models.ServiceDeployment
+		sErr := tx.QueryRow(ctx,
+			`SELECT id, deploy_number, image_tag, internal_port, build_strategy, build_command,
+			        start_command, runtime_type, COALESCE(dockerfile_path, 'Dockerfile'),
+			        COALESCE(build_context, '.'), COALESCE(health_strategy, 'auto'), health_check_path,
+			        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
+			        image_digest, source_revision, env_config_hash, COALESCE(execution_mode, 'build'), env_snapshot
+			 FROM service_deployments
+			 WHERE service_id = $1
+			   AND (deployment_id = $2 OR (status IN ($3, $4) AND (image_digest IS NOT NULL OR image_tag IS NOT NULL)))
+			 ORDER BY deploy_number DESC
+			 LIMIT 1`,
+			svcItem.ID, prev.ID, models.DeployStatusRunning, models.DeployStatusStopped,
+		).Scan(
+			&prevSvc.ID, &prevSvc.DeployNumber, &prevSvc.ImageTag, &prevSvc.InternalPort,
+			&prevSvc.BuildStrategy, &prevSvc.BuildCommand, &prevSvc.StartCommand, &prevSvc.RuntimeType,
+			&prevSvc.DockerfilePath, &prevSvc.BuildContext, &prevSvc.HealthStrategy, &prevSvc.HealthCheckPath,
+			&prevSvc.CpuMillicores, &prevSvc.MemoryMB, &prevSvc.PidsLimit, &prevSvc.EphemeralStorageMB,
+			&prevSvc.ImageDigest, &prevSvc.SourceRevision, &prevSvc.EnvConfigHash, &prevSvc.ExecutionMode, &prevSvc.EnvSnapshot,
+		)
+
+		var svcMaxNum *int
+		_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", svcItem.ID).Scan(&svcMaxNum)
+		svcDeployNum := 1
+		if svcMaxNum != nil {
+			svcDeployNum = *svcMaxNum + 1
+		}
+
+		svcDeployID := uuid.New()
+		sd := &models.ServiceDeployment{
+			ID:              svcDeployID,
+			DeploymentID:    &newDeploy.ID,
+			ServiceID:       svcItem.ID,
+			ServiceName:     svcItem.Name,
+			DeployNumber:    svcDeployNum,
+			Status:          models.DeployStatusQueued,
+			ExecutionMode:   models.ExecutionModeReuseImage,
+			ImageTag:        prevSvc.ImageTag,
+			ImageDigest:     prevSvc.ImageDigest,
+			InternalPort:    svcItem.InternalPort,
+			BuildStrategy:   svcItem.BuildStrategy,
+			BuildCommand:    svcItem.BuildCommand,
+			StartCommand:    svcItem.StartCommand,
+			RuntimeType:     svcItem.RuntimeType,
+			DockerfilePath:  svcItem.DockerfilePath,
+			BuildContext:    svcItem.BuildContext,
+			HealthStrategy:  svcItem.HealthStrategy,
+			HealthCheckPath: svcItem.HealthCheckPath,
+			ResourceConfig:  svcItem.ResourceConfig,
+			SourceRevision:  prevSvc.SourceRevision,
+			EnvConfigHash:   prevSvc.EnvConfigHash,
+			EnvSnapshot:     prevSvc.EnvSnapshot,
+			StartedAt:       &now,
+			CreatedAt:       now,
+		}
+		if sErr == nil && (prevSvc.ImageDigest != nil || prevSvc.ImageTag != nil) {
+			sd.InternalPort = prevSvc.InternalPort
+			sd.BuildStrategy = prevSvc.BuildStrategy
+			sd.BuildCommand = prevSvc.BuildCommand
+			sd.StartCommand = prevSvc.StartCommand
+			sd.RuntimeType = prevSvc.RuntimeType
+			sd.DockerfilePath = prevSvc.DockerfilePath
+			sd.BuildContext = prevSvc.BuildContext
+			sd.HealthStrategy = prevSvc.HealthStrategy
+			sd.HealthCheckPath = prevSvc.HealthCheckPath
+			sd.ResourceConfig = prevSvc.ResourceConfig
+		}
+
+		if _, insErr := tx.Exec(ctx,
+			`INSERT INTO service_deployments (
+				id, deployment_id, service_id, deploy_number, status, image_tag,
+				build_strategy, build_command, start_command, runtime_type,
+				dockerfile_path, build_context, internal_port, health_strategy, health_check_path,
+				cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
+				image_digest, source_revision, env_config_hash, execution_mode, env_snapshot,
+				started_at, created_at
+			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
+			sd.ID, sd.DeploymentID, sd.ServiceID, sd.DeployNumber, sd.Status, sd.ImageTag,
+			sd.BuildStrategy, sd.BuildCommand, sd.StartCommand, sd.RuntimeType,
+			sd.DockerfilePath, sd.BuildContext, sd.InternalPort, sd.HealthStrategy, sd.HealthCheckPath,
+			sd.CpuMillicores, sd.MemoryMB, sd.PidsLimit, sd.EphemeralStorageMB,
+			sd.ImageDigest, sd.SourceRevision, sd.EnvConfigHash, sd.ExecutionMode, sd.EnvSnapshot,
+			sd.StartedAt, sd.CreatedAt,
+		); insErr != nil {
+			return nil, fmt.Errorf("failed to insert rollback service deployment for service %s: %w", svcItem.Name, insErr)
+		}
+
+		_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3", models.ServiceStatusDeploying, now, svcItem.ID)
+		newDeploy.ServiceDeployments = append(newDeploy.ServiceDeployments, sd)
+	}
+
+	_, err = tx.Exec(ctx,
+		"UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
+		models.ProjectStatusDeploying, now, project.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update project status for rollback: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit project rollback: %w", err)
+	}
+
+	slog.Info("project rollback deployment created",
+		"deployment_id", newDeploy.ID,
+		"project_id", project.ID,
+		"deploy_number", newDeploy.DeployNumber,
+		"execution_mode", newDeploy.ExecutionMode,
+	)
+
+	return newDeploy, nil
+}
+
 // GetServiceDeployment retrieves an individual service deployment record by ID.
 func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) (*models.ServiceDeployment, error) {
 	sd := &models.ServiceDeployment{}
@@ -1021,6 +1368,12 @@ func (s *DeploymentService) AddDeploymentServiceLog(
 	serviceID *uuid.UUID,
 	phase, stream, message string,
 ) (*models.DeploymentLog, error) {
+	// Clamp single log message size to 64KB to prevent unbounded payload growth
+	const maxLogMsgBytes = 64 * 1024
+	if len(message) > maxLogMsgBytes {
+		message = message[:maxLogMsgBytes] + " ... [truncated: exceeded 64KB log size limit]"
+	}
+
 	log := &models.DeploymentLog{
 		DeploymentID:        deploymentID,
 		ServiceDeploymentID: serviceDeploymentID,
@@ -1041,12 +1394,21 @@ func (s *DeploymentService) AddDeploymentServiceLog(
 	return log, nil
 }
 
-// GetDeploymentLogs retrieves logs for a release deployment.
-func (s *DeploymentService) GetDeploymentLogs(ctx context.Context, deploymentID uuid.UUID) ([]*models.DeploymentLog, error) {
+// GetDeploymentLogs retrieves logs for a release deployment with bounded limit (default 2000, max 5000).
+func (s *DeploymentService) GetDeploymentLogs(ctx context.Context, deploymentID uuid.UUID, pagination ...int) ([]*models.DeploymentLog, error) {
+	limit := 2000
+	if len(pagination) > 0 && pagination[0] > 0 {
+		limit = pagination[0]
+		if limit > 5000 {
+			limit = 5000
+		}
+	}
+
 	rows, err := s.db.Query(ctx,
 		`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
-		 FROM deployment_logs WHERE deployment_id = $1 ORDER BY timestamp ASC, id ASC`,
-		deploymentID,
+		 FROM deployment_logs WHERE deployment_id = $1 ORDER BY timestamp ASC, id ASC
+		 LIMIT $2`,
+		deploymentID, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get deployment logs: %w", err)
@@ -1632,6 +1994,15 @@ func (s *DeploymentService) UpdateServiceDeploymentImageDigest(ctx context.Conte
 	_, err := s.db.Exec(ctx,
 		`UPDATE service_deployments SET image_digest = $2 WHERE id = $1`,
 		serviceDeploymentID, digest,
+	)
+	return err
+}
+
+// UpdateDeploymentImageDigest stores the immutable Docker image digest for project rollback.
+func (s *DeploymentService) UpdateDeploymentImageDigest(ctx context.Context, deploymentID uuid.UUID, digest string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE deployments SET image_digest = $2 WHERE id = $1`,
+		deploymentID, digest,
 	)
 	return err
 }

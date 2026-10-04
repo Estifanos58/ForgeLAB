@@ -553,18 +553,118 @@ func (s *ProjectService) GetProject(ctx context.Context, projectID, ownerID uuid
 	return project, nil
 }
 
-// ListProjects retrieves all projects for a user.
-func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID) ([]*models.Project, error) {
+// ListProjects retrieves all projects for a user with bounded pagination and batch-loaded services (no N+1).
+func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID, pagination ...int) ([]*models.Project, error) {
+	limit := 50
+	offset := 0
+	if len(pagination) > 0 && pagination[0] > 0 {
+		limit = pagination[0]
+		if limit > 200 {
+			limit = 200
+		}
+	}
+	if len(pagination) > 1 && pagination[1] >= 0 {
+		offset = pagination[1]
+	}
+
 	rows, err := s.db.Query(ctx,
 		`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
 		 dockerfile_path, build_context, build_strategy, build_command, start_command,
 		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
 		 status, current_deployment_id, port, created_at, updated_at
-		 FROM projects WHERE owner_id = $1 ORDER BY created_at DESC`,
-		ownerID,
+		 FROM projects WHERE owner_id = $1 ORDER BY created_at DESC
+		 LIMIT $2 OFFSET $3`,
+		ownerID, limit, offset,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list projects: %w", err)
+	}
+	defer rows.Close()
+
+	var projects []*models.Project
+	var projectIDs []uuid.UUID
+	for rows.Next() {
+		p := &models.Project{}
+		err := rows.Scan(
+			&p.ID, &p.OwnerID, &p.SourceID, &p.Name, &p.Slug, &p.SourceType, &p.SourceReference, &p.RepositoryPath,
+			&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
+			&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
+			&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
+			&p.CreatedAt, &p.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan project: %w", err)
+		}
+		projects = append(projects, p)
+		projectIDs = append(projectIDs, p.ID)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error reading projects: %w", err)
+	}
+
+	// Single batch query for all services across all fetched projects (resolves N+1 query issue)
+	var servicesByProject map[uuid.UUID][]*models.Service
+	if s.db != nil && len(projectIDs) > 0 {
+		servicesByProject, _ = s.getServiceService().ListServicesByProjectIDs(ctx, projectIDs)
+	}
+
+	for _, p := range projects {
+		var svcs []*models.Service
+		if servicesByProject != nil {
+			svcs = servicesByProject[p.ID]
+		}
+		if len(svcs) == 0 {
+			svcs = []*models.Service{
+				{
+					ID:                 p.ID,
+					ProjectID:          p.ID,
+					SourceID:           p.SourceID,
+					Name:               p.Name,
+					Role:               models.RoleOther,
+					SourcePath:         p.BuildContext,
+					RuntimeType:        p.RuntimeType,
+					BuildStrategy:      p.BuildStrategy,
+					BuildCommand:       p.BuildCommand,
+					StartCommand:       p.StartCommand,
+					DockerfilePath:     p.DockerfilePath,
+					BuildContext:       p.BuildContext,
+					InternalPort:       p.InternalPort,
+					HostPort:           p.Port,
+					PublicExposed:      true,
+					HealthStrategy:     p.HealthStrategy,
+					HealthCheckPath:    p.HealthCheckPath,
+					HealthCheckEnabled: p.HealthCheckEnabled,
+					Status:             p.Status,
+				},
+			}
+		}
+		p.Services = svcs
+		s.populateProjectPreviewURL(p)
+	}
+
+	if projects == nil {
+		projects = []*models.Project{}
+	}
+
+	return projects, nil
+}
+
+// ListActiveProjects retrieves all projects currently marked as running or active.
+func (s *ProjectService) ListActiveProjects(ctx context.Context) ([]*models.Project, error) {
+	if s.db == nil {
+		return []*models.Project{}, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
+		 dockerfile_path, build_context, build_strategy, build_command, start_command,
+		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
+		 status, current_deployment_id, port, created_at, updated_at
+		 FROM projects WHERE status IN ('running', 'partially_running', 'deploying') ORDER BY created_at DESC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active projects: %w", err)
 	}
 	defer rows.Close()
 
@@ -579,46 +679,15 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID) ([
 			&p.CreatedAt, &p.UpdatedAt,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan project: %w", err)
+			return nil, fmt.Errorf("failed to scan active project: %w", err)
 		}
-		if s.db != nil {
-			svcs, _ := s.getServiceService().ListServices(ctx, p.ID)
-			if len(svcs) == 0 {
-				svcs = []*models.Service{
-					{
-						ID:                 p.ID,
-						ProjectID:          p.ID,
-						SourceID:           p.SourceID,
-						Name:               p.Name,
-						Role:               models.RoleOther,
-						SourcePath:         p.BuildContext,
-						RuntimeType:        p.RuntimeType,
-						BuildStrategy:      p.BuildStrategy,
-						BuildCommand:       p.BuildCommand,
-						StartCommand:       p.StartCommand,
-						DockerfilePath:     p.DockerfilePath,
-						BuildContext:       p.BuildContext,
-						InternalPort:       p.InternalPort,
-						HostPort:           p.Port,
-						PublicExposed:      true,
-						HealthStrategy:     p.HealthStrategy,
-						HealthCheckPath:    p.HealthCheckPath,
-						HealthCheckEnabled: p.HealthCheckEnabled,
-						Status:             p.Status,
-					},
-				}
-			}
-			p.Services = svcs
-		}
-		s.populateProjectPreviewURL(p)
 		projects = append(projects, p)
 	}
 
 	if projects == nil {
 		projects = []*models.Project{}
 	}
-
-	return projects, nil
+	return projects, rows.Err()
 }
 
 // UpdateProject updates project settings.

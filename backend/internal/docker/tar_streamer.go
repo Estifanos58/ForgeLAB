@@ -8,8 +8,17 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+)
+
+var (
+	ErrBuildContextTooLarge     = errors.New("build context exceeds maximum allowed total size limit")
+	ErrBuildContextTooManyFiles = errors.New("build context exceeds maximum allowed file count limit")
+	ErrBuildContextFileTooLarge = errors.New("build context contains a file exceeding maximum allowed single file size limit")
+	ErrBuildContextAccessDenied = errors.New("build context file access denied or security violation during traversal")
+	ErrSymlinkEscape            = errors.New("build context contains a symlink pointing outside the build context boundary")
 )
 
 // TarStreamerOptions configures the streaming build context generator.
@@ -18,6 +27,27 @@ type TarStreamerOptions struct {
 	Matcher         *DockerignoreMatcher
 	VirtualFiles    map[string][]byte
 	EmitLog         func(phase, stream, message string)
+	MaxTotalBytes   int64
+	MaxFiles        int
+	MaxFileSize     int64
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	if v, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
 }
 
 // StreamBuildContext creates a streaming tar archive of the build context directory.
@@ -29,14 +59,38 @@ type TarStreamerOptions struct {
 func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadCloser {
 	pr, pw := io.Pipe()
 
+	maxTotalBytes := opts.MaxTotalBytes
+	if maxTotalBytes <= 0 {
+		maxTotalBytes = getEnvInt64("BUILD_CONTEXT_MAX_BYTES", 500*1024*1024) // 500 MB default
+	}
+	maxFiles := opts.MaxFiles
+	if maxFiles <= 0 {
+		maxFiles = getEnvInt("BUILD_CONTEXT_MAX_FILES", 50000) // 50,000 files default
+	}
+	maxFileSize := opts.MaxFileSize
+	if maxFileSize <= 0 {
+		maxFileSize = getEnvInt64("BUILD_CONTEXT_MAX_FILE_BYTES", 100*1024*1024) // 100 MB default
+	}
+
+	canonicalContextDir, err := filepath.EvalSymlinks(opts.BuildContextDir)
+	if err != nil {
+		canonicalContextDir = filepath.Clean(opts.BuildContextDir)
+	}
+
 	go func() {
 		var streamErr error
+		tw := tar.NewWriter(pw)
 		defer func() {
-			pw.CloseWithError(streamErr)
+			if streamErr != nil {
+				_ = pw.CloseWithError(streamErr)
+			} else {
+				_ = tw.Close()
+				_ = pw.Close()
+			}
 		}()
 
-		tw := tar.NewWriter(pw)
-		defer tw.Close()
+		var totalBytes int64
+		var fileCount int
 
 		// 1. Stream virtual in-memory files first (e.g. generated Dockerfile.forgelab)
 		for vName, vContent := range opts.VirtualFiles {
@@ -47,10 +101,28 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 			default:
 			}
 
+			fileCount++
+			if fileCount > maxFiles {
+				streamErr = fmt.Errorf("%w (limit: %d files)", ErrBuildContextTooManyFiles, maxFiles)
+				return
+			}
+
+			vSize := int64(len(vContent))
+			if vSize > maxFileSize {
+				streamErr = fmt.Errorf("%w: virtual file %s size %d exceeds limit %d", ErrBuildContextFileTooLarge, vName, vSize, maxFileSize)
+				return
+			}
+
+			totalBytes += vSize
+			if totalBytes > maxTotalBytes {
+				streamErr = fmt.Errorf("%w: total size exceeds limit of %d bytes", ErrBuildContextTooLarge, maxTotalBytes)
+				return
+			}
+
 			vHeader := &tar.Header{
 				Name:     filepath.ToSlash(strings.TrimPrefix(vName, "/")),
 				Mode:     0644,
-				Size:     int64(len(vContent)),
+				Size:     vSize,
 				ModTime:  time.Now(),
 				Typeflag: tar.TypeReg,
 			}
@@ -69,11 +141,18 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 		// 2. Efficiently walk the build context directory
 		streamErr = filepath.WalkDir(opts.BuildContextDir, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
-				// Log warning but continue if permission or transient error on non-essential file
-				if opts.EmitLog != nil {
-					opts.EmitLog("build", "stderr", fmt.Sprintf("Warning: could not read path %s: %v", path, walkErr))
+				if os.IsNotExist(walkErr) {
+					// File disappeared during traversal - non-fatal, log warning
+					if opts.EmitLog != nil {
+						opts.EmitLog("build", "stderr", fmt.Sprintf("Warning: file disappeared during traversal %s: %v", path, walkErr))
+					}
+					return nil
 				}
-				return nil
+				if os.IsPermission(walkErr) {
+					return fmt.Errorf("%w: permission denied accessing %s: %v", ErrBuildContextAccessDenied, path, walkErr)
+				}
+				// Other unexpected or security errors must fail the build
+				return fmt.Errorf("%w: failed accessing %s: %v", ErrBuildContextAccessDenied, path, walkErr)
 			}
 
 			select {
@@ -110,17 +189,56 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 
 			info, err := d.Info()
 			if err != nil {
-				// File may have been deleted concurrently
-				return nil
+				if os.IsNotExist(err) {
+					// File removed concurrently
+					return nil
+				}
+				if os.IsPermission(err) {
+					return fmt.Errorf("%w: permission denied on %s: %v", ErrBuildContextAccessDenied, slashRelPath, err)
+				}
+				return fmt.Errorf("stat error for %s: %w", slashRelPath, err)
 			}
 
 			var linkTarget string
 			if info.Mode()&os.ModeSymlink != 0 {
 				target, err := os.Readlink(path)
 				if err != nil {
-					return nil // Skip broken symlink
+					if os.IsNotExist(err) {
+						return nil // Disappeared concurrently
+					}
+					return fmt.Errorf("%w: failed reading symlink %s: %v", ErrBuildContextAccessDenied, slashRelPath, err)
+				}
+
+				// Verify symlink does not escape build context boundary
+				var resolvedTarget string
+				if filepath.IsAbs(target) {
+					resolvedTarget = filepath.Clean(target)
+				} else {
+					resolvedTarget = filepath.Clean(filepath.Join(filepath.Dir(path), target))
+				}
+				if realTarget, err := filepath.EvalSymlinks(resolvedTarget); err == nil {
+					resolvedTarget = realTarget
+				}
+				relToRoot, err := filepath.Rel(canonicalContextDir, resolvedTarget)
+				if err != nil || strings.HasPrefix(relToRoot, "..") || filepath.IsAbs(relToRoot) {
+					return fmt.Errorf("%w: symlink %s points to %s outside build context", ErrSymlinkEscape, slashRelPath, target)
 				}
 				linkTarget = target
+			}
+
+			fileCount++
+			if fileCount > maxFiles {
+				return fmt.Errorf("%w (limit: %d files exceeded at %s)", ErrBuildContextTooManyFiles, maxFiles, slashRelPath)
+			}
+
+			if info.Mode().IsRegular() {
+				if info.Size() > maxFileSize {
+					return fmt.Errorf("%w: file %s size %d exceeds limit %d bytes", ErrBuildContextFileTooLarge, slashRelPath, info.Size(), maxFileSize)
+				}
+				totalBytes += info.Size()
+				if totalBytes > maxTotalBytes {
+					return fmt.Errorf("%w: total context size %d exceeds limit %d bytes", ErrBuildContextTooLarge, totalBytes, maxTotalBytes)
+				}
 			}
 
 			header, err := tar.FileInfoHeader(info, linkTarget)
@@ -141,17 +259,23 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 			if info.Mode().IsRegular() {
 				file, err := os.Open(path)
 				if err != nil {
-					// File might be locked or removed
-					return nil
+					if os.IsNotExist(err) {
+						return nil // Disappeared concurrently
+					}
+					if os.IsPermission(err) {
+						return fmt.Errorf("%w: permission denied opening %s: %v", ErrBuildContextAccessDenied, slashRelPath, err)
+					}
+					return fmt.Errorf("%w: failed opening %s: %v", ErrBuildContextAccessDenied, slashRelPath, err)
 				}
-				defer file.Close()
 
 				// Stream directly using internal 32KB copy buffer
-				if _, err := io.Copy(tw, file); err != nil {
-					if errors.Is(err, io.ErrClosedPipe) {
-						return err
+				_, copyErr := io.Copy(tw, file)
+				file.Close()
+				if copyErr != nil {
+					if errors.Is(copyErr, io.ErrClosedPipe) {
+						return copyErr
 					}
-					return fmt.Errorf("failed streaming file %s: %w", slashRelPath, err)
+					return fmt.Errorf("failed streaming file %s: %w", slashRelPath, copyErr)
 				}
 			}
 

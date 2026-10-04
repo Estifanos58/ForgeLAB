@@ -42,6 +42,19 @@ func (s *AgentSession) IsExpired() bool {
 	return time.Now().After(s.ExpiresAt)
 }
 
+// Snapshot returns an immutable, detached copy of the session
+func (s *AgentSession) Snapshot() *AgentSession {
+	if s == nil {
+		return nil
+	}
+	snap := *s
+	if s.SourceID != nil {
+		id := *s.SourceID
+		snap.SourceID = &id
+	}
+	return &snap
+}
+
 // SessionManager manages active agent sessions in a thread-safe manner
 type SessionManager struct {
 	mu          sync.RWMutex
@@ -136,7 +149,7 @@ func (sm *SessionManager) CreateSession(userID uuid.UUID, agentID string, ttl ti
 	sm.tokens[token] = sessionID
 	sm.mu.Unlock()
 
-	return session, nil
+	return session.Snapshot(), nil
 }
 
 // ValidateToken looks up a session by token and verifies it is not expired
@@ -147,14 +160,13 @@ func (sm *SessionManager) ValidateToken(token string) (*AgentSession, error) {
 	}
 
 	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
 	sessionID, ok := sm.tokens[cleanToken]
 	if !ok {
-		sm.mu.RUnlock()
 		return nil, ErrSessionNotFound
 	}
 	session, exists := sm.sessions[sessionID]
-	sm.mu.RUnlock()
-
 	if !exists {
 		return nil, ErrSessionNotFound
 	}
@@ -165,19 +177,30 @@ func (sm *SessionManager) ValidateToken(token string) (*AgentSession, error) {
 		return nil, ErrSessionConsumed
 	}
 
-	return session, nil
+	return session.Snapshot(), nil
 }
 
 // BindSource associates an authenticated session with a source ID and folder name
 func (sm *SessionManager) BindSource(token string, sourceID uuid.UUID, folderName string, agentID string) (*AgentSession, error) {
-	session, err := sm.ValidateToken(token)
-	if err != nil {
-		return nil, err
+	cleanToken := strings.TrimSpace(token)
+	if cleanToken == "" {
+		return nil, ErrInvalidToken
 	}
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	sessionID, ok := sm.tokens[cleanToken]
+	if !ok {
+		return nil, ErrSessionNotFound
+	}
+	session, exists := sm.sessions[sessionID]
+	if !exists {
+		return nil, ErrSessionNotFound
+	}
+	if session.IsExpired() {
+		return nil, ErrSessionExpired
+	}
 	if session.Consumed {
 		return nil, ErrSessionConsumed
 	}
@@ -198,7 +221,7 @@ func (sm *SessionManager) BindSource(token string, sourceID uuid.UUID, folderNam
 
 	session.SourceID = &sourceID
 	session.FolderName = folderName
-	return session, nil
+	return session.Snapshot(), nil
 }
 
 // VerifyTokenForSource validates that a session token is authorized for a specific bound source.
@@ -215,14 +238,13 @@ func (sm *SessionManager) VerifyTokenForSource(token string, sourceID uuid.UUID,
 	}
 
 	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
 	sessionID, ok := sm.tokens[cleanToken]
 	if !ok {
-		sm.mu.RUnlock()
 		return nil, ErrSessionNotFound
 	}
 	session, exists := sm.sessions[sessionID]
-	sm.mu.RUnlock()
-
 	if !exists {
 		return nil, ErrSessionNotFound
 	}
@@ -243,15 +265,15 @@ func (sm *SessionManager) VerifyTokenForSource(token string, sourceID uuid.UUID,
 		return nil, fmt.Errorf("%w: session not bound to requested source", ErrUnauthorized)
 	}
 
-	return session, nil
+	return session.Snapshot(), nil
 }
 
 // VerifyForRegistration checks that user owns the session, it is unexpired, and source/agent match
 func (sm *SessionManager) VerifyForRegistration(userID uuid.UUID, sessionID uuid.UUID, token string) (*AgentSession, error) {
 	sm.mu.RLock()
-	session, exists := sm.sessions[sessionID]
-	sm.mu.RUnlock()
+	defer sm.mu.RUnlock()
 
+	session, exists := sm.sessions[sessionID]
 	if !exists {
 		return nil, ErrSessionNotFound
 	}
@@ -276,7 +298,7 @@ func (sm *SessionManager) VerifyForRegistration(userID uuid.UUID, sessionID uuid
 		return nil, errors.New("session has not been bound to a verified local source")
 	}
 
-	return session, nil
+	return session.Snapshot(), nil
 }
 
 // MarkConsumed flags a session as consumed so it cannot be reused
@@ -302,7 +324,7 @@ func (sm *SessionManager) FindSessionBySourceID(sourceID uuid.UUID) (*AgentSessi
 			if s.IsExpired() {
 				return nil, ErrSessionExpired
 			}
-			return s, nil
+			return s.Snapshot(), nil
 		}
 	}
 	return nil, ErrSessionNotFound

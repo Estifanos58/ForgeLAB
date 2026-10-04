@@ -4,7 +4,7 @@ services:
     container_name: forgelab-postgres
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-forgelab}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forgelab_dev_password}
@@ -23,7 +23,7 @@ services:
     container_name: forgelab-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - forgelab_redisdata:/data
     healthcheck:
@@ -97,8 +97,8 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
       timeout: 5s
-      retries: 5
-      start_period: 5s
+      retries: 10
+      start_period: 15s
 
   frontend:
     build:

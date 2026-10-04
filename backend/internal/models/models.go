@@ -284,6 +284,10 @@ type Deployment struct {
 	RuntimeType        string               `json:"runtime_type"`
 	InternalPort       int                  `json:"internal_port"`
 	HealthStrategy     string               `json:"health_strategy"`
+	ImageDigest        *string              `json:"image_digest,omitempty"`
+	ExecutionMode      string               `json:"execution_mode,omitempty"`
+	EnvConfigHash      *string              `json:"env_config_hash,omitempty"`
+	EnvSnapshot        []byte               `json:"-"`
 	ServiceDeployments []*ServiceDeployment `json:"service_deployments,omitempty"`
 	StartedAt          *time.Time           `json:"started_at"`
 	BuiltAt            *time.Time           `json:"built_at"`

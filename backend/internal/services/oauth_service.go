@@ -36,6 +36,21 @@ type OAuthUserInfo struct {
 	EmailVerified bool
 }
 
+// OAuthStateRecord stores metadata bound to the OAuth state parameter.
+type OAuthStateRecord struct {
+	Provider string    `json:"provider"`
+	Nonce    string    `json:"nonce"`
+	Expires  time.Time `json:"expires"`
+}
+
+var consumeOAuthStateScript = redis.NewScript(`
+	local val = redis.call('GET', KEYS[1])
+	if val then
+		redis.call('DEL', KEYS[1])
+	end
+	return val
+`)
+
 // OAuthService handles Google and GitHub OAuth 2.0 flows.
 type OAuthService struct {
 	googleCfg   config.OAuthConfig
@@ -43,11 +58,6 @@ type OAuthService struct {
 	redis       *redis.Client
 	httpClient  *http.Client
 	fallbackMem sync.Map
-}
-
-type memoryState struct {
-	provider string
-	expires  time.Time
 }
 
 // NewOAuthService creates a new OAuthService.
@@ -62,75 +72,95 @@ func NewOAuthService(googleCfg, githubCfg config.OAuthConfig, redisClient *redis
 	}
 }
 
-// GenerateState creates a cryptographically secure, single-use state token and stores it in Redis.
-func (s *OAuthService) GenerateState(ctx context.Context, provider string) (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("failed to generate random state: %w", err)
+// GenerateState creates a cryptographically secure, single-use state token and session nonce, storing it in Redis.
+func (s *OAuthService) GenerateState(ctx context.Context, provider string) (string, string, error) {
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return "", "", fmt.Errorf("failed to generate random state: %w", err)
 	}
-	state := hex.EncodeToString(b)
+	state := hex.EncodeToString(stateBytes)
+
+	nonceBytes := make([]byte, 32)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return "", "", fmt.Errorf("failed to generate random nonce: %w", err)
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+
+	record := OAuthStateRecord{
+		Provider: provider,
+		Nonce:    nonce,
+		Expires:  time.Now().Add(10 * time.Minute),
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return "", "", err
+	}
+
 	key := "forgelab:oauth:state:" + state
 
 	if s.redis != nil {
-		if err := s.redis.Set(ctx, key, provider, 10*time.Minute).Err(); err != nil {
-			return "", fmt.Errorf("failed to store oauth state in redis: %w", err)
+		if err := s.redis.Set(ctx, key, string(payload), 10*time.Minute).Err(); err != nil {
+			return "", "", fmt.Errorf("failed to store oauth state in redis: %w", err)
 		}
 	} else {
-		s.fallbackMem.Store(key, memoryState{
-			provider: provider,
-			expires:  time.Now().Add(10 * time.Minute),
-		})
+		s.fallbackMem.Store(key, record)
 	}
 
-	return state, nil
+	return state, nonce, nil
 }
 
-// ValidateState validates and single-use consumes the state parameter.
-func (s *OAuthService) ValidateState(ctx context.Context, provider, state string) error {
-	if state == "" {
+// ValidateState validates and single-use consumes the state parameter and matches the session nonce.
+func (s *OAuthService) ValidateState(ctx context.Context, provider, state, nonce string) error {
+	if state == "" || nonce == "" {
 		return ErrInvalidOAuthState
 	}
 	key := "forgelab:oauth:state:" + state
 
+	var record OAuthStateRecord
+
 	if s.redis != nil {
-		val, err := s.redis.Get(ctx, key).Result()
+		res, err := consumeOAuthStateScript.Run(ctx, s.redis, []string{key}).Result()
 		if err != nil {
 			if errors.Is(err, redis.Nil) {
 				return ErrInvalidOAuthState
 			}
-			return fmt.Errorf("failed to query oauth state: %w", err)
+			return fmt.Errorf("failed to atomically consume oauth state: %w", err)
 		}
-		// Single-use: delete immediately to prevent replay
-		_ = s.redis.Del(ctx, key).Err()
-
-		if val != provider {
+		rawStr, ok := res.(string)
+		if !ok || rawStr == "" {
 			return ErrInvalidOAuthState
 		}
-		return nil
+		if err := json.Unmarshal([]byte(rawStr), &record); err != nil {
+			return ErrInvalidOAuthState
+		}
+	} else {
+		raw, ok := s.fallbackMem.LoadAndDelete(key)
+		if !ok {
+			return ErrInvalidOAuthState
+		}
+		rec, ok := raw.(OAuthStateRecord)
+		if !ok || time.Now().After(rec.Expires) {
+			return ErrInvalidOAuthState
+		}
+		record = rec
 	}
 
-	// In-memory fallback
-	raw, ok := s.fallbackMem.LoadAndDelete(key)
-	if !ok {
-		return ErrInvalidOAuthState
-	}
-	ms, ok := raw.(memoryState)
-	if !ok || time.Now().After(ms.expires) || ms.provider != provider {
+	if record.Provider != provider || record.Nonce != nonce {
 		return ErrInvalidOAuthState
 	}
 
 	return nil
 }
 
-// GetGoogleAuthURL returns the authorization URL for Google OAuth.
-func (s *OAuthService) GetGoogleAuthURL(ctx context.Context) (string, error) {
+// GetGoogleAuthURL returns the authorization URL and browser nonce for Google OAuth.
+func (s *OAuthService) GetGoogleAuthURL(ctx context.Context) (authURL string, nonce string, err error) {
 	if !s.googleCfg.IsConfigured() {
-		return "", ErrProviderNotConfigured
+		return "", "", ErrProviderNotConfigured
 	}
 
-	state, err := s.GenerateState(ctx, "google")
+	state, nonce, err := s.GenerateState(ctx, "google")
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	params := url.Values{}
@@ -142,16 +172,16 @@ func (s *OAuthService) GetGoogleAuthURL(ctx context.Context) (string, error) {
 	params.Set("access_type", "online")
 	params.Set("prompt", "select_account")
 
-	return "https://accounts.google.com/o/oauth2/v2/auth?" + params.Encode(), nil
+	return "https://accounts.google.com/o/oauth2/v2/auth?" + params.Encode(), nonce, nil
 }
 
 // HandleGoogleCallback exchanges authorization code and fetches profile info.
-func (s *OAuthService) HandleGoogleCallback(ctx context.Context, code, state string) (*OAuthUserInfo, error) {
+func (s *OAuthService) HandleGoogleCallback(ctx context.Context, code, state, nonce string) (*OAuthUserInfo, error) {
 	if !s.googleCfg.IsConfigured() {
 		return nil, ErrProviderNotConfigured
 	}
 
-	if err := s.ValidateState(ctx, "google", state); err != nil {
+	if err := s.ValidateState(ctx, "google", state, nonce); err != nil {
 		return nil, err
 	}
 
@@ -226,15 +256,15 @@ func (s *OAuthService) HandleGoogleCallback(ctx context.Context, code, state str
 	}, nil
 }
 
-// GetGitHubAuthURL returns the authorization URL for GitHub OAuth.
-func (s *OAuthService) GetGitHubAuthURL(ctx context.Context) (string, error) {
+// GetGitHubAuthURL returns the authorization URL and browser nonce for GitHub OAuth.
+func (s *OAuthService) GetGitHubAuthURL(ctx context.Context) (authURL string, nonce string, err error) {
 	if !s.githubCfg.IsConfigured() {
-		return "", ErrProviderNotConfigured
+		return "", "", ErrProviderNotConfigured
 	}
 
-	state, err := s.GenerateState(ctx, "github")
+	state, nonce, err := s.GenerateState(ctx, "github")
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	params := url.Values{}
@@ -243,16 +273,16 @@ func (s *OAuthService) GetGitHubAuthURL(ctx context.Context) (string, error) {
 	params.Set("scope", "read:user user:email")
 	params.Set("state", state)
 
-	return "https://github.com/login/oauth/authorize?" + params.Encode(), nil
+	return "https://github.com/login/oauth/authorize?" + params.Encode(), nonce, nil
 }
 
 // HandleGitHubCallback exchanges authorization code and fetches profile info.
-func (s *OAuthService) HandleGitHubCallback(ctx context.Context, code, state string) (*OAuthUserInfo, error) {
+func (s *OAuthService) HandleGitHubCallback(ctx context.Context, code, state, nonce string) (*OAuthUserInfo, error) {
 	if !s.githubCfg.IsConfigured() {
 		return nil, ErrProviderNotConfigured
 	}
 
-	if err := s.ValidateState(ctx, "github", state); err != nil {
+	if err := s.ValidateState(ctx, "github", state, nonce); err != nil {
 		return nil, err
 	}
 

@@ -14,7 +14,7 @@ export interface AuthTokens {
 
 export interface AuthResponse {
   user: User;
-  tokens: AuthTokens;
+  expires_in: number;
 }
 
 export type ProjectStatus = 'inactive' | 'deploying' | 'running' | 'partially_running' | 'stopped' | 'failed';

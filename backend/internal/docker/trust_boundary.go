@@ -10,11 +10,27 @@ import (
 	"github.com/docker/go-connections/nat"
 )
 
+const (
+	MinCpuMillicores = 100
+	MaxCpuMillicores = 16000 // 16 cores
+
+	MinMemoryMB = 64
+	MaxMemoryMB = 32768 // 32 GB
+
+	MinPidsLimit = 16
+	MaxPidsLimit = 4096
+)
+
 var (
-	ErrDockerSocketMountRejected  = errors.New("security violation: mounting host Docker socket into deployed containers is strictly forbidden")
-	ErrSensitiveHostMountRejected = errors.New("security violation: mounting sensitive host filesystem paths into deployed containers is forbidden")
-	ErrPrivilegedModeRejected     = errors.New("security violation: running deployed containers in privileged mode is forbidden")
-	ErrHostNetworkingRejected     = errors.New("security violation: host networking mode for deployed containers is forbidden")
+	ErrDockerSocketMountRejected    = errors.New("security violation: mounting host Docker socket into deployed containers is strictly forbidden")
+	ErrSensitiveHostMountRejected   = errors.New("security violation: mounting sensitive host filesystem paths into deployed containers is forbidden")
+	ErrPrivilegedModeRejected       = errors.New("security violation: running deployed containers in privileged mode is forbidden")
+	ErrHostNetworkingRejected       = errors.New("security violation: host networking mode for deployed containers is forbidden")
+	ErrHostMountNotAllowed          = errors.New("security violation: host mount path is not within the approved ForgeLAB mount allowlist")
+	ErrCpuOutOfRange                = fmt.Errorf("cpu_millicores must be between %d and %d (0.1 to 16 cores)", MinCpuMillicores, MaxCpuMillicores)
+	ErrMemoryOutOfRange             = fmt.Errorf("memory_mb must be between %d and %d (64MB to 32GB)", MinMemoryMB, MaxMemoryMB)
+	ErrPidsOutOfRange               = fmt.Errorf("pids_limit must be between %d and %d", MinPidsLimit, MaxPidsLimit)
+	ErrEphemeralStorageNotSupported = errors.New("ephemeral_storage_mb is not supported on this host environment; remove or leave empty")
 )
 
 // Sensitive host paths that must never be mounted into tenant containers.
@@ -33,12 +49,13 @@ var restrictedHostMounts = []string{
 
 // ContainerSecurityOptions parameters for creating a strictly sandboxed container.
 type ContainerSecurityOptions struct {
-	PortBindings        nat.PortMap
-	TargetCpuMillicores int
-	TargetMemoryMB      int
-	TargetPidsLimit     int
-	Binds               []string
-	NetworkMode         string
+	PortBindings          nat.PortMap
+	TargetCpuMillicores   int
+	TargetMemoryMB        int
+	TargetPidsLimit       int
+	Binds                 []string
+	NetworkMode           string
+	AllowedMountPrefixes  []string
 }
 
 // ValidateAndBuildSecureHostConfig creates a centralized, strictly validated Docker HostConfig
@@ -66,47 +83,57 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 
 		// Check against sensitive paths
 		for _, restricted := range restrictedHostMounts {
-			if lowerHostPath == strings.ToLower(filepath.Clean(restricted)) || strings.HasPrefix(lowerHostPath, strings.ToLower(filepath.Clean(restricted))+string(filepath.Separator)) {
+			cleanRestricted := strings.ToLower(filepath.Clean(restricted))
+			if lowerHostPath == cleanRestricted || strings.HasPrefix(lowerHostPath, cleanRestricted+string(filepath.Separator)) {
 				return nil, fmt.Errorf("%w: %s", ErrSensitiveHostMountRejected, hostPath)
+			}
+		}
+
+		// Check against allowlist if configured
+		if len(opts.AllowedMountPrefixes) > 0 {
+			allowed := false
+			for _, prefix := range opts.AllowedMountPrefixes {
+				cleanPrefix := strings.ToLower(filepath.Clean(prefix))
+				if lowerHostPath == cleanPrefix || strings.HasPrefix(lowerHostPath, cleanPrefix+string(filepath.Separator)) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return nil, fmt.Errorf("%w: %s", ErrHostMountNotAllowed, hostPath)
 			}
 		}
 
 		validatedBinds = append(validatedBinds, bind)
 	}
 
-	// 3. Centralize and clamp resource limits
+	// 3. Truthful resource limits validation (no silent clamping)
 	cpuMilli := opts.TargetCpuMillicores
-	if cpuMilli <= 0 {
+	if cpuMilli == 0 {
 		cpuMilli = 1000 // default 1 CPU core
-	} else if cpuMilli < 100 {
-		cpuMilli = 100 // clamp minimum to 100 millicores (0.1 core)
-	} else if cpuMilli > 16000 {
-		cpuMilli = 16000 // cap at 16 cores
+	} else if cpuMilli < MinCpuMillicores || cpuMilli > MaxCpuMillicores {
+		return nil, ErrCpuOutOfRange
 	}
 
 	memMB := opts.TargetMemoryMB
-	if memMB <= 0 {
+	if memMB == 0 {
 		memMB = 1024 // default 1 GB
-	} else if memMB < 32 {
-		memMB = 32 // clamp minimum to 32 MB
-	} else if memMB > 32768 {
-		memMB = 32768 // cap at 32 GB
+	} else if memMB < MinMemoryMB || memMB > MaxMemoryMB {
+		return nil, ErrMemoryOutOfRange
 	}
 
 	pidsLimitVal := opts.TargetPidsLimit
-	if pidsLimitVal <= 0 {
+	if pidsLimitVal == 0 {
 		pidsLimitVal = 256 // default 256
-	} else if pidsLimitVal < 16 {
-		pidsLimitVal = 16 // clamp minimum to 16
-	} else if pidsLimitVal > 4096 {
-		pidsLimitVal = 4096 // cap at 4096
+	} else if pidsLimitVal < MinPidsLimit || pidsLimitVal > MaxPidsLimit {
+		return nil, ErrPidsOutOfRange
 	}
 
 	cpuNano := int64(cpuMilli) * 1_000_000
 	memBytes := int64(memMB) * 1024 * 1024
 	pidsLimit := int64(pidsLimitVal)
 
-	// 4. Construct secure HostConfig
+	// 4. Construct secure HostConfig with defense-in-depth isolation
 	hostConfig := &container.HostConfig{
 		PortBindings: opts.PortBindings,
 		Binds:        validatedBinds,
@@ -120,6 +147,23 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 			Memory:    memBytes,
 			NanoCPUs:  cpuNano,
 			PidsLimit: &pidsLimit,
+			Ulimits: []*container.Ulimit{
+				{
+					Name: "nofile",
+					Soft: 1024,
+					Hard: 2048,
+				},
+			},
+		},
+		Tmpfs: map[string]string{
+			"/tmp": "rw,noexec,nosuid,size=64m",
+		},
+		LogConfig: container.LogConfig{
+			Type: "json-file",
+			Config: map[string]string{
+				"max-size": "10m",
+				"max-file": "3",
+			},
 		},
 	}
 

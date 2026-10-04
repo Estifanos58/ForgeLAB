@@ -84,6 +84,112 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 	return services, nil
 }
 
+// ListServicesByProjectIDs retrieves services for multiple projects in a single batch query (avoiding N+1).
+func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectIDs []uuid.UUID) (map[uuid.UUID][]*models.Service, error) {
+	result := make(map[uuid.UUID][]*models.Service)
+	if s.db == nil || len(projectIDs) == 0 {
+		return result, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
+		        build_strategy, build_candidates, build_command, start_command, dockerfile_path, build_context,
+		        internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
+		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
+		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
+		 FROM services WHERE project_id = ANY($1) ORDER BY created_at ASC`,
+		projectIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to batch query services: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		svc := &models.Service{}
+		var candidatesJSON []byte
+
+		err := rows.Scan(
+			&svc.ID, &svc.ProjectID, &svc.SourceID, &svc.Name, &svc.Role, &svc.SourcePath, &svc.RuntimeType,
+			&svc.Framework, &svc.PackageManager, &svc.BuildStrategy, &candidatesJSON, &svc.BuildCommand,
+			&svc.StartCommand, &svc.DockerfilePath, &svc.BuildContext, &svc.InternalPort, &svc.HostPort,
+			&svc.PublicExposed, &svc.HealthStrategy, &svc.HealthCheckPath, &svc.HealthCheckEnabled,
+			&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
+			&svc.CreatedAt, &svc.UpdatedAt,
+			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan service: %w", err)
+		}
+
+		if len(candidatesJSON) > 0 {
+			_ = json.Unmarshal(candidatesJSON, &svc.BuildCandidates)
+		}
+		if svc.BuildCandidates == nil {
+			svc.BuildCandidates = []models.BuildCandidate{}
+		}
+
+		populateServicePreviewURL(svc)
+		result[svc.ProjectID] = append(result[svc.ProjectID], svc)
+	}
+
+	return result, rows.Err()
+}
+
+// ListActiveServices retrieves all services that are currently marked as running or deploying, or have an assigned container.
+func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Service, error) {
+	if s.db == nil {
+		return []*models.Service{}, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
+		        build_strategy, build_candidates, build_command, start_command, dockerfile_path, build_context,
+		        internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
+		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
+		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
+		 FROM services WHERE status IN ('running', 'deploying', 'starting', 'health_checking') OR container_id IS NOT NULL ORDER BY created_at ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active services: %w", err)
+	}
+	defer rows.Close()
+
+	var services []*models.Service
+	for rows.Next() {
+		svc := &models.Service{}
+		var candidatesJSON []byte
+
+		err := rows.Scan(
+			&svc.ID, &svc.ProjectID, &svc.SourceID, &svc.Name, &svc.Role, &svc.SourcePath, &svc.RuntimeType,
+			&svc.Framework, &svc.PackageManager, &svc.BuildStrategy, &candidatesJSON, &svc.BuildCommand,
+			&svc.StartCommand, &svc.DockerfilePath, &svc.BuildContext, &svc.InternalPort, &svc.HostPort,
+			&svc.PublicExposed, &svc.HealthStrategy, &svc.HealthCheckPath, &svc.HealthCheckEnabled,
+			&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
+			&svc.CreatedAt, &svc.UpdatedAt,
+			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan active service: %w", err)
+		}
+
+		if len(candidatesJSON) > 0 {
+			_ = json.Unmarshal(candidatesJSON, &svc.BuildCandidates)
+		}
+		if svc.BuildCandidates == nil {
+			svc.BuildCandidates = []models.BuildCandidate{}
+		}
+
+		populateServicePreviewURL(svc)
+		services = append(services, svc)
+	}
+
+	if services == nil {
+		services = []*models.Service{}
+	}
+	return services, rows.Err()
+}
+
 // GetService retrieves a service by ID.
 func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*models.Service, error) {
 	if s.db == nil {

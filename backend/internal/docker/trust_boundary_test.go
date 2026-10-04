@@ -56,17 +56,41 @@ func TestTrustBoundary_RejectsHostNetworking(t *testing.T) {
 	}
 }
 
-func TestTrustBoundary_EnforcesSecurityAndResourceClamping(t *testing.T) {
-	// Extreme/unbounded inputs
+func TestTrustBoundary_EnforcesTruthfulResourceLimitsAndIsolation(t *testing.T) {
+	// Rejects unsupported/excessive CPU
+	_, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
+		TargetCpuMillicores: 999999, // Exceeds 16 cores
+	})
+	if err == nil || !errors.Is(err, ErrCpuOutOfRange) {
+		t.Fatalf("expected ErrCpuOutOfRange, got %v", err)
+	}
+
+	// Rejects unsupported/excessive Memory
+	_, err = ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
+		TargetMemoryMB: 1000000, // Exceeds 32GB
+	})
+	if err == nil || !errors.Is(err, ErrMemoryOutOfRange) {
+		t.Fatalf("expected ErrMemoryOutOfRange, got %v", err)
+	}
+
+	// Rejects dangerously low Memory
+	_, err = ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
+		TargetMemoryMB: 10, // Below 64MB
+	})
+	if err == nil || !errors.Is(err, ErrMemoryOutOfRange) {
+		t.Fatalf("expected ErrMemoryOutOfRange, got %v", err)
+	}
+
+	// Default inputs (0 specified) should apply secure platform defaults
 	opts := ContainerSecurityOptions{
-		TargetCpuMillicores: 999999, // Unbounded high
-		TargetMemoryMB:      1,      // Dangerously low
-		TargetPidsLimit:     0,      // Unspecified
+		TargetCpuMillicores: 0,
+		TargetMemoryMB:      0,
+		TargetPidsLimit:     0,
 	}
 
 	cfg, err := ValidateAndBuildSecureHostConfig(opts)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("unexpected error on default limits: %v", err)
 	}
 
 	// Invariant: Privileged must be false
@@ -86,17 +110,41 @@ func TestTrustBoundary_EnforcesSecurityAndResourceClamping(t *testing.T) {
 		t.Errorf("expected security opt no-new-privileges:true, got %v", cfg.SecurityOpt)
 	}
 
-	// Clamped resources
-	// 16 cores max = 16_000_000_000 nanocores
-	if cfg.Resources.NanoCPUs != 16_000_000_000 {
-		t.Errorf("expected clamped NanoCPUs 16_000_000_000, got %d", cfg.Resources.NanoCPUs)
+	// Invariant: CapDrop ALL
+	if len(cfg.CapDrop) != 1 || cfg.CapDrop[0] != "ALL" {
+		t.Errorf("expected CapDrop [ALL], got %v", cfg.CapDrop)
 	}
-	// Min 32 MB = 32 * 1024 * 1024 bytes
-	if cfg.Resources.Memory != 32*1024*1024 {
-		t.Errorf("expected clamped Memory 33554432, got %d", cfg.Resources.Memory)
+
+	// Default resources: 1 core = 1_000_000_000 nanocores
+	if cfg.Resources.NanoCPUs != 1_000_000_000 {
+		t.Errorf("expected default NanoCPUs 1_000_000_000, got %d", cfg.Resources.NanoCPUs)
+	}
+	// Default 1024 MB = 1024 * 1024 * 1024 bytes
+	if cfg.Resources.Memory != 1024*1024*1024 {
+		t.Errorf("expected default Memory 1073741824, got %d", cfg.Resources.Memory)
 	}
 	// Default pids limit = 256
 	if *cfg.Resources.PidsLimit != 256 {
 		t.Errorf("expected default PidsLimit 256, got %d", *cfg.Resources.PidsLimit)
+	}
+
+	// Invariant: tmpfs and log rotation bounded
+	if cfg.Tmpfs["/tmp"] == "" {
+		t.Errorf("expected /tmp tmpfs mount configured")
+	}
+	if cfg.LogConfig.Config["max-size"] != "10m" {
+		t.Errorf("expected log rotation max-size 10m, got %s", cfg.LogConfig.Config["max-size"])
+	}
+}
+
+func TestTrustBoundary_EnforcesMountAllowlist(t *testing.T) {
+	opts := ContainerSecurityOptions{
+		AllowedMountPrefixes: []string{"/app/data/builds"},
+		Binds:                []string{"/home/user/malicious:/app/src"},
+	}
+
+	_, err := ValidateAndBuildSecureHostConfig(opts)
+	if err == nil || !errors.Is(err, ErrHostMountNotAllowed) {
+		t.Fatalf("expected ErrHostMountNotAllowed for mount outside allowlist, got %v", err)
 	}
 }
