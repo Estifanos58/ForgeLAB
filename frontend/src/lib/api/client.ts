@@ -348,6 +348,12 @@ export const api = {
         method: 'DELETE',
       });
     },
+
+    async importLocal(projectId: string): Promise<{ imported_count: number; message: string }> {
+      return apiFetch<{ imported_count: number; message: string }>(`/api/projects/${projectId}/env/import`, {
+        method: 'POST',
+      });
+    },
   },
 
   integrations: {

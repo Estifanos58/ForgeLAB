@@ -551,3 +551,145 @@ func (s *SecretService) GetBuildVariables(ctx context.Context, projectID uuid.UU
 
 	return normalArgs, secretVars, allSecretValues, nil
 }
+
+// IsSecretKey uses sensible heuristics to classify whether an environment variable key represents a secret.
+// Names containing PASSWORD, SECRET, TOKEN, API_KEY, etc. are classified as secret.
+// Common public frontend variables (e.g. NEXT_PUBLIC_) without secret keywords remain non-secret.
+func IsSecretKey(key string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	if upper == "" {
+		return false
+	}
+
+	// Explicitly non-secret prefixes (e.g. frontend public config) unless they also contain explicit secret keywords
+	isPublicPrefix := strings.HasPrefix(upper, "NEXT_PUBLIC_") ||
+		strings.HasPrefix(upper, "VITE_") ||
+		strings.HasPrefix(upper, "REACT_APP_") ||
+		strings.HasPrefix(upper, "PUBLIC_")
+
+	secretKeywords := []string{
+		"PASSWORD", "PASSWD", "SECRET", "TOKEN", "API_KEY", "APIKEY",
+		"PRIVATE_KEY", "PRIVKEY", "ACCESS_KEY", "AUTH_KEY", "DATABASE_URL",
+		"DB_PASS", "DB_PASSWORD", "CREDENTIAL", "CREDENTIALS", "CERTIFICATE",
+		"SIGNING_KEY", "ENCRYPTION_KEY", "BEARER", "SECRET_KEY", "CLIENT_SECRET",
+	}
+
+	for _, kw := range secretKeywords {
+		if strings.Contains(upper, kw) {
+			return true
+		}
+	}
+
+	if isPublicPrefix {
+		return false
+	}
+
+	return false
+}
+
+// ImportEnvVarEntry represents a candidate environment variable for import.
+type ImportEnvVarEntry struct {
+	ServiceID *uuid.UUID
+	Key       string
+	Value     string
+	Scope     string
+	IsSecret  *bool // nil = auto-classify via IsSecretKey
+}
+
+// ImportEnvVarsIfMissing idempotently imports environment variables, preserving existing user settings.
+// Values are immediately encrypted at rest using AES-256-GCM.
+// Precedence rule: existing ForgeLAB variable > imported .env value.
+func (s *SecretService) ImportEnvVarsIfMissing(ctx context.Context, projectID, ownerID uuid.UUID, entries []ImportEnvVarEntry) (int, error) {
+	if s.db == nil || s.encryptor == nil {
+		return 0, nil
+	}
+
+	// Verify project ownership if ownerID is provided
+	if ownerID != uuid.Nil && s.projectService != nil {
+		if _, err := s.projectService.GetProject(ctx, projectID, ownerID); err != nil {
+			return 0, err
+		}
+	}
+
+	// 1. Fetch existing keys for this project to prevent overwriting user configuration
+	rows, err := s.db.Query(ctx, `SELECT key, service_id FROM environment_variables WHERE project_id = $1`, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query existing environment variables: %w", err)
+	}
+	defer rows.Close()
+
+	existingSet := make(map[string]bool)
+	for rows.Next() {
+		var k string
+		var svcID *uuid.UUID
+		if err := rows.Scan(&k, &svcID); err == nil {
+			svcKey := "project"
+			if svcID != nil {
+				svcKey = svcID.String()
+			}
+			existingSet[svcKey+":"+k] = true
+		}
+	}
+
+	insertedCount := 0
+
+	for _, entry := range entries {
+		trimmedKey := strings.TrimSpace(entry.Key)
+		if trimmedKey == "" || len(trimmedKey) > 255 {
+			continue
+		}
+
+		svcKey := "project"
+		if entry.ServiceID != nil {
+			svcKey = entry.ServiceID.String()
+		}
+
+		// Conflict resolution rule: existing ForgeLAB variable > imported .env value
+		if existingSet[svcKey+":"+trimmedKey] {
+			continue
+		}
+
+		// Determine is_secret
+		isSecret := IsSecretKey(trimmedKey)
+		if entry.IsSecret != nil {
+			isSecret = *entry.IsSecret
+		}
+
+		// Default scope = runtime
+		scope := entry.Scope
+		if scope == "" {
+			scope = models.EnvScopeRuntime
+		}
+
+		// Encrypt value at rest immediately with AES-256-GCM
+		encVal, err := s.encryptor.Encrypt([]byte(entry.Value))
+		if err != nil {
+			slog.Warn("failed to encrypt imported environment variable", "key", trimmedKey, "error", err)
+			continue
+		}
+
+		now := time.Now()
+		if entry.ServiceID == nil {
+			_, err = s.db.Exec(ctx,
+				`INSERT INTO environment_variables (id, project_id, service_id, key, encrypted_value, is_secret, scope, created_at, updated_at)
+				 VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $7)
+				 ON CONFLICT (project_id, key) WHERE service_id IS NULL DO NOTHING`,
+				uuid.New(), projectID, trimmedKey, encVal, isSecret, scope, now,
+			)
+		} else {
+			_, err = s.db.Exec(ctx,
+				`INSERT INTO environment_variables (id, project_id, service_id, key, encrypted_value, is_secret, scope, created_at, updated_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+				 ON CONFLICT (project_id, service_id, key) WHERE service_id IS NOT NULL DO NOTHING`,
+				uuid.New(), projectID, entry.ServiceID, trimmedKey, encVal, isSecret, scope, now,
+			)
+		}
+
+		if err == nil {
+			existingSet[svcKey+":"+trimmedKey] = true
+			insertedCount++
+		}
+	}
+
+	return insertedCount, nil
+}

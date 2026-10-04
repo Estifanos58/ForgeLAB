@@ -147,6 +147,7 @@ func main() {
 	deploymentService := services.NewDeploymentService(pool)
 	secretService := services.NewSecretService(pool, encryptor, projectService)
 	deploymentService.SetSecretService(secretService)
+	projectService.SetSecretService(secretService)
 
 	// Initialize WebSocket Hub
 	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient, cfg.App.AllowedOriginsList()...)
@@ -250,7 +251,7 @@ func main() {
 	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
 	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, deploymentService, dockerEngine, deployQueue)
-	envHandler := handlers.NewEnvHandler(secretService)
+	envHandler := handlers.NewEnvHandler(secretService, projectService)
 	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
@@ -369,6 +370,7 @@ func main() {
 				// Environment Variables / Secrets
 				r.Get("/{id}/env", envHandler.List)
 				r.Post("/{id}/env", envHandler.Set)
+				r.Post("/{id}/env/import", envHandler.ImportLocalEnv)
 				r.Delete("/{id}/env/{key}", envHandler.Delete)
 
 				// Deployments

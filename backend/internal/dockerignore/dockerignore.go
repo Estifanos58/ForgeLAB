@@ -23,6 +23,8 @@ var DefaultIgnorePatterns = []string{
 	".DS_Store",
 	"Thumbs.db",
 	"*.log",
+	".env",
+	".env.*",
 	".env.local",
 	".env.*.local",
 }

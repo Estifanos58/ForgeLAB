@@ -24,6 +24,7 @@ import (
 	"github.com/forgelab/backend/internal/analyzer"
 	"github.com/forgelab/backend/internal/detector"
 	"github.com/forgelab/backend/internal/dockerignore"
+	"github.com/forgelab/backend/internal/envparser"
 	"github.com/forgelab/backend/internal/security"
 )
 
@@ -1046,6 +1047,13 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		s.mu.Unlock()
 		s.renderSessionResponse(w, session)
 
+	case "environment", "env":
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleSourceEnvironment(w, r, session)
+
 	case "stream-context":
 		// Streams tarball of a service's source directory (respects .dockerignore)
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
@@ -1192,6 +1200,97 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 	default:
 		http.Error(w, "unknown action", http.StatusNotFound)
 	}
+}
+
+// SourceEnvironmentResponse represents the parsed .env variables returned to the authenticated backend.
+type SourceEnvironmentResponse struct {
+	SourceID uuid.UUID                    `json:"source_id"`
+	Root     map[string]string            `json:"root"`
+	Services map[string]map[string]string `json:"services"`
+}
+
+func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Request, session *LocalSourceSession) {
+	resp := SourceEnvironmentResponse{
+		SourceID: session.SourceID,
+		Root:     make(map[string]string),
+		Services: make(map[string]map[string]string),
+	}
+
+	// 1. Root .env
+	rootEnvPath := filepath.Join(session.CanonicalPath, ".env")
+	if fi, err := os.Stat(rootEnvPath); err == nil && !fi.IsDir() {
+		if rootVars, err := envparser.ParseFile(rootEnvPath); err == nil {
+			resp.Root = rootVars
+		} else {
+			slog.Warn("error parsing root .env", "source_id", session.SourceID, "error", err)
+		}
+	}
+
+	// 2. Service-specific .env
+	servicePaths := r.URL.Query()["service_path"]
+	if len(servicePaths) == 0 {
+		if sp := r.URL.Query().Get("service_paths"); sp != "" {
+			servicePaths = strings.Split(sp, ",")
+		} else if sp := r.URL.Query().Get("services"); sp != "" {
+			servicePaths = strings.Split(sp, ",")
+		}
+	}
+
+	if len(servicePaths) > 0 {
+		for _, sp := range servicePaths {
+			trimmed := strings.TrimSpace(sp)
+			if trimmed == "" || trimmed == "." {
+				continue
+			}
+			cleanRel, err := security.ValidateRelativeServicePath(trimmed)
+			if err != nil {
+				continue
+			}
+			svcDir := filepath.Join(session.CanonicalPath, filepath.FromSlash(cleanRel))
+			evalSvcDir, err := filepath.EvalSymlinks(svcDir)
+			if err != nil {
+				continue
+			}
+			relCheck, err := filepath.Rel(session.CanonicalPath, evalSvcDir)
+			if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
+				continue
+			}
+
+			svcEnvPath := filepath.Join(evalSvcDir, ".env")
+			if fi, err := os.Stat(svcEnvPath); err == nil && !fi.IsDir() {
+				if svcVars, err := envparser.ParseFile(svcEnvPath); err == nil && len(svcVars) > 0 {
+					resp.Services[cleanRel] = svcVars
+				}
+			}
+		}
+	} else {
+		// Discover immediate subdirectories under root for .env
+		entries, err := os.ReadDir(session.CanonicalPath)
+		if err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() || analyzer.IsPrunedDir(entry.Name()) {
+					continue
+				}
+				subDir := filepath.Join(session.CanonicalPath, entry.Name())
+				evalSubDir, err := filepath.EvalSymlinks(subDir)
+				if err != nil {
+					continue
+				}
+				relCheck, err := filepath.Rel(session.CanonicalPath, evalSubDir)
+				if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
+					continue
+				}
+				subEnvPath := filepath.Join(evalSubDir, ".env")
+				if fi, err := os.Stat(subEnvPath); err == nil && !fi.IsDir() {
+					if subVars, err := envparser.ParseFile(subEnvPath); err == nil && len(subVars) > 0 {
+						resp.Services[entry.Name()] = subVars
+					}
+				}
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {

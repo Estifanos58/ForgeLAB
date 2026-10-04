@@ -3,6 +3,8 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -12,11 +14,16 @@ import (
 )
 
 type EnvHandler struct {
-	secretService *services.SecretService
+	secretService  *services.SecretService
+	projectService *services.ProjectService
 }
 
-func NewEnvHandler(secretService *services.SecretService) *EnvHandler {
-	return &EnvHandler{secretService: secretService}
+func NewEnvHandler(secretService *services.SecretService, projectService ...*services.ProjectService) *EnvHandler {
+	h := &EnvHandler{secretService: secretService}
+	if len(projectService) > 0 {
+		h.projectService = projectService[0]
+	}
+	return h
 }
 
 // Set handles POST /api/projects/{id}/env
@@ -138,4 +145,50 @@ func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "environment variable deleted"})
+}
+
+// ImportLocalEnv handles POST /api/projects/{id}/env/import
+func (h *EnvHandler) ImportLocalEnv(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	if h.projectService == nil {
+		writeError(w, http.StatusInternalServerError, "project service not configured")
+		return
+	}
+
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	count, err := h.projectService.ImportProjectEnvironment(r.Context(), project, userID)
+	if err != nil {
+		slog.Error("failed to import environment variables", "project_id", projectID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to import environment variables")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"imported_count": count,
+		"message":        fmt.Sprintf("Successfully imported %d environment variable(s)", count),
+	})
 }

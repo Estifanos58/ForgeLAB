@@ -45,6 +45,8 @@ export function EnvManager({ projectId, services = [] }: EnvManagerProps) {
   const [value, setValue] = useState('');
   const [isSecret, setIsSecret] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importMsg, setImportMsg] = useState<string | null>(null);
 
   // Reveal / Copied State per var id
   const [revealedIds, setRevealedIds] = useState<Record<string, boolean>>({});
@@ -59,6 +61,21 @@ export function EnvManager({ projectId, services = [] }: EnvManagerProps) {
       setError(err.message || 'Failed to load environment variables');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleImportLocal = async () => {
+    setImporting(true);
+    setError(null);
+    setImportMsg(null);
+    try {
+      const res = await api.env.importLocal(projectId);
+      setImportMsg(res.message);
+      await loadEnvVars();
+    } catch (err: any) {
+      setError(err.message || 'Failed to import environment variables');
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -295,9 +312,26 @@ export function EnvManager({ projectId, services = [] }: EnvManagerProps) {
 
       {/* Variables List Header with Filter Tabs */}
       <div className="space-y-3">
+        {importMsg && (
+          <Alert variant="info" className="text-xs py-2">
+            {importMsg}
+          </Alert>
+        )}
+
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
           <div className="text-[11px] font-mono text-neutral-400 uppercase tracking-wider font-semibold flex items-center gap-2">
             <span>Configured Environment Variables ({filteredVars.length})</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handleImportLocal}
+              loading={importing}
+              className="h-6 text-[11px] px-2 gap-1 border-surface-border text-neutral-300 hover:text-white"
+            >
+              <Sparkles className="w-3 h-3 text-emerald-400" />
+              <span>Rescan .env</span>
+            </Button>
           </div>
 
           {/* Navigation Filter Tabs */}

@@ -48,7 +48,8 @@ type Engine struct {
 	workDir             string
 	localBuildMode      string
 	maxConcurrentBuilds int
-	buildSemaphore      chan struct{}
+	buildSem            *BuildSemaphore
+	semMu               sync.Mutex
 	activeLogCollectors sync.Map // map[string]context.CancelFunc — tracks running log collector goroutines
 	activeCancels       sync.Map // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
 }
@@ -83,16 +84,29 @@ func NewEngine(
 		wsHub:               wsHub,
 		workDir:             workDir,
 		localBuildMode:      "direct",
-		maxConcurrentBuilds: 4,
-		buildSemaphore:      make(chan struct{}, 4),
+		maxConcurrentBuilds: 1,
+		buildSem:            NewBuildSemaphore(1),
 	}
+}
+
+func (e *Engine) getBuildSemaphore() *BuildSemaphore {
+	e.semMu.Lock()
+	defer e.semMu.Unlock()
+	if e.buildSem == nil {
+		lim := e.maxConcurrentBuilds
+		if lim <= 0 {
+			lim = 1
+		}
+		e.buildSem = NewBuildSemaphore(lim)
+	}
+	return e.buildSem
 }
 
 // SetMaxConcurrentBuilds configures the global Docker build concurrency limit.
 func (e *Engine) SetMaxConcurrentBuilds(n int) {
 	if n > 0 {
 		e.maxConcurrentBuilds = n
-		e.buildSemaphore = make(chan struct{}, n)
+		e.getBuildSemaphore().SetLimit(n)
 	}
 }
 
@@ -124,20 +138,7 @@ func (e *Engine) CancelActiveDeployment(deploymentID uuid.UUID) bool {
 
 // acquireBuildSlot acquires a slot under the global Docker build concurrency limit.
 func (e *Engine) acquireBuildSlot(ctx context.Context) (func(), error) {
-	if e.buildSemaphore == nil {
-		return func() {}, nil
-	}
-	select {
-	case e.buildSemaphore <- struct{}{}:
-		var once sync.Once
-		return func() {
-			once.Do(func() {
-				<-e.buildSemaphore
-			})
-		}, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return e.getBuildSemaphore().Acquire(ctx)
 }
 
 // SetServiceService configures the service management service.
@@ -268,12 +269,6 @@ func toCoarseServiceStatus(deployStatus string, hasPreviousHealthy bool) string 
 // source -> build -> container -> start -> health check -> promote service -> cleanup old service.
 // It enforces the safety invariant: a failed deployment never replaces the previous healthy service container.
 func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) error {
-	releaseSlot, err := e.acquireBuildSlot(ctx)
-	if err != nil {
-		return fmt.Errorf("concurrency limit wait cancelled: %w", err)
-	}
-	defer releaseSlot()
-
 	serviceDeploy, err := e.deploymentService.GetServiceDeployment(ctx, serviceDeploymentID)
 	if err != nil {
 		return fmt.Errorf("failed to get service deployment %s: %w", serviceDeploymentID, err)
@@ -498,6 +493,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 		// 2. Building Docker Image
 		emitStatus(models.DeployStatusBuilding, nil, nil)
+		if err := e.verifyDockerDaemon(ctx); err != nil {
+			reason := fmt.Sprintf("Docker daemon check failed before build: %v. Please ensure Docker Desktop is running.", err)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
+		}
 		relDockerPath := "Dockerfile"
 		var tarArchive io.ReadCloser
 
@@ -681,7 +682,13 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 		}); err != nil {
 			reason := err.Error()
-			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			cat := ClassifyDockerBuildError(err)
+			if cat == CategoryStorageDaemon || cat == CategoryDaemonUnreachable {
+				diag := e.formatDockerDiagnostic(ctx, err, cat)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, diag)
+			} else {
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			}
 			emitStatus(models.DeployStatusFailed, nil, &reason)
 			return errors.New(reason)
 		}
@@ -1086,12 +1093,6 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 
 // executeLegacySingleContainerDeployment provides fallback execution for legacy projects with 0 services.
 func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, deployment *models.Deployment, project *models.Project) error {
-	releaseSlot, err := e.acquireBuildSlot(ctx)
-	if err != nil {
-		return fmt.Errorf("concurrency limit wait cancelled: %w", err)
-	}
-	defer releaseSlot()
-
 	redactor := logging.NewLogRedactor()
 	emitLog := func(phase, stream, message string) {
 		redactedMsg := redactor.Redact(message)
@@ -1214,6 +1215,12 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		}
 
 		updateStatus(models.DeployStatusBuilding, nil)
+		if err := e.verifyDockerDaemon(ctx); err != nil {
+			reason := fmt.Sprintf("Docker daemon check failed before build: %v. Please ensure Docker Desktop is running.", err)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Preparing build for image '%s'...", *deployment.ImageTag))
 
 		buildStrategy := deployment.BuildStrategy
@@ -1373,7 +1380,13 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 		}); err != nil {
 			reason := err.Error()
-			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			cat := ClassifyDockerBuildError(err)
+			if cat == CategoryStorageDaemon || cat == CategoryDaemonUnreachable {
+				diag := e.formatDockerDiagnostic(ctx, err, cat)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, diag)
+			} else {
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			}
 			updateStatus(models.DeployStatusFailed, &reason)
 			return errors.New(reason)
 		}
@@ -2000,18 +2013,35 @@ func (e *Engine) PruneDanglingResources(ctx context.Context, maxBuildAge time.Du
 // 7. Cancels build context.
 // Defer-based cleanup guarantees response body, source stream, and build context
 // are closed/cancelled exactly once across all success and error paths.
+func (e *Engine) verifyDockerDaemon(ctx context.Context) error {
+	if e.dockerClient == nil {
+		return nil
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, err := e.dockerClient.Ping(pingCtx)
+	return err
+}
+
 func (e *Engine) buildImage(
 	ctx context.Context,
 	tarArchive io.ReadCloser,
 	options types.ImageBuildOptions,
 	onLogLine func(string),
 ) error {
-	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
-	defer buildCancel()
-
 	if tarArchive != nil {
 		defer tarArchive.Close()
 	}
+
+	// Acquire Docker build slot under configurable concurrency limit
+	releaseSlot, err := e.acquireBuildSlot(ctx)
+	if err != nil {
+		return fmt.Errorf("Docker build concurrency limit wait cancelled: %w", err)
+	}
+	defer releaseSlot()
+
+	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer buildCancel()
 
 	var buildReader io.Reader = tarArchive
 	if tarArchive != nil {

@@ -15,7 +15,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"encoding/json"
+	"net"
+	"net/http"
+	"path/filepath"
+
 	"github.com/forgelab/backend/internal/agent"
+	"github.com/forgelab/backend/internal/envparser"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
 )
@@ -36,6 +42,7 @@ type ProjectService struct {
 	sourceService  *SourceService
 	githubService  *GitHubService
 	serviceService *ServiceService
+	secretService  *SecretService
 }
 
 // NewProjectService creates a new ProjectService.
@@ -63,6 +70,10 @@ func (s *ProjectService) getServiceService() *ServiceService {
 
 func (s *ProjectService) SetServiceService(ss *ServiceService) {
 	s.serviceService = ss
+}
+
+func (s *ProjectService) SetSecretService(sec *SecretService) {
+	s.secretService = sec
 }
 
 type CreateServiceInput struct {
@@ -565,6 +576,13 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		}
 	}
 
+	// Automatically import .env variables if present in the local repository
+	if s.secretService != nil {
+		if count, err := s.ImportProjectEnvironment(ctx, project, ownerID); err == nil && count > 0 {
+			slog.Info("imported environment variables from local repository", "project_id", project.ID, "count", count)
+		}
+	}
+
 	s.populateProjectPreviewURL(project)
 	slog.Info("project created", "project_id", project.ID, "name", project.Name, "owner_id", ownerID)
 	return project, nil
@@ -989,4 +1007,153 @@ func generateSlug(name string) string {
 		slug = "project"
 	}
 	return slug
+}
+
+func resolveAgentBaseURL() string {
+	if u := os.Getenv("FORGELAB_AGENT_URL"); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	if h := os.Getenv("FORGELAB_AGENT_HOST"); h != "" {
+		return fmt.Sprintf("http://%s", h)
+	}
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:4142", 200*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return "http://127.0.0.1:4142"
+	}
+	return "http://host.docker.internal:4142"
+}
+
+// ImportProjectEnvironment imports .env files from a local source repository into ForgeLAB's encrypted environment variable store.
+// Handles both root repository .env and service-specific .env in each service's source_path.
+// Service-specific variables override root variables for that service.
+func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *models.Project, ownerID uuid.UUID) (int, error) {
+	if s.secretService == nil {
+		return 0, nil
+	}
+
+	var entries []ImportEnvVarEntry
+
+	if project.SourceType == models.SourceTypeLocalAgent && project.SourceReference != "" {
+		sourceUUID, err := uuid.Parse(project.SourceReference)
+		if err != nil {
+			return 0, fmt.Errorf("invalid source UUID: %w", err)
+		}
+
+		var agentToken string
+		if s.sourceService != nil {
+			agentToken, _ = s.sourceService.GetDecryptedAgentToken(ctx, ownerID, sourceUUID)
+		}
+
+		baseURL := resolveAgentBaseURL()
+		var serviceQueryParts []string
+		for _, svc := range project.Services {
+			if svc.SourcePath != "" && svc.SourcePath != "." {
+				serviceQueryParts = append(serviceQueryParts, "service_path="+url.QueryEscape(svc.SourcePath))
+			}
+		}
+
+		agentURL := fmt.Sprintf("%s/api/agent/sources/%s/environment", baseURL, project.SourceReference)
+		if len(serviceQueryParts) > 0 {
+			agentURL += "?" + strings.Join(serviceQueryParts, "&")
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+		if err != nil {
+			slog.Warn("failed to create agent environment request", "error", err)
+			return 0, nil
+		}
+		if agentToken != "" {
+			req.Header.Set("Authorization", "Bearer "+agentToken)
+			req.Header.Set("X-Agent-Session-Token", agentToken)
+		}
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Warn("agent environment request failed", "error", err)
+			return 0, nil
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			slog.Warn("agent environment request returned non-OK", "status", resp.StatusCode)
+			return 0, nil
+		}
+
+		var envResp struct {
+			Root     map[string]string            `json:"root"`
+			Services map[string]map[string]string `json:"services"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&envResp); err != nil {
+			slog.Warn("failed to decode agent environment response", "error", err)
+			return 0, nil
+		}
+
+		// Root .env mapped to project-level
+		for k, v := range envResp.Root {
+			entries = append(entries, ImportEnvVarEntry{
+				ServiceID: nil,
+				Key:       k,
+				Value:     v,
+				Scope:     models.EnvScopeRuntime,
+			})
+		}
+
+		// Service-specific .env mapped to service
+		for _, svc := range project.Services {
+			if svcEnv, ok := envResp.Services[svc.SourcePath]; ok {
+				svcID := svc.ID
+				for k, v := range svcEnv {
+					entries = append(entries, ImportEnvVarEntry{
+						ServiceID: &svcID,
+						Key:       k,
+						Value:     v,
+						Scope:     models.EnvScopeRuntime,
+					})
+				}
+			}
+		}
+	} else if (project.SourceType == models.SourceTypeLocalDirectory || project.SourceType == models.SourceTypeLocal) && project.RepositoryPath != "" {
+		// Root .env
+		rootEnvPath := filepath.Join(project.RepositoryPath, ".env")
+		if rootVars, err := envparser.ParseFile(rootEnvPath); err == nil {
+			for k, v := range rootVars {
+				entries = append(entries, ImportEnvVarEntry{
+					ServiceID: nil,
+					Key:       k,
+					Value:     v,
+					Scope:     models.EnvScopeRuntime,
+				})
+			}
+		}
+
+		// Service-specific .env
+		for _, svc := range project.Services {
+			if svc.SourcePath != "" && svc.SourcePath != "." {
+				cleanRel, err := security.ValidateRelativeServicePath(svc.SourcePath)
+				if err != nil {
+					continue
+				}
+				svcEnvPath := filepath.Join(project.RepositoryPath, filepath.FromSlash(cleanRel), ".env")
+				if svcVars, err := envparser.ParseFile(svcEnvPath); err == nil && len(svcVars) > 0 {
+					svcID := svc.ID
+					for k, v := range svcVars {
+						entries = append(entries, ImportEnvVarEntry{
+							ServiceID: &svcID,
+							Key:       k,
+							Value:     v,
+							Scope:     models.EnvScopeRuntime,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	if len(entries) == 0 {
+		return 0, nil
+	}
+
+	return s.secretService.ImportEnvVarsIfMissing(ctx, project.ID, ownerID, entries)
 }

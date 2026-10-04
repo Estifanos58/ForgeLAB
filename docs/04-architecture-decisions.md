@@ -406,3 +406,21 @@ On backend startup, the engine queries the Docker daemon to reconcile container 
 - Cleans up orphaned ForgeLAB containers whose project or deployment has reached a terminal state.
 - Synchronizes the in-memory `PortManager` with currently bound host ports to eliminate allocation collisions.
 
+### 7. Docker Build Concurrency & Error Classification
+- **Decoupled Concurrency:** ForgeLAB separates service deployment concurrency from Docker image build concurrency. Service deployments (source resolution, staging, container launch, and health checking) run concurrently, while `ImageBuild` calls are gated through a thread-safe `BuildSemaphore`.
+- **Configurable Limit:** Build concurrency is configured via `FORGELAB_MAX_CONCURRENT_BUILDS` or `FORGELAB_MAX_DOCKER_BUILDS`. For local development and Docker Desktop environments, it defaults conservatively to `1` to avoid containerd snapshotter layer export collisions (`io.containerd.content.v1.content/ingest/` rename races).
+- **Safe Semaphore Lifecycles:** The `BuildSemaphore` guarantees slots are released on build success, daemon failure, timeout, or context cancellation without deadlocks or slot leaks.
+- **Error Classification & Diagnostics:** Errors returned during layer export (e.g. `CreateDiff`, `mount callback failed`, `io.containerd.content.v1.content`, `no such file or directory`) are classified as storage/daemon failures (`CategoryStorageDaemon`). The engine logs clear actionable diagnostics (inspecting Docker Desktop health, storage, and disk space) and queries non-sensitive Docker daemon info (Ping, ServerVersion, OS/Arch, StorageDriver) without leaking credentials or environment variables.
+- **Stream Lifecycle Integrity:** Build contexts are streamed through `io.Reader` (e.g. from the Local Agent). Because streams are consumed once sent to Docker and buffering repositories in memory is unsafe, failed builds fail cleanly once with diagnostic telemetry rather than attempting blind retries with an exhausted stream.
+
+### 8. Local Agent Automatic `.env` Import & Precedence Rules
+- **Automatic Import:** During project creation from a local repository (via Local Agent), ForgeLAB inspects `.env` files and imports missing environment variables into the project's Environment Settings.
+- **Precedence Hierarchy:**
+  1. Service-specific `.env` (`<repo_root>/<service_source_path>/.env`) overrides root-level variables.
+  2. Root `.env` (`<repo_root>/.env`) provides default variables for all services.
+  3. Existing user-configured ForgeLAB variables ALWAYS take precedence over imported values (`existing > imported`).
+- **Secret Classification & Encryption:** Variables matching credential patterns (`*PASSWORD*`, `*SECRET*`, `*TOKEN*`, `*API_KEY*`, `*PRIVATE_KEY*`, `*DATABASE_URL*`) are classified as `is_secret = true`, unless prefixed with public indicators (such as `NEXT_PUBLIC_`). ALL imported variables are immediately encrypted at rest using AES-256-GCM.
+- **Docker Build Context Isolation:** `.env` and `.env.*` are strictly excluded from Docker build context archives via `dockerignore.DefaultIgnorePatterns`. Environment variables are injected only at container runtime or via explicit BuildKit secret mounts, never baked into Docker images.
+- **Parser Security Limits:** The `.env` parser enforces strict limits (maximum 512KB file size, 500 variables, 256 char key length, 8192 char value length) and literal parsing without executing shell expressions or subshells.
+
+
