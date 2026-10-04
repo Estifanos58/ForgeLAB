@@ -27,7 +27,11 @@ func TestConfigLoadDevelopment(t *testing.T) {
 
 func TestConfigLoadProductionRejectsDefaultSecrets(t *testing.T) {
 	os.Setenv("APP_ENV", "production")
+	os.Setenv("COOKIE_SECURE", "true")
+	os.Setenv("RATE_LIMIT_TRUSTED_PROXIES", "127.0.0.1")
 	defer os.Unsetenv("APP_ENV")
+	defer os.Unsetenv("COOKIE_SECURE")
+	defer os.Unsetenv("RATE_LIMIT_TRUSTED_PROXIES")
 
 	// 1. Insecure / short JWT_SECRET
 	os.Setenv("JWT_SECRET", "short-secret")

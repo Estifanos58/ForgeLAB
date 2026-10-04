@@ -310,7 +310,8 @@ func TestEngine_LocalAgent_Deployment_AuthenticatesAfterProjectCreation(t *testi
 	assert.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound}, respWrong.StatusCode)
 
 	// 9. Verify security boundaries: expired token is rejected
-	authSession.ExpiresAt = time.Now().Add(-1 * time.Minute)
+	sm.ExpireSession(authSession.Token)
+	srv.ExpireSession(sourceID)
 	reqExpired, err := http.NewRequestWithContext(context.Background(), http.MethodGet, agentURL, nil)
 	require.NoError(t, err)
 	reqExpired.Header.Set("Authorization", "Bearer "+decryptedToken)

@@ -502,6 +502,14 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		var tarArchive io.ReadCloser
 
 		if project.SourceType == models.SourceTypeLocalAgent {
+			cleanRelPath, pathErr := e.pathValidator.ValidateRelativeServicePath(service.SourcePath)
+			if pathErr != nil {
+				reason := fmt.Sprintf("Path isolation security violation: invalid service path: %v", pathErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
+			}
+
 			baseURL := resolveAgentBaseURL()
 			agentToken := ""
 			if e.sourceService != nil {
@@ -525,7 +533,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s",
 				baseURL,
 				project.SourceReference,
-				url.QueryEscape(service.SourcePath),
+				url.QueryEscape(cleanRelPath),
 				url.QueryEscape(service.RuntimeType),
 				service.InternalPort,
 				url.QueryEscape(service.StartCommand),
@@ -595,7 +603,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			tarArchive = resp.Body
 			if service.BuildStrategy == models.BuildStrategyAuto {
 				relDockerPath = "Dockerfile.forgelab"
+			} else {
+				if service.DockerfilePath != "" {
+					relDockerPath = service.DockerfilePath
+				} else {
+					relDockerPath = "Dockerfile"
+				}
 			}
+		} else {
+			// For non-local-agent sources: local_directory, local_upload, github
 			// Validate build paths against canonical project root using PathValidator
 			isAuto := service.BuildStrategy == models.BuildStrategyAuto
 			svcContextDir, resolvedDockerPath, valErr := e.pathValidator.ValidateServiceBuildPaths(
@@ -1209,74 +1225,130 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		}
 		isAuto := buildStrategy == models.BuildStrategyAuto
 
-		buildContextDir, resolvedDockerPath, valErr := e.pathValidator.ValidateServiceBuildPaths(
-			buildSourceDir,
-			project.BuildContext,
-			project.BuildContext,
-			project.DockerfilePath,
-			isAuto,
-		)
-		if valErr != nil {
-			reason := fmt.Sprintf("Path isolation security violation: %v", valErr)
-			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-			updateStatus(models.DeployStatusFailed, &reason)
-			return errors.New(reason)
-		}
+		var relDockerPath string
+		var tarStream io.ReadCloser
 
-		dockerfilePath := project.DockerfilePath
-		if dockerfilePath == "" {
-			dockerfilePath = "Dockerfile"
-		}
-
-		actualDockerPath := filepath.Join(buildContextDir, dockerfilePath)
-		hasExistingDockerfile := false
-		if _, err := os.Stat(actualDockerPath); err == nil {
-			hasExistingDockerfile = true
-		}
-
-		relDockerPath := resolvedDockerPath
-		var virtualFiles map[string][]byte
-
-		if buildStrategy == models.BuildStrategyDockerfile || (buildStrategy == models.BuildStrategyAuto && hasExistingDockerfile) {
-			if !hasExistingDockerfile {
-				reason := fmt.Sprintf("Dockerfile '%s' not found in build context", dockerfilePath)
+		if project.SourceType == models.SourceTypeLocalAgent {
+			cleanRelPath, pathErr := e.pathValidator.ValidateRelativeServicePath(project.BuildContext)
+			if pathErr != nil {
+				reason := fmt.Sprintf("Path isolation security violation: invalid build context: %v", pathErr)
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 				updateStatus(models.DeployStatusFailed, &reason)
 				return errors.New(reason)
 			}
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Using Dockerfile at '%s'", dockerfilePath))
-		} else {
-			port := deployment.InternalPort
-			if port == 0 {
-				port = project.InternalPort
+			baseURL := resolveAgentBaseURL()
+			agentToken := ""
+			if e.sourceService != nil {
+				if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
+					tok, _ := e.sourceService.GetDecryptedAgentToken(ctx, project.OwnerID, srcUUID)
+					agentToken = tok
+				}
 			}
-			if port == 0 {
-				port = 8080
+			if agentToken == "" {
+				reason := "Local agent session credential missing or expired; please re-select project folder"
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
 			}
-			startCmd := deployment.StartCommand
-			if startCmd == "" {
-				startCmd = project.StartCommand
+			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s",
+				baseURL,
+				project.SourceReference,
+				url.QueryEscape(cleanRelPath),
+				url.QueryEscape(deployment.RuntimeType),
+				deployment.InternalPort,
+				url.QueryEscape(deployment.StartCommand),
+			)
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+			if reqErr != nil {
+				reason := fmt.Sprintf("Failed to request agent stream context: %v", reqErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
 			}
-			dockerfileContent := detector.GenerateDockerfile(deployment.RuntimeType, port, startCmd)
+			req.Header.Set("Authorization", "Bearer "+agentToken)
+			req.Header.Set("X-Agent-Session-Token", agentToken)
+			resp, httpErr := http.DefaultClient.Do(req)
+			if httpErr != nil || resp.StatusCode != http.StatusOK {
+				reason := "Failed to stream source from local agent"
+				if httpErr != nil {
+					reason = httpErr.Error()
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
+			tarStream = resp.Body
 			relDockerPath = "Dockerfile.forgelab"
-			virtualFiles = map[string][]byte{
-				"Dockerfile.forgelab": []byte(dockerfileContent),
+		} else {
+			buildContextDir, resolvedDockerPath, valErr := e.pathValidator.ValidateServiceBuildPaths(
+				buildSourceDir,
+				project.BuildContext,
+				project.BuildContext,
+				project.DockerfilePath,
+				isAuto,
+			)
+			if valErr != nil {
+				reason := fmt.Sprintf("Path isolation security violation: %v", valErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
 			}
-		}
 
-		matcher, _ := LoadDockerignore(buildContextDir)
-		if matcher == nil {
-			matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
-		}
+			dockerfilePath := project.DockerfilePath
+			if dockerfilePath == "" {
+				dockerfilePath = "Dockerfile"
+			}
 
-		tarStream := StreamBuildContext(ctx, TarStreamerOptions{
-			BuildContextDir: buildContextDir,
-			Matcher:         matcher,
-			VirtualFiles:    virtualFiles,
-			EmitLog: func(phase, stream, msg string) {
-				emitLog(phase, stream, msg)
-			},
-		})
+			actualDockerPath := filepath.Join(buildContextDir, dockerfilePath)
+			hasExistingDockerfile := false
+			if _, err := os.Stat(actualDockerPath); err == nil {
+				hasExistingDockerfile = true
+			}
+
+			relDockerPath = resolvedDockerPath
+			var virtualFiles map[string][]byte
+
+			if buildStrategy == models.BuildStrategyDockerfile || (buildStrategy == models.BuildStrategyAuto && hasExistingDockerfile) {
+				if !hasExistingDockerfile {
+					reason := fmt.Sprintf("Dockerfile '%s' not found in build context", dockerfilePath)
+					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+					updateStatus(models.DeployStatusFailed, &reason)
+					return errors.New(reason)
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Using Dockerfile at '%s'", dockerfilePath))
+			} else {
+				port := deployment.InternalPort
+				if port == 0 {
+					port = project.InternalPort
+				}
+				if port == 0 {
+					port = 8080
+				}
+				startCmd := deployment.StartCommand
+				if startCmd == "" {
+					startCmd = project.StartCommand
+				}
+				dockerfileContent := detector.GenerateDockerfile(deployment.RuntimeType, port, startCmd)
+				relDockerPath = "Dockerfile.forgelab"
+				virtualFiles = map[string][]byte{
+					"Dockerfile.forgelab": []byte(dockerfileContent),
+				}
+			}
+
+			matcher, _ := LoadDockerignore(buildContextDir)
+			if matcher == nil {
+				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
+			}
+
+			tarStream = StreamBuildContext(ctx, TarStreamerOptions{
+				BuildContextDir: buildContextDir,
+				Matcher:         matcher,
+				VirtualFiles:    virtualFiles,
+				EmitLog: func(phase, stream, msg string) {
+					emitLog(phase, stream, msg)
+				},
+			})
+		}
 
 		buildArgs := make(map[string]*string)
 		for k, v := range normalBuildArgs {

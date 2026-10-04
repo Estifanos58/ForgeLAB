@@ -643,7 +643,7 @@ func TestSourceHandler_ValidateAgentSession_SourceAwareAuth(t *testing.T) {
 	// 4. Expired token -> rejected
 	expiredSession, err := sm.CreateSession(testUserID, agentID, 10*time.Minute)
 	require.NoError(t, err)
-	expiredSession.ExpiresAt = time.Now().Add(-1 * time.Minute)
+	sm.ExpireSession(expiredSession.Token)
 	payload4, _ := json.Marshal(map[string]string{
 		"token":     expiredSession.Token,
 		"source_id": sourceUUID.String(),

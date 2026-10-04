@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,7 +33,20 @@ import (
 	ws "github.com/forgelab/backend/internal/websocket"
 )
 
+var (
+	Version   = "1.0.0"
+	CommitSHA = "dev"
+	BuildTime = "unknown"
+)
+
 func main() {
+	versionFlag := flag.Bool("version", false, "Print version and exit")
+	flag.Parse()
+	if *versionFlag {
+		fmt.Printf("forgelab-server v%s (commit: %s, built: %s)\n", Version, CommitSHA, BuildTime)
+		return
+	}
+
 	// Load .env file if it exists
 	if err := godotenv.Load("../.env"); err != nil {
 		godotenv.Load(".env")
@@ -61,6 +76,13 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
+
+	fmt.Printf("====================================================\n")
+	fmt.Printf("   ForgeLAB Backend Server v%s (commit: %s, built: %s)\n", Version, CommitSHA, BuildTime)
+	fmt.Printf("   Listening on: http://%s:%d\n", cfg.Server.Host, cfg.Server.Port)
+	fmt.Printf("   Environment:  %s\n", cfg.App.Environment)
+	fmt.Printf("====================================================\n")
+	slog.Info("starting ForgeLAB backend server", "version", Version, "commit", CommitSHA, "build_time", BuildTime, "env", cfg.App.Environment)
 
 	// Connect to database
 	ctx, cancel := context.WithCancel(context.Background())

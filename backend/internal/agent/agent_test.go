@@ -947,7 +947,7 @@ func TestAgentServer_ConsumedSession_SourceBoundAccess(t *testing.T) {
 	// 6. Regression test: Expired token is rejected even for the bound source
 	expiredSession, err := sm.CreateSession(testUser, agentID, 10*time.Minute)
 	require.NoError(t, err)
-	expiredSession.ExpiresAt = time.Now().Add(-1 * time.Minute)
+	sm.ExpireSession(expiredSession.Token)
 	_, err = sm.VerifyTokenForSource(expiredSession.Token, session1.SourceID, agentID)
 	assert.ErrorIs(t, err, ErrSessionExpired, "expired session must be rejected")
 }

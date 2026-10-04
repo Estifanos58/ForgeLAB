@@ -387,6 +387,15 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			if svcSourcePath == "" {
 				svcSourcePath = "."
 			}
+			if sourceType == models.SourceTypeLocalAgent {
+				if s.pathValidator != nil {
+					cleanRel, err := s.pathValidator.ValidateRelativeServicePath(svcSourcePath)
+					if err != nil {
+						return nil, fmt.Errorf("%w: invalid service source path %q for local agent: %v", ErrValidationFailed, svcSourcePath, err)
+					}
+					svcSourcePath = cleanRel
+				}
+			}
 			svcHealthStrat := strings.TrimSpace(svcIn.HealthStrategy)
 			if svcHealthStrat == "" {
 				svcHealthStrat = models.HealthStrategyAuto
@@ -411,6 +420,15 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			bCtx := strings.TrimSpace(svcIn.BuildContext)
 			if bCtx == "" {
 				bCtx = svcSourcePath
+			}
+			if sourceType == models.SourceTypeLocalAgent {
+				if s.pathValidator != nil {
+					cleanCtx, err := s.pathValidator.ValidateRelativeServicePath(bCtx)
+					if err != nil {
+						return nil, fmt.Errorf("%w: invalid service build context %q for local agent: %v", ErrValidationFailed, bCtx, err)
+					}
+					bCtx = cleanCtx
+				}
 			}
 
 			svc := &models.Service{
@@ -441,13 +459,26 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		}
 	} else {
 		// Single service fallback ensuring every project is modeled with at least 1 service
+		srcPath := project.BuildContext
+		if srcPath == "" {
+			srcPath = "."
+		}
+		if sourceType == models.SourceTypeLocalAgent {
+			if s.pathValidator != nil {
+				cleanRel, err := s.pathValidator.ValidateRelativeServicePath(srcPath)
+				if err != nil {
+					cleanRel = "."
+				}
+				srcPath = cleanRel
+			}
+		}
 		svc := &models.Service{
 			ID:                 uuid.New(),
 			ProjectID:          project.ID,
 			SourceID:           project.SourceID,
 			Name:               project.Name,
 			Role:               models.RoleOther,
-			SourcePath:         project.BuildContext,
+			SourcePath:         srcPath,
 			RuntimeType:        project.RuntimeType,
 			BuildStrategy:      project.BuildStrategy,
 			BuildCommand:       project.BuildCommand,
@@ -718,7 +749,9 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 	}
 	if input.RepositoryPath != nil {
 		newPath := strings.TrimSpace(*input.RepositoryPath)
-		if newPath != "" && (project.SourceType == models.SourceTypeLocalDirectory || project.SourceType == models.SourceTypeLocal) {
+		if project.SourceType == models.SourceTypeLocalAgent {
+			newPath = ""
+		} else if newPath != "" && (project.SourceType == models.SourceTypeLocalDirectory || project.SourceType == models.SourceTypeLocal) {
 			if s.pathValidator != nil {
 				canonical, err := s.pathValidator.ValidateSourcePath(newPath)
 				if err != nil {
@@ -736,7 +769,17 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 		project.DockerfilePath = *input.DockerfilePath
 	}
 	if input.BuildContext != nil {
-		project.BuildContext = *input.BuildContext
+		bCtx := *input.BuildContext
+		if project.SourceType == models.SourceTypeLocalAgent {
+			if s.pathValidator != nil {
+				cleanRel, err := s.pathValidator.ValidateRelativeServicePath(bCtx)
+				if err != nil {
+					return nil, fmt.Errorf("%w: invalid build context path for local agent: %v", ErrValidationFailed, err)
+				}
+				bCtx = cleanRel
+			}
+		}
+		project.BuildContext = bCtx
 	}
 	if input.BuildStrategy != nil {
 		project.BuildStrategy = *input.BuildStrategy

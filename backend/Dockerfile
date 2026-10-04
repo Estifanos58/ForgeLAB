@@ -15,10 +15,14 @@ RUN for i in 1 2 3; do go mod download && break || (echo "Retrying go mod downlo
 # Copy source code
 COPY . .
 
+ARG VERSION=1.0.0
+ARG COMMIT_SHA=dev
+ARG BUILD_TIME=unknown
+
 # Build binaries
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/forgelab-server ./cmd/server && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/forgelab-migrate ./cmd/migrate
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s -X main.Version=${VERSION} -X main.CommitSHA=${COMMIT_SHA} -X main.BuildTime=${BUILD_TIME}" -o /app/forgelab-server ./cmd/server && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s -X main.Version=${VERSION} -X main.CommitSHA=${COMMIT_SHA} -X main.BuildTime=${BUILD_TIME}" -o /app/forgelab-migrate ./cmd/migrate
 
 # Final runtime stage
 FROM alpine:3.19

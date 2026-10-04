@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -410,4 +412,68 @@ func (v *PathValidator) ValidateServiceBuildPaths(
 	}
 
 	return canonicalContextDir, filepath.ToSlash(relDF), nil
+}
+
+// ValidateRelativeServicePath validates and sanitizes a relative service path (e.g. for local_agent).
+// It strictly validates path syntax and boundary without performing host filesystem checks:
+// - Rejects absolute POSIX paths (/...)
+// - Rejects Windows drive paths (C:\..., C:/...)
+// - Rejects UNC paths (\\..., //...)
+// - Rejects '..' traversal components
+// - Rejects paths that normalize outside '.'
+// - Normalizes separators safely to forward slashes
+// - Allows valid relative paths such as '.', 'frontend', 'backend', 'apps/web'
+func ValidateRelativeServicePath(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "." {
+		return ".", nil
+	}
+
+	// 1. Check for UNC network paths (\\server\share or //server/share)
+	if strings.HasPrefix(trimmed, `\\`) || strings.HasPrefix(trimmed, "//") {
+		return "", errors.New("UNC network paths are not allowed")
+	}
+
+	// 2. Check for POSIX absolute paths (/foo) or backslash rooted paths (\foo)
+	if strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, `\`) {
+		return "", errors.New("absolute paths are not allowed")
+	}
+
+	// 3. Check for Windows drive letters (e.g., C:, D:, etc.)
+	if len(trimmed) >= 2 && trimmed[1] == ':' && unicode.IsLetter(rune(trimmed[0])) {
+		return "", errors.New("windows drive letter paths are not allowed")
+	}
+
+	// 4. Normalize all backslashes to forward slashes
+	slashPath := strings.ReplaceAll(trimmed, `\`, "/")
+
+	// 5. Check components for '..' traversal and colons
+	parts := strings.Split(slashPath, "/")
+	for _, part := range parts {
+		p := strings.TrimSpace(part)
+		if p == ".." {
+			return "", errors.New("path traversal '..' is not allowed")
+		}
+		if strings.Contains(p, ":") {
+			return "", errors.New("colons are not allowed in path components")
+		}
+	}
+
+	// 6. Clean the path using path.Clean (clean POSIX paths)
+	cleaned := path.Clean(slashPath)
+	if cleaned == "." || cleaned == "" {
+		return ".", nil
+	}
+
+	// 7. Verify cleaned path does not escape or become absolute
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") {
+		return "", errors.New("path escapes root boundary")
+	}
+
+	return cleaned, nil
+}
+
+// ValidateRelativeServicePath validates a relative service path using the validator instance.
+func (v *PathValidator) ValidateRelativeServicePath(raw string) (string, error) {
+	return ValidateRelativeServicePath(raw)
 }

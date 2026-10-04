@@ -122,6 +122,20 @@ func (sm *SessionManager) CleanupExpired() int {
 	return removed
 }
 
+// ExpireSession marks a session identified by token as expired immediately (useful for testing and revocation)
+func (sm *SessionManager) ExpireSession(token string) bool {
+	cleanToken := strings.TrimSpace(token)
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if id, ok := sm.tokens[cleanToken]; ok {
+		if s, exists := sm.sessions[id]; exists {
+			s.ExpiresAt = time.Now().Add(-1 * time.Minute)
+			return true
+		}
+	}
+	return false
+}
+
 // CreateSession generates a new cryptographically secure token and session for a user and agent
 func (sm *SessionManager) CreateSession(userID uuid.UUID, agentID string, ttl time.Duration) (*AgentSession, error) {
 	if ttl <= 0 {

@@ -202,3 +202,112 @@ func TestPathValidatorValidateServiceBuildPaths(t *testing.T) {
 	})
 }
 
+func TestValidateRelativeServicePath(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		expected    string
+		expectError bool
+	}{
+		{name: "dot", input: ".", expected: ".", expectError: false},
+		{name: "empty", input: "", expected: ".", expectError: false},
+		{name: "frontend", input: "frontend", expected: "frontend", expectError: false},
+		{name: "backend", input: "backend", expected: "backend", expectError: false},
+		{name: "nested posix", input: "apps/web", expected: "apps/web", expectError: false},
+		{name: "nested windows separator", input: `apps\web`, expected: "apps/web", expectError: false},
+		{name: "dot-slash prefix", input: "./frontend", expected: "frontend", expectError: false},
+		{name: "dot-backslash prefix", input: `.\backend`, expected: "backend", expectError: false},
+		{name: "whitespace padded", input: "  frontend  ", expected: "frontend", expectError: false},
+
+		// Rejected traversal and absolute paths
+		{name: "parent traversal", input: "../outside", expectError: true},
+		{name: "double parent traversal", input: "../../outside", expectError: true},
+		{name: "posix absolute", input: "/absolute/path", expectError: true},
+		{name: "posix root", input: "/", expectError: true},
+		{name: "windows drive backslash", input: `C:\outside`, expectError: true},
+		{name: "windows drive slash", input: "C:/outside", expectError: true},
+		{name: "windows drive lowercase", input: "d:/outside", expectError: true},
+		{name: "unc backslash", input: `\\server\share`, expectError: true},
+		{name: "unc slash", input: "//server/share", expectError: true},
+		{name: "component escape", input: "frontend/../../outside", expectError: true},
+		{name: "component traversal", input: "frontend/../outside", expectError: true},
+		{name: "backslash rooted", input: `\windows\system32`, expectError: true},
+		{name: "internal colon", input: "front:end", expectError: true},
+	}
+
+	validator := security.NewPathValidator(nil)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res1, err1 := security.ValidateRelativeServicePath(tt.input)
+			res2, err2 := validator.ValidateRelativeServicePath(tt.input)
+
+			if tt.expectError {
+				if err1 == nil {
+					t.Errorf("expected error for input %q, got nil (%s)", tt.input, res1)
+				}
+				if err2 == nil {
+					t.Errorf("validator method expected error for input %q, got nil (%s)", tt.input, res2)
+				}
+			} else {
+				if err1 != nil {
+					t.Errorf("unexpected error for input %q: %v", tt.input, err1)
+				}
+				if res1 != tt.expected {
+					t.Errorf("expected %q, got %q", tt.expected, res1)
+				}
+				if err2 != nil {
+					t.Errorf("validator method unexpected error for input %q: %v", tt.input, err2)
+				}
+				if res2 != tt.expected {
+					t.Errorf("validator method expected %q, got %q", tt.expected, res2)
+				}
+			}
+		})
+	}
+}
+
+func TestLocalDirectoryTrustBoundaryPreserved(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "forgelab_localdirectory_")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	allowedRoot := filepath.Join(tempDir, "allowed")
+	_ = os.MkdirAll(allowedRoot, 0755)
+
+	forbiddenRoot := filepath.Join(tempDir, "forbidden")
+	_ = os.MkdirAll(forbiddenRoot, 0755)
+
+	validator := security.NewPathValidator([]string{allowedRoot})
+
+	// 1. Valid local directory within allowed root passes
+	canonical, err := validator.ValidateSourcePath(allowedRoot)
+	if err != nil {
+		t.Fatalf("expected allowed directory to pass validation: %v", err)
+	}
+	if canonical == "" {
+		t.Errorf("expected non-empty canonical path")
+	}
+
+	// 2. Forbidden local directory outside allowed root is rejected
+	_, err = validator.ValidateSourcePath(forbiddenRoot)
+	if err == nil {
+		t.Fatalf("expected error for directory outside allowed roots, got nil")
+	}
+
+	// 3. Non-existent local directory is rejected
+	_, err = validator.ValidateSourcePath(filepath.Join(allowedRoot, "non-existent"))
+	if err == nil {
+		t.Fatalf("expected error for non-existent directory, got nil")
+	}
+
+	// 4. File instead of directory is rejected
+	filePath := filepath.Join(allowedRoot, "file.txt")
+	_ = os.WriteFile(filePath, []byte("hello"), 0644)
+	_, err = validator.ValidateSourcePath(filePath)
+	if err == nil {
+		t.Fatalf("expected error when path is a file, got nil")
+	}
+}

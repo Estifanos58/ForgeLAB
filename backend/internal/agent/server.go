@@ -24,6 +24,7 @@ import (
 	"github.com/forgelab/backend/internal/analyzer"
 	"github.com/forgelab/backend/internal/detector"
 	"github.com/forgelab/backend/internal/dockerignore"
+	"github.com/forgelab/backend/internal/security"
 )
 
 // LocalSourceSession stores the in-memory mapping between an opaque source ID and the local host path
@@ -728,6 +729,20 @@ func (s *AgentServer) ConsumeSession(sourceID uuid.UUID) error {
 	return nil
 }
 
+// ExpireSession marks a local agent source session as expired immediately (for revocation/testing)
+func (s *AgentServer) ExpireSession(sourceID uuid.UUID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, exists := s.sessions[sourceID]
+	if !exists {
+		return false
+	}
+	session.ExpiresAt = time.Now().Add(-1 * time.Minute)
+	session.UpdatedAt = time.Now()
+	return true
+}
+
 func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSession, error) {
 	canonicalPath, err := s.pathValidator.ValidateSourcePath(rawPath)
 	if err != nil {
@@ -1039,11 +1054,13 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		}
 
 		serviceRelPath := r.URL.Query().Get("service_path")
-		if serviceRelPath == "" {
-			serviceRelPath = "."
+		cleanRelPath, pathErr := security.ValidateRelativeServicePath(serviceRelPath)
+		if pathErr != nil {
+			http.Error(w, fmt.Sprintf("invalid service path traversal: %v", pathErr), http.StatusForbidden)
+			return
 		}
 
-		serviceDir := filepath.Join(session.CanonicalPath, filepath.FromSlash(serviceRelPath))
+		serviceDir := filepath.Join(session.CanonicalPath, filepath.FromSlash(cleanRelPath))
 		evalServiceDir, err := filepath.EvalSymlinks(serviceDir)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("invalid service directory: %v", err), http.StatusBadRequest)
@@ -1052,6 +1069,16 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		relCheck, err := filepath.Rel(session.CanonicalPath, evalServiceDir)
 		if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
 			http.Error(w, "invalid service path traversal", http.StatusForbidden)
+			return
+		}
+
+		fi, err := os.Stat(evalServiceDir)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("service directory not accessible: %v", err), http.StatusBadRequest)
+			return
+		}
+		if !fi.IsDir() {
+			http.Error(w, "service path is not a directory", http.StatusBadRequest)
 			return
 		}
 

@@ -49,13 +49,13 @@ var restrictedHostMounts = []string{
 
 // ContainerSecurityOptions parameters for creating a strictly sandboxed container.
 type ContainerSecurityOptions struct {
-	PortBindings          nat.PortMap
-	TargetCpuMillicores   int
-	TargetMemoryMB        int
-	TargetPidsLimit       int
-	Binds                 []string
-	NetworkMode           string
-	AllowedMountPrefixes  []string
+	PortBindings         nat.PortMap
+	TargetCpuMillicores  int
+	TargetMemoryMB       int
+	TargetPidsLimit      int
+	Binds                []string
+	NetworkMode          string
+	AllowedMountPrefixes []string
 }
 
 // ValidateAndBuildSecureHostConfig creates a centralized, strictly validated Docker HostConfig
