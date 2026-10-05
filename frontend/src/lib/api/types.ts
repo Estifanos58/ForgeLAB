@@ -61,9 +61,9 @@ export interface Service {
   health_check_path?: string | null;
   health_check_enabled: boolean;
   classification?: string;
-  image?: string | null;
   depends_on?: string[];
   volumes?: VolumeMountConfig[];
+  networks?: string[];
   healthcheck_config?: HealthCheckConfig | null;
   status: string;
   container_id?: string | null;
@@ -89,6 +89,7 @@ export interface ServiceDeployment {
   image?: string | null;
   depends_on?: string[];
   volumes?: VolumeMountConfig[];
+  networks?: string[];
   healthcheck_config?: HealthCheckConfig | null;
   image_tag?: string | null;
   container_id?: string | null;
@@ -415,16 +416,27 @@ export interface ResourceConfig {
 }
 
 export interface VolumeMountConfig {
-  name: string;
-  container_path: string;
+  source: string;
+  target: string;
+  type?: 'volume' | 'bind' | string;
   read_only?: boolean;
+  // Aliases for compatibility
+  name?: string;
+  container_path?: string;
 }
 
 export interface HealthCheckConfig {
+  strategy?: string;
+  path?: string;
+  port?: number;
   test?: string[];
+  interval_seconds?: number;
+  timeout_seconds?: number;
+  retries?: number;
+  start_period_seconds?: number;
+  // String duration aliases for compatibility
   interval?: string;
   timeout?: string;
-  retries?: number;
   start_period?: string;
 }
 
@@ -469,6 +481,7 @@ export interface PlannedService {
   resource_config: ResourceConfig;
   depends_on: string[];
   volumes: VolumeMountConfig[];
+  networks?: string[];
   environment: EnvironmentProvenance[];
   build_candidates?: BuildCandidate[];
 }
@@ -516,6 +529,7 @@ export interface DiscoveredService {
   health_check_enabled: boolean;
   depends_on: string[];
   volumes: VolumeMountConfig[];
+  networks?: string[];
   environment: EnvironmentProvenance[];
   resource_config: ResourceConfig;
   files_count: number;

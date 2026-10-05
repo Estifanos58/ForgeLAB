@@ -126,8 +126,13 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		workspaceDir = canonicalPath
-		hash := sha256.Sum256([]byte(fmt.Sprintf("dir:%s", canonicalPath)))
-		sourceRevision = fmt.Sprintf("fp_%s", hex.EncodeToString(hash[:16]))
+		fp, fpErr := discovery.ComputeDirectoryContentFingerprint(canonicalPath)
+		if fpErr != nil {
+			slog.Warn("failed to compute deterministic directory fingerprint", "path", canonicalPath, "error", fpErr)
+			hash := sha256.Sum256([]byte(fmt.Sprintf("dir:%s", canonicalPath)))
+			fp = fmt.Sprintf("fp_%s", hex.EncodeToString(hash[:16]))
+		}
+		sourceRevision = fp
 
 	case models.SourceTypeLocalUpload:
 		if req.SourceReference == "" {
@@ -149,20 +154,43 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		workspaceDir = p
-		hash := sha256.Sum256([]byte(fmt.Sprintf("upload:%s", sourceUUID.String())))
-		sourceRevision = fmt.Sprintf("fp_%s", hex.EncodeToString(hash[:16]))
+		fp, fpErr := discovery.ComputeDirectoryContentFingerprint(p)
+		if fpErr != nil {
+			slog.Warn("failed to compute deterministic upload fingerprint", "path", p, "error", fpErr)
+			hash := sha256.Sum256([]byte(fmt.Sprintf("upload:%s", sourceUUID.String())))
+			fp = fmt.Sprintf("fp_%s", hex.EncodeToString(hash[:16]))
+		}
+		sourceRevision = fp
 
 	case models.SourceTypeLocalAgent:
 		if req.RepositoryPath != "" {
 			canonicalPath, valErr := h.pathValidator.ValidateSourcePath(req.RepositoryPath)
 			if valErr == nil {
 				workspaceDir = canonicalPath
+				if fp, fpErr := discovery.ComputeDirectoryContentFingerprint(canonicalPath); fpErr == nil && fp != "" {
+					sourceRevision = fp
+				}
 			}
 		}
-		if workspaceDir == "" {
-			workspaceDir = "."
+		if sourceRevision == "" && h.sourceService != nil {
+			if srcUUID, parseErr := uuid.Parse(req.SourceReference); parseErr == nil {
+				if src, sErr := h.sourceService.GetSource(r.Context(), userID, srcUUID); sErr == nil && src != nil && src.Fingerprint != "" {
+					sourceRevision = src.Fingerprint
+				}
+			}
 		}
-		sourceRevision = fmt.Sprintf("agent_%s", req.SourceReference)
+		if sourceRevision == "" && workspaceDir != "" && workspaceDir != "." {
+			if fp, fpErr := discovery.ComputeDirectoryContentFingerprint(workspaceDir); fpErr == nil && fp != "" {
+				sourceRevision = fp
+			}
+		}
+		if sourceRevision == "" {
+			if workspaceDir == "" {
+				workspaceDir = "."
+			}
+			hSha := sha256.Sum256([]byte(fmt.Sprintf("agent:%s", req.SourceReference)))
+			sourceRevision = fmt.Sprintf("fp_%s", hex.EncodeToString(hSha[:16]))
+		}
 
 	default:
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported source type '%s'", req.SourceType))
@@ -207,6 +235,43 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 				plan.Environment[i].HasConflict = true
 				plan.Environment[i].ConflictResolution = "overridden_by_forgelab"
 				plan.Environment[i].ActiveValue = "forgelab"
+			}
+		}
+		for i := range discResult.Topology.RootEnvVars {
+			if _, alreadySet := existingEnv[discResult.Topology.RootEnvVars[i].Key]; alreadySet {
+				discResult.Topology.RootEnvVars[i].HasConflict = true
+				discResult.Topology.RootEnvVars[i].ConflictResolution = "overridden_by_forgelab"
+				discResult.Topology.RootEnvVars[i].ActiveValue = "forgelab"
+			}
+		}
+	}
+
+	// 4. Guaranteed Secret-Safe Output: Never return plaintext values for secret variables
+	for i := range plan.Environment {
+		if plan.Environment[i].IsSecret || discovery.IsSecretEnvKey(plan.Environment[i].Key) {
+			plan.Environment[i].IsSecret = true
+			plan.Environment[i].Value = "[REDACTED]"
+		}
+	}
+	for i := range plan.Services {
+		for j := range plan.Services[i].Environment {
+			if plan.Services[i].Environment[j].IsSecret || discovery.IsSecretEnvKey(plan.Services[i].Environment[j].Key) {
+				plan.Services[i].Environment[j].IsSecret = true
+				plan.Services[i].Environment[j].Value = "[REDACTED]"
+			}
+		}
+	}
+	for i := range discResult.Topology.RootEnvVars {
+		if discResult.Topology.RootEnvVars[i].IsSecret || discovery.IsSecretEnvKey(discResult.Topology.RootEnvVars[i].Key) {
+			discResult.Topology.RootEnvVars[i].IsSecret = true
+			discResult.Topology.RootEnvVars[i].Value = "[REDACTED]"
+		}
+	}
+	for i := range discResult.Services {
+		for j := range discResult.Services[i].Environment {
+			if discResult.Services[i].Environment[j].IsSecret || discovery.IsSecretEnvKey(discResult.Services[i].Environment[j].Key) {
+				discResult.Services[i].Environment[j].IsSecret = true
+				discResult.Services[i].Environment[j].Value = "[REDACTED]"
 			}
 		}
 	}

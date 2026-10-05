@@ -519,7 +519,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					_ = reader.Close()
 					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' ready. Skipping source build.", targetImage))
 				} else if pullErr != nil {
-					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image pull note (%v); attempting local image cache.", pullErr))
+					// Image pull failed: check if image is available in local cache
+					_, _, inspectErr := e.dockerClient.ImageInspectWithRaw(ctx, targetImage)
+					if inspectErr != nil {
+						reason := fmt.Sprintf("Infrastructure image '%s' could not be pulled and is not available in local cache: %v", targetImage, pullErr)
+						emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+						emitStatus(models.DeployStatusFailed, nil, &reason)
+						return errors.New(reason)
+					}
+					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' found in local image cache.", targetImage))
 				}
 			}
 			reusingExistingImage = true
@@ -732,10 +740,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			BuildArgs:  buildArgs,
 			Remove:     true,
 			Labels: map[string]string{
-				"forgelab.managed":        "true",
-				"forgelab.project_id":     project.ID.String(),
-				"forgelab.service_name":   service.Name,
-				"forgelab.deployment_id":  serviceDeploy.DeploymentID.String(),
+				"forgelab.managed":       "true",
+				"forgelab.project_id":    project.ID.String(),
+				"forgelab.service_name":  service.Name,
+				"forgelab.deployment_id": serviceDeploy.DeploymentID.String(),
 			},
 		}
 
@@ -830,12 +838,51 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 	}
 
-	networkName := fmt.Sprintf("forgelab-net-%s", project.ID.String())
-	_, netErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{})
-	if netErr != nil {
-		_, _ = e.dockerClient.NetworkCreate(ctx, networkName, dockernetwork.CreateOptions{
-			Driver: "bridge",
-		})
+	// Preserve service-level network membership and create isolated project networks
+	var serviceNetworks []string
+	if len(serviceDeploy.Networks) > 0 {
+		serviceNetworks = serviceDeploy.Networks
+	} else if len(service.Networks) > 0 {
+		serviceNetworks = service.Networks
+	}
+
+	var primaryNetworkName string
+	var secondaryNetworkNames []string
+
+	if len(serviceNetworks) > 0 {
+		for i, net := range serviceNetworks {
+			projNet := fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
+			if e.dockerClient != nil {
+				_, netErr := e.dockerClient.NetworkInspect(ctx, projNet, dockernetwork.InspectOptions{})
+				if netErr != nil {
+					_, _ = e.dockerClient.NetworkCreate(ctx, projNet, dockernetwork.CreateOptions{
+						Driver: "bridge",
+						Labels: map[string]string{
+							"forgelab.project_id": project.ID.String(),
+							"forgelab.network":    net,
+						},
+					})
+				}
+			}
+			if i == 0 {
+				primaryNetworkName = projNet
+			} else {
+				secondaryNetworkNames = append(secondaryNetworkNames, projNet)
+			}
+		}
+	} else {
+		primaryNetworkName = fmt.Sprintf("forgelab-net-%s", project.ID.String())
+		if e.dockerClient != nil {
+			_, netErr := e.dockerClient.NetworkInspect(ctx, primaryNetworkName, dockernetwork.InspectOptions{})
+			if netErr != nil {
+				_, _ = e.dockerClient.NetworkCreate(ctx, primaryNetworkName, dockernetwork.CreateOptions{
+					Driver: "bridge",
+					Labels: map[string]string{
+						"forgelab.project_id": project.ID.String(),
+					},
+				})
+			}
+		}
 	}
 
 	containerName := fmt.Sprintf("forgelab-app-%s-%s", serviceDeploy.ID.String()[:8], service.Name)
@@ -858,27 +905,53 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	// Attach Compose healthcheck if configured
 	if serviceDeploy.HealthCheckConfig != nil && len(serviceDeploy.HealthCheckConfig.Test) > 0 {
-		containerConfig.Healthcheck = &container.HealthConfig{
-			Test: serviceDeploy.HealthCheckConfig.Test,
-		}
-		if serviceDeploy.HealthCheckConfig.IntervalSeconds > 0 {
-			containerConfig.Healthcheck.Interval = time.Duration(serviceDeploy.HealthCheckConfig.IntervalSeconds) * time.Second
-		}
-		if serviceDeploy.HealthCheckConfig.TimeoutSeconds > 0 {
-			containerConfig.Healthcheck.Timeout = time.Duration(serviceDeploy.HealthCheckConfig.TimeoutSeconds) * time.Second
-		}
-		if serviceDeploy.HealthCheckConfig.Retries > 0 {
-			containerConfig.Healthcheck.Retries = serviceDeploy.HealthCheckConfig.Retries
-		}
-		if serviceDeploy.HealthCheckConfig.StartPeriodSeconds > 0 {
-			containerConfig.Healthcheck.StartPeriod = time.Duration(serviceDeploy.HealthCheckConfig.StartPeriodSeconds) * time.Second
+		if serviceDeploy.HealthCheckConfig.Strategy == models.HealthStrategyNone ||
+			(len(serviceDeploy.HealthCheckConfig.Test) == 1 && serviceDeploy.HealthCheckConfig.Test[0] == "NONE") {
+			containerConfig.Healthcheck = &container.HealthConfig{
+				Test: []string{"NONE"},
+			}
+		} else {
+			containerConfig.Healthcheck = &container.HealthConfig{
+				Test: serviceDeploy.HealthCheckConfig.Test,
+			}
+			if serviceDeploy.HealthCheckConfig.IntervalSeconds > 0 {
+				containerConfig.Healthcheck.Interval = time.Duration(serviceDeploy.HealthCheckConfig.IntervalSeconds) * time.Second
+			}
+			if serviceDeploy.HealthCheckConfig.TimeoutSeconds > 0 {
+				containerConfig.Healthcheck.Timeout = time.Duration(serviceDeploy.HealthCheckConfig.TimeoutSeconds) * time.Second
+			}
+			if serviceDeploy.HealthCheckConfig.Retries > 0 {
+				containerConfig.Healthcheck.Retries = serviceDeploy.HealthCheckConfig.Retries
+			}
+			if serviceDeploy.HealthCheckConfig.StartPeriodSeconds > 0 {
+				containerConfig.Healthcheck.StartPeriod = time.Duration(serviceDeploy.HealthCheckConfig.StartPeriodSeconds) * time.Second
+			}
 		}
 	}
 
-	// Prepare persistent named volumes
+	// Prepare volume mounts: preserve named volume vs bind mount semantics with strict security boundary validation
 	var binds []string
+	var allowedMountPrefixes []string
+	projectRoot := project.RepositoryPath
+	if projectRoot != "" {
+		allowedMountPrefixes = append(allowedMountPrefixes, projectRoot)
+	}
+
 	for _, v := range serviceDeploy.Volumes {
-		if v.Source != "" && v.Target != "" {
+		if v.Target == "" {
+			continue
+		}
+
+		volType := v.Type
+		if volType == "" {
+			if strings.HasPrefix(v.Source, ".") || strings.HasPrefix(v.Source, "/") || strings.HasPrefix(v.Source, "~") || strings.Contains(v.Source, string(filepath.Separator)) || strings.Contains(v.Source, "/") {
+				volType = models.VolumeTypeBind
+			} else {
+				volType = models.VolumeTypeNamed
+			}
+		}
+
+		if volType == models.VolumeTypeNamed || volType == "volume" {
 			volName := fmt.Sprintf("forgelab-vol-%s-%s", project.ID.String()[:8], v.Source)
 			if e.dockerClient != nil {
 				_, _ = e.dockerClient.VolumeCreate(ctx, dockervolume.CreateOptions{
@@ -890,6 +963,17 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				})
 			}
 			bindEntry := fmt.Sprintf("%s:%s", volName, v.Target)
+			if v.ReadOnly {
+				bindEntry += ":ro"
+			}
+			binds = append(binds, bindEntry)
+		} else if volType == models.VolumeTypeBind || volType == "bind" {
+			hostPath := v.Source
+			if !filepath.IsAbs(hostPath) && projectRoot != "" {
+				hostPath = filepath.Join(projectRoot, hostPath)
+			}
+			hostPath = filepath.Clean(hostPath)
+			bindEntry := fmt.Sprintf("%s:%s", hostPath, v.Target)
 			if v.ReadOnly {
 				bindEntry += ":ro"
 			}
@@ -912,12 +996,13 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	hostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
-		PortBindings:        portBindings,
-		TargetCpuMillicores: targetCpuMillicores,
-		TargetMemoryMB:      targetMemoryMB,
-		TargetPidsLimit:     targetPidsLimit,
-		Binds:               binds,
-		NetworkMode:         "",
+		PortBindings:         portBindings,
+		TargetCpuMillicores:  targetCpuMillicores,
+		TargetMemoryMB:       targetMemoryMB,
+		TargetPidsLimit:      targetPidsLimit,
+		Binds:                binds,
+		NetworkMode:          "",
+		AllowedMountPrefixes: allowedMountPrefixes,
 	})
 	if err != nil {
 		if hostPort != nil {
@@ -931,7 +1016,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	netConfig := &dockernetwork.NetworkingConfig{
 		EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
-			networkName: {
+			primaryNetworkName: {
 				Aliases: []string{service.Name},
 			},
 		},
@@ -948,6 +1033,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
 		emitStatus(models.DeployStatusFailed, nil, &reason)
 		return errors.New(reason)
+	}
+
+	// Connect to any secondary isolated project networks
+	for _, secNet := range secondaryNetworkNames {
+		if e.dockerClient != nil {
+			_ = e.dockerClient.NetworkConnect(ctx, secNet, resp.ID, &dockernetwork.EndpointSettings{
+				Aliases: []string{service.Name},
+			})
+		}
 	}
 
 	containerID := resp.ID
@@ -973,6 +1067,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	healthStrat := service.HealthStrategy
 	if healthStrat == "" {
+		healthStrat = serviceDeploy.HealthStrategy
+	}
+	if (serviceDeploy.HealthCheckConfig != nil && serviceDeploy.HealthCheckConfig.Strategy == models.HealthStrategyNone) ||
+		(service.HealthCheckConfig != nil && service.HealthCheckConfig.Strategy == models.HealthStrategyNone) {
+		healthStrat = models.HealthStrategyNone
+	} else if healthStrat == "" {
 		healthStrat = models.HealthStrategyAuto
 	}
 	healthPath := "/"

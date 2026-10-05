@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -545,18 +546,9 @@ func generateBuildCandidates(
 		}
 	}
 
-	candidates = append(candidates, models.BuildCandidate{
-		ID:              "custom",
-		Strategy:        StrategyCustom,
-		Name:            "Custom Build",
-		Description:     "Specify custom build and startup commands",
-		Confidence:      0.40,
-		BuildCommand:    buildCmd,
-		StartCommand:    startCmd,
-		SuggestedPort:   port,
-		HealthCheckPath: healthPath,
-		HealthStrategy:  healthStrat,
-	})
+	if rec := RecommendProductionExecution(runtime, framework, pkgManager, port, healthPath, healthStrat); len(rec.Candidates) > 0 {
+		candidates = append(rec.Candidates, candidates...)
+	}
 
 	return candidates
 }
@@ -651,11 +643,22 @@ func scanEnvFileProvenance(dir string, envFiles []string) []EnvironmentProvenanc
 		if err != nil {
 			continue
 		}
-		for k, v := range vars {
+		keys := make([]string, 0, len(vars))
+		for k := range vars {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := vars[k]
+			isSecret := IsSecretEnvKey(k)
+			val := v
+			if isSecret {
+				val = "[REDACTED]"
+			}
 			results = append(results, EnvironmentProvenance{
 				Key:                k,
-				Value:              v,
-				IsSecret:           isSecretEnvKey(k),
+				Value:              val,
+				IsSecret:           isSecret,
 				Scope:              models.EnvScopeRuntime,
 				SourceFile:         ef,
 				HasConflict:        false,
@@ -683,28 +686,30 @@ func GeneratePlan(res *DiscoveryResult, opts PlanOptions) (*DeploymentPlan, erro
 	plannedServices := make([]PlannedService, 0, len(res.Services))
 	for _, s := range res.Services {
 		ps := PlannedService{
-			Name:            s.Name,
-			Role:            s.Role,
-			Classification:  s.Classification,
-			SourcePath:      s.SourcePath,
-			BuildStrategy:   s.BuildStrategy,
-			Image:           s.Image,
-			DockerfilePath:  s.DockerfilePath,
-			BuildContext:    s.BuildContext,
-			BuildCommand:    s.BuildCommand,
-			StartCommand:    s.StartCommand,
-			RuntimeType:     s.RuntimeType,
-			Framework:       s.Framework,
-			PackageManager:  s.PackageManager,
-			InternalPort:    s.InternalPort,
-			HostPort:        s.HostPort,
-			PublicExposed:   s.PublicExposed,
-			HealthCheck:     s.HealthCheck,
-			ResourceConfig:  s.ResourceConfig,
-			DependsOn:       s.DependsOn,
-			Volumes:         s.Volumes,
-			Environment:     s.Environment,
-			BuildCandidates: s.BuildCandidates,
+			Name:                s.Name,
+			Role:                s.Role,
+			Classification:      s.Classification,
+			SourcePath:          s.SourcePath,
+			BuildStrategy:       s.BuildStrategy,
+			Image:               s.Image,
+			DockerfilePath:      s.DockerfilePath,
+			BuildContext:        s.BuildContext,
+			BuildCommand:        s.BuildCommand,
+			StartCommand:        s.StartCommand,
+			RuntimeType:         s.RuntimeType,
+			Framework:           s.Framework,
+			PackageManager:      s.PackageManager,
+			InternalPort:        s.InternalPort,
+			HostPort:            s.HostPort,
+			PublicExposed:       s.PublicExposed,
+			HealthCheck:         s.HealthCheck,
+			ResourceConfig:      s.ResourceConfig,
+			DependsOn:           s.DependsOn,
+			DependsOnConditions: s.DependsOnConditions,
+			Volumes:             s.Volumes,
+			Networks:            s.Networks,
+			Environment:         s.Environment,
+			BuildCandidates:     s.BuildCandidates,
 		}
 		plannedServices = append(plannedServices, ps)
 	}
@@ -750,12 +755,25 @@ func GeneratePlan(res *DiscoveryResult, opts PlanOptions) (*DeploymentPlan, erro
 	}
 
 	// 4. Collect networks and named volumes
+	netSet := make(map[string]bool)
 	var networks []string
 	if len(res.Topology.Networks) > 0 {
 		for _, n := range res.Topology.Networks {
-			networks = append(networks, n.Name)
+			if !netSet[n.Name] {
+				netSet[n.Name] = true
+				networks = append(networks, n.Name)
+			}
 		}
-	} else {
+	}
+	for _, s := range plannedServices {
+		for _, n := range s.Networks {
+			if !netSet[n] {
+				netSet[n] = true
+				networks = append(networks, n)
+			}
+		}
+	}
+	if len(networks) == 0 {
 		networks = []string{"default"}
 	}
 
@@ -781,6 +799,32 @@ func GeneratePlan(res *DiscoveryResult, opts PlanOptions) (*DeploymentPlan, erro
 	allEnv = append(allEnv, res.Topology.RootEnvVars...)
 	for _, s := range plannedServices {
 		allEnv = append(allEnv, s.Environment...)
+	}
+
+	// Redact all secret values across plan and discovery to ensure zero plaintext secret leakage
+	for i := range allEnv {
+		if allEnv[i].IsSecret {
+			allEnv[i].Value = "[REDACTED]"
+		}
+	}
+	for i := range plannedServices {
+		for j := range plannedServices[i].Environment {
+			if plannedServices[i].Environment[j].IsSecret {
+				plannedServices[i].Environment[j].Value = "[REDACTED]"
+			}
+		}
+	}
+	for i := range res.Topology.RootEnvVars {
+		if res.Topology.RootEnvVars[i].IsSecret {
+			res.Topology.RootEnvVars[i].Value = "[REDACTED]"
+		}
+	}
+	for i := range res.Services {
+		for j := range res.Services[i].Environment {
+			if res.Services[i].Environment[j].IsSecret {
+				res.Services[i].Environment[j].Value = "[REDACTED]"
+			}
+		}
 	}
 
 	return &DeploymentPlan{

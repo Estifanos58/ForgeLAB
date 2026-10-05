@@ -89,8 +89,9 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 			}
 		}
 
-		// Check against allowlist if configured
-		if len(opts.AllowedMountPrefixes) > 0 {
+		// Check against allowlist if configured (only for host bind paths, not Docker named volumes)
+		isNamedVolume := !filepath.IsAbs(parts[0]) && !strings.Contains(parts[0], "/") && !strings.Contains(parts[0], "\\") && !strings.HasPrefix(parts[0], ".")
+		if !isNamedVolume && len(opts.AllowedMountPrefixes) > 0 {
 			allowed := false
 			for _, prefix := range opts.AllowedMountPrefixes {
 				cleanPrefix := strings.ToLower(filepath.Clean(prefix))

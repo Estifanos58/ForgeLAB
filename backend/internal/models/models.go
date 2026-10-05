@@ -2,6 +2,8 @@ package models
 
 import (
 	"encoding/json"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,12 +44,47 @@ type GitHubIntegration struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 }
 
+// Volume types
+const (
+	VolumeTypeNamed = "volume"
+	VolumeTypeBind  = "bind"
+)
+
 // VolumeMountConfig specifies a container volume mount.
 type VolumeMountConfig struct {
-	Source   string `json:"source"`            // volume name or host path
-	Target   string `json:"target"`            // container mount path
-	Type     string `json:"type"`              // "volume" (named) or "bind" (host)
+	Source   string `json:"source"` // volume name or host path
+	Target   string `json:"target"` // container mount path
+	Type     string `json:"type"`   // "volume" (named) or "bind" (host)
 	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
+// UnmarshalJSON supports both canonical fields (source, target, type) and UI aliases (name, container_path).
+func (v *VolumeMountConfig) UnmarshalJSON(data []byte) error {
+	type Alias VolumeMountConfig
+	aux := struct {
+		Name          string `json:"name"`
+		ContainerPath string `json:"container_path"`
+		*Alias
+	}{
+		Alias: (*Alias)(v),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if v.Source == "" && aux.Name != "" {
+		v.Source = aux.Name
+	}
+	if v.Target == "" && aux.ContainerPath != "" {
+		v.Target = aux.ContainerPath
+	}
+	if v.Type == "" {
+		if strings.HasPrefix(v.Source, ".") || strings.HasPrefix(v.Source, "/") || strings.Contains(v.Source, "/") || strings.Contains(v.Source, "\\") {
+			v.Type = "bind"
+		} else {
+			v.Type = "volume"
+		}
+	}
+	return nil
 }
 
 // HealthCheckConfig represents detailed healthcheck configuration.
@@ -60,6 +97,64 @@ type HealthCheckConfig struct {
 	TimeoutSeconds     int      `json:"timeout_seconds,omitempty"`
 	Retries            int      `json:"retries,omitempty"`
 	StartPeriodSeconds int      `json:"start_period_seconds,omitempty"`
+}
+
+// UnmarshalJSON supports canonical integer second fields as well as duration string aliases (interval, timeout, start_period).
+func (h *HealthCheckConfig) UnmarshalJSON(data []byte) error {
+	type Alias HealthCheckConfig
+	aux := struct {
+		Interval    interface{} `json:"interval"`
+		Timeout     interface{} `json:"timeout"`
+		StartPeriod interface{} `json:"start_period"`
+		*Alias
+	}{
+		Alias: (*Alias)(h),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	parseSec := func(val interface{}) int {
+		if val == nil {
+			return 0
+		}
+		switch v := val.(type) {
+		case float64:
+			return int(v)
+		case string:
+			v = strings.TrimSpace(v)
+			if v == "" {
+				return 0
+			}
+			if d, err := time.ParseDuration(v); err == nil {
+				return int(d.Seconds())
+			}
+			if n, err := strconv.Atoi(v); err == nil {
+				return n
+			}
+		}
+		return 0
+	}
+	if h.IntervalSeconds == 0 && aux.Interval != nil {
+		h.IntervalSeconds = parseSec(aux.Interval)
+	}
+	if h.TimeoutSeconds == 0 && aux.Timeout != nil {
+		h.TimeoutSeconds = parseSec(aux.Timeout)
+	}
+	if h.StartPeriodSeconds == 0 && aux.StartPeriod != nil {
+		h.StartPeriodSeconds = parseSec(aux.StartPeriod)
+	}
+	if h.Strategy == "" {
+		if len(h.Test) > 0 {
+			if len(h.Test) == 1 && strings.EqualFold(h.Test[0], "none") {
+				h.Strategy = "none"
+			} else {
+				h.Strategy = "docker"
+			}
+		} else {
+			h.Strategy = "auto"
+		}
+	}
+	return nil
 }
 
 // Project represents a registered project in ForgeLab.
@@ -154,6 +249,7 @@ type Service struct {
 	DependsOn                  []string            `json:"depends_on,omitempty"`
 	Volumes                    []VolumeMountConfig `json:"volumes,omitempty"`
 	HealthCheckConfig          *HealthCheckConfig  `json:"healthcheck_config,omitempty"`
+	Networks                   []string            `json:"networks,omitempty"`
 	SourcePath                 string              `json:"source_path"` // relative path inside repo, e.g. ".", "./frontend"
 	RuntimeType                string              `json:"runtime_type"`
 	Framework                  string              `json:"framework"`
@@ -194,6 +290,7 @@ type ServiceDeployment struct {
 	DependsOn         []string            `json:"depends_on,omitempty"`
 	Volumes           []VolumeMountConfig `json:"volumes,omitempty"`
 	HealthCheckConfig *HealthCheckConfig  `json:"healthcheck_config,omitempty"`
+	Networks          []string            `json:"networks,omitempty"`
 	ImageTag          *string             `json:"image_tag"`
 	ImageDigest       *string             `json:"image_digest,omitempty"`
 	ContainerID       *string             `json:"container_id"`

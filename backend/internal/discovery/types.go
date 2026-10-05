@@ -59,34 +59,36 @@ type EnvironmentProvenance struct {
 
 // DiscoveredService represents an individual deployable unit found during discovery
 type DiscoveredService struct {
-	Name               string                  `json:"name"`
-	Role               string                  `json:"role"`           // "frontend", "backend", "worker", "other"
-	Classification     string                  `json:"classification"` // "application", "worker", "infrastructure", "job"
-	SourcePath         string                  `json:"source_path"`
-	Runtime            string                  `json:"runtime"`
-	RuntimeType        string                  `json:"runtime_type"`
-	Framework          string                  `json:"framework"`
-	PackageManager     string                  `json:"package_manager"`
-	BuildStrategy      string                  `json:"build_strategy"` // "dockerfile", "auto", "custom", "image"
-	Image              string                  `json:"image,omitempty"` // e.g. "postgres:16-alpine"
-	BuildCandidates    []models.BuildCandidate `json:"build_candidates"`
-	BuildCommand       string                  `json:"build_command"`
-	StartCommand       string                  `json:"start_command"`
-	DockerfilePath     string                  `json:"dockerfile_path"`
-	BuildContext       string                  `json:"build_context"`
-	InternalPort       int                     `json:"internal_port"`
-	HostPort           *int                    `json:"host_port,omitempty"`
-	PublicExposed      bool                    `json:"public_exposed"`
-	HealthCheck        HealthCheckConfig       `json:"health_check"`
-	HealthStrategy     string                  `json:"health_strategy"`
-	HealthCheckPath    string                  `json:"health_check_path"`
-	HealthCheckEnabled bool                    `json:"health_check_enabled"`
-	DependsOn          []string                `json:"depends_on"`
-	Volumes            []VolumeMountConfig     `json:"volumes"`
-	Environment        []EnvironmentProvenance `json:"environment"`
-	ResourceConfig     models.ResourceConfig   `json:"resource_config"`
-	FilesCount         int                     `json:"files_count"`
-	TotalBytes         int64                   `json:"total_bytes"`
+	Name                string                  `json:"name"`
+	Role                string                  `json:"role"`           // "frontend", "backend", "worker", "other"
+	Classification      string                  `json:"classification"` // "application", "worker", "infrastructure", "job"
+	SourcePath          string                  `json:"source_path"`
+	Runtime             string                  `json:"runtime"`
+	RuntimeType         string                  `json:"runtime_type"`
+	Framework           string                  `json:"framework"`
+	PackageManager      string                  `json:"package_manager"`
+	BuildStrategy       string                  `json:"build_strategy"`  // "dockerfile", "auto", "custom", "image"
+	Image               string                  `json:"image,omitempty"` // e.g. "postgres:16-alpine"
+	BuildCandidates     []models.BuildCandidate `json:"build_candidates"`
+	BuildCommand        string                  `json:"build_command"`
+	StartCommand        string                  `json:"start_command"`
+	DockerfilePath      string                  `json:"dockerfile_path"`
+	BuildContext        string                  `json:"build_context"`
+	InternalPort        int                     `json:"internal_port"`
+	HostPort            *int                    `json:"host_port,omitempty"`
+	PublicExposed       bool                    `json:"public_exposed"`
+	HealthCheck         HealthCheckConfig       `json:"health_check"`
+	HealthStrategy      string                  `json:"health_strategy"`
+	HealthCheckPath     string                  `json:"health_check_path"`
+	HealthCheckEnabled  bool                    `json:"health_check_enabled"`
+	DependsOn           []string                `json:"depends_on"`
+	DependsOnConditions map[string]string       `json:"depends_on_conditions,omitempty"`
+	Volumes             []VolumeMountConfig     `json:"volumes"`
+	Networks            []string                `json:"networks,omitempty"`
+	Environment         []EnvironmentProvenance `json:"environment"`
+	ResourceConfig      models.ResourceConfig   `json:"resource_config"`
+	FilesCount          int                     `json:"files_count"`
+	TotalBytes          int64                   `json:"total_bytes"`
 }
 
 // DiscoveredTopology describes the discovered structure of the codebase
@@ -121,28 +123,30 @@ type PlannedEndpoint struct {
 
 // PlannedService represents a service ready for execution under a DeploymentPlan
 type PlannedService struct {
-	Name            string                  `json:"name"`
-	Role            string                  `json:"role"`
-	Classification  string                  `json:"classification"` // "application", "worker", "infrastructure", "job"
-	SourcePath      string                  `json:"source_path"`
-	BuildStrategy   string                  `json:"build_strategy"` // "dockerfile", "auto", "custom", "image"
-	Image           string                  `json:"image,omitempty"`
-	DockerfilePath  string                  `json:"dockerfile_path,omitempty"`
-	BuildContext    string                  `json:"build_context,omitempty"`
-	BuildCommand    string                  `json:"build_command,omitempty"`
-	StartCommand    string                  `json:"start_command,omitempty"`
-	RuntimeType     string                  `json:"runtime_type"`
-	Framework       string                  `json:"framework"`
-	PackageManager  string                  `json:"package_manager,omitempty"`
-	InternalPort    int                     `json:"internal_port"`
-	HostPort        *int                    `json:"host_port,omitempty"`
-	PublicExposed   bool                    `json:"public_exposed"`
-	HealthCheck     HealthCheckConfig       `json:"health_check"`
-	ResourceConfig  models.ResourceConfig   `json:"resource_config"`
-	DependsOn       []string                `json:"depends_on"`
-	Volumes         []VolumeMountConfig     `json:"volumes"`
-	Environment     []EnvironmentProvenance `json:"environment"`
-	BuildCandidates []models.BuildCandidate `json:"build_candidates,omitempty"`
+	Name                string                  `json:"name"`
+	Role                string                  `json:"role"`
+	Classification      string                  `json:"classification"` // "application", "worker", "infrastructure", "job"
+	SourcePath          string                  `json:"source_path"`
+	BuildStrategy       string                  `json:"build_strategy"` // "dockerfile", "auto", "custom", "image"
+	Image               string                  `json:"image,omitempty"`
+	DockerfilePath      string                  `json:"dockerfile_path,omitempty"`
+	BuildContext        string                  `json:"build_context,omitempty"`
+	BuildCommand        string                  `json:"build_command,omitempty"`
+	StartCommand        string                  `json:"start_command,omitempty"`
+	RuntimeType         string                  `json:"runtime_type"`
+	Framework           string                  `json:"framework"`
+	PackageManager      string                  `json:"package_manager,omitempty"`
+	InternalPort        int                     `json:"internal_port"`
+	HostPort            *int                    `json:"host_port,omitempty"`
+	PublicExposed       bool                    `json:"public_exposed"`
+	HealthCheck         HealthCheckConfig       `json:"health_check"`
+	ResourceConfig      models.ResourceConfig   `json:"resource_config"`
+	DependsOn           []string                `json:"depends_on"`
+	DependsOnConditions map[string]string       `json:"depends_on_conditions,omitempty"`
+	Volumes             []VolumeMountConfig     `json:"volumes"`
+	Networks            []string                `json:"networks,omitempty"`
+	Environment         []EnvironmentProvenance `json:"environment"`
+	BuildCandidates     []models.BuildCandidate `json:"build_candidates,omitempty"`
 }
 
 // DeploymentPlan is the immutable blueprint for a deployment release

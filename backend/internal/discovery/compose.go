@@ -12,6 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/forgelab/backend/internal/envparser"
 	"github.com/forgelab/backend/internal/models"
 )
 
@@ -35,10 +36,10 @@ func FindComposeFile(dir string) (string, bool) {
 
 // RawComposeData holds the top-level structure of a docker-compose / compose file
 type RawComposeData struct {
-	Version  string                           `yaml:"version"`
-	Services map[string]RawComposeService     `yaml:"services"`
-	Networks map[string]RawComposeNetwork     `yaml:"networks"`
-	Volumes  map[string]interface{}           `yaml:"volumes"`
+	Version  string                       `yaml:"version"`
+	Services map[string]RawComposeService `yaml:"services"`
+	Networks map[string]RawComposeNetwork `yaml:"networks"`
+	Volumes  map[string]interface{}       `yaml:"volumes"`
 }
 
 type RawComposeNetwork struct {
@@ -128,9 +129,10 @@ func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []Discove
 	}
 	sort.Strings(svcNames)
 
+	composeDir := filepath.Dir(filePath)
 	for _, name := range svcNames {
 		rawSvc := raw.Services[name]
-		svc := parseComposeService(name, rawSvc, repoRoot, declaredVolMap)
+		svc := parseComposeService(name, rawSvc, repoRoot, composeDir, declaredVolMap)
 		services = append(services, svc)
 	}
 
@@ -145,7 +147,7 @@ func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []Discove
 	return topology, services, nil
 }
 
-func parseComposeService(name string, raw RawComposeService, repoRoot string, declaredVolumes map[string]bool) DiscoveredService {
+func parseComposeService(name string, raw RawComposeService, repoRoot, composeDir string, declaredVolumes map[string]bool) DiscoveredService {
 	classification := ClassifyService(name, raw.Image, raw.Command, raw.Restart)
 	role := inferComposeRole(name, classification, raw)
 
@@ -182,13 +184,18 @@ func parseComposeService(name string, raw RawComposeService, repoRoot string, de
 	healthCheck := parseHealthCheck(raw.HealthCheck, internalPort)
 
 	// Parse depends_on
-	dependsOn := parseDependsOn(raw.DependsOn)
+	dependsOn, depConditions := parseDependsOn(raw.DependsOn)
 
 	// Parse volumes
 	volumes := parseVolumes(raw.Volumes, declaredVolumes)
 
-	// Parse environment
-	envVars := parseEnvironment(raw.Environment, name)
+	// Parse networks
+	networks := parseNetworks(raw.Networks)
+
+	// Parse environment & env_files (explicit environment overrides env_file)
+	explicitEnvVars := parseEnvironment(raw.Environment, name)
+	envFileVars := parseEnvFiles(raw.EnvFile, repoRoot, composeDir, name)
+	envVars := mergeEnvironment(envFileVars, explicitEnvVars)
 
 	// Commands
 	if raw.Command != nil {
@@ -238,33 +245,37 @@ func parseComposeService(name string, raw RawComposeService, repoRoot string, de
 		})
 	}
 
+	healthEnabled := healthCheck.Strategy != models.HealthStrategyNone && healthCheck.Strategy != "none"
+
 	return DiscoveredService{
-		Name:               name,
-		Role:               role,
-		Classification:     classification,
-		SourcePath:         sourcePath,
-		Runtime:            "compose",
-		RuntimeType:        inferRuntimeType(name, raw.Image, classification),
-		Framework:          inferFramework(name, raw.Image, classification),
-		PackageManager:     "",
-		BuildStrategy:      buildStrategy,
-		Image:              raw.Image,
-		BuildCandidates:    candidates,
-		BuildCommand:       buildCmd,
-		StartCommand:       startCmd,
-		DockerfilePath:     dockerfilePath,
-		BuildContext:       buildContext,
-		InternalPort:       internalPort,
-		HostPort:           hostPort,
-		PublicExposed:      publicExposed,
-		HealthCheck:        healthCheck,
-		HealthStrategy:     healthCheck.Strategy,
-		HealthCheckPath:    healthCheck.Path,
-		HealthCheckEnabled: healthCheck.Strategy != "none",
-		DependsOn:          dependsOn,
-		Volumes:            volumes,
-		Environment:        envVars,
-		ResourceConfig:     resConfig,
+		Name:                name,
+		Role:                role,
+		Classification:      classification,
+		SourcePath:          sourcePath,
+		Runtime:             "compose",
+		RuntimeType:         inferRuntimeType(name, raw.Image, classification),
+		Framework:           inferFramework(name, raw.Image, classification),
+		PackageManager:      "",
+		BuildStrategy:       buildStrategy,
+		Image:               raw.Image,
+		BuildCandidates:     candidates,
+		BuildCommand:        buildCmd,
+		StartCommand:        startCmd,
+		DockerfilePath:      dockerfilePath,
+		BuildContext:        buildContext,
+		InternalPort:        internalPort,
+		HostPort:            hostPort,
+		PublicExposed:       publicExposed,
+		HealthCheck:         healthCheck,
+		HealthStrategy:      healthCheck.Strategy,
+		HealthCheckPath:     healthCheck.Path,
+		HealthCheckEnabled:  healthEnabled,
+		DependsOn:           dependsOn,
+		DependsOnConditions: depConditions,
+		Volumes:             volumes,
+		Networks:            networks,
+		Environment:         envVars,
+		ResourceConfig:      resConfig,
 	}
 }
 
@@ -400,11 +411,20 @@ func parsePorts(ports []interface{}, expose []interface{}, classification, role 
 }
 
 func parseHealthCheck(hc *RawComposeHealthCheck, internalPort int) HealthCheckConfig {
-	if hc == nil || hc.Disable {
+	if hc == nil {
 		return HealthCheckConfig{
 			Strategy: models.HealthStrategyAuto,
 			Path:     "/",
 			Port:     internalPort,
+		}
+	}
+
+	if hc.Disable {
+		return HealthCheckConfig{
+			Strategy: models.HealthStrategyNone,
+			Path:     "/",
+			Port:     internalPort,
+			Test:     []string{"NONE"},
 		}
 	}
 
@@ -429,6 +449,8 @@ func parseHealthCheck(hc *RawComposeHealthCheck, internalPort int) HealthCheckCo
 	strat := "docker"
 	if len(testCmd) == 0 {
 		strat = models.HealthStrategyAuto
+	} else if len(testCmd) == 1 && strings.EqualFold(testCmd[0], "none") {
+		strat = models.HealthStrategyNone
 	}
 
 	return HealthCheckConfig{
@@ -454,10 +476,11 @@ func parseDurationSeconds(s string, defaultSec int) int {
 	return defaultSec
 }
 
-func parseDependsOn(dep interface{}) []string {
+func parseDependsOn(dep interface{}) ([]string, map[string]string) {
 	var result []string
+	conditions := make(map[string]string)
 	if dep == nil {
-		return result
+		return result, conditions
 	}
 
 	switch d := dep.(type) {
@@ -465,15 +488,23 @@ func parseDependsOn(dep interface{}) []string {
 		for _, item := range d {
 			if s, ok := item.(string); ok && s != "" {
 				result = append(result, s)
+				conditions[s] = "service_started"
 			}
 		}
 	case map[string]interface{}:
-		for k := range d {
+		for k, v := range d {
 			result = append(result, k)
+			cond := "service_started"
+			if m, ok := v.(map[string]interface{}); ok {
+				if c, ok := m["condition"].(string); ok && c != "" {
+					cond = c
+				}
+			}
+			conditions[k] = cond
 		}
 	}
 	sort.Strings(result)
-	return result
+	return result, conditions
 }
 
 func parseVolumes(vols []interface{}, declaredVolumes map[string]bool) []VolumeMountConfig {
@@ -490,7 +521,7 @@ func parseVolumes(vols []interface{}, declaredVolumes map[string]bool) []VolumeM
 					readOnly = true
 				}
 				volType := "bind"
-				if declaredVolumes[source] || (!strings.HasPrefix(source, ".") && !strings.HasPrefix(source, "/") && !strings.Contains(source, "\\")) {
+				if declaredVolumes[source] || (!strings.HasPrefix(source, ".") && !strings.HasPrefix(source, "/") && !strings.Contains(source, "/") && !strings.Contains(source, "\\")) {
 					volType = "volume"
 				}
 				mounts = append(mounts, VolumeMountConfig{
@@ -499,10 +530,76 @@ func parseVolumes(vols []interface{}, declaredVolumes map[string]bool) []VolumeM
 					Type:     volType,
 					ReadOnly: readOnly,
 				})
+			} else if len(parts) == 1 && parts[0] != "" {
+				mounts = append(mounts, VolumeMountConfig{
+					Source:   parts[0],
+					Target:   parts[0],
+					Type:     "volume",
+					ReadOnly: false,
+				})
+			}
+		case map[string]interface{}:
+			vType, _ := item["type"].(string)
+			source, _ := item["source"].(string)
+			target, _ := item["target"].(string)
+			readOnly := false
+			if ro, ok := item["read_only"].(bool); ok {
+				readOnly = ro
+			}
+			if vType == "" {
+				if declaredVolumes[source] || (!strings.HasPrefix(source, ".") && !strings.HasPrefix(source, "/") && !strings.Contains(source, "/") && !strings.Contains(source, "\\")) {
+					vType = "volume"
+				} else {
+					vType = "bind"
+				}
+			}
+			if target != "" {
+				mounts = append(mounts, VolumeMountConfig{
+					Source:   source,
+					Target:   target,
+					Type:     vType,
+					ReadOnly: readOnly,
+				})
 			}
 		}
 	}
 	return mounts
+}
+
+func parseNetworks(nets interface{}) []string {
+	var result []string
+	if nets == nil {
+		return result
+	}
+	switch n := nets.(type) {
+	case string:
+		if strings.TrimSpace(n) != "" {
+			result = append(result, strings.TrimSpace(n))
+		}
+	case []interface{}:
+		for _, item := range n {
+			switch it := item.(type) {
+			case string:
+				if strings.TrimSpace(it) != "" {
+					result = append(result, strings.TrimSpace(it))
+				}
+			case map[string]interface{}:
+				for k := range it {
+					if strings.TrimSpace(k) != "" {
+						result = append(result, strings.TrimSpace(k))
+					}
+				}
+			}
+		}
+	case map[string]interface{}:
+		for k := range n {
+			if strings.TrimSpace(k) != "" {
+				result = append(result, strings.TrimSpace(k))
+			}
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 func parseEnvironment(env interface{}, serviceName string) []EnvironmentProvenance {
@@ -515,10 +612,14 @@ func parseEnvironment(env interface{}, serviceName string) []EnvironmentProvenan
 	case map[string]interface{}:
 		for k, v := range e {
 			valStr := fmt.Sprintf("%v", v)
-			isSecret := isSecretEnvKey(k)
+			isSecret := IsSecretEnvKey(k)
+			val := valStr
+			if isSecret {
+				val = "[REDACTED]"
+			}
 			result = append(result, EnvironmentProvenance{
 				Key:                k,
-				Value:              valStr,
+				Value:              val,
 				IsSecret:           isSecret,
 				Scope:              models.EnvScopeRuntime,
 				SourceFile:         "compose.yaml",
@@ -537,7 +638,10 @@ func parseEnvironment(env interface{}, serviceName string) []EnvironmentProvenan
 			if len(parts) > 1 {
 				val = parts[1]
 			}
-			isSecret := isSecretEnvKey(key)
+			isSecret := IsSecretEnvKey(key)
+			if isSecret {
+				val = "[REDACTED]"
+			}
 			result = append(result, EnvironmentProvenance{
 				Key:                key,
 				Value:              val,
@@ -558,10 +662,118 @@ func parseEnvironment(env interface{}, serviceName string) []EnvironmentProvenan
 	return result
 }
 
-func isSecretEnvKey(key string) bool {
-	upper := strings.ToUpper(key)
+func parseEnvFiles(envFile interface{}, repoRoot, composeDir, serviceName string) []EnvironmentProvenance {
+	var fileList []string
+	switch ef := envFile.(type) {
+	case string:
+		if strings.TrimSpace(ef) != "" {
+			fileList = append(fileList, strings.TrimSpace(ef))
+		}
+	case []interface{}:
+		for _, item := range ef {
+			switch it := item.(type) {
+			case string:
+				if strings.TrimSpace(it) != "" {
+					fileList = append(fileList, strings.TrimSpace(it))
+				}
+			case map[string]interface{}:
+				if p, ok := it["path"].(string); ok && strings.TrimSpace(p) != "" {
+					fileList = append(fileList, strings.TrimSpace(p))
+				}
+			}
+		}
+	}
+
+	var results []EnvironmentProvenance
+	for _, rawPath := range fileList {
+		candidates := []string{
+			filepath.Join(composeDir, rawPath),
+			filepath.Join(repoRoot, rawPath),
+		}
+		var targetPath string
+		for _, cand := range candidates {
+			if info, err := os.Stat(cand); err == nil && !info.IsDir() {
+				targetPath = cand
+				break
+			}
+		}
+		if targetPath == "" {
+			continue
+		}
+
+		relPath, _ := filepath.Rel(repoRoot, targetPath)
+		if relPath == "" {
+			relPath = rawPath
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		parsed, err := envparser.ParseFile(targetPath)
+		if err != nil {
+			continue
+		}
+
+		keys := make([]string, 0, len(parsed))
+		for k := range parsed {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			v := parsed[k]
+			isSecret := IsSecretEnvKey(k)
+			val := v
+			if isSecret {
+				val = "[REDACTED]"
+			}
+			results = append(results, EnvironmentProvenance{
+				Key:                k,
+				Value:              val,
+				IsSecret:           isSecret,
+				Scope:              models.EnvScopeRuntime,
+				SourceFile:         relPath,
+				ServiceName:        serviceName,
+				HasConflict:        false,
+				ConflictResolution: "imported",
+				ActiveValue:        "source",
+			})
+		}
+	}
+	return results
+}
+
+func mergeEnvironment(envFileVars, explicitEnvVars []EnvironmentProvenance) []EnvironmentProvenance {
+	envMap := make(map[string]EnvironmentProvenance)
+	for _, ef := range envFileVars {
+		envMap[ef.Key] = ef
+	}
+	for _, ex := range explicitEnvVars {
+		envMap[ex.Key] = ex
+	}
+
+	keys := make([]string, 0, len(envMap))
+	for k := range envMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	res := make([]EnvironmentProvenance, 0, len(keys))
+	for _, k := range keys {
+		res = append(res, envMap[k])
+	}
+	return res
+}
+
+// IsSecretEnvKey checks if an environment variable key indicates sensitive data.
+func IsSecretEnvKey(key string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	if upper == "" {
+		return false
+	}
 	secretKeywords := []string{
-		"PASSWORD", "PASSWD", "SECRET", "TOKEN", "API_KEY", "PRIVATE_KEY", "DATABASE_URL", "DB_PASS",
+		"PASSWORD", "PASSWD", "SECRET", "TOKEN", "API_KEY", "APIKEY",
+		"PRIVATE_KEY", "PRIVKEY", "ACCESS_KEY", "AUTH_KEY", "DATABASE_URL",
+		"DB_PASS", "DB_PASSWORD", "CREDENTIAL", "CREDENTIALS", "CERTIFICATE",
+		"SIGNING_KEY", "ENCRYPTION_KEY", "BEARER", "SECRET_KEY", "CLIENT_SECRET",
 	}
 	for _, kw := range secretKeywords {
 		if strings.Contains(upper, kw) {

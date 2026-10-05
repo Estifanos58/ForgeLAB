@@ -9,6 +9,7 @@ ALTER TABLE service_deployments
     DROP COLUMN IF EXISTS image,
     DROP COLUMN IF EXISTS depends_on,
     DROP COLUMN IF EXISTS volumes,
+    DROP COLUMN IF EXISTS networks,
     DROP COLUMN IF EXISTS healthcheck_config;
 
 ALTER TABLE services
@@ -16,6 +17,7 @@ ALTER TABLE services
     DROP COLUMN IF EXISTS image,
     DROP COLUMN IF EXISTS depends_on,
     DROP COLUMN IF EXISTS volumes,
+    DROP COLUMN IF EXISTS networks,
     DROP COLUMN IF EXISTS healthcheck_config;
 
 ALTER TABLE projects

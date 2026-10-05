@@ -189,7 +189,7 @@ func DetectTechnology(files map[string][]byte) (runtime, framework, pkgManager s
 			port = 5000
 			healthPath = "/"
 			healthStrat = models.HealthStrategyHTTP
-			startCmd = "python app.py"
+			startCmd = "gunicorn --bind 0.0.0.0:5000 --workers 2 app:app"
 			return
 		}
 		if strings.Contains(lowerPy, "django") || hasKey(files, "manage.py") {
@@ -198,7 +198,7 @@ func DetectTechnology(files map[string][]byte) (runtime, framework, pkgManager s
 			port = 8000
 			healthPath = "/"
 			healthStrat = models.HealthStrategyHTTP
-			startCmd = "python manage.py runserver 0.0.0.0:8000"
+			startCmd = "gunicorn --bind 0.0.0.0:8000 --workers 2 wsgi:application"
 			return
 		}
 
@@ -224,7 +224,7 @@ func DetectTechnology(files map[string][]byte) (runtime, framework, pkgManager s
 		healthStrat = models.HealthStrategyHTTP
 		if hasKey(files, "artisan") {
 			framework = "Laravel"
-			startCmd = "php artisan serve --host=0.0.0.0 --port=8000"
+			startCmd = "php -d variables_order=EGPCS -S 0.0.0.0:8000 -t public"
 		} else {
 			framework = "PHP"
 			startCmd = "php -S 0.0.0.0:8000"
@@ -318,16 +318,17 @@ func DetectTechnology(files map[string][]byte) (runtime, framework, pkgManager s
 	}
 
 	// 8. Ruby Ecosystem
-	if _, ok := files["Gemfile"]; ok {
+	if gemRaw, ok := files["Gemfile"]; ok {
 		runtime = "ruby"
 		framework = "Ruby"
 		pkgManager = "bundler"
 		port = 3000
 		healthPath = "/"
 		healthStrat = models.HealthStrategyHTTP
-		if hasKey(files, "config/routes.rb") {
+		lowerGem := strings.ToLower(string(gemRaw))
+		if hasKey(files, "config/routes.rb") || strings.Contains(lowerGem, "rails") {
 			framework = "Ruby on Rails"
-			startCmd = "bundle exec rails server -b 0.0.0.0 -p 3000"
+			startCmd = "bundle exec puma -C config/puma.rb -b tcp://0.0.0.0:3000"
 		} else {
 			startCmd = "bundle exec rackup -o 0.0.0.0 -p 3000"
 		}
@@ -459,26 +460,36 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "%d"]
 `, port, port, port)
 
 	case "python-flask":
+		cmd := fmt.Sprintf("gunicorn --bind 0.0.0.0:%d --workers 2 app:app", port)
+		if startCmd != "" {
+			cmd = startCmd
+		}
 		return fmt.Sprintf(`FROM python:3.11-slim
 WORKDIR /app
 COPY requirements*.txt pyproject.toml* Pipfile* ./
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi && \
+    pip install --no-cache-dir gunicorn
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["python", "app.py"]
-`, port, port)
+CMD ["sh", "-c", "%s"]
+`, port, port, cmd)
 
 	case "python-django":
+		cmd := fmt.Sprintf("gunicorn --bind 0.0.0.0:%d --workers 2 wsgi:application", port)
+		if startCmd != "" {
+			cmd = startCmd
+		}
 		return fmt.Sprintf(`FROM python:3.11-slim
 WORKDIR /app
 COPY requirements*.txt pyproject.toml* Pipfile* ./
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi && \
+    pip install --no-cache-dir gunicorn
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["python", "manage.py", "runserver", "0.0.0.0:%d"]
-`, port, port, port)
+CMD ["sh", "-c", "%s"]
+`, port, port, cmd)
 
 	case "python":
 		cmd := "python main.py"
@@ -563,14 +574,14 @@ CMD ["/app/server"]
 `, port, port)
 
 	case "php":
-		cmd := "php -S 0.0.0.0:8000"
+		cmd := fmt.Sprintf("php -d variables_order=EGPCS -S 0.0.0.0:%d -t public", port)
 		if startCmd != "" {
 			cmd = startCmd
 		}
 		return fmt.Sprintf(`FROM php:8.2-cli-alpine
 WORKDIR /app
 COPY composer.json* composer.lock* ./
-RUN if [ -f composer.json ]; then curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer && composer install --no-dev; fi
+RUN if [ -f composer.json ]; then curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer && composer install --no-dev --optimize-autoloader; fi
 COPY . .
 ENV PORT=%d
 EXPOSE %d
@@ -578,7 +589,7 @@ CMD ["sh", "-c", "%s"]
 `, port, port, cmd)
 
 	case "ruby":
-		cmd := "bundle exec rackup -o 0.0.0.0 -p 3000"
+		cmd := fmt.Sprintf("bundle exec puma -C config/puma.rb -b tcp://0.0.0.0:%d", port)
 		if startCmd != "" {
 			cmd = startCmd
 		}
@@ -586,7 +597,7 @@ CMD ["sh", "-c", "%s"]
 RUN apk add --no-cache build-base
 WORKDIR /app
 COPY Gemfile Gemfile.lock* ./
-RUN bundle install
+RUN bundle install --without development test
 COPY . .
 ENV PORT=%d
 EXPOSE %d
@@ -667,4 +678,148 @@ func hasFileWithExt(files map[string][]byte, ext string) bool {
 		}
 	}
 	return false
+}
+
+// ProductionRecommendation specifies production-ready commands and build candidates.
+type ProductionRecommendation struct {
+	ProdBuildCommand string                  `json:"prod_build_command"`
+	ProdStartCommand string                  `json:"prod_start_command"`
+	DevStartCommand  string                  `json:"dev_start_command"`
+	Candidates       []models.BuildCandidate `json:"candidates"`
+}
+
+// RecommendProductionExecution cleanly separates technology detection from production execution recommendations.
+func RecommendProductionExecution(runtime, framework, pkgManager string, port int, healthPath, healthStrat string) ProductionRecommendation {
+	rec := ProductionRecommendation{}
+	switch {
+	case strings.Contains(runtime, "django") || framework == "Django":
+		rec.ProdBuildCommand = "pip install -r requirements.txt gunicorn"
+		rec.ProdStartCommand = fmt.Sprintf("gunicorn --bind 0.0.0.0:%d --workers 2 wsgi:application", port)
+		rec.DevStartCommand = fmt.Sprintf("python manage.py runserver 0.0.0.0:%d", port)
+		rec.Candidates = []models.BuildCandidate{
+			{
+				ID:              "django-production",
+				Strategy:        StrategyAuto,
+				Name:            "Django Production (Gunicorn)",
+				Description:     "Production WSGI server with Gunicorn and 2 workers",
+				Confidence:      0.95,
+				BuildCommand:    rec.ProdBuildCommand,
+				StartCommand:    rec.ProdStartCommand,
+				PackageManager:  pkgManager,
+				SuggestedPort:   port,
+				HealthCheckPath: healthPath,
+				HealthStrategy:  healthStrat,
+			},
+			{
+				ID:              "django-dev",
+				Strategy:        StrategyAuto,
+				Name:            "Django Development Server",
+				Description:     "Django built-in development server (non-production)",
+				Confidence:      0.50,
+				BuildCommand:    "",
+				StartCommand:    rec.DevStartCommand,
+				PackageManager:  pkgManager,
+				SuggestedPort:   port,
+				HealthCheckPath: healthPath,
+				HealthStrategy:  healthStrat,
+			},
+		}
+	case strings.Contains(runtime, "flask") || framework == "Flask":
+		rec.ProdBuildCommand = "pip install -r requirements.txt gunicorn"
+		rec.ProdStartCommand = fmt.Sprintf("gunicorn --bind 0.0.0.0:%d --workers 2 app:app", port)
+		rec.DevStartCommand = "python app.py"
+		rec.Candidates = []models.BuildCandidate{
+			{
+				ID:              "flask-production",
+				Strategy:        StrategyAuto,
+				Name:            "Flask Production (Gunicorn)",
+				Description:     "Production WSGI server with Gunicorn and 2 workers",
+				Confidence:      0.95,
+				BuildCommand:    rec.ProdBuildCommand,
+				StartCommand:    rec.ProdStartCommand,
+				PackageManager:  pkgManager,
+				SuggestedPort:   port,
+				HealthCheckPath: healthPath,
+				HealthStrategy:  healthStrat,
+			},
+			{
+				ID:              "flask-dev",
+				Strategy:        StrategyAuto,
+				Name:            "Flask Development Server",
+				Description:     "Flask built-in development server (non-production)",
+				Confidence:      0.50,
+				BuildCommand:    "",
+				StartCommand:    rec.DevStartCommand,
+				PackageManager:  pkgManager,
+				SuggestedPort:   port,
+				HealthCheckPath: healthPath,
+				HealthStrategy:  healthStrat,
+			},
+		}
+	case framework == "Laravel":
+		rec.ProdBuildCommand = "composer install --no-dev --optimize-autoloader"
+		rec.ProdStartCommand = fmt.Sprintf("php -d variables_order=EGPCS -S 0.0.0.0:%d -t public", port)
+		rec.DevStartCommand = fmt.Sprintf("php artisan serve --host=0.0.0.0 --port=%d", port)
+		rec.Candidates = []models.BuildCandidate{
+			{
+				ID:              "laravel-production",
+				Strategy:        StrategyAuto,
+				Name:            "Laravel Production (Optimized)",
+				Description:     "Production standalone public server with optimized autoloader",
+				Confidence:      0.95,
+				BuildCommand:    rec.ProdBuildCommand,
+				StartCommand:    rec.ProdStartCommand,
+				PackageManager:  "composer",
+				SuggestedPort:   port,
+				HealthCheckPath: healthPath,
+				HealthStrategy:  healthStrat,
+			},
+			{
+				ID:              "laravel-dev",
+				Strategy:        StrategyAuto,
+				Name:            "Laravel Artisan Server (Development)",
+				Description:     "Artisan development serve command (non-production)",
+				Confidence:      0.50,
+				BuildCommand:    "",
+				StartCommand:    rec.DevStartCommand,
+				PackageManager:  "composer",
+				SuggestedPort:   port,
+				HealthCheckPath: healthPath,
+				HealthStrategy:  healthStrat,
+			},
+		}
+	case framework == "Ruby on Rails":
+		rec.ProdBuildCommand = "bundle install --without development test"
+		rec.ProdStartCommand = fmt.Sprintf("bundle exec puma -C config/puma.rb -b tcp://0.0.0.0:%d", port)
+		rec.DevStartCommand = fmt.Sprintf("bundle exec rails server -b 0.0.0.0 -p %d", port)
+		rec.Candidates = []models.BuildCandidate{
+			{
+				ID:              "rails-production",
+				Strategy:        StrategyAuto,
+				Name:            "Ruby on Rails Production (Puma)",
+				Description:     "Production Puma web server",
+				Confidence:      0.95,
+				BuildCommand:    rec.ProdBuildCommand,
+				StartCommand:    rec.ProdStartCommand,
+				PackageManager:  "bundler",
+				SuggestedPort:   port,
+				HealthCheckPath: healthPath,
+				HealthStrategy:  healthStrat,
+			},
+			{
+				ID:              "rails-dev",
+				Strategy:        StrategyAuto,
+				Name:            "Rails Server (Development)",
+				Description:     "Rails built-in development server (non-production)",
+				Confidence:      0.50,
+				BuildCommand:    "",
+				StartCommand:    rec.DevStartCommand,
+				PackageManager:  "bundler",
+				SuggestedPort:   port,
+				HealthCheckPath: healthPath,
+				HealthStrategy:  healthStrat,
+			},
+		}
+	}
+	return rec
 }

@@ -2626,7 +2626,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                   {svc.volumes && svc.volumes.length > 0 && (
                     <div className="text-[11px] text-neutral-400 font-mono bg-black/20 p-2 rounded border border-neutral-800/60">
                       <span className="text-neutral-500">Volumes: </span>
-                      {svc.volumes.map((v) => `${v.name} -> ${v.container_path}${v.read_only ? ' (ro)' : ''}`).join(', ')}
+                      {svc.volumes.map((v) => `${v.source || v.name} -> ${v.target || v.container_path}${v.read_only ? ' (ro)' : ''}`).join(', ')}
                     </div>
                   )}
                 </div>
