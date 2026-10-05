@@ -50,8 +50,10 @@ type Engine struct {
 	maxConcurrentBuilds int
 	buildSem            *BuildSemaphore
 	semMu               sync.Mutex
-	activeLogCollectors sync.Map // map[string]context.CancelFunc — tracks running log collector goroutines
-	activeCancels       sync.Map // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	buildMaintenanceMu  sync.RWMutex // synchronizes Docker image builds vs image pruning/maintenance
+	pruneFilterLabel    string       // optional label filter for scoped image pruning
+	activeLogCollectors sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
+	activeCancels       sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
 }
 
 func NewEngine(
@@ -113,6 +115,21 @@ func (e *Engine) SetMaxConcurrentBuilds(n int) {
 // GetMaxConcurrentBuilds returns the current global Docker build concurrency limit.
 func (e *Engine) GetMaxConcurrentBuilds() int {
 	return e.maxConcurrentBuilds
+}
+
+// SetPruneFilterLabel configures an optional label filter for scoped image pruning.
+func (e *Engine) SetPruneFilterLabel(label string) {
+	e.pruneFilterLabel = label
+}
+
+// GetPruneFilterLabel returns the configured label filter for scoped image pruning.
+func (e *Engine) GetPruneFilterLabel() string {
+	return e.pruneFilterLabel
+}
+
+// GetBuildWaitersCount returns the number of builds waiting on the BuildSemaphore.
+func (e *Engine) GetBuildWaitersCount() int {
+	return e.getBuildSemaphore().GetWaitersCount()
 }
 
 // RegisterActiveCancel registers a cancellation function for an active deployment execution.
@@ -676,6 +693,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			Dockerfile: relDockerPath,
 			BuildArgs:  buildArgs,
 			Remove:     true,
+			Labels: map[string]string{
+				"forgelab.managed":        "true",
+				"forgelab.project_id":     project.ID.String(),
+				"forgelab.service_name":   service.Name,
+				"forgelab.deployment_id":  serviceDeploy.DeploymentID.String(),
+			},
 		}
 
 		if err := e.buildImage(ctx, tarArchive, buildOpts, func(msg string) {
@@ -1374,6 +1397,11 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			Dockerfile: relDockerPath,
 			BuildArgs:  buildArgs,
 			Remove:     true,
+			Labels: map[string]string{
+				"forgelab.managed":       "true",
+				"forgelab.project_id":    project.ID.String(),
+				"forgelab.deployment_id": deployment.ID.String(),
+			},
 		}
 
 		if err := e.buildImage(ctx, tarStream, buildOpts, func(msg string) {
@@ -1968,6 +1996,8 @@ func (e *Engine) PruneDanglingResources(ctx context.Context, maxBuildAge time.Du
 		maxBuildAge = 2 * time.Hour
 	}
 
+	var pruneErrs []error
+
 	// 1. Prune old build directories in workDir
 	if e.workDir != "" {
 		entries, err := os.ReadDir(e.workDir)
@@ -1983,23 +2013,60 @@ func (e *Engine) PruneDanglingResources(ctx context.Context, maxBuildAge time.Du
 				}
 				if now.Sub(info.ModTime()) > maxBuildAge {
 					dirPath := filepath.Join(e.workDir, entry.Name())
-					_ = os.RemoveAll(dirPath)
-					slog.Info("pruned expired build directory", "path", dirPath, "age", now.Sub(info.ModTime()).String())
+					if err := os.RemoveAll(dirPath); err != nil {
+						slog.Warn("failed to remove expired build directory", "path", dirPath, "error", err)
+						pruneErrs = append(pruneErrs, fmt.Errorf("failed to remove build dir %s: %w", dirPath, err))
+					} else {
+						slog.Info("pruned expired build directory", "path", dirPath, "age", now.Sub(info.ModTime()).String())
+					}
 				}
 			}
+		} else if !os.IsNotExist(err) {
+			slog.Warn("failed to read build workDir for pruning", "path", e.workDir, "error", err)
+			pruneErrs = append(pruneErrs, fmt.Errorf("failed to read workDir %s: %w", e.workDir, err))
 		}
 	}
 
-	// 2. Prune dangling Docker images
+	// 2. Prune dangling Docker images with exclusive maintenance synchronization
 	if e.dockerClient != nil {
-		pruneFilters := filters.NewArgs()
-		pruneFilters.Add("dangling", "true")
-		report, err := e.dockerClient.ImagesPrune(ctx, pruneFilters)
-		if err == nil && len(report.ImagesDeleted) > 0 {
-			slog.Info("pruned dangling docker images", "count", len(report.ImagesDeleted), "space_reclaimed_bytes", report.SpaceReclaimed)
+		if err := e.pruneDanglingImages(ctx); err != nil {
+			pruneErrs = append(pruneErrs, err)
 		}
 	}
 
+	if len(pruneErrs) > 0 {
+		return errors.Join(pruneErrs...)
+	}
+	return nil
+}
+
+// pruneDanglingImages acquires the exclusive buildMaintenanceMu lock to ensure no Docker image builds
+// are active or can start while dangling Docker images are being pruned.
+func (e *Engine) pruneDanglingImages(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if !e.buildMaintenanceMu.TryLock() {
+		slog.Info("docker image prune waiting for active builds")
+		e.buildMaintenanceMu.Lock()
+	}
+	defer e.buildMaintenanceMu.Unlock()
+
+	slog.Info("docker image prune started")
+	pruneFilters := filters.NewArgs()
+	pruneFilters.Add("dangling", "true")
+	if e.pruneFilterLabel != "" {
+		pruneFilters.Add("label", e.pruneFilterLabel)
+	}
+
+	report, err := e.dockerClient.ImagesPrune(ctx, pruneFilters)
+	if err != nil {
+		slog.Warn("failed to prune dangling docker images", "error", err)
+		return fmt.Errorf("docker image prune failed: %w", err)
+	}
+
+	slog.Info("docker image prune completed", "deleted_count", len(report.ImagesDeleted), "space_reclaimed_bytes", report.SpaceReclaimed)
 	return nil
 }
 
@@ -2033,12 +2100,26 @@ func (e *Engine) buildImage(
 		defer tarArchive.Close()
 	}
 
-	// Acquire Docker build slot under configurable concurrency limit
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// 1. Acquire shared build-maintenance lock (read side).
+	// Prevents Docker image pruning from running while any ImageBuild is active.
+	if !e.buildMaintenanceMu.TryRLock() {
+		slog.Info("docker build waiting for build-maintenance access")
+		e.buildMaintenanceMu.RLock()
+	}
+	defer e.buildMaintenanceMu.RUnlock()
+
+	// 2. Acquire Docker build slot under configurable concurrency limit (BuildSemaphore)
 	releaseSlot, err := e.acquireBuildSlot(ctx)
 	if err != nil {
 		return fmt.Errorf("Docker build concurrency limit wait cancelled: %w", err)
 	}
 	defer releaseSlot()
+
+	slog.Info("docker image build started", "tags", options.Tags)
 
 	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer buildCancel()
@@ -2058,6 +2139,7 @@ func (e *Engine) buildImage(
 		return fmt.Errorf("Docker build error: %w", err)
 	}
 
+	slog.Info("docker image build completed", "tags", options.Tags)
 	return nil
 }
 

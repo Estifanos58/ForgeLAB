@@ -60,6 +60,13 @@ func (s *BuildSemaphore) GetActiveCount() int {
 	return s.active
 }
 
+// GetWaitersCount returns the current number of builds waiting for a slot.
+func (s *BuildSemaphore) GetWaitersCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.waiters)
+}
+
 // Acquire requests a build slot, waiting if necessary until one becomes available or ctx is cancelled.
 // It returns a release function that must be called when the build finishes.
 func (s *BuildSemaphore) Acquire(ctx context.Context) (func(), error) {

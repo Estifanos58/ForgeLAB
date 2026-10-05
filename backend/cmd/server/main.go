@@ -170,6 +170,9 @@ func main() {
 	dockerEngine.SetServiceService(serviceService)
 	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
 	dockerEngine.SetMaxConcurrentBuilds(cfg.Docker.MaxConcurrentBuilds)
+	if cfg.Docker.PruneFilterLabel != "" {
+		dockerEngine.SetPruneFilterLabel(cfg.Docker.PruneFilterLabel)
+	}
 	defer dockerEngine.StopAllLogCollectors()
 
 	// Initialize Redis deployment queue & worker
@@ -206,10 +209,6 @@ func main() {
 		if err := dockerEngine.ReconcileDaemonContainers(ctx); err != nil {
 			slog.Warn("failed to reconcile daemon containers", "error", err)
 		}
-		// Prune dangling build workspaces and images
-		if err := dockerEngine.PruneDanglingResources(ctx, 2*time.Hour); err != nil {
-			slog.Warn("failed to prune dangling build resources", "error", err)
-		}
 
 		if deployQueue != nil {
 			if reconciled, err := deploymentService.ReconcileOrphanedDeploymentsWithQueue(ctx, deployQueue, 10*time.Minute, queue.DefaultMaxRetries); err != nil {
@@ -238,6 +237,27 @@ func main() {
 				return
 			case <-ticker.C:
 				reconcileFn()
+			}
+		}
+	}()
+
+	// Launch periodic garbage collection on a separate, less frequent schedule
+	// Protected by the exclusive build-maintenance lock inside dockerEngine to prevent overlap with builds
+	pruneInterval := cfg.Docker.PruneInterval
+	if pruneInterval <= 0 {
+		pruneInterval = 1 * time.Hour
+	}
+	go func() {
+		pruneTicker := time.NewTicker(pruneInterval)
+		defer pruneTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pruneTicker.C:
+				if err := dockerEngine.PruneDanglingResources(ctx, 2*time.Hour); err != nil {
+					slog.Warn("failed to prune dangling build resources", "error", err)
+				}
 			}
 		}
 	}()

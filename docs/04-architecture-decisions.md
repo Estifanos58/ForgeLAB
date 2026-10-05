@@ -400,16 +400,22 @@ Container configuration is validated through authoritative unified boundaries in
 - Defense-in-depth isolation: `CapDrop: ["ALL"]`, `SecurityOpt: ["no-new-privileges:true"]`, `Tmpfs: {"/tmp": "rw,noexec,nosuid,size=64m"}`, `LogConfig: {"max-size": "10m", "max-file": "3"}`.
 - Host mounts are restricted strictly to configured allowlist prefixes; sensitive mounts (`/var/run/docker.sock`, `/etc`, `/proc`, `/sys`) are unconditionally rejected.
 
-### 6. Daemon Container & Port Reconciliation
-On backend startup, the engine queries the Docker daemon to reconcile container status against DB records:
-- Detects containers that exited or crashed while ForgeLAB was offline and updates service/deployment states.
-- Cleans up orphaned ForgeLAB containers whose project or deployment has reached a terminal state.
-- Synchronizes the in-memory `PortManager` with currently bound host ports to eliminate allocation collisions.
+### 6. Daemon Container & Port Reconciliation vs. Image Garbage Collection
+- **Separation of Responsibilities:** Container and port reconciliation is strictly decoupled from Docker image garbage collection:
+  - **Container & Port Reconciliation:** Runs immediately at server startup and repeats frequently (every 2 minutes) to detect exited or crashed containers, clean up orphaned containers in terminal states, and reconcile the in-memory `PortManager` with active host port allocations. It does NOT invoke Docker image pruning.
+  - **Periodic Garbage Collection:** Pruning expired build directories in `workDir` and dangling Docker images runs on a separate, less frequent background schedule (configurable via `FORGELAB_IMAGE_PRUNE_INTERVAL`, defaulting to 1 hour). Image pruning is never run directly inside the rapid 2-minute container reconciliation loop.
+  - **Observable Diagnostics:** Failures during workspace removal or Docker image pruning (`dockerClient.ImagesPrune`) are explicitly logged with context and returned rather than silently swallowed.
 
-### 7. Docker Build Concurrency & Error Classification
+### 7. Docker Build Concurrency & Maintenance Synchronization
 - **Decoupled Concurrency:** ForgeLAB separates service deployment concurrency from Docker image build concurrency. Service deployments (source resolution, staging, container launch, and health checking) run concurrently, while `ImageBuild` calls are gated through a thread-safe `BuildSemaphore`.
-- **Configurable Limit:** Build concurrency is configured via `FORGELAB_MAX_CONCURRENT_BUILDS` or `FORGELAB_MAX_DOCKER_BUILDS`. For local development and Docker Desktop environments, it defaults conservatively to `1` to avoid containerd snapshotter layer export collisions (`io.containerd.content.v1.content/ingest/` rename races).
+- **Configurable Concurrency Limit:** Build concurrency is configured via `FORGELAB_MAX_CONCURRENT_BUILDS` or `FORGELAB_MAX_DOCKER_BUILDS`. For local development and Docker Desktop environments, it defaults conservatively to `1` to avoid containerd snapshotter layer export collisions (`io.containerd.content.v1.content/ingest/` rename races).
 - **Safe Semaphore Lifecycles:** The `BuildSemaphore` guarantees slots are released on build success, daemon failure, timeout, or context cancellation without deadlocks or slot leaks.
+- **Mutual Build / Prune Synchronization Invariant:**
+  - Docker image builds (`ImageBuild`) and Docker image pruning (`ImagesPrune`) are mutually synchronized at the Docker engine level using a shared/exclusive lock (`buildMaintenanceMu sync.RWMutex`).
+  - **Shared/Read Access for Builds:** `buildImage` acquires the read lock before acquiring `BuildSemaphore` and holds it across the entire lifecycle of the build, including response stream parsing until `io.EOF`, ensuring containerd layer ingestion and blob commit are complete before any pruning can run.
+  - **Exclusive/Write Access for Maintenance:** `PruneDanglingResources` acquires the exclusive lock before calling `ImagesPrune` and releases it once the prune report is returned.
+  - **Core Invariant:** NO `ImagesPrune` may execute while ANY `ImageBuild` is in-flight. NO new `ImageBuild` may begin while `ImagesPrune` is actively executing.
+  - **Prevention of Containerd Layer Ingest Collisions:** This synchronization directly eliminates the containerd error: `failed to export layer: CreateDiff: mount callback failed ... failed to commit: rename .../io.containerd.content.v1.content/ingest/<id>/data .../io.containerd.content.v1.content/blobs/sha256/<digest>: no such file or directory`, which occurred when the 2-minute maintenance loop triggered `ImagesPrune` concurrently with an active multi-minute Docker build.
 - **Error Classification & Diagnostics:** Errors returned during layer export (e.g. `CreateDiff`, `mount callback failed`, `io.containerd.content.v1.content`, `no such file or directory`) are classified as storage/daemon failures (`CategoryStorageDaemon`). The engine logs clear actionable diagnostics (inspecting Docker Desktop health, storage, and disk space) and queries non-sensitive Docker daemon info (Ping, ServerVersion, OS/Arch, StorageDriver) without leaking credentials or environment variables.
 - **Stream Lifecycle Integrity:** Build contexts are streamed through `io.Reader` (e.g. from the Local Agent). Because streams are consumed once sent to Docker and buffering repositories in memory is unsafe, failed builds fail cleanly once with diagnostic telemetry rather than attempting blind retries with an exhausted stream.
 

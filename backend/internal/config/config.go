@@ -129,8 +129,10 @@ type DockerConfig struct {
 	HostSourceRoot      string
 	ContainerSourceRoot string
 	LocalBuildMode      string
-	MaxConcurrentBuilds int // global cap on concurrent Docker builds/deploys
-	QueueWorkerCount    int // number of queue worker goroutines
+	MaxConcurrentBuilds int           // global cap on concurrent Docker builds/deploys
+	QueueWorkerCount    int           // number of queue worker goroutines
+	PruneInterval       time.Duration // interval between image & workspace GC runs
+	PruneFilterLabel    string        // optional label filter for scoped image pruning
 }
 
 // LogConfig holds logging settings.
@@ -220,6 +222,8 @@ func Load() (*Config, error) {
 			LocalBuildMode:      getEnv("FORGELAB_LOCAL_BUILD_MODE", "direct"),
 			MaxConcurrentBuilds: parseIntEnv("FORGELAB_MAX_CONCURRENT_BUILDS", parseIntEnv("FORGELAB_MAX_DOCKER_BUILDS", 1)),
 			QueueWorkerCount:    parseIntEnv("FORGELAB_QUEUE_WORKERS", 4),
+			PruneInterval:       parseDurationEnv("FORGELAB_IMAGE_PRUNE_INTERVAL", parseDurationEnv("FORGELAB_PRUNE_INTERVAL", 1*time.Hour)),
+			PruneFilterLabel:    getEnv("FORGELAB_PRUNE_FILTER_LABEL", ""),
 		},
 		Log: LogConfig{
 			Level:  getEnv("LOG_LEVEL", "debug"),
@@ -272,6 +276,15 @@ func parseIntEnv(key string, fallback int) int {
 	if value, ok := os.LookupEnv(key); ok {
 		if n, err := strconv.Atoi(value); err == nil && n > 0 {
 			return n
+		}
+	}
+	return fallback
+}
+
+func parseDurationEnv(key string, fallback time.Duration) time.Duration {
+	if value, ok := os.LookupEnv(key); ok {
+		if d, err := time.ParseDuration(value); err == nil && d > 0 {
+			return d
 		}
 	}
 	return fallback
