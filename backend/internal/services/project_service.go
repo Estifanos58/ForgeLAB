@@ -100,6 +100,7 @@ type CreateServiceInput struct {
 	HealthCheckConfig *models.HealthCheckConfig  `json:"healthcheck_config,omitempty"`
 	DependsOn         []string                   `json:"depends_on,omitempty"`
 	Volumes           []models.VolumeMountConfig `json:"volumes,omitempty"`
+	Networks          []string                   `json:"networks,omitempty"`
 }
 
 // CreateProjectInput holds the data needed to create a project.
@@ -475,6 +476,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				Image:              strings.TrimSpace(svcIn.Image),
 				DependsOn:          svcIn.DependsOn,
 				Volumes:            svcIn.Volumes,
+				Networks:           svcIn.Networks,
 				HealthCheckConfig:  svcIn.HealthCheckConfig,
 				SourcePath:         svcSourcePath,
 				RuntimeType:        rt,
@@ -518,6 +520,9 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			Name:               project.Name,
 			Role:               models.RoleOther,
 			Classification:     models.ClassificationApplication,
+			Networks:           []string{},
+			DependsOn:          []string{},
+			Volumes:            []models.VolumeMountConfig{},
 			SourcePath:         srcPath,
 			RuntimeType:        project.RuntimeType,
 			BuildStrategy:      project.BuildStrategy,
@@ -538,6 +543,11 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 	// Transactional persistence for project, source, and services
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
+		slog.Error("failed to begin transaction during project creation",
+			"project_name", name,
+			"owner_id", ownerID,
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
@@ -554,7 +564,15 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		sourceUUID, ownerID, sourceType, sourceRef, agentIDStr,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to save source record: %w", err)
+		slog.Error("source persistence failure during project creation",
+			"failure_stage", "source_persistence",
+			"project_name", name,
+			"owner_id", ownerID,
+			"source_id", sourceUUID,
+			"source_type", sourceType,
+			"error", err,
+		)
+		return nil, fmt.Errorf("source persistence failure: %w", err)
 	}
 
 	// 2. Insert project record
@@ -581,20 +599,44 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		if strings.Contains(err.Error(), "uq_projects_owner_slug") {
 			return nil, ErrProjectSlugTaken
 		}
-		return nil, fmt.Errorf("failed to create project: %w", err)
+		slog.Error("project persistence failure during project creation",
+			"failure_stage", "project_persistence",
+			"project_name", name,
+			"project_id", project.ID,
+			"owner_id", ownerID,
+			"slug", slug,
+			"error", err,
+		)
+		return nil, fmt.Errorf("project persistence failure: %w", err)
 	}
 
 	// 3. Insert services transactionally
 	svcService := s.getServiceService()
 	for _, svc := range servicesToCreate {
 		if err := svcService.CreateServiceTx(ctx, tx, svc); err != nil {
-			return nil, fmt.Errorf("failed to create service %q: %w", svc.Name, err)
+			slog.Error("service persistence failure during project creation",
+				"failure_stage", "service_persistence",
+				"project_name", name,
+				"project_id", project.ID,
+				"owner_id", ownerID,
+				"service_name", svc.Name,
+				"service_id", svc.ID,
+				"error", err,
+			)
+			return nil, fmt.Errorf("service persistence failure for %q: %w", svc.Name, err)
 		}
 		project.Services = append(project.Services, svc)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit project creation: %w", err)
+		slog.Error("transaction commit failure during project creation",
+			"failure_stage", "transaction_commit",
+			"project_name", name,
+			"project_id", project.ID,
+			"owner_id", ownerID,
+			"error", err,
+		)
+		return nil, fmt.Errorf("transaction commit failure: %w", err)
 	}
 
 	// If local agent source, mark session consumed in SessionManager

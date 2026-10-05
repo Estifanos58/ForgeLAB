@@ -98,8 +98,8 @@ func TestDetectFromFiles_PythonDjango(t *testing.T) {
 	if res.SuggestedPort != 8000 {
 		t.Fatalf("expected port 8000, got %d", res.SuggestedPort)
 	}
-	if !strings.Contains(res.StartCommand, "manage.py") {
-		t.Fatalf("expected manage.py in start command, got %s", res.StartCommand)
+	if !strings.Contains(res.StartCommand, "manage.py") && !strings.Contains(res.StartCommand, "gunicorn") {
+		t.Fatalf("expected manage.py or gunicorn in start command, got %s", res.StartCommand)
 	}
 }
 

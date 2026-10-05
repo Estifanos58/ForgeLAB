@@ -10,7 +10,6 @@ ALTER TABLE services
     ADD COLUMN IF NOT EXISTS image TEXT DEFAULT '',
     ADD COLUMN IF NOT EXISTS depends_on JSONB DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS volumes JSONB DEFAULT '[]'::jsonb,
-    ADD COLUMN IF NOT EXISTS networks JSONB DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS healthcheck_config JSONB DEFAULT '{}'::jsonb;
 
 ALTER TABLE service_deployments
@@ -18,7 +17,6 @@ ALTER TABLE service_deployments
     ADD COLUMN IF NOT EXISTS image TEXT DEFAULT '',
     ADD COLUMN IF NOT EXISTS depends_on JSONB DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS volumes JSONB DEFAULT '[]'::jsonb,
-    ADD COLUMN IF NOT EXISTS networks JSONB DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS healthcheck_config JSONB DEFAULT '{}'::jsonb;
 
 ALTER TABLE deployments
