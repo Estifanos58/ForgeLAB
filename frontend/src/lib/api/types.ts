@@ -60,6 +60,11 @@ export interface Service {
   health_strategy: string;
   health_check_path?: string | null;
   health_check_enabled: boolean;
+  classification?: string;
+  image?: string | null;
+  depends_on?: string[];
+  volumes?: VolumeMountConfig[];
+  healthcheck_config?: HealthCheckConfig | null;
   status: string;
   container_id?: string | null;
   image_tag?: string | null;
@@ -80,6 +85,11 @@ export interface ServiceDeployment {
   service_name?: string;
   deploy_number: number;
   status: DeploymentStatus;
+  classification?: string;
+  image?: string | null;
+  depends_on?: string[];
+  volumes?: VolumeMountConfig[];
+  healthcheck_config?: HealthCheckConfig | null;
   image_tag?: string | null;
   container_id?: string | null;
   host_port?: number | null;
@@ -140,6 +150,11 @@ export interface ServiceDefinition {
   internal_port?: number;
   health_strategy?: string;
   health_check_path?: string;
+  classification?: string;
+  image?: string;
+  depends_on?: string[];
+  volumes?: VolumeMountConfig[];
+  healthcheck_config?: HealthCheckConfig;
 }
 
 export interface AgentSourceSession {
@@ -177,6 +192,8 @@ export interface Project {
   health_strategy?: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path: string | null;
   health_check_enabled: boolean;
+  deployment_strategy?: string;
+  deployment_plan?: any;
   status: ProjectStatus;
   current_deployment_id: string | null;
   port: number | null;
@@ -260,6 +277,8 @@ export interface CreateProjectInput {
   internal_port?: number;
   health_strategy?: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path?: string;
+  deployment_strategy?: string;
+  deployment_plan?: any;
   services?: Partial<Service>[];
 }
 
@@ -387,3 +406,151 @@ export interface LocalPathValidationResult {
   health_check_path: string;
   error?: string;
 }
+
+export interface ResourceConfig {
+  cpu_millicores?: number;
+  memory_mb?: number;
+  pids_limit?: number;
+  ephemeral_storage_mb?: number | null;
+}
+
+export interface VolumeMountConfig {
+  name: string;
+  container_path: string;
+  read_only?: boolean;
+}
+
+export interface HealthCheckConfig {
+  test?: string[];
+  interval?: string;
+  timeout?: string;
+  retries?: number;
+  start_period?: string;
+}
+
+export interface EnvironmentProvenance {
+  key: string;
+  value: string;
+  is_secret: boolean;
+  scope: string;
+  source_file?: string;
+  service_name?: string;
+  has_conflict: boolean;
+  conflict_resolution: string;
+  active_value: string;
+}
+
+export interface PlannedEndpoint {
+  service_name: string;
+  port: number;
+  type: 'public' | 'internal';
+  protocol: string;
+  address: string;
+}
+
+export interface PlannedService {
+  name: string;
+  role: string;
+  classification: 'application' | 'worker' | 'infrastructure' | 'job';
+  source_path: string;
+  build_strategy: 'dockerfile' | 'auto' | 'custom' | 'image';
+  image?: string;
+  dockerfile_path?: string;
+  build_context?: string;
+  build_command?: string;
+  start_command?: string;
+  runtime_type: string;
+  framework: string;
+  package_manager?: string;
+  internal_port: number;
+  host_port?: number;
+  public_exposed: boolean;
+  health_check: HealthCheckConfig;
+  resource_config: ResourceConfig;
+  depends_on: string[];
+  volumes: VolumeMountConfig[];
+  environment: EnvironmentProvenance[];
+  build_candidates?: BuildCandidate[];
+}
+
+export interface DeploymentPlan {
+  id: string;
+  source_id?: string;
+  source_revision: string;
+  source_type: string;
+  strategy: 'compose' | 'dockerfile' | 'auto' | 'custom';
+  topology: string;
+  services: PlannedService[];
+  dependencies: Record<string, string[]>;
+  execution_tiers: string[][];
+  networks: string[];
+  volumes: string[];
+  environment: EnvironmentProvenance[];
+  public_endpoints: PlannedEndpoint[];
+  internal_endpoints: PlannedEndpoint[];
+  created_at: string;
+}
+
+export interface DiscoveredService {
+  name: string;
+  role: string;
+  classification: string;
+  source_path: string;
+  runtime: string;
+  runtime_type: string;
+  framework: string;
+  package_manager: string;
+  build_strategy: string;
+  image?: string;
+  build_candidates: BuildCandidate[];
+  build_command: string;
+  start_command: string;
+  dockerfile_path: string;
+  build_context: string;
+  internal_port: number;
+  host_port?: number;
+  public_exposed: boolean;
+  health_check: HealthCheckConfig;
+  health_strategy: string;
+  health_check_path: string;
+  health_check_enabled: boolean;
+  depends_on: string[];
+  volumes: VolumeMountConfig[];
+  environment: EnvironmentProvenance[];
+  resource_config: ResourceConfig;
+  files_count: number;
+  total_bytes: number;
+}
+
+export interface DiscoveryResult {
+  repository_name: string;
+  topology: {
+    type: string;
+    compose_file_path?: string;
+    networks: Array<{ name: string; driver?: string; internal?: boolean }>;
+    volumes: string[];
+    env_files: string[];
+    root_env_vars: EnvironmentProvenance[];
+  };
+  primary_strategy: string;
+  services: DiscoveredService[];
+  total_files: number;
+  total_bytes: number;
+  dependencies: Record<string, string[]>;
+}
+
+export interface GeneratePlanRequest {
+  source_type: string;
+  source_reference?: string;
+  repository_path?: string;
+  branch?: string;
+  root_dir?: string;
+  agent_id?: string;
+  project_id?: string;
+}
+
+export interface GeneratePlanResponse {
+  discovery: DiscoveryResult;
+  plan: DeploymentPlan;
+}
+

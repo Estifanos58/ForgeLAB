@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,35 +42,57 @@ type GitHubIntegration struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 }
 
+// VolumeMountConfig specifies a container volume mount.
+type VolumeMountConfig struct {
+	Source   string `json:"source"`            // volume name or host path
+	Target   string `json:"target"`            // container mount path
+	Type     string `json:"type"`              // "volume" (named) or "bind" (host)
+	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
+// HealthCheckConfig represents detailed healthcheck configuration.
+type HealthCheckConfig struct {
+	Strategy           string   `json:"strategy"` // "auto", "http", "tcp", "docker", "none"
+	Path               string   `json:"path,omitempty"`
+	Port               int      `json:"port,omitempty"`
+	Test               []string `json:"test,omitempty"` // e.g. ["CMD", "curl", "-f", "http://localhost/"]
+	IntervalSeconds    int      `json:"interval_seconds,omitempty"`
+	TimeoutSeconds     int      `json:"timeout_seconds,omitempty"`
+	Retries            int      `json:"retries,omitempty"`
+	StartPeriodSeconds int      `json:"start_period_seconds,omitempty"`
+}
+
 // Project represents a registered project in ForgeLab.
 // A project is an application that ForgeLab manages, containing one or more services.
 type Project struct {
-	ID                  uuid.UUID  `json:"id"`
-	OwnerID             uuid.UUID  `json:"owner_id"`
-	SourceID            *uuid.UUID `json:"source_id,omitempty"`
-	Name                string     `json:"name"`
-	Slug                string     `json:"slug"`
-	SourceType          string     `json:"source_type"`      // "local_agent", "local_directory", "local_upload", "github", or legacy "local"
-	SourceReference     string     `json:"source_reference"` // repo "owner/repo" or local upload source_id
-	RepositoryPath      string     `json:"repository_path"`  // host path for local_directory projects
-	Branch              string     `json:"branch"`
-	DockerfilePath      string     `json:"dockerfile_path"`
-	BuildContext        string     `json:"build_context"`
-	BuildStrategy       string     `json:"build_strategy"` // "auto" or "dockerfile"
-	BuildCommand        string     `json:"build_command"`
-	StartCommand        string     `json:"start_command"`
-	RuntimeType         string     `json:"runtime_type"`      // "nextjs", "nodejs", "python-fastapi", "go", etc.
-	InternalPort        int        `json:"internal_port"`     // 3000, 8000, 8080, etc.
-	HealthCheckPath     *string    `json:"health_check_path"` // Nullable
-	HealthCheckEnabled  bool       `json:"health_check_enabled"`
-	HealthStrategy      string     `json:"health_strategy"` // "auto", "http", "tcp", "none"
-	Status              string     `json:"status"`          // inactive, deploying, running, partially_running, stopped, failed
-	CurrentDeploymentID *uuid.UUID `json:"current_deployment_id"`
-	Port                *int       `json:"port"`
-	PreviewURL          *string    `json:"preview_url,omitempty"`
-	Services            []*Service `json:"services,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	ID                  uuid.UUID       `json:"id"`
+	OwnerID             uuid.UUID       `json:"owner_id"`
+	SourceID            *uuid.UUID      `json:"source_id,omitempty"`
+	Name                string          `json:"name"`
+	Slug                string          `json:"slug"`
+	SourceType          string          `json:"source_type"`      // "local_agent", "local_directory", "local_upload", "github", or legacy "local"
+	SourceReference     string          `json:"source_reference"` // repo "owner/repo" or local upload source_id
+	RepositoryPath      string          `json:"repository_path"`  // host path for local_directory projects
+	Branch              string          `json:"branch"`
+	DeploymentStrategy  string          `json:"deployment_strategy"` // "auto", "compose", "dockerfile", "custom"
+	DeploymentPlan      json.RawMessage `json:"deployment_plan,omitempty"`
+	DockerfilePath      string          `json:"dockerfile_path"`
+	BuildContext        string          `json:"build_context"`
+	BuildStrategy       string          `json:"build_strategy"` // "auto" or "dockerfile"
+	BuildCommand        string          `json:"build_command"`
+	StartCommand        string          `json:"start_command"`
+	RuntimeType         string          `json:"runtime_type"`      // "nextjs", "nodejs", "python-fastapi", "go", etc.
+	InternalPort        int             `json:"internal_port"`     // 3000, 8000, 8080, etc.
+	HealthCheckPath     *string         `json:"health_check_path"` // Nullable
+	HealthCheckEnabled  bool            `json:"health_check_enabled"`
+	HealthStrategy      string          `json:"health_strategy"` // "auto", "http", "tcp", "none"
+	Status              string          `json:"status"`          // inactive, deploying, running, partially_running, stopped, failed
+	CurrentDeploymentID *uuid.UUID      `json:"current_deployment_id"`
+	Port                *int            `json:"port"`
+	PreviewURL          *string         `json:"preview_url,omitempty"`
+	Services            []*Service      `json:"services,omitempty"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UpdatedAt           time.Time       `json:"updated_at"`
 }
 
 // Source represents an abstracted code origin (local agent session, archive upload, or GitHub repo).
@@ -121,74 +144,84 @@ func DefaultResourceConfig() ResourceConfig {
 
 // Service represents an individual deployable service within a parent Project.
 type Service struct {
-	ID                         uuid.UUID        `json:"id"`
-	ProjectID                  uuid.UUID        `json:"project_id"`
-	SourceID                   *uuid.UUID       `json:"source_id,omitempty"`
-	Name                       string           `json:"name"`
-	Role                       string           `json:"role"`        // "frontend", "backend", "worker", "other"
-	SourcePath                 string           `json:"source_path"` // relative path inside repo, e.g. ".", "./frontend"
-	RuntimeType                string           `json:"runtime_type"`
-	Framework                  string           `json:"framework"`
-	PackageManager             string           `json:"package_manager"`
-	BuildStrategy              string           `json:"build_strategy"`
-	BuildCandidates            []BuildCandidate `json:"build_candidates"`
-	BuildCommand               string           `json:"build_command"`
-	StartCommand               string           `json:"start_command"`
-	DockerfilePath             string           `json:"dockerfile_path"`
-	BuildContext               string           `json:"build_context"`
-	InternalPort               int              `json:"internal_port"`
-	HostPort                   *int             `json:"host_port"`
-	PublicExposed              bool             `json:"public_exposed"`
-	HealthStrategy             string           `json:"health_strategy"`
-	HealthCheckPath            *string          `json:"health_check_path"`
-	HealthCheckEnabled         bool             `json:"health_check_enabled"`
-	Status                     string           `json:"status"` // inactive, deploying, running, stopped, failed
-	ContainerID                *string          `json:"container_id"`
-	ImageTag                   *string          `json:"image_tag"`
-	PreviewURL                 *string          `json:"preview_url,omitempty"`
-	CurrentServiceDeploymentID *uuid.UUID       `json:"current_service_deployment_id"`
-	ResourceConfig                              // embedded resource limits
-	CreatedAt                  time.Time        `json:"created_at"`
-	UpdatedAt                  time.Time        `json:"updated_at"`
+	ID                         uuid.UUID           `json:"id"`
+	ProjectID                  uuid.UUID           `json:"project_id"`
+	SourceID                   *uuid.UUID          `json:"source_id,omitempty"`
+	Name                       string              `json:"name"`
+	Role                       string              `json:"role"`           // "frontend", "backend", "worker", "other"
+	Classification             string              `json:"classification"` // "application", "worker", "infrastructure", "job"
+	Image                      string              `json:"image,omitempty"`
+	DependsOn                  []string            `json:"depends_on,omitempty"`
+	Volumes                    []VolumeMountConfig `json:"volumes,omitempty"`
+	HealthCheckConfig          *HealthCheckConfig  `json:"healthcheck_config,omitempty"`
+	SourcePath                 string              `json:"source_path"` // relative path inside repo, e.g. ".", "./frontend"
+	RuntimeType                string              `json:"runtime_type"`
+	Framework                  string              `json:"framework"`
+	PackageManager             string              `json:"package_manager"`
+	BuildStrategy              string              `json:"build_strategy"`
+	BuildCandidates            []BuildCandidate    `json:"build_candidates"`
+	BuildCommand               string              `json:"build_command"`
+	StartCommand               string              `json:"start_command"`
+	DockerfilePath             string              `json:"dockerfile_path"`
+	BuildContext               string              `json:"build_context"`
+	InternalPort               int                 `json:"internal_port"`
+	HostPort                   *int                `json:"host_port"`
+	PublicExposed              bool                `json:"public_exposed"`
+	HealthStrategy             string              `json:"health_strategy"`
+	HealthCheckPath            *string             `json:"health_check_path"`
+	HealthCheckEnabled         bool                `json:"health_check_enabled"`
+	Status                     string              `json:"status"` // inactive, deploying, running, stopped, failed
+	ContainerID                *string             `json:"container_id"`
+	ImageTag                   *string             `json:"image_tag"`
+	PreviewURL                 *string             `json:"preview_url,omitempty"`
+	CurrentServiceDeploymentID *uuid.UUID          `json:"current_service_deployment_id"`
+	ResourceConfig                                 // embedded resource limits
+	CreatedAt                  time.Time           `json:"created_at"`
+	UpdatedAt                  time.Time           `json:"updated_at"`
 }
 
 // ServiceDeployment represents the deployment record of an individual service.
 // In a service-only deployment, DeploymentID is nil. In a release deployment, it references the parent release.
 type ServiceDeployment struct {
-	ID              uuid.UUID  `json:"id"`
-	DeploymentID    *uuid.UUID `json:"deployment_id,omitempty"`
-	ServiceID       uuid.UUID  `json:"service_id"`
-	ServiceName     string     `json:"service_name,omitempty"`
-	DeployNumber    int        `json:"deploy_number"`
-	Status          string     `json:"status"`
-	ImageTag        *string    `json:"image_tag"`
-	ImageDigest     *string    `json:"image_digest,omitempty"`
-	ContainerID     *string    `json:"container_id"`
-	HostPort        *int       `json:"host_port"`
-	InternalPort    int        `json:"internal_port"`
-	PreviewURL      *string    `json:"preview_url,omitempty"`
-	BuildStrategy   string     `json:"build_strategy"`
-	BuildCommand    string     `json:"build_command"`
-	StartCommand    string     `json:"start_command"`
-	RuntimeType     string     `json:"runtime_type"`
-	DockerfilePath  string     `json:"dockerfile_path,omitempty"`
-	BuildContext    string     `json:"build_context,omitempty"`
-	HealthStrategy  string     `json:"health_strategy,omitempty"`
-	HealthCheckPath *string    `json:"health_check_path,omitempty"`
-	ResourceConfig             // snapshotted resource limits at deploy time
-	ExecutionMode   string     `json:"execution_mode,omitempty"`
-	SourceRevision  *string    `json:"source_revision,omitempty"`
-	EnvConfigHash   *string    `json:"env_config_hash,omitempty"`
-	EnvSnapshot     []byte     `json:"-"` // encrypted at rest; never exposed in API responses
-	StartedAt       *time.Time `json:"started_at"`
-	BuiltAt         *time.Time `json:"built_at"`
-	DeployedAt      *time.Time `json:"deployed_at"`
-	FinishedAt      *time.Time `json:"finished_at"`
-	DurationMs      *int64     `json:"duration_ms"`
-	FailureReason   *string    `json:"failure_reason"`
-	LeaseAcquiredAt *time.Time `json:"lease_acquired_at,omitempty"`
-	LeaseWorkerID   *string    `json:"lease_worker_id,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
+	ID                uuid.UUID           `json:"id"`
+	DeploymentID      *uuid.UUID          `json:"deployment_id,omitempty"`
+	ServiceID         uuid.UUID           `json:"service_id"`
+	ServiceName       string              `json:"service_name,omitempty"`
+	DeployNumber      int                 `json:"deploy_number"`
+	Status            string              `json:"status"`
+	Classification    string              `json:"classification,omitempty"`
+	Image             string              `json:"image,omitempty"`
+	DependsOn         []string            `json:"depends_on,omitempty"`
+	Volumes           []VolumeMountConfig `json:"volumes,omitempty"`
+	HealthCheckConfig *HealthCheckConfig  `json:"healthcheck_config,omitempty"`
+	ImageTag          *string             `json:"image_tag"`
+	ImageDigest       *string             `json:"image_digest,omitempty"`
+	ContainerID       *string             `json:"container_id"`
+	HostPort          *int                `json:"host_port"`
+	InternalPort      int                 `json:"internal_port"`
+	PreviewURL        *string             `json:"preview_url,omitempty"`
+	BuildStrategy     string              `json:"build_strategy"`
+	BuildCommand      string              `json:"build_command"`
+	StartCommand      string              `json:"start_command"`
+	RuntimeType       string              `json:"runtime_type"`
+	DockerfilePath    string              `json:"dockerfile_path,omitempty"`
+	BuildContext      string              `json:"build_context,omitempty"`
+	HealthStrategy    string              `json:"health_strategy,omitempty"`
+	HealthCheckPath   *string             `json:"health_check_path,omitempty"`
+	ResourceConfig                        // snapshotted resource limits at deploy time
+	ExecutionMode     string              `json:"execution_mode,omitempty"`
+	SourceRevision    *string             `json:"source_revision,omitempty"`
+	EnvConfigHash     *string             `json:"env_config_hash,omitempty"`
+	EnvSnapshot       []byte              `json:"-"` // encrypted at rest; never exposed in API responses
+	StartedAt         *time.Time          `json:"started_at"`
+	BuiltAt           *time.Time          `json:"built_at"`
+	DeployedAt        *time.Time          `json:"deployed_at"`
+	FinishedAt        *time.Time          `json:"finished_at"`
+	DurationMs        *int64              `json:"duration_ms"`
+	FailureReason     *string             `json:"failure_reason"`
+	LeaseAcquiredAt   *time.Time          `json:"lease_acquired_at,omitempty"`
+	LeaseWorkerID     *string             `json:"lease_worker_id,omitempty"`
+	CreatedAt         time.Time           `json:"created_at"`
 }
 
 // Source provider constants
@@ -208,19 +241,37 @@ const (
 	RoleOther    = "other"
 )
 
+// Service classifications
+const (
+	ClassificationApplication    = "application"
+	ClassificationWorker         = "worker"
+	ClassificationInfrastructure = "infrastructure"
+	ClassificationJob            = "job"
+)
+
+// Repository deployment strategy constants
+const (
+	StrategyCompose     = "compose"
+	StrategyDockerfiles = "dockerfile"
+	StrategyAuto        = "auto"
+	StrategyCustom      = "custom"
+)
+
 // Build strategy constants
 const (
 	BuildStrategyAuto       = "auto"
 	BuildStrategyDockerfile = "dockerfile"
 	BuildStrategyCustom     = "custom"
+	BuildStrategyImage      = "image"
 )
 
 // Health strategy constants
 const (
-	HealthStrategyAuto = "auto"
-	HealthStrategyHTTP = "http"
-	HealthStrategyTCP  = "tcp"
-	HealthStrategyNone = "none"
+	HealthStrategyAuto   = "auto"
+	HealthStrategyHTTP   = "http"
+	HealthStrategyTCP    = "tcp"
+	HealthStrategyDocker = "docker"
+	HealthStrategyNone   = "none"
 )
 
 // Deployment execution mode constants
@@ -278,6 +329,8 @@ type Deployment struct {
 	ImageTag           *string              `json:"image_tag"`
 	ContainerID        *string              `json:"container_id"`
 	SourceRevision     *string              `json:"source_revision"`
+	DeploymentStrategy string               `json:"deployment_strategy,omitempty"`
+	DeploymentPlan     json.RawMessage      `json:"deployment_plan,omitempty"`
 	BuildStrategy      string               `json:"build_strategy"`
 	BuildCommand       string               `json:"build_command"`
 	StartCommand       string               `json:"start_command"`

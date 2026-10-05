@@ -7,6 +7,8 @@ import {
   DeploymentLog,
   DetectionResult,
   EnvVar,
+  GeneratePlanRequest,
+  GeneratePlanResponse,
   GitHubBranch,
   GitHubRepo,
   GitHubStatus,
@@ -621,6 +623,15 @@ export const api = {
 
     async getSource(sourceId: string, token?: string): Promise<AgentSourceSession> {
       return agentFetch<AgentSourceSession>(`/api/agent/sources/${encodeURIComponent(sourceId)}`, {}, token);
+    },
+  },
+
+  discovery: {
+    async generatePlan(data: GeneratePlanRequest): Promise<GeneratePlanResponse> {
+      return apiFetch<GeneratePlanResponse>('/api/discovery/plan', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      });
     },
   },
 };

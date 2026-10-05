@@ -320,7 +320,85 @@ ForgeLAB supports three distinct source ingestion models:
 
 ### 3. GitHub Repository Import (`source_type: "github"`)
 - Users authorize GitHub via OAuth.
-- Source tarball is fetched into an isolated source workspace.
+- Exact commit SHA is resolved via GitHub API (`ResolveCommitSHA`) and pinned to the snapshot.
+- Source tarball is fetched into an isolated temporary analysis workspace and strictly cleaned up after analysis.
+- Subsequent deployments use the exact pinned commit SHA, guaranteeing zero divergence from analyzed code.
+
+### 4. Local Agent Connected Source (`source_type: "local_agent"`)
+- Users connect via the local ForgeLAB agent running on the host.
+- Ephemeral credentials encrypted via AES-256-GCM.
+- Deterministic SHA-256 source fingerprinting.
+
+---
+
+## Unified Deployment Pipeline Architecture
+
+ForgeLAB implements a unified 7-stage deployment pipeline:
+
+`Source → Immutable Snapshot → Discovery → Deployment Plan → User Review → Release → ServiceDeployments`
+
+1. **Source**: Ingestion from GitHub, Local Directory, Local Agent, or Archive Upload.
+2. **Immutable Snapshot**:
+   - Materializes an isolated workspace with a deterministic fingerprint or pinned commit SHA.
+   - For GitHub: exact 40-character commit SHA is resolved and recorded.
+   - Automatic `.env` and environment-file discovery with conflict detection. Existing ForgeLAB secret values are strictly preserved without being overwritten (`overridden_by_forgelab`).
+3. **Discovery**:
+   - Authoritative discovery engine (`internal/discovery`) inspects topology (`compose`, `monorepo`, `single_service`).
+   - Identifies individual deployable services, runtimes, package managers, Dockerfiles, and Docker Compose manifests (`compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`).
+   - Discovers declared ports, healthchecks, dependencies (`depends_on`), persistent named volumes, and isolated networks.
+   - Constructs a Directed Acyclic Graph (DAG) with execution tiers and cycle detection.
+4. **Deployment Plan**:
+   - Generates an immutable `DeploymentPlan` blueprint capturing source revision, deployment strategy, services, execution tiers, endpoints (public vs internal), volumes, and environment provenance.
+5. **User Review**:
+   - Frontend provides an interactive plan review step in the project creation workflow.
+   - Users inspect execution tiers, service classifications, public/internal endpoints, persistent volumes, and environment variables before committing deployment.
+6. **Release**:
+   - Orchestration layer (`Deployment`) manages release-level state and orchestrates execution across DAG tiers.
+7. **ServiceDeployments**:
+   - The fundamental unit of deployment execution. Every service retains independent logs, status, resources, container, deployment history, and rollback.
+
+---
+
+## Deployment Strategies
+
+### Repository-Level Strategies
+- **Docker Compose (`compose`)**: Multi-service topology parsed from Compose manifests. Manages internal networking, volumes, service roles, and dependency tiers.
+- **Individual Dockerfiles (`dockerfile`)**: Multi-service or single-service topology driven by explicit Dockerfiles in service source directories.
+- **ForgeLAB Generated Containers (`auto`)**: Automatic multi-stage container generation based on detected runtimes and package managers.
+- **Custom Configuration (`custom`)**: User-overridden build and run commands.
+
+### Service-Level Strategies
+- **Dockerfile (`dockerfile`)**: Service built from a designated Dockerfile path.
+- **ForgeLAB Auto (`auto`)**: Service built via runtime-specific generated Dockerfile.
+- **Custom Commands (`custom`)**: Service built using customized build and start commands.
+- **Pre-built Image (`image`)**: Infrastructure services (e.g. PostgreSQL, Redis) pull and run verified pre-built images without build steps.
+
+---
+
+## Compose Execution Foundation
+
+ForgeLAB provides Compose-style execution capabilities natively within its single control-plane architecture:
+
+1. **Per-Project Docker Network**:
+   - Isolated Docker bridge network (`forgelab-net-<projectID>`).
+   - Internal DNS resolution allows services to address each other directly by service name (e.g. `http://backend:8080`, `postgres:5432`).
+2. **Persistent Named Volumes**:
+   - Managed Docker named volumes (`forgelab-vol-<projectID>-<volumeName>`) attached to containers with configurable mount points and read-only flags.
+   - Preserves state across container restarts and redeployments.
+3. **DAG Dependency Ordering**:
+   - Services are partitioned into execution tiers (e.g. Tier 1: `db`, `redis` → Tier 2: `backend`, `worker` → Tier 3: `frontend`).
+   - Tiers execute sequentially; within each tier, services execute concurrently subject to semaphore limits.
+   - If a dependency fails healthcheck gating, downstream dependent services are halted and marked failed.
+4. **Endpoint Classification**:
+   - **Public Endpoints**: Frontend and designated public services bind host ports from the dynamic port pool (`10000–60000`).
+   - **Internal Endpoints**: Infrastructure, worker, and internal backend services do not bind host ports, keeping internal databases and caches isolated from the host network.
+5. **Service Role Classification**:
+   - `application`: Web user interfaces and API services.
+   - `worker`: Background workers and task consumers.
+   - `infrastructure`: Pre-built databases, caches, and message queues.
+   - `job`: One-off tasks or batch operations.
+
+**Architectural Boundary:** ForgeLAB explicitly avoids Kubernetes, multi-node clustering, distributed scheduling, or VM orchestration. All capabilities are implemented purely on top of the local Docker Engine SDK.
 
 ---
 

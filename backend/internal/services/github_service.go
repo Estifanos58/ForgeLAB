@@ -576,17 +576,82 @@ func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner,
 	return detector.DetectFromFiles(filesMap), nil
 }
 
-// AnalyzeRepo acquires the repository archive and runs analyzer.AnalyzeRepository to produce normalized services
+// ResolveCommitSHA resolves a branch/ref to the exact 40-character commit SHA.
+func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, owner, repo, ref string) (string, error) {
+	token, err := s.getDecryptedToken(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if ref == "" {
+		ref = "main"
+	}
+
+	commitURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s",
+		url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(ref))
+
+	req, err := http.NewRequestWithContext(ctx, "GET", commitURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "ForgeLAB-App")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve commit SHA: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("github returned HTTP %d when resolving commit for %s", resp.StatusCode, ref)
+	}
+
+	var commitData struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&commitData); err != nil {
+		return "", fmt.Errorf("failed to decode commit response: %w", err)
+	}
+	return commitData.SHA, nil
+}
+
+// MaterializeGitHubSnapshot downloads and extracts an isolated source snapshot pinned to exact commit SHA.
+func (s *GitHubService) MaterializeGitHubSnapshot(ctx context.Context, userID uuid.UUID, owner, repo, ref, destDir string) (string, error) {
+	sha, err := s.ResolveCommitSHA(ctx, userID, owner, repo, ref)
+	pinnedRef := ref
+	if err == nil && sha != "" {
+		pinnedRef = sha
+	}
+	if err := s.AcquireRepoTarball(ctx, userID, owner, repo, pinnedRef, destDir); err != nil {
+		return "", err
+	}
+	return pinnedRef, nil
+}
+
+// AnalyzeRepo acquires the repository archive and runs analyzer.AnalyzeRepository to produce normalized services.
+// It resolves the exact commit SHA for the analyzed snapshot and cleans up temporary workspaces.
 func (s *GitHubService) AnalyzeRepo(ctx context.Context, userID uuid.UUID, owner, repo, branch, rootDir string) (*analyzer.AnalysisResult, error) {
 	if branch == "" {
 		branch = "main"
 	}
 
-	targetDir := filepath.Join(os.TempDir(), fmt.Sprintf("forgelab-gh-%s-%s-%s", owner, repo, branch))
-	_ = os.RemoveAll(targetDir)
-	_ = os.MkdirAll(targetDir, 0755)
+	// Resolve exact commit SHA to pin analyzed revision
+	commitSHA, _ := s.ResolveCommitSHA(ctx, userID, owner, repo, branch)
+	revision := branch
+	if commitSHA != "" {
+		revision = commitSHA
+	}
 
-	err := s.AcquireRepoTarball(ctx, userID, owner, repo, branch, targetDir)
+	targetDir, err := os.MkdirTemp("", fmt.Sprintf("forgelab-gh-%s-%s-*", owner, repo))
+	if err != nil {
+		targetDir = filepath.Join(os.TempDir(), fmt.Sprintf("forgelab-gh-%s-%s-%s", owner, repo, branch))
+		_ = os.RemoveAll(targetDir)
+		_ = os.MkdirAll(targetDir, 0755)
+	}
+	defer os.RemoveAll(targetDir) // Clean up temporary GitHub analysis workspace correctly
+
+	err = s.AcquireRepoTarball(ctx, userID, owner, repo, revision, targetDir)
 	if err == nil {
 		analysisDir := targetDir
 		if rootDir != "" && rootDir != "." {

@@ -147,6 +147,7 @@ func main() {
 	deploymentService := services.NewDeploymentService(pool)
 	secretService := services.NewSecretService(pool, encryptor, projectService)
 	deploymentService.SetSecretService(secretService)
+	deploymentService.SetGitHubService(githubService)
 	projectService.SetSecretService(secretService)
 
 	// Initialize WebSocket Hub
@@ -274,6 +275,7 @@ func main() {
 	envHandler := handlers.NewEnvHandler(secretService, projectService)
 	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
+	discoveryHandler := handlers.NewDiscoveryHandler(githubService, sourceService, pathValidator, secretService)
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
 
 	// Setup router
@@ -344,6 +346,11 @@ func main() {
 				r.Get("/local/validate/{sessionId}", sourceHandler.GetLocalValidationStatus)
 				r.Get("/{id}", sourceHandler.GetStatus)
 				r.Delete("/{id}", sourceHandler.Delete)
+			})
+
+			// Discovery & Deployment Plan
+			r.Route("/discovery", func(r chi.Router) {
+				r.With(sourceThrottle).Post("/plan", discoveryHandler.GeneratePlan)
 			})
 
 			// Integrations (GitHub Repository Access)

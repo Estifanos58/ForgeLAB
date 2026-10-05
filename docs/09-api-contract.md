@@ -269,6 +269,138 @@ Common status codes:
 
 ---
 
+## 3.5 Discovery & Deployment Plan Endpoints (`/api/discovery`)
+
+### `POST /api/discovery/plan`
+Generates an authoritative repository discovery analysis and immutable `DeploymentPlan` blueprint from any supported source (GitHub, Local Directory, Local Agent, or Archive Upload).
+
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Request Body:**
+  ```json
+  {
+    "source_type": "github",
+    "source_reference": "octocat/hello-world",
+    "branch": "main",
+    "root_dir": ".",
+    "repository_path": "/var/projects/local-app",
+    "agent_id": "00000000-0000-0000-0000-000000000000",
+    "project_id": "00000000-0000-0000-0000-000000000000"
+  }
+  ```
+  - `source_type`: Required. `"github"`, `"local_directory"`, `"local_agent"`, or `"local_upload"`.
+  - `source_reference`: Required for `"github"` (`owner/repo`) or `"local_upload"` (upload source UUID) or `"local_agent"` (agent source UUID).
+  - `branch`: Optional git branch for `"github"` (defaults to repository default branch). Resolves to exact 40-character commit SHA.
+  - `repository_path`: Required for `"local_directory"`. Must reside in configured allowed source roots.
+  - `project_id`: Optional existing project UUID used to perform environment-variable conflict checks against existing ForgeLAB secrets.
+
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "discovery": {
+      "repository_name": "hello-world",
+      "topology": {
+        "type": "compose",
+        "compose_file_path": "docker-compose.yml",
+        "networks": [
+          { "name": "backend-net", "driver": "bridge" }
+        ],
+        "volumes": ["db_data"],
+        "env_files": [".env"],
+        "root_env_vars": [
+          {
+            "key": "DATABASE_URL",
+            "value": "postgres://user:pass@db:5432/app",
+            "is_secret": true,
+            "scope": "runtime",
+            "source_file": ".env",
+            "has_conflict": false,
+            "conflict_resolution": "imported",
+            "active_value": "source"
+          }
+        ]
+      },
+      "primary_strategy": "compose",
+      "services": [
+        {
+          "name": "web",
+          "role": "frontend",
+          "classification": "application",
+          "source_path": "./web",
+          "runtime": "nodejs",
+          "framework": "nextjs",
+          "build_strategy": "dockerfile",
+          "dockerfile_path": "Dockerfile",
+          "internal_port": 3000,
+          "host_port": 3000,
+          "public_exposed": true,
+          "depends_on": ["api"]
+        },
+        {
+          "name": "db",
+          "role": "other",
+          "classification": "infrastructure",
+          "build_strategy": "image",
+          "image": "postgres:16-alpine",
+          "internal_port": 5432,
+          "public_exposed": false,
+          "volumes": [
+            { "name": "db_data", "container_path": "/var/lib/postgresql/data" }
+          ]
+        }
+      ],
+      "total_files": 38,
+      "total_bytes": 1048576,
+      "dependencies": {
+        "web": ["api"],
+        "api": ["db"]
+      }
+    },
+    "plan": {
+      "id": "e0b04a9e-1234-5678-9abc-def012345678",
+      "source_revision": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+      "source_type": "github",
+      "strategy": "compose",
+      "topology": "compose",
+      "execution_tiers": [
+        ["db"],
+        ["api"],
+        ["web"]
+      ],
+      "networks": ["forgelab-net"],
+      "volumes": ["forgelab-vol-db_data"],
+      "services": [...],
+      "public_endpoints": [
+        {
+          "service_name": "web",
+          "port": 3000,
+          "type": "public",
+          "protocol": "http",
+          "address": "0.0.0.0:3000"
+        }
+      ],
+      "internal_endpoints": [
+        {
+          "service_name": "api",
+          "port": 8080,
+          "type": "internal",
+          "protocol": "http",
+          "address": "api:8080"
+        },
+        {
+          "service_name": "db",
+          "port": 5432,
+          "type": "internal",
+          "protocol": "tcp",
+          "address": "db:5432"
+        }
+      ],
+      "created_at": "2026-10-05T12:00:00Z"
+    }
+  }
+  ```
+
+---
+
 ## 4. Project Management Endpoints (`/api/projects`)
 
 ### `POST /api/projects`
@@ -288,12 +420,42 @@ Common status codes:
     "health_strategy": "auto",
     "health_check_path": "/health",
     "dockerfile_path": "Dockerfile",
-    "build_context": "."
+    "build_context": ".",
+    "deployment_strategy": "compose",
+    "deployment_plan": {
+      "strategy": "compose",
+      "source_revision": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+      "execution_tiers": [["db"], ["web"]]
+    },
+    "services": [
+      {
+        "name": "web",
+        "role": "frontend",
+        "classification": "application",
+        "build_strategy": "dockerfile",
+        "internal_port": 3000,
+        "depends_on": ["db"]
+      },
+      {
+        "name": "db",
+        "role": "other",
+        "classification": "infrastructure",
+        "build_strategy": "image",
+        "image": "postgres:16-alpine",
+        "internal_port": 5432,
+        "volumes": [
+          { "name": "db_data", "container_path": "/var/lib/postgresql/data" }
+        ]
+      }
+    ]
   }
   ```
 - **Validation & Business Rules:**
   - `name`: Required, non-empty. Unique per-user slug is generated.
-  - `source_type`: `"local_directory"`, `"local_upload"`, `"github"`, or legacy `"local"`.
+  - `deployment_strategy`: `"compose"`, `"dockerfile"`, `"auto"`, or `"custom"`. Defaults to `"auto"`.
+  - `deployment_plan`: Optional JSON snapshot generated by `/api/discovery/plan`.
+  - `services`: Optional array of service definitions. Services support `classification` (`application`, `worker`, `infrastructure`, `job`), `image` (pre-built images), `depends_on` (service DAG), and `volumes` (named persistent mounts).
+  - `source_type`: `"local_directory"`, `"local_upload"`, `"local_agent"`, `"github"`, or legacy `"local"`.
   - For `source_type: "local_directory"`:
     - `repository_path`: Required absolute host directory path situated within configured `FORGELAB_ALLOWED_SOURCE_ROOTS`. Validated via `PathValidator`.
   - For `source_type: "local_upload"`:

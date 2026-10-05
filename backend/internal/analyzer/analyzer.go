@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/models"
 )
 
@@ -93,7 +94,8 @@ func AnalyzeRepository(repoRoot string) (*AnalysisResult, error) {
 	return AnalyzeRepositoryWithProgress(repoRoot, nil)
 }
 
-// AnalyzeRepositoryWithProgress recursively inspects the repository root with progress reporting.
+// AnalyzeRepositoryWithProgress recursively inspects the repository root with progress reporting
+// by delegating to the authoritative discovery engine.
 func AnalyzeRepositoryWithProgress(repoRoot string, onProgress ProgressCallback) (*AnalysisResult, error) {
 	cleanRoot := filepath.Clean(repoRoot)
 	info, err := os.Stat(cleanRoot)
@@ -104,80 +106,52 @@ func AnalyzeRepositoryWithProgress(repoRoot string, onProgress ProgressCallback)
 		return nil, fmt.Errorf("repository path is not a directory")
 	}
 
-	repoName := filepath.Base(cleanRoot)
-	if repoName == "" || repoName == "/" || repoName == "." || repoName == "\\" {
-		repoName = "project"
-	}
-
 	if onProgress != nil {
 		onProgress("scanning", 0, 0, 0)
 	}
 
-	totalFiles := 0
-	var totalBytes int64
-
-	// Quick stats scan respecting prune rules
-	_ = filepath.WalkDir(cleanRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if IsPrunedDir(d.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !IsSecretFile(d.Name()) {
-			totalFiles++
-			if info, err := d.Info(); err == nil {
-				totalBytes += info.Size()
-			}
-			if onProgress != nil && totalFiles%50 == 0 {
-				onProgress("scanning", totalFiles, 0, 0)
-			}
-		}
-		return nil
-	})
-
-	if onProgress != nil {
-		onProgress("detecting", totalFiles, totalFiles, 0)
+	discResult, err := discovery.Discover(cleanRoot)
+	if err != nil {
+		return nil, fmt.Errorf("discovery failed: %w", err)
 	}
 
-	// 1. Discover potential service root subdirectories
-	servicePaths := discoverServicePaths(cleanRoot)
+	if onProgress != nil {
+		onProgress("detecting", discResult.TotalFiles, discResult.TotalFiles, len(discResult.Services))
+	}
 
 	var services []ServiceDefinition
-	for _, relPath := range servicePaths {
-		svcDir := filepath.Join(cleanRoot, filepath.FromSlash(relPath))
-		svc, err := inspectServiceDirectory(cleanRoot, svcDir, relPath)
-		if err == nil && svc != nil {
-			services = append(services, *svc)
-			if onProgress != nil {
-				onProgress("detecting", totalFiles, totalFiles, len(services))
-			}
-		}
-	}
-
-	// 2. If no sub-services were discovered, evaluate the repository root as a single service
-	if len(services) == 0 {
-		svc, err := inspectServiceDirectory(cleanRoot, cleanRoot, ".")
-		if err == nil && svc != nil {
-			svc.Name = repoName
-			services = append(services, *svc)
-		} else {
-			// Fallback generic single service
-			services = append(services, createGenericService(repoName, "."))
-		}
+	for _, s := range discResult.Services {
+		services = append(services, ServiceDefinition{
+			Name:               s.Name,
+			Role:               s.Role,
+			SourcePath:         s.SourcePath,
+			Runtime:            s.Runtime,
+			RuntimeType:        s.Runtime,
+			Framework:          s.Framework,
+			PackageManager:     s.PackageManager,
+			BuildStrategy:      s.BuildStrategy,
+			BuildCandidates:    s.BuildCandidates,
+			BuildCommand:       s.BuildCommand,
+			StartCommand:       s.StartCommand,
+			DockerfilePath:     s.DockerfilePath,
+			BuildContext:       s.BuildContext,
+			InternalPort:       s.InternalPort,
+			HealthStrategy:     s.HealthStrategy,
+			HealthCheckPath:    s.HealthCheckPath,
+			HealthCheckEnabled: s.HealthCheckEnabled,
+			FilesCount:         s.FilesCount,
+			TotalBytes:         s.TotalBytes,
+		})
 	}
 
 	if onProgress != nil {
-		onProgress("ready", totalFiles, totalFiles, len(services))
+		onProgress("ready", discResult.TotalFiles, discResult.TotalFiles, len(services))
 	}
 
 	return &AnalysisResult{
-		RepositoryName: repoName,
-		TotalFiles:     totalFiles,
-		TotalBytes:     totalBytes,
+		RepositoryName: discResult.RepositoryName,
+		TotalFiles:     discResult.TotalFiles,
+		TotalBytes:     discResult.TotalBytes,
 		Services:       services,
 	}, nil
 }

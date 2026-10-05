@@ -77,44 +77,51 @@ func (s *ProjectService) SetSecretService(sec *SecretService) {
 }
 
 type CreateServiceInput struct {
-	Name            string                  `json:"name"`
-	Role            string                  `json:"role"`
-	SourcePath      string                  `json:"source_path"`
-	Runtime         string                  `json:"runtime"`
-	RuntimeType     string                  `json:"runtime_type"`
-	Framework       string                  `json:"framework"`
-	PackageManager  string                  `json:"package_manager"`
-	BuildStrategy   string                  `json:"build_strategy"`
-	BuildCandidates []models.BuildCandidate `json:"build_candidates"`
-	BuildCommand    string                  `json:"build_command"`
-	StartCommand    string                  `json:"start_command"`
-	DockerfilePath  string                  `json:"dockerfile_path"`
-	BuildContext    string                  `json:"build_context"`
-	InternalPort    int                     `json:"internal_port"`
-	HostPort        *int                    `json:"host_port"`
-	PublicExposed   bool                    `json:"public_exposed"`
-	HealthStrategy  string                  `json:"health_strategy"`
-	HealthCheckPath *string                 `json:"health_check_path"`
+	Name              string                     `json:"name"`
+	Role              string                     `json:"role"`
+	Classification    string                     `json:"classification,omitempty"`
+	SourcePath        string                     `json:"source_path"`
+	Runtime           string                     `json:"runtime"`
+	RuntimeType       string                     `json:"runtime_type"`
+	Framework         string                     `json:"framework"`
+	PackageManager    string                     `json:"package_manager"`
+	BuildStrategy     string                     `json:"build_strategy"`
+	Image             string                     `json:"image,omitempty"`
+	BuildCandidates   []models.BuildCandidate    `json:"build_candidates"`
+	BuildCommand      string                     `json:"build_command"`
+	StartCommand      string                     `json:"start_command"`
+	DockerfilePath    string                     `json:"dockerfile_path"`
+	BuildContext      string                     `json:"build_context"`
+	InternalPort      int                        `json:"internal_port"`
+	HostPort          *int                       `json:"host_port"`
+	PublicExposed     bool                       `json:"public_exposed"`
+	HealthStrategy    string                     `json:"health_strategy"`
+	HealthCheckPath   *string                    `json:"health_check_path"`
+	HealthCheckConfig *models.HealthCheckConfig  `json:"healthcheck_config,omitempty"`
+	DependsOn         []string                   `json:"depends_on,omitempty"`
+	Volumes           []models.VolumeMountConfig `json:"volumes,omitempty"`
 }
 
 // CreateProjectInput holds the data needed to create a project.
 type CreateProjectInput struct {
-	Name            string               `json:"name"`
-	SourceType      string               `json:"source_type"`      // "local", "local_directory", "local_upload", "local_agent", "github"
-	SourceReference string               `json:"source_reference"` // repo "owner/repo", upload source_id, or agent source_id
-	AgentID         string               `json:"agent_id"`
-	RepositoryPath  string               `json:"repository_path"` // legacy/optional host path
-	Branch          string               `json:"branch"`
-	DockerfilePath  string               `json:"dockerfile_path"`
-	BuildContext    string               `json:"build_context"`
-	BuildStrategy   string               `json:"build_strategy"` // "auto" or "dockerfile"
-	BuildCommand    string               `json:"build_command"`
-	StartCommand    string               `json:"start_command"`
-	RuntimeType     string               `json:"runtime_type"`
-	InternalPort    int                  `json:"internal_port"`
-	HealthCheckPath *string              `json:"health_check_path"`
-	HealthStrategy  string               `json:"health_strategy"`
-	Services        []CreateServiceInput `json:"services"`
+	Name               string               `json:"name"`
+	SourceType         string               `json:"source_type"`      // "local", "local_directory", "local_upload", "local_agent", "github"
+	SourceReference    string               `json:"source_reference"` // repo "owner/repo", upload source_id, or agent source_id
+	AgentID            string               `json:"agent_id"`
+	RepositoryPath     string               `json:"repository_path"` // legacy/optional host path
+	Branch             string               `json:"branch"`
+	DeploymentStrategy string               `json:"deployment_strategy"` // "compose", "dockerfile", "auto", "custom"
+	DeploymentPlan     json.RawMessage      `json:"deployment_plan,omitempty"`
+	DockerfilePath     string               `json:"dockerfile_path"`
+	BuildContext       string               `json:"build_context"`
+	BuildStrategy      string               `json:"build_strategy"` // "auto" or "dockerfile"
+	BuildCommand       string               `json:"build_command"`
+	StartCommand       string               `json:"start_command"`
+	RuntimeType        string               `json:"runtime_type"`
+	InternalPort       int                  `json:"internal_port"`
+	HealthCheckPath    *string              `json:"health_check_path"`
+	HealthStrategy     string               `json:"health_strategy"`
+	Services           []CreateServiceInput `json:"services"`
 }
 
 // UpdateProjectInput holds the data that can be updated on a project.
@@ -349,6 +356,15 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 	agentIDStr := strings.TrimSpace(input.AgentID)
 	sourceIDPtr = &sourceUUID
 
+	deploymentStrategy := strings.TrimSpace(input.DeploymentStrategy)
+	if deploymentStrategy == "" {
+		deploymentStrategy = "auto"
+	}
+	deploymentPlan := input.DeploymentPlan
+	if len(deploymentPlan) == 0 {
+		deploymentPlan = json.RawMessage("{}")
+	}
+
 	project := &models.Project{
 		ID:                 uuid.New(),
 		OwnerID:            ownerID,
@@ -359,6 +375,8 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		SourceReference:    sourceRef,
 		RepositoryPath:     repoPath,
 		Branch:             branch,
+		DeploymentStrategy: deploymentStrategy,
+		DeploymentPlan:     deploymentPlan,
 		DockerfilePath:     dockerfilePath,
 		BuildContext:       buildContext,
 		BuildStrategy:      buildStrategy,
@@ -442,12 +460,22 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				}
 			}
 
+			svcClassification := strings.TrimSpace(svcIn.Classification)
+			if svcClassification == "" {
+				svcClassification = models.ClassificationApplication
+			}
+
 			svc := &models.Service{
 				ID:                 uuid.New(),
 				ProjectID:          project.ID,
 				SourceID:           project.SourceID,
 				Name:               svcName,
 				Role:               svcRole,
+				Classification:     svcClassification,
+				Image:              strings.TrimSpace(svcIn.Image),
+				DependsOn:          svcIn.DependsOn,
+				Volumes:            svcIn.Volumes,
+				HealthCheckConfig:  svcIn.HealthCheckConfig,
 				SourcePath:         svcSourcePath,
 				RuntimeType:        rt,
 				Framework:          svcIn.Framework,
@@ -489,6 +517,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			SourceID:           project.SourceID,
 			Name:               project.Name,
 			Role:               models.RoleOther,
+			Classification:     models.ClassificationApplication,
 			SourcePath:         srcPath,
 			RuntimeType:        project.RuntimeType,
 			BuildStrategy:      project.BuildStrategy,
@@ -534,18 +563,19 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
 			dockerfile_path, build_context, build_strategy, build_command, start_command,
 			runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
-			status, created_at, updated_at
+			status, deployment_strategy, deployment_plan, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $12, $13, $14,
 			$15, $16, $17, $18, $19,
-			$20, $21, $22
+			$20, $21, $22, $23, $24
 		)`,
 		project.ID, project.OwnerID, project.SourceID, project.Name, project.Slug, project.SourceType, project.SourceReference,
 		project.RepositoryPath, project.Branch, project.DockerfilePath, project.BuildContext,
 		project.BuildStrategy, project.BuildCommand, project.StartCommand,
 		project.RuntimeType, project.InternalPort, project.HealthCheckPath, project.HealthCheckEnabled,
-		project.HealthStrategy, project.Status, project.CreatedAt, project.UpdatedAt,
+		project.HealthStrategy, project.Status, project.DeploymentStrategy, project.DeploymentPlan,
+		project.CreatedAt, project.UpdatedAt,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "uq_projects_owner_slug") {
@@ -620,7 +650,8 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID, pa
 		`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
 		 dockerfile_path, build_context, build_strategy, build_command, start_command,
 		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
-		 status, current_deployment_id, port, created_at, updated_at
+		 status, current_deployment_id, port, created_at, updated_at,
+		 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb)
 		 FROM projects WHERE owner_id = $1 ORDER BY created_at DESC
 		 LIMIT $2 OFFSET $3`,
 		ownerID, limit, offset,
@@ -639,7 +670,7 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID, pa
 			&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
 			&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
 			&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
-			&p.CreatedAt, &p.UpdatedAt,
+			&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan project: %w", err)
@@ -671,6 +702,7 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID, pa
 					SourceID:           p.SourceID,
 					Name:               p.Name,
 					Role:               models.RoleOther,
+					Classification:     models.ClassificationApplication,
 					SourcePath:         p.BuildContext,
 					RuntimeType:        p.RuntimeType,
 					BuildStrategy:      p.BuildStrategy,
@@ -709,7 +741,8 @@ func (s *ProjectService) ListActiveProjects(ctx context.Context) ([]*models.Proj
 		`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
 		 dockerfile_path, build_context, build_strategy, build_command, start_command,
 		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
-		 status, current_deployment_id, port, created_at, updated_at
+		 status, current_deployment_id, port, created_at, updated_at,
+		 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb)
 		 FROM projects WHERE status IN ('running', 'partially_running', 'deploying') ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -725,7 +758,7 @@ func (s *ProjectService) ListActiveProjects(ctx context.Context) ([]*models.Proj
 			&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
 			&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
 			&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
-			&p.CreatedAt, &p.UpdatedAt,
+			&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan active project: %w", err)
@@ -877,7 +910,8 @@ func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, pro
 		`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
 		 dockerfile_path, build_context, build_strategy, build_command, start_command,
 		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
-		 status, current_deployment_id, port, created_at, updated_at
+		 status, current_deployment_id, port, created_at, updated_at,
+		 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb)
 		 FROM projects WHERE id = $1`,
 		projectID,
 	).Scan(
@@ -885,7 +919,7 @@ func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, pro
 		&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
 		&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
 		&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
-		&p.CreatedAt, &p.UpdatedAt,
+		&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -903,6 +937,7 @@ func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, pro
 					SourceID:           p.SourceID,
 					Name:               p.Name,
 					Role:               models.RoleOther,
+					Classification:     models.ClassificationApplication,
 					SourcePath:         p.BuildContext,
 					RuntimeType:        p.RuntimeType,
 					BuildStrategy:      p.BuildStrategy,

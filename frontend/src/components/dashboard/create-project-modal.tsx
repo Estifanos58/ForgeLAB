@@ -18,6 +18,9 @@ import {
   ServiceDefinition,
   BuildCandidate,
   ServiceRole,
+  DeploymentPlan,
+  DiscoveryResult,
+  GeneratePlanRequest,
 } from '@/lib/api/types';
 import { Modal } from '@/components/ui/modal';
 import { Input } from '@/components/ui/input';
@@ -50,6 +53,10 @@ import {
   Plus,
   Trash2,
   Layers,
+  GitCommit,
+  Network,
+  Workflow,
+  FileText,
 } from 'lucide-react';
 
 interface CreateProjectModalProps {
@@ -58,7 +65,7 @@ interface CreateProjectModalProps {
   onCreated?: (project: Project) => void;
 }
 
-type Step = 'source' | 'config';
+type Step = 'source' | 'config' | 'plan';
 type SourceTab = 'github' | 'local';
 type LocalMode = 'agent' | 'archive';
 
@@ -128,7 +135,12 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   const [step, setStep] = useState<Step>('source');
   const [sourceTab, setSourceTab] = useState<SourceTab>('local');
   const [loading, setLoading] = useState(false);
+  const [loadingPlan, setLoadingPlan] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Deployment Plan state
+  const [deploymentPlan, setDeploymentPlan] = useState<DeploymentPlan | null>(null);
+  const [discoveryResult, setDiscoveryResult] = useState<DiscoveryResult | null>(null);
 
   // GitHub integration state
   const [ghStatus, setGhStatus] = useState<GitHubStatus | null>(null);
@@ -902,6 +914,72 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     }
   };
 
+  const handleProceedToPlan = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!projectName.trim()) {
+      setError('Project name is required');
+      return;
+    }
+    if (configuredServices.length === 0) {
+      setError('At least one configured service is required');
+      return;
+    }
+
+    setLoadingPlan(true);
+    setError(null);
+
+    try {
+      let req: GeneratePlanRequest;
+      if (sourceTab === 'github') {
+        if (!selectedRepo) {
+          setError('Please select a GitHub repository');
+          setLoadingPlan(false);
+          return;
+        }
+        req = {
+          source_type: 'github',
+          source_reference: selectedRepo.full_name,
+          branch: selectedBranch,
+          root_dir: rootDir,
+        };
+      } else if (localMode === 'agent') {
+        if (!agentSession) {
+          setError('Please select a local folder using ForgeLAB Agent first');
+          setLoadingPlan(false);
+          return;
+        }
+        req = {
+          source_type: 'local_agent',
+          source_reference: agentSession.source_id,
+          agent_id: agentSession.agent_id,
+          branch: 'main',
+          root_dir: '.',
+        };
+      } else {
+        if (!localSourceId) {
+          setError('Please upload an archive file first');
+          setLoadingPlan(false);
+          return;
+        }
+        req = {
+          source_type: 'local_upload',
+          source_reference: localSourceId,
+          branch: 'main',
+          root_dir: '.',
+        };
+      }
+
+      const res = await api.discovery.generatePlan(req);
+      setDiscoveryResult(res.discovery);
+      setDeploymentPlan(res.plan);
+      setStep('plan');
+    } catch (err: any) {
+      setError(`Failed to generate deployment plan: ${err.message || 'unknown error'}`);
+    } finally {
+      setLoadingPlan(false);
+    }
+  };
+
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!projectName.trim()) {
@@ -921,23 +999,60 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         return;
       }
 
-      const servicesPayload = configuredServices.map((svc) => ({
-        name: svc.name.trim(),
-        role: svc.role,
-        source_path: svc.source_path,
-        runtime: svc.runtime,
-        runtime_type: svc.runtime,
-        framework: svc.framework,
-        package_manager: svc.package_manager,
-        build_strategy: svc.build_strategy,
-        build_candidates: svc.build_candidates,
-        build_command: svc.build_command,
-        start_command: svc.start_command,
-        dockerfile_path: svc.dockerfile_path,
-        internal_port: Number(svc.internal_port) || 8080,
-        health_strategy: svc.health_strategy,
-        health_check_path: svc.health_check_path,
-      }));
+      const servicesPayload: any[] = configuredServices.map((svc) => {
+        const planned = deploymentPlan?.services.find((ps) => ps.name === svc.name);
+        return {
+          name: svc.name.trim(),
+          role: svc.role,
+          source_path: svc.source_path,
+          runtime: svc.runtime,
+          runtime_type: svc.runtime,
+          framework: svc.framework,
+          package_manager: svc.package_manager,
+          build_strategy: planned?.build_strategy || svc.build_strategy,
+          image: planned?.image,
+          classification: planned?.classification || 'application',
+          depends_on: planned?.depends_on || [],
+          volumes: planned?.volumes || [],
+          healthcheck_config: planned?.health_check,
+          build_candidates: svc.build_candidates,
+          build_command: svc.build_command,
+          start_command: svc.start_command,
+          dockerfile_path: svc.dockerfile_path,
+          internal_port: Number(svc.internal_port) || 8080,
+          health_strategy: svc.health_strategy,
+          health_check_path: svc.health_check_path,
+        };
+      });
+
+      if (deploymentPlan?.services) {
+        for (const ps of deploymentPlan.services) {
+          if (!servicesPayload.some((s) => s.name === ps.name)) {
+            servicesPayload.push({
+              name: ps.name,
+              role: (ps.role as any) || 'other',
+              source_path: ps.source_path || '.',
+              runtime: ps.runtime_type || 'generic',
+              runtime_type: ps.runtime_type || 'generic',
+              framework: ps.framework || 'generic',
+              package_manager: ps.package_manager || 'generic',
+              build_strategy: ps.build_strategy,
+              image: ps.image,
+              classification: ps.classification,
+              depends_on: ps.depends_on,
+              volumes: ps.volumes,
+              healthcheck_config: ps.health_check,
+              build_candidates: ps.build_candidates || [],
+              build_command: ps.build_command || '',
+              start_command: ps.start_command || '',
+              dockerfile_path: ps.dockerfile_path || '',
+              internal_port: ps.internal_port || 8080,
+              health_strategy: 'auto',
+              health_check_path: '/health',
+            });
+          }
+        }
+      }
 
       if (sourceTab === 'github') {
         if (!selectedRepo) {
@@ -1006,6 +1121,11 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         };
       }
 
+      if (deploymentPlan) {
+        payload.deployment_strategy = deploymentPlan.strategy;
+        payload.deployment_plan = deploymentPlan;
+      }
+
       const project = await api.projects.create(payload);
 
       onClose();
@@ -1032,11 +1152,19 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title={step === 'source' ? 'Import Project' : 'Configure Application'}
+      title={
+        step === 'source'
+          ? 'Import Project'
+          : step === 'config'
+          ? 'Configure Application'
+          : 'Review Deployment Plan'
+      }
       description={
         step === 'source'
           ? 'Select a project from your local computer or import from a GitHub repository.'
-          : 'Review detected service architecture, configure build strategies and ports.'
+          : step === 'config'
+          ? 'Review detected service architecture, configure build strategies and ports.'
+          : 'Inspect immutable execution DAG, service classifications, endpoints, volumes, and environment provenance.'
       }
       maxWidth="2xl"
     >
@@ -1934,7 +2062,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
       {/* STEP 2: CONFIGURATION & REVIEW */}
       {step === 'config' && (
-        <form onSubmit={handleCreateProject} className="space-y-4">
+        <form onSubmit={handleProceedToPlan} className="space-y-4">
           {/* Source Banner */}
           <div className="p-3 rounded-md bg-surface-elevated border border-surface-border flex items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-2.5 min-w-0">
@@ -2329,15 +2457,258 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
               Back
             </Button>
             <div className="flex items-center gap-2">
-              <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={loading}>
+              <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={loading || loadingPlan}>
                 Cancel
               </Button>
-              <Button type="submit" variant="primary" size="sm" loading={loading}>
-                Create Project
+              <Button
+                type="submit"
+                variant="primary"
+                size="sm"
+                loading={loadingPlan}
+                icon={<ArrowRight className="w-3.5 h-3.5" />}
+              >
+                Review Deployment Plan
               </Button>
             </div>
           </div>
         </form>
+      )}
+
+      {/* STEP 3: DEPLOYMENT PLAN REVIEW */}
+      {step === 'plan' && deploymentPlan && (
+        <div className="space-y-5">
+          {/* Header Card: Strategy & Revision */}
+          <div className="p-4 rounded-lg bg-surface-elevated/70 border border-surface-border space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-400 font-medium">Deployment Strategy:</span>
+                <span
+                  className={cn(
+                    'px-2.5 py-0.5 rounded-full text-xs font-semibold uppercase tracking-wider border',
+                    deploymentPlan.strategy === 'compose'
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                      : deploymentPlan.strategy === 'dockerfile'
+                      ? 'bg-sky-500/10 text-sky-400 border-sky-500/30'
+                      : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                  )}
+                >
+                  {deploymentPlan.strategy === 'compose'
+                    ? 'Docker Compose'
+                    : deploymentPlan.strategy === 'dockerfile'
+                    ? 'Dockerfile'
+                    : 'ForgeLAB Auto'}
+                </span>
+                <span className="text-xs text-neutral-500 font-mono">({deploymentPlan.topology})</span>
+              </div>
+
+              <div className="flex items-center gap-1.5 text-xs text-neutral-300 font-mono bg-black/40 px-2.5 py-1 rounded border border-neutral-800">
+                <GitCommit className="w-3.5 h-3.5 text-neutral-400" />
+                <span className="text-neutral-500">Revision:</span>
+                <span className="text-primary-light font-semibold">
+                  {deploymentPlan.source_revision ? deploymentPlan.source_revision.substring(0, 8) : 'pinned'}
+                </span>
+              </div>
+            </div>
+
+            {/* Network & Volumes info */}
+            <div className="flex flex-wrap items-center gap-4 text-xs text-neutral-400 pt-2 border-t border-surface-border/50">
+              <div className="flex items-center gap-1.5">
+                <Network className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Isolated Network:</span>
+                <span className="font-mono text-neutral-300">{deploymentPlan.networks?.[0] || 'forgelab-net'}</span>
+              </div>
+              {deploymentPlan.volumes && deploymentPlan.volumes.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <HardDrive className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Named Volumes:</span>
+                  <span className="font-mono text-neutral-300">{deploymentPlan.volumes.length} persistent</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Execution Tiers / DAG */}
+          {deploymentPlan.execution_tiers && deploymentPlan.execution_tiers.length > 0 && (
+            <div className="p-4 rounded-lg bg-surface-elevated/40 border border-surface-border space-y-3">
+              <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                <Workflow className="w-4 h-4 text-primary-light" />
+                <span>Dependency Execution Stages (DAG)</span>
+              </div>
+              <p className="text-[11px] text-neutral-400">
+                ForgeLAB enforces strict dependency startup ordering. Each tier must achieve healthy status before dependent tiers are launched.
+              </p>
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                {deploymentPlan.execution_tiers.map((tier, idx) => (
+                  <React.Fragment key={idx}>
+                    <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-surface border border-surface-border text-xs font-mono">
+                      <span className="text-primary-light font-bold">Tier {idx + 1}:</span>
+                      <span className="text-neutral-200">{tier.join(', ')}</span>
+                    </div>
+                    {idx < deploymentPlan.execution_tiers.length - 1 && (
+                      <ArrowRight className="w-3.5 h-3.5 text-neutral-500" />
+                    )}
+                  </React.Fragment>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Services List */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-white uppercase tracking-wider">
+                Planned Services ({deploymentPlan.services.length})
+              </span>
+              <span className="text-[11px] text-neutral-400">
+                Independent containers & logs per service
+              </span>
+            </div>
+
+            <div className="space-y-2">
+              {deploymentPlan.services.map((svc) => (
+                <div
+                  key={svc.name}
+                  className="p-3.5 rounded-lg bg-surface border border-surface-border space-y-2.5 text-xs"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 font-mono">
+                      <span className="font-bold text-white text-sm">{svc.name}</span>
+                      <span
+                        className={cn(
+                          'px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider border',
+                          svc.classification === 'infrastructure'
+                            ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                            : svc.classification === 'worker'
+                            ? 'bg-purple-500/10 text-purple-400 border-purple-500/20'
+                            : svc.classification === 'job'
+                            ? 'bg-teal-500/10 text-teal-400 border-teal-500/20'
+                            : 'bg-sky-500/10 text-sky-400 border-sky-500/20'
+                        )}
+                      >
+                        {svc.classification}
+                      </span>
+                      <span className="text-neutral-500 text-[11px]">({svc.role})</span>
+                    </div>
+
+                    <div className="flex items-center gap-2 text-[11px]">
+                      {svc.public_exposed ? (
+                        <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
+                          Public: :{svc.host_port || svc.internal_port} &rarr; :{svc.internal_port}
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+                          Internal: {svc.name}:{svc.internal_port}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] text-neutral-400 font-mono">
+                    <div>
+                      <span className="text-neutral-500">Build: </span>
+                      {svc.build_strategy === 'image' ? (
+                        <span className="text-amber-400">Pre-built image ({svc.image})</span>
+                      ) : svc.build_strategy === 'dockerfile' ? (
+                        <span className="text-sky-300">Dockerfile ({svc.dockerfile_path || 'Dockerfile'})</span>
+                      ) : (
+                        <span className="text-emerald-400">ForgeLAB Generated ({svc.runtime_type})</span>
+                      )}
+                    </div>
+
+                    {svc.depends_on && svc.depends_on.length > 0 && (
+                      <div>
+                        <span className="text-neutral-500">Depends on: </span>
+                        <span className="text-primary-light">{svc.depends_on.join(', ')}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {svc.volumes && svc.volumes.length > 0 && (
+                    <div className="text-[11px] text-neutral-400 font-mono bg-black/20 p-2 rounded border border-neutral-800/60">
+                      <span className="text-neutral-500">Volumes: </span>
+                      {svc.volumes.map((v) => `${v.name} -> ${v.container_path}${v.read_only ? ' (ro)' : ''}`).join(', ')}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Environment Variables Provenance & Conflicts */}
+          {deploymentPlan.environment && deploymentPlan.environment.length > 0 && (
+            <div className="p-4 rounded-lg bg-surface border border-surface-border space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                  <FileText className="w-4 h-4 text-emerald-400" />
+                  <span>Discovered Environment Variables ({deploymentPlan.environment.length})</span>
+                </div>
+                <span className="text-[11px] text-neutral-400">
+                  Imported from .env / Compose
+                </span>
+              </div>
+
+              <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1">
+                {deploymentPlan.environment.map((env) => (
+                  <div
+                    key={`${env.service_name || 'root'}-${env.key}`}
+                    className="flex items-center justify-between p-2 rounded bg-surface-elevated/40 border border-surface-border/50 text-xs font-mono"
+                  >
+                    <div className="flex items-center gap-2 overflow-hidden">
+                      <span className="text-emerald-400 font-semibold">{env.key}</span>
+                      <span className="text-neutral-500">=</span>
+                      <span className="text-neutral-300 truncate max-w-[150px]">
+                        {env.is_secret ? '••••••••' : env.value}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2 text-[10px]">
+                      {env.source_file && (
+                        <span className="text-neutral-500">{env.source_file}</span>
+                      )}
+                      {env.has_conflict ? (
+                        <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                          ForgeLAB Secret Preserved
+                        </span>
+                      ) : (
+                        <span className="px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                          Imported
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Sticky Actions */}
+          <div className="sticky bottom-0 -mx-5 sm:-mx-6 -mb-5 sm:-mb-6 px-5 sm:px-6 py-3.5 bg-surface/95 backdrop-blur border-t border-surface-border flex items-center justify-between z-10 mt-6">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setStep('config')}
+              icon={<ArrowLeft className="w-3.5 h-3.5" />}
+            >
+              Back to Configuration
+            </Button>
+            <div className="flex items-center gap-2">
+              <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={loading}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="primary"
+                size="sm"
+                onClick={handleCreateProject}
+                loading={loading}
+                icon={<CheckCircle2 className="w-3.5 h-3.5" />}
+              >
+                Deploy Project
+              </Button>
+            </div>
+          </div>
+        </div>
       )}
     </Modal>
   );

@@ -20,7 +20,9 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	dockerimage "github.com/docker/docker/api/types/image"
 	dockernetwork "github.com/docker/docker/api/types/network"
+	dockervolume "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	"github.com/google/uuid"
@@ -171,14 +173,22 @@ func (e *Engine) SetLocalBuildMode(mode string) {
 }
 
 // resolveSourceDirectory acquires or resolves the source code directory for build operations.
-func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Project, execID string, emitLog func(phase, stream, message string)) (buildSourceDir string, cleanupDir string, err error) {
+func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Project, execID string, emitLog func(phase, stream, message string), sourceRevision ...string) (buildSourceDir string, cleanupDir string, err error) {
 	if project.SourceType == models.SourceTypeGitHub {
 		snapshotDir := filepath.Join(e.workDir, execID)
 		_ = os.MkdirAll(snapshotDir, 0755)
 		cleanupDir = snapshotDir
 		buildSourceDir = snapshotDir
 
-		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (branch: %s)...", project.SourceReference, project.Branch))
+		ref := project.Branch
+		if len(sourceRevision) > 0 && sourceRevision[0] != "" {
+			ref = sourceRevision[0]
+		}
+		if ref == "" {
+			ref = "main"
+		}
+
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (revision: %s)...", project.SourceReference, ref))
 		parts := strings.Split(project.SourceReference, "/")
 		if len(parts) != 2 {
 			return "", cleanupDir, fmt.Errorf("invalid GitHub repository reference '%s'. Expected format 'owner/repo'", project.SourceReference)
@@ -186,7 +196,7 @@ func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Pro
 		if e.githubService == nil {
 			return "", cleanupDir, errors.New("GitHub integration service is not available")
 		}
-		if err := e.githubService.AcquireRepoTarball(ctx, project.OwnerID, parts[0], parts[1], project.Branch, snapshotDir); err != nil {
+		if err := e.githubService.AcquireRepoTarball(ctx, project.OwnerID, parts[0], parts[1], ref, snapshotDir); err != nil {
 			return "", cleanupDir, fmt.Errorf("failed to acquire GitHub repository archive: %w", err)
 		}
 		emitLog(models.LogPhaseSource, models.LogStreamSystem, "GitHub repository archive acquired successfully.")
@@ -492,10 +502,38 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 	}
 
+	// Check if this service is an infrastructure service or specifies a pre-built image
+	isInfraService := service.Classification == models.ClassificationInfrastructure || serviceDeploy.Classification == models.ClassificationInfrastructure || serviceDeploy.BuildStrategy == models.BuildStrategyImage || (service.Image != "" && (service.DockerfilePath == "" || service.BuildStrategy == models.BuildStrategyImage))
+	if !reusingExistingImage && isInfraService {
+		targetImage := service.Image
+		if targetImage == "" {
+			targetImage = serviceDeploy.Image
+		}
+		if targetImage != "" {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Infrastructure / pre-built image '%s' detected for service '%s'. Pulling image...", targetImage, service.Name))
+			runImage = targetImage
+			if e.dockerClient != nil {
+				reader, pullErr := e.dockerClient.ImagePull(ctx, targetImage, dockerimage.PullOptions{})
+				if pullErr == nil && reader != nil {
+					_, _ = io.Copy(io.Discard, reader)
+					_ = reader.Close()
+					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' ready. Skipping source build.", targetImage))
+				} else if pullErr != nil {
+					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image pull note (%v); attempting local image cache.", pullErr))
+				}
+			}
+			reusingExistingImage = true
+		}
+	}
+
 	if !reusingExistingImage {
 		// 1. Source acquisition & resolution
 		emitStatus(models.DeployStatusCloning, nil, nil)
-		buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, serviceDeploy.ID.String(), emitLog)
+		srcRev := ""
+		if serviceDeploy.SourceRevision != nil {
+			srcRev = *serviceDeploy.SourceRevision
+		}
+		buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, serviceDeploy.ID.String(), emitLog, srcRev)
 		if cleanupDir != "" {
 			defer func() {
 				_ = os.RemoveAll(cleanupDir)
@@ -746,7 +784,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	targetPortStr := fmt.Sprintf("%d/tcp", intPort)
 
 	allProjectServices, _ := e.serviceService.ListServices(ctx, project.ID)
-	if service.PublicExposed || service.Role == models.RoleFrontend || len(allProjectServices) <= 1 {
+	// Internal infrastructure, workers, and non-public services do not allocate host ports when part of multi-service project
+	isInternalService := service.Classification == models.ClassificationInfrastructure ||
+		service.Classification == models.ClassificationWorker ||
+		service.Classification == models.ClassificationJob ||
+		serviceDeploy.Classification == models.ClassificationInfrastructure ||
+		serviceDeploy.Classification == models.ClassificationWorker ||
+		serviceDeploy.Classification == models.ClassificationJob
+	shouldExposePort := !isInternalService && (service.PublicExposed || service.Role == models.RoleFrontend || len(allProjectServices) <= 1)
+
+	if shouldExposePort {
 		allocated, err := e.portManager.AllocatePort()
 		if err == nil {
 			hostPort = &allocated
@@ -809,6 +856,47 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		containerConfig.Labels["forgelab.deployment_id"] = serviceDeploy.DeploymentID.String()
 	}
 
+	// Attach Compose healthcheck if configured
+	if serviceDeploy.HealthCheckConfig != nil && len(serviceDeploy.HealthCheckConfig.Test) > 0 {
+		containerConfig.Healthcheck = &container.HealthConfig{
+			Test: serviceDeploy.HealthCheckConfig.Test,
+		}
+		if serviceDeploy.HealthCheckConfig.IntervalSeconds > 0 {
+			containerConfig.Healthcheck.Interval = time.Duration(serviceDeploy.HealthCheckConfig.IntervalSeconds) * time.Second
+		}
+		if serviceDeploy.HealthCheckConfig.TimeoutSeconds > 0 {
+			containerConfig.Healthcheck.Timeout = time.Duration(serviceDeploy.HealthCheckConfig.TimeoutSeconds) * time.Second
+		}
+		if serviceDeploy.HealthCheckConfig.Retries > 0 {
+			containerConfig.Healthcheck.Retries = serviceDeploy.HealthCheckConfig.Retries
+		}
+		if serviceDeploy.HealthCheckConfig.StartPeriodSeconds > 0 {
+			containerConfig.Healthcheck.StartPeriod = time.Duration(serviceDeploy.HealthCheckConfig.StartPeriodSeconds) * time.Second
+		}
+	}
+
+	// Prepare persistent named volumes
+	var binds []string
+	for _, v := range serviceDeploy.Volumes {
+		if v.Source != "" && v.Target != "" {
+			volName := fmt.Sprintf("forgelab-vol-%s-%s", project.ID.String()[:8], v.Source)
+			if e.dockerClient != nil {
+				_, _ = e.dockerClient.VolumeCreate(ctx, dockervolume.CreateOptions{
+					Name: volName,
+					Labels: map[string]string{
+						"forgelab.project_id":  project.ID.String(),
+						"forgelab.volume_name": v.Source,
+					},
+				})
+			}
+			bindEntry := fmt.Sprintf("%s:%s", volName, v.Target)
+			if v.ReadOnly {
+				bindEntry += ":ro"
+			}
+			binds = append(binds, bindEntry)
+		}
+	}
+
 	// Use snapshotted resource configuration from the service deployment, with fallback to service config
 	targetCpuMillicores := serviceDeploy.CpuMillicores
 	if targetCpuMillicores <= 0 && service.CpuMillicores > 0 {
@@ -828,7 +916,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		TargetCpuMillicores: targetCpuMillicores,
 		TargetMemoryMB:      targetMemoryMB,
 		TargetPidsLimit:     targetPidsLimit,
-		Binds:               nil,
+		Binds:               binds,
 		NetworkMode:         "",
 	})
 	if err != nil {
@@ -1063,7 +1151,6 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	}
 
 	var (
-		wg         sync.WaitGroup
 		mu         sync.Mutex
 		allHealthy = true
 		anyHealthy = false
@@ -1073,25 +1160,56 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	maxConcurrent := 4
 	sem := make(chan struct{}, maxConcurrent)
 
-	for _, sd := range svcDeploys {
-		wg.Add(1)
-		go func(sdItem *models.ServiceDeployment) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if execErr := e.ExecuteServiceDeployment(ctx, sdItem.ID); execErr != nil {
+	tiers := buildServiceDeploymentTiers(svcDeploys)
+	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("DAG execution plan computed: %d deployment tier(s).", len(tiers)))
+
+	failedServices := make(map[string]bool)
+
+	for tierIdx, tier := range tiers {
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Executing Tier %d (%d service(s))...", tierIdx+1, len(tier)))
+		var tierWg sync.WaitGroup
+		for _, sd := range tier {
+			// Check if any dependencies failed in earlier tiers
+			hasFailedDep := false
+			var failedDepName string
+			for _, dep := range sd.DependsOn {
+				if failedServices[dep] {
+					hasFailedDep = true
+					failedDepName = dep
+					break
+				}
+			}
+			if hasFailedDep {
 				mu.Lock()
 				allHealthy = false
-				errList = append(errList, fmt.Sprintf("%s: %v", sdItem.ServiceName, execErr))
+				failedServices[sd.ServiceName] = true
+				errList = append(errList, fmt.Sprintf("%s: skipped because dependency '%s' failed", sd.ServiceName, failedDepName))
 				mu.Unlock()
-			} else {
-				mu.Lock()
-				anyHealthy = true
-				mu.Unlock()
+				reason := fmt.Sprintf("Skipped because dependency '%s' failed", failedDepName)
+				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusFailed, &reason)
+				continue
 			}
-		}(sd)
+
+			tierWg.Add(1)
+			go func(sdItem *models.ServiceDeployment) {
+				defer tierWg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				if execErr := e.ExecuteServiceDeployment(ctx, sdItem.ID); execErr != nil {
+					mu.Lock()
+					allHealthy = false
+					failedServices[sdItem.ServiceName] = true
+					errList = append(errList, fmt.Sprintf("%s: %v", sdItem.ServiceName, execErr))
+					mu.Unlock()
+				} else {
+					mu.Lock()
+					anyHealthy = true
+					mu.Unlock()
+				}
+			}(sd)
+		}
+		tierWg.Wait()
 	}
-	wg.Wait()
 
 	newProjectStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
 
@@ -2367,4 +2485,52 @@ func (e *Engine) verifyServiceHealth(
 	}
 
 	return false, "health check failed after all attempts"
+}
+
+// buildServiceDeploymentTiers partitions service deployments into dependency execution tiers (DAG)
+func buildServiceDeploymentTiers(svcDeploys []*models.ServiceDeployment) [][]*models.ServiceDeployment {
+	nameToDeploy := make(map[string]*models.ServiceDeployment)
+	for _, sd := range svcDeploys {
+		nameToDeploy[sd.ServiceName] = sd
+	}
+
+	deployed := make(map[string]bool)
+	remaining := make(map[string]*models.ServiceDeployment)
+	for _, sd := range svcDeploys {
+		remaining[sd.ServiceName] = sd
+	}
+
+	var tiers [][]*models.ServiceDeployment
+	for len(remaining) > 0 {
+		var currentTier []*models.ServiceDeployment
+		for _, sd := range remaining {
+			depsSatisfied := true
+			for _, dep := range sd.DependsOn {
+				if _, exists := nameToDeploy[dep]; exists && !deployed[dep] {
+					depsSatisfied = false
+					break
+				}
+			}
+			if depsSatisfied {
+				currentTier = append(currentTier, sd)
+			}
+		}
+
+		if len(currentTier) == 0 {
+			// Circular dependency or unresolvable: group all remaining into a final tier
+			var fallback []*models.ServiceDeployment
+			for _, sd := range remaining {
+				fallback = append(fallback, sd)
+			}
+			tiers = append(tiers, fallback)
+			break
+		}
+
+		for _, sd := range currentTier {
+			deployed[sd.ServiceName] = true
+			delete(remaining, sd.ServiceName)
+		}
+		tiers = append(tiers, currentTier)
+	}
+	return tiers
 }
