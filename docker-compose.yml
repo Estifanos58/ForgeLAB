@@ -34,9 +34,6 @@ services:
 
   migrate:
     image: forgelab-backend:latest
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
     container_name: forgelab-migrate
     restart: "no"
     command: ["./forgelab-migrate", "up"]
