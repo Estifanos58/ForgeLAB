@@ -343,7 +343,7 @@ func inspectServiceDirectory(repoRoot, dirPath, relPath string) (*DiscoveredServ
 	runtime, framework, pkgManager, suggestedPort, healthPath, healthStrat, buildCmd, startCmd := DetectTechnology(files)
 
 	hasDockerfile := false
-	dockerfilePath := "Dockerfile"
+	dockerfilePath := ""
 	for f, content := range files {
 		if strings.EqualFold(filepath.Base(f), "dockerfile") {
 			hasDockerfile = true
@@ -373,6 +373,14 @@ func inspectServiceDirectory(repoRoot, dirPath, relPath string) (*DiscoveredServ
 		if candidates[0].Strategy == models.BuildStrategyDockerfile && candidates[0].DockerfilePath != "" {
 			dockerfilePath = candidates[0].DockerfilePath
 		}
+	}
+	if !hasDockerfile && selectedStrategy != models.BuildStrategyDockerfile {
+		dockerfilePath = ""
+	}
+
+	buildContext := relPath
+	if buildContext == "" {
+		buildContext = "."
 	}
 
 	classification := ClassificationApplication
@@ -409,7 +417,7 @@ func inspectServiceDirectory(repoRoot, dirPath, relPath string) (*DiscoveredServ
 		BuildCommand:       buildCmd,
 		StartCommand:       startCmd,
 		DockerfilePath:     dockerfilePath,
-		BuildContext:       ".",
+		BuildContext:       buildContext,
 		InternalPort:       suggestedPort,
 		PublicExposed:      publicExposed,
 		HealthCheck:        healthCheck,

@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
@@ -172,24 +173,36 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 		}
-		if sourceRevision == "" && h.sourceService != nil {
+		if workspaceDir == "" && req.SourceReference != "" {
 			if srcUUID, parseErr := uuid.Parse(req.SourceReference); parseErr == nil {
-				if src, sErr := h.sourceService.GetSource(r.Context(), userID, srcUUID); sErr == nil && src != nil && src.Fingerprint != "" {
-					sourceRevision = src.Fingerprint
+				if sess, ok := agent.LookupLocalSourceSession(srcUUID); ok && sess != nil && sess.CanonicalPath != "" {
+					if cPath, vErr := h.pathValidator.ValidateSourcePath(sess.CanonicalPath); vErr == nil {
+						workspaceDir = cPath
+					}
+				}
+				if workspaceDir == "" && h.sourceService != nil {
+					if p, getErr := h.sourceService.GetSourcePath(r.Context(), userID, srcUUID); getErr == nil && p != "" {
+						workspaceDir = p
+					}
+				}
+				if sourceRevision == "" && h.sourceService != nil {
+					if src, sErr := h.sourceService.GetSource(r.Context(), userID, srcUUID); sErr == nil && src != nil && src.Fingerprint != "" {
+						sourceRevision = src.Fingerprint
+					}
 				}
 			}
 		}
-		if sourceRevision == "" && workspaceDir != "" && workspaceDir != "." {
-			if fp, fpErr := discovery.ComputeDirectoryContentFingerprint(workspaceDir); fpErr == nil && fp != "" {
-				sourceRevision = fp
-			}
+		if workspaceDir == "" || workspaceDir == "." {
+			writeError(w, http.StatusBadRequest, "workspace directory cannot be resolved for local agent source: provide repository_path or a valid agent source reference")
+			return
 		}
 		if sourceRevision == "" {
-			if workspaceDir == "" {
-				workspaceDir = "."
+			if fp, fpErr := discovery.ComputeDirectoryContentFingerprint(workspaceDir); fpErr == nil && fp != "" {
+				sourceRevision = fp
+			} else {
+				hSha := sha256.Sum256([]byte(fmt.Sprintf("agent:%s", req.SourceReference)))
+				sourceRevision = fmt.Sprintf("fp_%s", hex.EncodeToString(hSha[:16]))
 			}
-			hSha := sha256.Sum256([]byte(fmt.Sprintf("agent:%s", req.SourceReference)))
-			sourceRevision = fmt.Sprintf("fp_%s", hex.EncodeToString(hSha[:16]))
 		}
 
 	default:

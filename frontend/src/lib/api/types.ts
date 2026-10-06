@@ -61,7 +61,9 @@ export interface Service {
   health_check_path?: string | null;
   health_check_enabled: boolean;
   classification?: string;
+  image?: string | null;
   depends_on?: string[];
+  depends_on_conditions?: Record<string, string>;
   volumes?: VolumeMountConfig[];
   networks?: string[];
   healthcheck_config?: HealthCheckConfig | null;
@@ -88,6 +90,7 @@ export interface ServiceDeployment {
   classification?: string;
   image?: string | null;
   depends_on?: string[];
+  depends_on_conditions?: Record<string, string>;
   volumes?: VolumeMountConfig[];
   networks?: string[];
   healthcheck_config?: HealthCheckConfig | null;
@@ -148,13 +151,16 @@ export interface ServiceDefinition {
   build_command?: string;
   start_command?: string;
   dockerfile_path?: string;
+  build_context?: string;
   internal_port?: number;
   health_strategy?: string;
   health_check_path?: string;
   classification?: string;
   image?: string;
   depends_on?: string[];
+  depends_on_conditions?: Record<string, string>;
   volumes?: VolumeMountConfig[];
+  networks?: string[];
   healthcheck_config?: HealthCheckConfig;
 }
 
@@ -480,6 +486,7 @@ export interface PlannedService {
   health_check: HealthCheckConfig;
   resource_config: ResourceConfig;
   depends_on: string[];
+  depends_on_conditions?: Record<string, string>;
   volumes: VolumeMountConfig[];
   networks?: string[];
   environment: EnvironmentProvenance[];
@@ -528,6 +535,7 @@ export interface DiscoveredService {
   health_check_path: string;
   health_check_enabled: boolean;
   depends_on: string[];
+  depends_on_conditions?: Record<string, string>;
   volumes: VolumeMountConfig[];
   networks?: string[];
   environment: EnvironmentProvenance[];

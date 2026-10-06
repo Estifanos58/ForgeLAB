@@ -247,6 +247,7 @@ type Service struct {
 	Classification             string              `json:"classification"` // "application", "worker", "infrastructure", "job"
 	Image                      string              `json:"image,omitempty"`
 	DependsOn                  []string            `json:"depends_on,omitempty"`
+	DependsOnConditions        map[string]string   `json:"depends_on_conditions,omitempty"`
 	Volumes                    []VolumeMountConfig `json:"volumes,omitempty"`
 	HealthCheckConfig          *HealthCheckConfig  `json:"healthcheck_config,omitempty"`
 	Networks                   []string            `json:"networks,omitempty"`
@@ -279,34 +280,35 @@ type Service struct {
 // ServiceDeployment represents the deployment record of an individual service.
 // In a service-only deployment, DeploymentID is nil. In a release deployment, it references the parent release.
 type ServiceDeployment struct {
-	ID                uuid.UUID           `json:"id"`
-	DeploymentID      *uuid.UUID          `json:"deployment_id,omitempty"`
-	ServiceID         uuid.UUID           `json:"service_id"`
-	ServiceName       string              `json:"service_name,omitempty"`
-	DeployNumber      int                 `json:"deploy_number"`
-	Status            string              `json:"status"`
-	Classification    string              `json:"classification,omitempty"`
-	Image             string              `json:"image,omitempty"`
-	DependsOn         []string            `json:"depends_on,omitempty"`
-	Volumes           []VolumeMountConfig `json:"volumes,omitempty"`
-	HealthCheckConfig *HealthCheckConfig  `json:"healthcheck_config,omitempty"`
-	Networks          []string            `json:"networks,omitempty"`
-	ImageTag          *string             `json:"image_tag"`
-	ImageDigest       *string             `json:"image_digest,omitempty"`
-	ContainerID       *string             `json:"container_id"`
-	HostPort          *int                `json:"host_port"`
-	InternalPort      int                 `json:"internal_port"`
-	PreviewURL        *string             `json:"preview_url,omitempty"`
-	BuildStrategy     string              `json:"build_strategy"`
-	BuildCommand      string              `json:"build_command"`
-	StartCommand      string              `json:"start_command"`
-	RuntimeType       string              `json:"runtime_type"`
-	DockerfilePath    string              `json:"dockerfile_path,omitempty"`
-	BuildContext      string              `json:"build_context,omitempty"`
-	HealthStrategy    string              `json:"health_strategy,omitempty"`
-	HealthCheckPath   *string             `json:"health_check_path,omitempty"`
-	ResourceConfig                        // snapshotted resource limits at deploy time
-	ExecutionMode     string              `json:"execution_mode,omitempty"`
+	ID                  uuid.UUID           `json:"id"`
+	DeploymentID        *uuid.UUID          `json:"deployment_id,omitempty"`
+	ServiceID           uuid.UUID           `json:"service_id"`
+	ServiceName         string              `json:"service_name,omitempty"`
+	DeployNumber        int                 `json:"deploy_number"`
+	Status              string              `json:"status"`
+	Classification      string              `json:"classification,omitempty"`
+	Image               string              `json:"image,omitempty"`
+	DependsOn           []string            `json:"depends_on,omitempty"`
+	DependsOnConditions map[string]string   `json:"depends_on_conditions,omitempty"`
+	Volumes             []VolumeMountConfig `json:"volumes,omitempty"`
+	HealthCheckConfig   *HealthCheckConfig  `json:"healthcheck_config,omitempty"`
+	Networks            []string            `json:"networks,omitempty"`
+	ImageTag            *string             `json:"image_tag"`
+	ImageDigest         *string             `json:"image_digest,omitempty"`
+	ContainerID         *string             `json:"container_id"`
+	HostPort            *int                `json:"host_port"`
+	InternalPort        int                 `json:"internal_port"`
+	PreviewURL          *string             `json:"preview_url,omitempty"`
+	BuildStrategy       string              `json:"build_strategy"`
+	BuildCommand        string              `json:"build_command"`
+	StartCommand        string              `json:"start_command"`
+	RuntimeType         string              `json:"runtime_type"`
+	DockerfilePath      string              `json:"dockerfile_path,omitempty"`
+	BuildContext        string              `json:"build_context,omitempty"`
+	HealthStrategy      string              `json:"health_strategy,omitempty"`
+	HealthCheckPath     *string             `json:"health_check_path,omitempty"`
+	ResourceConfig                          // snapshotted resource limits at deploy time
+	ExecutionMode       string              `json:"execution_mode,omitempty"`
 	SourceRevision    *string             `json:"source_revision,omitempty"`
 	EnvConfigHash     *string             `json:"env_config_hash,omitempty"`
 	EnvSnapshot       []byte              `json:"-"` // encrypted at rest; never exposed in API responses

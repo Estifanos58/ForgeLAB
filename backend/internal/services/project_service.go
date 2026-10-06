@@ -98,9 +98,10 @@ type CreateServiceInput struct {
 	HealthStrategy    string                     `json:"health_strategy"`
 	HealthCheckPath   *string                    `json:"health_check_path"`
 	HealthCheckConfig *models.HealthCheckConfig  `json:"healthcheck_config,omitempty"`
-	DependsOn         []string                   `json:"depends_on,omitempty"`
-	Volumes           []models.VolumeMountConfig `json:"volumes,omitempty"`
-	Networks          []string                   `json:"networks,omitempty"`
+	DependsOn           []string                   `json:"depends_on,omitempty"`
+	DependsOnConditions map[string]string          `json:"depends_on_conditions,omitempty"`
+	Volumes             []models.VolumeMountConfig `json:"volumes,omitempty"`
+	Networks            []string                   `json:"networks,omitempty"`
 }
 
 // CreateProjectInput holds the data needed to create a project.
@@ -305,7 +306,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		buildStrategy = models.BuildStrategyAuto
 	}
 	dockerfilePath := strings.TrimSpace(input.DockerfilePath)
-	if dockerfilePath == "" {
+	if dockerfilePath == "" && buildStrategy == models.BuildStrategyDockerfile {
 		dockerfilePath = "Dockerfile"
 	}
 	buildContext := strings.TrimSpace(input.BuildContext)
@@ -444,7 +445,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			}
 
 			dfPath := strings.TrimSpace(svcIn.DockerfilePath)
-			if dfPath == "" {
+			if dfPath == "" && svcStrat == models.BuildStrategyDockerfile {
 				dfPath = "Dockerfile"
 			}
 			bCtx := strings.TrimSpace(svcIn.BuildContext)
@@ -467,17 +468,18 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			}
 
 			svc := &models.Service{
-				ID:                 uuid.New(),
-				ProjectID:          project.ID,
-				SourceID:           project.SourceID,
-				Name:               svcName,
-				Role:               svcRole,
-				Classification:     svcClassification,
-				Image:              strings.TrimSpace(svcIn.Image),
-				DependsOn:          svcIn.DependsOn,
-				Volumes:            svcIn.Volumes,
-				Networks:           svcIn.Networks,
-				HealthCheckConfig:  svcIn.HealthCheckConfig,
+				ID:                  uuid.New(),
+				ProjectID:           project.ID,
+				SourceID:            project.SourceID,
+				Name:                svcName,
+				Role:                svcRole,
+				Classification:      svcClassification,
+				Image:               strings.TrimSpace(svcIn.Image),
+				DependsOn:           svcIn.DependsOn,
+				DependsOnConditions: svcIn.DependsOnConditions,
+				Volumes:             svcIn.Volumes,
+				Networks:            svcIn.Networks,
+				HealthCheckConfig:   svcIn.HealthCheckConfig,
 				SourcePath:         svcSourcePath,
 				RuntimeType:        rt,
 				Framework:          svcIn.Framework,

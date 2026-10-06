@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"unicode"
+
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -35,6 +37,13 @@ import (
 	"github.com/forgelab/backend/internal/services"
 	ws "github.com/forgelab/backend/internal/websocket"
 )
+
+type sharedBuildPromise struct {
+	done     chan struct{}
+	imageTag string
+	digest   string
+	err      error
+}
 
 type Engine struct {
 	dockerClient        *client.Client
@@ -56,6 +65,7 @@ type Engine struct {
 	pruneFilterLabel    string       // optional label filter for scoped image pruning
 	activeLogCollectors sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
 	activeCancels       sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	sharedBuildArtifacts sync.Map    // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
 }
 
 func NewEngine(
@@ -117,6 +127,60 @@ func (e *Engine) SetMaxConcurrentBuilds(n int) {
 // GetMaxConcurrentBuilds returns the current global Docker build concurrency limit.
 func (e *Engine) GetMaxConcurrentBuilds() int {
 	return e.maxConcurrentBuilds
+}
+
+func (e *Engine) getOrInitSharedBuild(key string) (*sharedBuildPromise, bool) {
+	val, loaded := e.sharedBuildArtifacts.Load(key)
+	if loaded {
+		return val.(*sharedBuildPromise), true
+	}
+	newPromise := &sharedBuildPromise{
+		done: make(chan struct{}),
+	}
+	actual, loaded := e.sharedBuildArtifacts.LoadOrStore(key, newPromise)
+	return actual.(*sharedBuildPromise), loaded
+}
+
+func parseCommandToArgs(cmdStr string) []string {
+	cmdStr = strings.TrimSpace(cmdStr)
+	if cmdStr == "" {
+		return nil
+	}
+	if strings.HasPrefix(cmdStr, "[") && strings.HasSuffix(cmdStr, "]") {
+		var parts []string
+		if err := json.Unmarshal([]byte(cmdStr), &parts); err == nil && len(parts) > 0 {
+			return parts
+		}
+	}
+	var parts []string
+	var current strings.Builder
+	inQuotes := false
+	quoteChar := rune(0)
+	for _, r := range cmdStr {
+		if inQuotes {
+			if r == quoteChar {
+				inQuotes = false
+			} else {
+				current.WriteRune(r)
+			}
+		} else {
+			if r == '"' || r == '\'' {
+				inQuotes = true
+				quoteChar = r
+			} else if unicode.IsSpace(r) {
+				if current.Len() > 0 {
+					parts = append(parts, current.String())
+					current.Reset()
+				}
+			} else {
+				current.WriteRune(r)
+			}
+		}
+	}
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
+	}
+	return parts
 }
 
 // SetPruneFilterLabel configures an optional label filter for scoped image pruning.
@@ -458,6 +522,19 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Starting service deployment #%d for '%s' (role: %s, runtime: %s)...", serviceDeploy.DeployNumber, service.Name, service.Role, service.RuntimeType))
 
+	// Preflight validation for single service deployment
+	if err := ValidateDeploymentPreflight(execCtx, PreflightOptions{
+		Project:       project,
+		Deployments:   []*models.ServiceDeployment{serviceDeploy},
+		ServicesMap:   map[string]*models.Service{service.Name: service},
+		PathValidator: e.pathValidator,
+	}); err != nil {
+		reason := fmt.Sprintf("Preflight validation failed: %v", err)
+		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
+	}
+
 	svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, service.Name, serviceDeploy.DeployNumber)
 	runImage := svcTag
 	reusingExistingImage := false
@@ -502,35 +579,105 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 	}
 
-	// Check if this service is an infrastructure service or specifies a pre-built image
-	isInfraService := service.Classification == models.ClassificationInfrastructure || serviceDeploy.Classification == models.ClassificationInfrastructure || serviceDeploy.BuildStrategy == models.BuildStrategyImage || (service.Image != "" && (service.DockerfilePath == "" || service.BuildStrategy == models.BuildStrategyImage))
-	if !reusingExistingImage && isInfraService {
-		targetImage := service.Image
+	// Strict image build-strategy enforcement: image strategy NEVER attempts source or Dockerfile build
+	isImageStrategy := service.Classification == models.ClassificationInfrastructure ||
+		serviceDeploy.Classification == models.ClassificationInfrastructure ||
+		serviceDeploy.BuildStrategy == models.BuildStrategyImage ||
+		service.BuildStrategy == models.BuildStrategyImage ||
+		(service.Image != "" && (service.DockerfilePath == "" || service.BuildStrategy == models.BuildStrategyImage))
+
+	if !reusingExistingImage && isImageStrategy {
+		targetImage := strings.TrimSpace(service.Image)
 		if targetImage == "" {
-			targetImage = serviceDeploy.Image
+			targetImage = strings.TrimSpace(serviceDeploy.Image)
 		}
-		if targetImage != "" {
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Infrastructure / pre-built image '%s' detected for service '%s'. Pulling image...", targetImage, service.Name))
-			runImage = targetImage
-			if e.dockerClient != nil {
-				reader, pullErr := e.dockerClient.ImagePull(ctx, targetImage, dockerimage.PullOptions{})
-				if pullErr == nil && reader != nil {
-					_, _ = io.Copy(io.Discard, reader)
-					_ = reader.Close()
-					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' ready. Skipping source build.", targetImage))
-				} else if pullErr != nil {
-					// Image pull failed: check if image is available in local cache
-					_, _, inspectErr := e.dockerClient.ImageInspectWithRaw(ctx, targetImage)
-					if inspectErr != nil {
-						reason := fmt.Sprintf("Infrastructure image '%s' could not be pulled and is not available in local cache: %v", targetImage, pullErr)
+		if targetImage == "" {
+			reason := fmt.Sprintf("Service '%s' specifies image strategy or infrastructure classification but has no image configured", service.Name)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
+		}
+
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Infrastructure / pre-built image '%s' detected for service '%s'. Pulling/verifying image...", targetImage, service.Name))
+		runImage = targetImage
+		if e.dockerClient != nil {
+			reader, pullErr := e.dockerClient.ImagePull(ctx, targetImage, dockerimage.PullOptions{})
+			if pullErr == nil && reader != nil {
+				_, _ = io.Copy(io.Discard, reader)
+				_ = reader.Close()
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' ready. Skipping source build.", targetImage))
+			} else {
+				// Image pull failed: check if image is available in local cache
+				_, _, inspectErr := e.dockerClient.ImageInspectWithRaw(ctx, targetImage)
+				if inspectErr != nil {
+					reason := fmt.Sprintf("Infrastructure image '%s' could not be pulled and is not available in local cache: %v", targetImage, pullErr)
+					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+					emitStatus(models.DeployStatusFailed, nil, &reason)
+					return errors.New(reason)
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' found in local image cache. Skipping source build.", targetImage))
+			}
+		}
+		reusingExistingImage = true
+	}
+
+	var sharedPromise *sharedBuildPromise
+	var sharedKey string
+
+	if !reusingExistingImage {
+		srcRev := ""
+		if serviceDeploy.SourceRevision != nil {
+			srcRev = *serviceDeploy.SourceRevision
+		}
+		cleanCtx := strings.TrimSpace(service.BuildContext)
+		if cleanCtx == "" {
+			cleanCtx = strings.TrimSpace(serviceDeploy.BuildContext)
+		}
+		if cleanCtx == "" {
+			cleanCtx = "."
+		}
+		cleanDF := strings.TrimSpace(service.DockerfilePath)
+		if cleanDF == "" {
+			cleanDF = strings.TrimSpace(serviceDeploy.DockerfilePath)
+		}
+		if cleanDF == "" {
+			cleanDF = "Dockerfile"
+		}
+
+		// Detect if this service can share a build artifact with another service
+		isSharedCandidate := (service.BuildStrategy == models.BuildStrategyDockerfile || serviceDeploy.BuildStrategy == models.BuildStrategyDockerfile)
+		if isSharedCandidate {
+			sharedKey = fmt.Sprintf("%s:%s:%s:%s", project.ID.String(), srcRev, cleanCtx, cleanDF)
+			p, loaded := e.getOrInitSharedBuild(sharedKey)
+			sharedPromise = p
+			if loaded {
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Service '%s' shares build context and Dockerfile ('%s', '%s') with another service. Waiting for shared build artifact...", service.Name, cleanCtx, cleanDF))
+				select {
+				case <-sharedPromise.done:
+					if sharedPromise.err != nil {
+						reason := fmt.Sprintf("Shared image build failed: %v", sharedPromise.err)
 						emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 						emitStatus(models.DeployStatusFailed, nil, &reason)
 						return errors.New(reason)
 					}
-					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' found in local image cache.", targetImage))
+					if sharedPromise.imageTag != "" {
+						runImage = sharedPromise.imageTag
+						if e.dockerClient != nil {
+							_ = e.dockerClient.ImageTag(ctx, sharedPromise.imageTag, svcTag)
+							runImage = svcTag
+						}
+						if sharedPromise.digest != "" && e.deploymentService != nil {
+							_ = e.deploymentService.UpdateServiceDeploymentImageDigest(ctx, serviceDeploy.ID, sharedPromise.digest)
+						}
+						reusingExistingImage = true
+						emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Reusing shared build artifact '%s' (build context: '%s', dockerfile: '%s'). Skipping Docker build.", sharedPromise.imageTag, cleanCtx, cleanDF))
+					}
+				case <-ctx.Done():
+					reason := "Context cancelled while waiting for shared image build"
+					emitStatus(models.DeployStatusFailed, nil, &reason)
+					return errors.New(reason)
 				}
 			}
-			reusingExistingImage = true
 		}
 	}
 
@@ -734,22 +881,31 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Isolated %d build secrets from Docker BuildArgs and image history.", len(secretBuildVars)))
 		}
 
+		buildLabels := map[string]string{
+			"forgelab.managed":      "true",
+			"forgelab.project_id":   project.ID.String(),
+			"forgelab.service_name": service.Name,
+		}
+		if serviceDeploy.DeploymentID != nil {
+			buildLabels["forgelab.deployment_id"] = serviceDeploy.DeploymentID.String()
+		}
+
 		buildOpts := types.ImageBuildOptions{
 			Tags:       []string{svcTag},
 			Dockerfile: relDockerPath,
 			BuildArgs:  buildArgs,
 			Remove:     true,
-			Labels: map[string]string{
-				"forgelab.managed":       "true",
-				"forgelab.project_id":    project.ID.String(),
-				"forgelab.service_name":  service.Name,
-				"forgelab.deployment_id": serviceDeploy.DeploymentID.String(),
-			},
+			Labels:     buildLabels,
 		}
 
 		if err := e.buildImage(ctx, tarArchive, buildOpts, func(msg string) {
 			emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 		}); err != nil {
+			if sharedPromise != nil {
+				sharedPromise.err = err
+				close(sharedPromise.done)
+				e.sharedBuildArtifacts.Delete(sharedKey)
+			}
 			reason := err.Error()
 			cat := ClassifyDockerBuildError(err)
 			if cat == CategoryStorageDaemon || cat == CategoryDaemonUnreachable {
@@ -764,16 +920,23 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Docker image '%s' built successfully.", svcTag))
 
 		// Inspect image to record immutable digest for rollback / reproducibility
-		if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, svcTag); err == nil {
-			var digest string
-			if len(inspect.RepoDigests) > 0 {
-				digest = inspect.RepoDigests[0]
-			} else if inspect.ID != "" {
-				digest = inspect.ID
+		var digest string
+		if e.dockerClient != nil {
+			if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, svcTag); err == nil {
+				if len(inspect.RepoDigests) > 0 {
+					digest = inspect.RepoDigests[0]
+				} else if inspect.ID != "" {
+					digest = inspect.ID
+				}
+				if digest != "" && e.deploymentService != nil {
+					_ = e.deploymentService.UpdateServiceDeploymentImageDigest(ctx, serviceDeploy.ID, digest)
+				}
 			}
-			if digest != "" && e.deploymentService != nil {
-				_ = e.deploymentService.UpdateServiceDeploymentImageDigest(ctx, serviceDeploy.ID, digest)
-			}
+		}
+		if sharedPromise != nil {
+			sharedPromise.imageTag = svcTag
+			sharedPromise.digest = digest
+			close(sharedPromise.done)
 		}
 		runImage = svcTag
 	}
@@ -901,6 +1064,18 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 	if serviceDeploy.DeploymentID != nil {
 		containerConfig.Labels["forgelab.deployment_id"] = serviceDeploy.DeploymentID.String()
+	}
+
+	var cmdParts []string
+	startCmd := strings.TrimSpace(serviceDeploy.StartCommand)
+	if startCmd == "" {
+		startCmd = strings.TrimSpace(service.StartCommand)
+	}
+	if startCmd != "" {
+		cmdParts = parseCommandToArgs(startCmd)
+	}
+	if len(cmdParts) > 0 {
+		containerConfig.Cmd = cmdParts
 	}
 
 	// Attach Compose healthcheck if configured
@@ -1060,6 +1235,54 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	// Start runtime log collector — continuously reads container stdout/stderr
 	e.startRuntimeLogCollector(ctx, containerID, serviceDeploy.ID, service.ID, project.ID, redactor, emitLog)
+
+	isJob := service.Classification == models.ClassificationJob || serviceDeploy.Classification == models.ClassificationJob
+	if isJob {
+		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Service '%s' is a one-shot job (classification: %s). Waiting for container execution to complete...", service.Name, service.Classification))
+		if e.dockerClient != nil {
+			statusCh, errCh := e.dockerClient.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+			select {
+			case err := <-errCh:
+				if err != nil {
+					reason := fmt.Sprintf("Failed waiting for job container '%s': %v", service.Name, err)
+					emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+					emitStatus(models.DeployStatusFailed, nil, &reason)
+					return errors.New(reason)
+				}
+			case status := <-statusCh:
+				if status.Error != nil && status.Error.Message != "" {
+					reason := fmt.Sprintf("Job container '%s' failed: %s (exit code %d)", service.Name, status.Error.Message, status.StatusCode)
+					emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+					emitStatus(models.DeployStatusFailed, nil, &reason)
+					return errors.New(reason)
+				}
+				if status.StatusCode != 0 {
+					reason := fmt.Sprintf("Job container '%s' exited with non-zero status code %d", service.Name, status.StatusCode)
+					emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+					emitStatus(models.DeployStatusFailed, nil, &reason)
+					return errors.New(reason)
+				}
+				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Job container '%s' completed successfully with exit code 0.", service.Name))
+			case <-ctx.Done():
+				reason := fmt.Sprintf("Job execution timed out or was cancelled for service '%s'", service.Name)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
+			}
+		}
+		e.StopLogCollector(serviceDeploy.ID)
+		err = e.serviceService.PromoteServiceDeployment(ctx, service.ID, serviceDeploy.ID, containerID, runImage, nil)
+		if err != nil {
+			reason := fmt.Sprintf("Failed to promote job service deployment '%s': %v", service.Name, err)
+			emitLog(models.LogPhaseHealth, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return fmt.Errorf("failed to promote job service deployment: %w", err)
+		}
+		_ = e.deploymentService.UpdateServiceDeploymentContainer(ctx, serviceDeploy.ID, containerID, nil)
+		_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, models.DeployStatusRunning, nil)
+		emitStatus(models.DeployStatusRunning, nil, nil)
+		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Job service '%s' deployment #%d completed successfully!", service.Name, serviceDeploy.DeployNumber))
+		return nil
+	}
 
 	// 4. Health Checking
 	emitStatus(models.DeployStatusHealthChecking, hostPort, nil)
@@ -1250,6 +1473,24 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		return errors.New(reason)
 	}
 
+	servicesMap := make(map[string]*models.Service, len(allProjectServices))
+	for _, s := range allProjectServices {
+		servicesMap[s.Name] = s
+	}
+
+	// Preflight validation for the release: fails fast before any builds or container creation
+	if err := ValidateDeploymentPreflight(execCtx, PreflightOptions{
+		Project:       project,
+		Deployments:   svcDeploys,
+		ServicesMap:   servicesMap,
+		PathValidator: e.pathValidator,
+	}); err != nil {
+		reason := fmt.Sprintf("Preflight validation failed: %v", err)
+		updateReleaseStatus(models.DeployStatusFailed, &reason)
+		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+		return errors.New(reason)
+	}
+
 	var (
 		mu         sync.Mutex
 		allHealthy = true
@@ -1264,28 +1505,50 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("DAG execution plan computed: %d deployment tier(s).", len(tiers)))
 
 	failedServices := make(map[string]bool)
+	serviceExitCodes := make(map[string]int)
 
 	for tierIdx, tier := range tiers {
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Executing Tier %d (%d service(s))...", tierIdx+1, len(tier)))
 		var tierWg sync.WaitGroup
 		for _, sd := range tier {
-			// Check if any dependencies failed in earlier tiers
+			// Check if any dependencies failed or did not satisfy required conditions
 			hasFailedDep := false
 			var failedDepName string
+			var failedCondition string
 			for _, dep := range sd.DependsOn {
+				reqCondition := ""
+				if sd.DependsOnConditions != nil {
+					reqCondition = sd.DependsOnConditions[dep]
+				}
+				if reqCondition == "" {
+					reqCondition = "service_started"
+				}
+
 				if failedServices[dep] {
 					hasFailedDep = true
 					failedDepName = dep
+					failedCondition = reqCondition
 					break
+				}
+
+				if reqCondition == "service_completed_successfully" {
+					code, exists := serviceExitCodes[dep]
+					if !exists || code != 0 {
+						hasFailedDep = true
+						failedDepName = dep
+						failedCondition = reqCondition
+						break
+					}
 				}
 			}
 			if hasFailedDep {
 				mu.Lock()
 				allHealthy = false
 				failedServices[sd.ServiceName] = true
-				errList = append(errList, fmt.Sprintf("%s: skipped because dependency '%s' failed", sd.ServiceName, failedDepName))
+				serviceExitCodes[sd.ServiceName] = 1
+				errList = append(errList, fmt.Sprintf("%s: skipped because dependency '%s' failed condition '%s'", sd.ServiceName, failedDepName, failedCondition))
 				mu.Unlock()
-				reason := fmt.Sprintf("Skipped because dependency '%s' failed", failedDepName)
+				reason := fmt.Sprintf("Skipped because dependency '%s' failed condition '%s'", failedDepName, failedCondition)
 				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusFailed, &reason)
 				continue
 			}
@@ -1299,11 +1562,13 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					mu.Lock()
 					allHealthy = false
 					failedServices[sdItem.ServiceName] = true
+					serviceExitCodes[sdItem.ServiceName] = 1
 					errList = append(errList, fmt.Sprintf("%s: %v", sdItem.ServiceName, execErr))
 					mu.Unlock()
 				} else {
 					mu.Lock()
 					anyHealthy = true
+					serviceExitCodes[sdItem.ServiceName] = 0
 					mu.Unlock()
 				}
 			}(sd)

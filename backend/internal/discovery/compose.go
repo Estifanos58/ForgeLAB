@@ -152,12 +152,13 @@ func parseComposeService(name string, raw RawComposeService, repoRoot, composeDi
 	role := inferComposeRole(name, classification, raw)
 
 	buildStrategy := StrategyAuto
-	dockerfilePath := "Dockerfile"
+	dockerfilePath := ""
 	buildContext := "."
 	sourcePath := "."
 	var buildCmd, startCmd string
 
 	if raw.Build != nil {
+		dockerfilePath = "Dockerfile"
 		switch b := raw.Build.(type) {
 		case string:
 			buildContext = b
@@ -175,6 +176,7 @@ func parseComposeService(name string, raw RawComposeService, repoRoot, composeDi
 		}
 	} else if raw.Image != "" {
 		buildStrategy = "image"
+		dockerfilePath = ""
 	}
 
 	// Parse ports

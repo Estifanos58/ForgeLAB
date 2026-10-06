@@ -47,6 +47,28 @@ type LocalSourceSession struct {
 	Token         string                   `json:"-"`
 	mu            sync.RWMutex             `json:"-"`
 }
+var (
+	globalSourceSessionsMu sync.RWMutex
+	globalSourceSessions   = make(map[uuid.UUID]*LocalSourceSession)
+)
+
+// RegisterLocalSourceSession registers a local source session in the global registry.
+func RegisterLocalSourceSession(session *LocalSourceSession) {
+	if session == nil {
+		return
+	}
+	globalSourceSessionsMu.Lock()
+	defer globalSourceSessionsMu.Unlock()
+	globalSourceSessions[session.SourceID] = session
+}
+
+// LookupLocalSourceSession finds a registered local source session by source ID.
+func LookupLocalSourceSession(sourceID uuid.UUID) (*LocalSourceSession, bool) {
+	globalSourceSessionsMu.RLock()
+	defer globalSourceSessionsMu.RUnlock()
+	sess, ok := globalSourceSessions[sourceID]
+	return sess, ok
+}
 
 type AgentServerConfig struct {
 	AgentID                string
@@ -786,6 +808,7 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 		s.mu.Lock()
 		s.sessions[sourceID] = session
 		s.mu.Unlock()
+		RegisterLocalSourceSession(session)
 
 		if token != "" {
 			if sm := GetGlobalSessionManager(); sm != nil {
@@ -811,6 +834,7 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 	s.mu.Lock()
 	s.sessions[sourceID] = session
 	s.mu.Unlock()
+	RegisterLocalSourceSession(session)
 
 	// Bind source and folder on backend session
 	if token != "" {

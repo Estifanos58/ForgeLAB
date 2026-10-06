@@ -256,12 +256,13 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	// Create service deployments for all project services
 	rows, err := tx.Query(ctx,
 		`SELECT id, name, role, build_strategy, build_command, start_command, runtime_type, internal_port,
-		        COALESCE(dockerfile_path, 'Dockerfile'), COALESCE(build_context, '.'),
+		        COALESCE(dockerfile_path, ''), COALESCE(build_context, '.'),
 		        COALESCE(health_strategy, 'auto'), health_check_path,
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 		        COALESCE(classification, 'application'), COALESCE(image, ''),
 		        COALESCE(depends_on, '[]'::jsonb), COALESCE(volumes, '[]'::jsonb),
-		        COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
+		        COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb),
+		        COALESCE(depends_on_conditions, '{}'::jsonb)
 		 FROM services WHERE project_id = $1`,
 		project.ID,
 	)
@@ -269,12 +270,12 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	if err == nil {
 		for rows.Next() {
 			var s models.Service
-			var dependsOnJSON, volumesJSON, networksJSON, hcJSON []byte
+			var dependsOnJSON, volumesJSON, networksJSON, hcJSON, docJSON []byte
 			if err := rows.Scan(
 				&s.ID, &s.Name, &s.Role, &s.BuildStrategy, &s.BuildCommand, &s.StartCommand, &s.RuntimeType,
 				&s.InternalPort, &s.DockerfilePath, &s.BuildContext, &s.HealthStrategy, &s.HealthCheckPath,
 				&s.CpuMillicores, &s.MemoryMB, &s.PidsLimit, &s.EphemeralStorageMB,
-				&s.Classification, &s.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON,
+				&s.Classification, &s.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON, &docJSON,
 			); err == nil {
 				if len(dependsOnJSON) > 0 {
 					_ = json.Unmarshal(dependsOnJSON, &s.DependsOn)
@@ -299,6 +300,12 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 					if err := json.Unmarshal(hcJSON, &hc); err == nil {
 						s.HealthCheckConfig = &hc
 					}
+				}
+				if len(docJSON) > 0 && string(docJSON) != "{}" {
+					_ = json.Unmarshal(docJSON, &s.DependsOnConditions)
+				}
+				if s.DependsOnConditions == nil {
+					s.DependsOnConditions = map[string]string{}
 				}
 				svcList = append(svcList, s)
 			}
@@ -331,6 +338,7 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		} else {
 			hcBytes = []byte("{}")
 		}
+		dependsOnCondBytes, _ := json.Marshal(svcItem.DependsOnConditions)
 
 		svcDeployID := uuid.New()
 		svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, svcItem.Name, svcDeployNum)
@@ -341,8 +349,9 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 				health_strategy, health_check_path, cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 				source_revision, env_config_hash, execution_mode, env_snapshot,
 				started_at, created_at,
-				classification, image, depends_on, volumes, networks, healthcheck_config
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)`,
+				classification, image, depends_on, volumes, networks, healthcheck_config,
+				depends_on_conditions
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)`,
 			svcDeployID, deployment.ID, svcItem.ID, svcDeployNum, models.DeployStatusQueued, svcTag,
 			svcItem.BuildStrategy, svcItem.BuildCommand, svcItem.StartCommand, svcItem.RuntimeType, svcItem.DockerfilePath, svcItem.BuildContext,
 			svcItem.InternalPort, svcItem.HealthStrategy, svcItem.HealthCheckPath,
@@ -350,6 +359,7 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 			sourceRevision, envConfigHash, models.ExecutionModeBuild, envSnapshot,
 			now, now,
 			svcItem.Classification, svcItem.Image, dependsOnBytes, volumesBytes, networksBytes, hcBytes,
+			dependsOnCondBytes,
 		); err != nil {
 			return nil, fmt.Errorf("failed to create service deployment record: %w", err)
 		}
@@ -545,13 +555,15 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		SourceRevision:    sourceRevision,
 		EnvConfigHash:     envConfigHash,
 		EnvSnapshot:       envSnapshot,
-		Classification:    targetService.Classification,
-		Image:             targetService.Image,
-		DependsOn:         targetService.DependsOn,
-		Volumes:           targetService.Volumes,
-		HealthCheckConfig: targetService.HealthCheckConfig,
-		StartedAt:         &now,
-		CreatedAt:         now,
+		Classification:      targetService.Classification,
+		Image:               targetService.Image,
+		DependsOn:           targetService.DependsOn,
+		DependsOnConditions: targetService.DependsOnConditions,
+		Volumes:             targetService.Volumes,
+		Networks:            targetService.Networks,
+		HealthCheckConfig:   targetService.HealthCheckConfig,
+		StartedAt:           &now,
+		CreatedAt:           now,
 	}
 
 	dependsOnBytes, _ := json.Marshal(targetService.DependsOn)
@@ -563,6 +575,7 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	} else {
 		hcBytes = []byte("{}")
 	}
+	dependsOnCondBytes, _ := json.Marshal(targetService.DependsOnConditions)
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO service_deployments (
@@ -572,8 +585,9 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 			source_revision, env_config_hash, execution_mode, env_snapshot,
 			started_at, created_at,
-			classification, image, depends_on, volumes, networks, healthcheck_config
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)`,
+			classification, image, depends_on, volumes, networks, healthcheck_config,
+			depends_on_conditions
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)`,
 		serviceDeployment.ID, serviceDeployment.DeploymentID, serviceDeployment.ServiceID,
 		serviceDeployment.DeployNumber, serviceDeployment.Status, serviceDeployment.ImageTag,
 		serviceDeployment.BuildStrategy, serviceDeployment.BuildCommand, serviceDeployment.StartCommand,
@@ -583,6 +597,7 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		sourceRevision, envConfigHash, models.ExecutionModeBuild, envSnapshot,
 		serviceDeployment.StartedAt, serviceDeployment.CreatedAt,
 		serviceDeployment.Classification, serviceDeployment.Image, dependsOnBytes, volumesBytes, networksBytes, hcBytes,
+		dependsOnCondBytes,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "uq_active_service_deployment") || strings.Contains(err.Error(), "uq_service_deployments_service_number") {
@@ -950,16 +965,17 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 
 	// Find the most recent successful deployment for this service strictly before the current deployment
 	var prev models.ServiceDeployment
-	var prevDependsOnJSON, prevVolumesJSON, prevNetworksJSON, prevHcJSON []byte
+	var prevDependsOnJSON, prevVolumesJSON, prevNetworksJSON, prevHcJSON, prevDocJSON []byte
 	err = tx.QueryRow(ctx,
 		`SELECT id, deploy_number, image_tag, internal_port, build_strategy, build_command,
-		        start_command, runtime_type, COALESCE(dockerfile_path, 'Dockerfile'),
+		        start_command, runtime_type, COALESCE(dockerfile_path, ''),
 		        COALESCE(build_context, '.'), COALESCE(health_strategy, 'auto'), health_check_path,
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 		        image_digest, source_revision, env_config_hash, COALESCE(execution_mode, 'build'), env_snapshot,
 		        COALESCE(classification, 'application'), COALESCE(image, ''),
 		        COALESCE(depends_on, '[]'::jsonb), COALESCE(volumes, '[]'::jsonb),
-		        COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
+		        COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb),
+		        COALESCE(depends_on_conditions, '{}'::jsonb)
 		 FROM service_deployments
 		 WHERE service_id = $1
 		   AND deploy_number < $2
@@ -979,7 +995,7 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		&prev.DockerfilePath, &prev.BuildContext, &prev.HealthStrategy, &prev.HealthCheckPath,
 		&prev.CpuMillicores, &prev.MemoryMB, &prev.PidsLimit, &prev.EphemeralStorageMB,
 		&prev.ImageDigest, &prev.SourceRevision, &prev.EnvConfigHash, &prev.ExecutionMode, &prev.EnvSnapshot,
-		&prev.Classification, &prev.Image, &prevDependsOnJSON, &prevVolumesJSON, &prevNetworksJSON, &prevHcJSON,
+		&prev.Classification, &prev.Image, &prevDependsOnJSON, &prevVolumesJSON, &prevNetworksJSON, &prevHcJSON, &prevDocJSON,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1012,6 +1028,12 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 			prev.HealthCheckConfig = &hc
 		}
 	}
+	if len(prevDocJSON) > 0 && string(prevDocJSON) != "{}" {
+		_ = json.Unmarshal(prevDocJSON, &prev.DependsOnConditions)
+	}
+	if prev.DependsOnConditions == nil {
+		prev.DependsOnConditions = map[string]string{}
+	}
 
 	var maxNumber *int
 	_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", targetService.ID).Scan(&maxNumber)
@@ -1029,36 +1051,37 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 	now := time.Now()
 	svcDeployID := uuid.New()
 	serviceDeployment := &models.ServiceDeployment{
-		ID:                svcDeployID,
-		DeploymentID:      nil,
-		ServiceID:         targetService.ID,
-		ServiceName:       targetService.Name,
-		DeployNumber:      deployNumber,
-		Status:            models.DeployStatusQueued,
-		ExecutionMode:     executionMode,
-		ImageTag:          prev.ImageTag,
-		InternalPort:      prev.InternalPort,
-		BuildStrategy:     prev.BuildStrategy,
-		BuildCommand:      prev.BuildCommand,
-		StartCommand:      prev.StartCommand,
-		RuntimeType:       prev.RuntimeType,
-		DockerfilePath:    prev.DockerfilePath,
-		BuildContext:      prev.BuildContext,
-		HealthStrategy:    prev.HealthStrategy,
-		HealthCheckPath:   prev.HealthCheckPath,
-		ResourceConfig:    prev.ResourceConfig,
-		ImageDigest:       prev.ImageDigest,
-		SourceRevision:    prev.SourceRevision,
-		EnvConfigHash:     prev.EnvConfigHash,
-		EnvSnapshot:       prev.EnvSnapshot,
-		Classification:    prev.Classification,
-		Image:             prev.Image,
-		DependsOn:         prev.DependsOn,
-		Volumes:           prev.Volumes,
-		Networks:          prev.Networks,
-		HealthCheckConfig: prev.HealthCheckConfig,
-		StartedAt:         &now,
-		CreatedAt:         now,
+		ID:                  svcDeployID,
+		DeploymentID:        nil,
+		ServiceID:           targetService.ID,
+		ServiceName:         targetService.Name,
+		DeployNumber:        deployNumber,
+		Status:              models.DeployStatusQueued,
+		ExecutionMode:       executionMode,
+		ImageTag:            prev.ImageTag,
+		InternalPort:        prev.InternalPort,
+		BuildStrategy:       prev.BuildStrategy,
+		BuildCommand:        prev.BuildCommand,
+		StartCommand:        prev.StartCommand,
+		RuntimeType:         prev.RuntimeType,
+		DockerfilePath:      prev.DockerfilePath,
+		BuildContext:        prev.BuildContext,
+		HealthStrategy:      prev.HealthStrategy,
+		HealthCheckPath:     prev.HealthCheckPath,
+		ResourceConfig:      prev.ResourceConfig,
+		ImageDigest:         prev.ImageDigest,
+		SourceRevision:      prev.SourceRevision,
+		EnvConfigHash:       prev.EnvConfigHash,
+		EnvSnapshot:         prev.EnvSnapshot,
+		Classification:      prev.Classification,
+		Image:               prev.Image,
+		DependsOn:           prev.DependsOn,
+		DependsOnConditions: prev.DependsOnConditions,
+		Volumes:             prev.Volumes,
+		Networks:            prev.Networks,
+		HealthCheckConfig:   prev.HealthCheckConfig,
+		StartedAt:           &now,
+		CreatedAt:           now,
 	}
 
 	dependsOnBytes, _ := json.Marshal(serviceDeployment.DependsOn)
@@ -1070,6 +1093,7 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 	} else {
 		hcBytes = []byte("{}")
 	}
+	dependsOnCondBytes, _ := json.Marshal(serviceDeployment.DependsOnConditions)
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO service_deployments (
@@ -1079,8 +1103,9 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 			image_digest, source_revision, env_config_hash, execution_mode, env_snapshot,
 			started_at, created_at,
-			classification, image, depends_on, volumes, networks, healthcheck_config
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)`,
+			classification, image, depends_on, volumes, networks, healthcheck_config,
+			depends_on_conditions
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)`,
 		serviceDeployment.ID, serviceDeployment.DeploymentID, serviceDeployment.ServiceID,
 		serviceDeployment.DeployNumber, serviceDeployment.Status, serviceDeployment.ImageTag,
 		serviceDeployment.BuildStrategy, serviceDeployment.BuildCommand, serviceDeployment.StartCommand,
@@ -1091,6 +1116,7 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		serviceDeployment.ExecutionMode, serviceDeployment.EnvSnapshot,
 		serviceDeployment.StartedAt, serviceDeployment.CreatedAt,
 		serviceDeployment.Classification, serviceDeployment.Image, dependsOnBytes, volumesBytes, networksBytes, hcBytes,
+		dependsOnCondBytes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert rollback service deployment: %w", err)
@@ -1219,7 +1245,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 	// Fetch any services for the project
 	rows, err := tx.Query(ctx,
 		`SELECT id, name, role, build_strategy, build_command, start_command, runtime_type, internal_port,
-		        COALESCE(dockerfile_path, 'Dockerfile'), COALESCE(build_context, '.'),
+		        COALESCE(dockerfile_path, ''), COALESCE(build_context, '.'),
 		        COALESCE(health_strategy, 'auto'), health_check_path,
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
 		 FROM services WHERE project_id = $1`,
@@ -1303,16 +1329,17 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 	// For multi-service projects, create rollback service deployment for each service
 	for _, svcItem := range svcList {
 		var prevSvc models.ServiceDeployment
-		var prevDependsOnJSON, prevVolumesJSON, prevNetworksJSON, prevHcJSON []byte
+		var prevDependsOnJSON, prevVolumesJSON, prevNetworksJSON, prevHcJSON, prevDocJSON []byte
 		sErr := tx.QueryRow(ctx,
 			`SELECT id, deploy_number, image_tag, internal_port, build_strategy, build_command,
-			        start_command, runtime_type, COALESCE(dockerfile_path, 'Dockerfile'),
+			        start_command, runtime_type, COALESCE(dockerfile_path, ''),
 			        COALESCE(build_context, '.'), COALESCE(health_strategy, 'auto'), health_check_path,
 			        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 			        image_digest, source_revision, env_config_hash, COALESCE(execution_mode, 'build'), env_snapshot,
 			        COALESCE(classification, 'application'), COALESCE(image, ''),
 			        COALESCE(depends_on, '[]'::jsonb), COALESCE(volumes, '[]'::jsonb),
-			        COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
+			        COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb),
+			        COALESCE(depends_on_conditions, '{}'::jsonb)
 			 FROM service_deployments
 			 WHERE service_id = $1
 			   AND (deployment_id = $2 OR (status IN ($3, $4) AND (image_digest IS NOT NULL OR image_tag IS NOT NULL)))
@@ -1325,7 +1352,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 			&prevSvc.DockerfilePath, &prevSvc.BuildContext, &prevSvc.HealthStrategy, &prevSvc.HealthCheckPath,
 			&prevSvc.CpuMillicores, &prevSvc.MemoryMB, &prevSvc.PidsLimit, &prevSvc.EphemeralStorageMB,
 			&prevSvc.ImageDigest, &prevSvc.SourceRevision, &prevSvc.EnvConfigHash, &prevSvc.ExecutionMode, &prevSvc.EnvSnapshot,
-			&prevSvc.Classification, &prevSvc.Image, &prevDependsOnJSON, &prevVolumesJSON, &prevNetworksJSON, &prevHcJSON,
+			&prevSvc.Classification, &prevSvc.Image, &prevDependsOnJSON, &prevVolumesJSON, &prevNetworksJSON, &prevHcJSON, &prevDocJSON,
 		)
 
 		if len(prevDependsOnJSON) > 0 {
@@ -1352,6 +1379,12 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 				prevSvc.HealthCheckConfig = &hc
 			}
 		}
+		if len(prevDocJSON) > 0 && string(prevDocJSON) != "{}" {
+			_ = json.Unmarshal(prevDocJSON, &prevSvc.DependsOnConditions)
+		}
+		if prevSvc.DependsOnConditions == nil {
+			prevSvc.DependsOnConditions = map[string]string{}
+		}
 
 		var svcMaxNum *int
 		_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", svcItem.ID).Scan(&svcMaxNum)
@@ -1362,36 +1395,37 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 
 		svcDeployID := uuid.New()
 		sd := &models.ServiceDeployment{
-			ID:                svcDeployID,
-			DeploymentID:      &newDeploy.ID,
-			ServiceID:         svcItem.ID,
-			ServiceName:       svcItem.Name,
-			DeployNumber:      svcDeployNum,
-			Status:            models.DeployStatusQueued,
-			ExecutionMode:     models.ExecutionModeReuseImage,
-			ImageTag:          prevSvc.ImageTag,
-			ImageDigest:       prevSvc.ImageDigest,
-			InternalPort:      svcItem.InternalPort,
-			BuildStrategy:     svcItem.BuildStrategy,
-			BuildCommand:      svcItem.BuildCommand,
-			StartCommand:      svcItem.StartCommand,
-			RuntimeType:       svcItem.RuntimeType,
-			DockerfilePath:    svcItem.DockerfilePath,
-			BuildContext:      svcItem.BuildContext,
-			HealthStrategy:    svcItem.HealthStrategy,
-			HealthCheckPath:   svcItem.HealthCheckPath,
-			ResourceConfig:    svcItem.ResourceConfig,
-			SourceRevision:    prevSvc.SourceRevision,
-			EnvConfigHash:     prevSvc.EnvConfigHash,
-			EnvSnapshot:       prevSvc.EnvSnapshot,
-			Classification:    prevSvc.Classification,
-			Image:             prevSvc.Image,
-			DependsOn:         prevSvc.DependsOn,
-			Volumes:           prevSvc.Volumes,
-			Networks:          prevSvc.Networks,
-			HealthCheckConfig: prevSvc.HealthCheckConfig,
-			StartedAt:         &now,
-			CreatedAt:         now,
+			ID:                  svcDeployID,
+			DeploymentID:        &newDeploy.ID,
+			ServiceID:           svcItem.ID,
+			ServiceName:         svcItem.Name,
+			DeployNumber:        svcDeployNum,
+			Status:              models.DeployStatusQueued,
+			ExecutionMode:       models.ExecutionModeReuseImage,
+			ImageTag:            prevSvc.ImageTag,
+			ImageDigest:         prevSvc.ImageDigest,
+			InternalPort:        svcItem.InternalPort,
+			BuildStrategy:       svcItem.BuildStrategy,
+			BuildCommand:        svcItem.BuildCommand,
+			StartCommand:        svcItem.StartCommand,
+			RuntimeType:         svcItem.RuntimeType,
+			DockerfilePath:      svcItem.DockerfilePath,
+			BuildContext:        svcItem.BuildContext,
+			HealthStrategy:      svcItem.HealthStrategy,
+			HealthCheckPath:     svcItem.HealthCheckPath,
+			ResourceConfig:      svcItem.ResourceConfig,
+			SourceRevision:      prevSvc.SourceRevision,
+			EnvConfigHash:       prevSvc.EnvConfigHash,
+			EnvSnapshot:         prevSvc.EnvSnapshot,
+			Classification:      prevSvc.Classification,
+			Image:               prevSvc.Image,
+			DependsOn:           prevSvc.DependsOn,
+			DependsOnConditions: prevSvc.DependsOnConditions,
+			Volumes:             prevSvc.Volumes,
+			Networks:            prevSvc.Networks,
+			HealthCheckConfig:   prevSvc.HealthCheckConfig,
+			StartedAt:           &now,
+			CreatedAt:           now,
 		}
 		if sErr == nil && (prevSvc.ImageDigest != nil || prevSvc.ImageTag != nil) {
 			sd.InternalPort = prevSvc.InternalPort
@@ -1415,6 +1449,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 		} else {
 			hcBytes = []byte("{}")
 		}
+		dependsOnCondBytes, _ := json.Marshal(sd.DependsOnConditions)
 
 		if _, insErr := tx.Exec(ctx,
 			`INSERT INTO service_deployments (
@@ -1424,8 +1459,9 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 				cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 				image_digest, source_revision, env_config_hash, execution_mode, env_snapshot,
 				started_at, created_at,
-				classification, image, depends_on, volumes, networks, healthcheck_config
-			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)`,
+				classification, image, depends_on, volumes, networks, healthcheck_config,
+				depends_on_conditions
+			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)`,
 			sd.ID, sd.DeploymentID, sd.ServiceID, sd.DeployNumber, sd.Status, sd.ImageTag,
 			sd.BuildStrategy, sd.BuildCommand, sd.StartCommand, sd.RuntimeType,
 			sd.DockerfilePath, sd.BuildContext, sd.InternalPort, sd.HealthStrategy, sd.HealthCheckPath,
@@ -1433,6 +1469,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 			sd.ImageDigest, sd.SourceRevision, sd.EnvConfigHash, sd.ExecutionMode, sd.EnvSnapshot,
 			sd.StartedAt, sd.CreatedAt,
 			sd.Classification, sd.Image, dependsOnBytes, volumesBytes, networksBytes, hcBytes,
+			dependsOnCondBytes,
 		); insErr != nil {
 			return nil, fmt.Errorf("failed to insert rollback service deployment for service %s: %w", svcItem.Name, insErr)
 		}
@@ -1467,12 +1504,12 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) (*models.ServiceDeployment, error) {
 	sd := &models.ServiceDeployment{}
 	var publicExposed bool
-	var dependsOnJSON, volumesJSON, networksJSON, hcJSON []byte
+	var dependsOnJSON, volumesJSON, networksJSON, hcJSON, docJSON []byte
 	err := s.db.QueryRow(ctx,
 		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, s.public_exposed, sd.deploy_number,
 		        sd.status, sd.image_tag, sd.container_id, sd.host_port, sd.internal_port,
 		        sd.build_strategy, sd.build_command, sd.start_command, sd.runtime_type,
-		        COALESCE(sd.dockerfile_path, 'Dockerfile'), COALESCE(sd.build_context, '.'),
+		        COALESCE(sd.dockerfile_path, ''), COALESCE(sd.build_context, '.'),
 		        COALESCE(sd.health_strategy, 'auto'), sd.health_check_path,
 		        sd.cpu_millicores, sd.memory_mb, sd.pids_limit, sd.ephemeral_storage_mb,
 		        sd.image_digest, sd.source_revision, sd.env_config_hash,
@@ -1481,7 +1518,8 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 		        sd.duration_ms, sd.failure_reason, sd.created_at,
 		        COALESCE(sd.classification, 'application'), COALESCE(sd.image, ''),
 		        COALESCE(sd.depends_on, '[]'::jsonb), COALESCE(sd.volumes, '[]'::jsonb),
-		        COALESCE(sd.networks, '[]'::jsonb), COALESCE(sd.healthcheck_config, '{}'::jsonb)
+		        COALESCE(sd.networks, '[]'::jsonb), COALESCE(sd.healthcheck_config, '{}'::jsonb),
+		        COALESCE(sd.depends_on_conditions, '{}'::jsonb)
 		 FROM service_deployments sd
 		 JOIN services s ON s.id = sd.service_id
 		 WHERE sd.id = $1`,
@@ -1496,7 +1534,7 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 		&sd.ExecutionMode, &sd.EnvSnapshot,
 		&sd.StartedAt, &sd.BuiltAt, &sd.DeployedAt, &sd.FinishedAt,
 		&sd.DurationMs, &sd.FailureReason, &sd.CreatedAt,
-		&sd.Classification, &sd.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON,
+		&sd.Classification, &sd.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON, &docJSON,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1529,6 +1567,12 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 			sd.HealthCheckConfig = &hc
 		}
 	}
+	if len(docJSON) > 0 && string(docJSON) != "{}" {
+		_ = json.Unmarshal(docJSON, &sd.DependsOnConditions)
+	}
+	if sd.DependsOnConditions == nil {
+		sd.DependsOnConditions = map[string]string{}
+	}
 
 	if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 {
 		url := fmt.Sprintf("http://%s:%d", resolvePublicHost(), *sd.HostPort)
@@ -1536,15 +1580,13 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 	}
 
 	return sd, nil
-}
-
-// ListServiceDeploymentsByService retrieves all service deployments for a specific service ordered by deploy number.
+}// ListServiceDeploymentsByService retrieves all service deployments for a specific service ordered by deploy number.
 func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context, serviceID uuid.UUID) ([]*models.ServiceDeployment, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, s.public_exposed, sd.deploy_number,
 		        sd.status, sd.image_tag, sd.container_id, sd.host_port, sd.internal_port,
 		        sd.build_strategy, sd.build_command, sd.start_command, sd.runtime_type,
-		        COALESCE(sd.dockerfile_path, 'Dockerfile'), COALESCE(sd.build_context, '.'),
+		        COALESCE(sd.dockerfile_path, ''), COALESCE(sd.build_context, '.'),
 		        COALESCE(sd.health_strategy, 'auto'), sd.health_check_path,
 		        sd.cpu_millicores, sd.memory_mb, sd.pids_limit, sd.ephemeral_storage_mb,
 		        sd.image_digest, sd.source_revision, sd.env_config_hash,
@@ -1553,7 +1595,8 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 		        sd.duration_ms, sd.failure_reason, sd.created_at,
 		        COALESCE(sd.classification, 'application'), COALESCE(sd.image, ''),
 		        COALESCE(sd.depends_on, '[]'::jsonb), COALESCE(sd.volumes, '[]'::jsonb),
-		        COALESCE(sd.networks, '[]'::jsonb), COALESCE(sd.healthcheck_config, '{}'::jsonb)
+		        COALESCE(sd.networks, '[]'::jsonb), COALESCE(sd.healthcheck_config, '{}'::jsonb),
+		        COALESCE(sd.depends_on_conditions, '{}'::jsonb)
 		 FROM service_deployments sd
 		 JOIN services s ON s.id = sd.service_id
 		 WHERE sd.service_id = $1
@@ -1570,7 +1613,7 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 	for rows.Next() {
 		sd := &models.ServiceDeployment{}
 		var publicExposed bool
-		var dependsOnJSON, volumesJSON, networksJSON, hcJSON []byte
+		var dependsOnJSON, volumesJSON, networksJSON, hcJSON, docJSON []byte
 		err := rows.Scan(
 			&sd.ID, &sd.DeploymentID, &sd.ServiceID, &sd.ServiceName, &publicExposed, &sd.DeployNumber,
 			&sd.Status, &sd.ImageTag, &sd.ContainerID, &sd.HostPort, &sd.InternalPort,
@@ -1581,7 +1624,7 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 			&sd.ExecutionMode, &sd.EnvSnapshot,
 			&sd.StartedAt, &sd.BuiltAt, &sd.DeployedAt, &sd.FinishedAt,
 			&sd.DurationMs, &sd.FailureReason, &sd.CreatedAt,
-			&sd.Classification, &sd.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON,
+			&sd.Classification, &sd.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON, &docJSON,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan service deployment: %w", err)
@@ -1609,6 +1652,12 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 			if err := json.Unmarshal(hcJSON, &hc); err == nil {
 				sd.HealthCheckConfig = &hc
 			}
+		}
+		if len(docJSON) > 0 && string(docJSON) != "{}" {
+			_ = json.Unmarshal(docJSON, &sd.DependsOnConditions)
+		}
+		if sd.DependsOnConditions == nil {
+			sd.DependsOnConditions = map[string]string{}
 		}
 		if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 {
 			url := fmt.Sprintf("http://%s:%d", publicHost, *sd.HostPort)
@@ -1820,7 +1869,7 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, s.public_exposed, sd.deploy_number,
 		        sd.status, sd.image_tag, sd.container_id, sd.host_port, sd.internal_port,
 		        sd.build_strategy, sd.build_command, sd.start_command, sd.runtime_type,
-		        COALESCE(sd.dockerfile_path, 'Dockerfile'), COALESCE(sd.build_context, '.'),
+		        COALESCE(sd.dockerfile_path, ''), COALESCE(sd.build_context, '.'),
 		        COALESCE(sd.health_strategy, 'auto'), sd.health_check_path,
 		        sd.cpu_millicores, sd.memory_mb, sd.pids_limit, sd.ephemeral_storage_mb,
 		        sd.image_digest, sd.source_revision, sd.env_config_hash,
@@ -1829,7 +1878,8 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 		        sd.duration_ms, sd.failure_reason, sd.created_at,
 		        COALESCE(sd.classification, 'application'), COALESCE(sd.image, ''),
 		        COALESCE(sd.depends_on, '[]'::jsonb), COALESCE(sd.volumes, '[]'::jsonb),
-		        COALESCE(sd.healthcheck_config, '{}'::jsonb)
+		        COALESCE(sd.networks, '[]'::jsonb), COALESCE(sd.healthcheck_config, '{}'::jsonb),
+		        COALESCE(sd.depends_on_conditions, '{}'::jsonb)
 		 FROM service_deployments sd
 		 JOIN services s ON s.id = sd.service_id
 		 WHERE sd.deployment_id = $1
@@ -1846,7 +1896,7 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 	for rows.Next() {
 		sd := &models.ServiceDeployment{}
 		var publicExposed bool
-		var dependsOnJSON, volumesJSON, hcJSON []byte
+		var dependsOnJSON, volumesJSON, networksJSON, hcJSON, docJSON []byte
 		err := rows.Scan(
 			&sd.ID, &sd.DeploymentID, &sd.ServiceID, &sd.ServiceName, &publicExposed, &sd.DeployNumber,
 			&sd.Status, &sd.ImageTag, &sd.ContainerID, &sd.HostPort, &sd.InternalPort,
@@ -1857,7 +1907,7 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 			&sd.ExecutionMode, &sd.EnvSnapshot,
 			&sd.StartedAt, &sd.BuiltAt, &sd.DeployedAt, &sd.FinishedAt,
 			&sd.DurationMs, &sd.FailureReason, &sd.CreatedAt,
-			&sd.Classification, &sd.Image, &dependsOnJSON, &volumesJSON, &hcJSON,
+			&sd.Classification, &sd.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON, &docJSON,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan service deployment: %w", err)
@@ -1874,11 +1924,23 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 		if sd.Volumes == nil {
 			sd.Volumes = []models.VolumeMountConfig{}
 		}
+		if len(networksJSON) > 0 {
+			_ = json.Unmarshal(networksJSON, &sd.Networks)
+		}
+		if sd.Networks == nil {
+			sd.Networks = []string{}
+		}
 		if len(hcJSON) > 0 && string(hcJSON) != "{}" {
 			var hc models.HealthCheckConfig
 			if err := json.Unmarshal(hcJSON, &hc); err == nil {
 				sd.HealthCheckConfig = &hc
 			}
+		}
+		if len(docJSON) > 0 && string(docJSON) != "{}" {
+			_ = json.Unmarshal(docJSON, &sd.DependsOnConditions)
+		}
+		if sd.DependsOnConditions == nil {
+			sd.DependsOnConditions = map[string]string{}
 		}
 		if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 {
 			url := fmt.Sprintf("http://%s:%d", publicHost, *sd.HostPort)
@@ -2003,9 +2065,13 @@ func (s *DeploymentService) UpdateServiceDeploymentContainerByDepAndSvc(ctx cont
 func (s *DeploymentService) listServicesTx(ctx context.Context, tx pgx.Tx, projectID uuid.UUID) ([]*models.Service, error) {
 	rows, err := tx.Query(ctx,
 		`SELECT id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
-		        build_strategy, build_command, start_command, dockerfile_path, build_context,
+		        build_strategy, build_command, start_command, COALESCE(dockerfile_path, ''), build_context,
 		        internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
-		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at
+		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
+		        COALESCE(classification, 'application'), COALESCE(image, ''),
+		        COALESCE(depends_on, '[]'::jsonb), COALESCE(volumes, '[]'::jsonb),
+		        COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb),
+		        COALESCE(depends_on_conditions, '{}'::jsonb)
 		 FROM services WHERE project_id = $1`,
 		projectID,
 	)
@@ -2017,6 +2083,7 @@ func (s *DeploymentService) listServicesTx(ctx context.Context, tx pgx.Tx, proje
 	var list []*models.Service
 	for rows.Next() {
 		svc := &models.Service{}
+		var dependsOnJSON, volumesJSON, networksJSON, hcJSON, docJSON []byte
 		err := rows.Scan(
 			&svc.ID, &svc.ProjectID, &svc.SourceID, &svc.Name, &svc.Role, &svc.SourcePath, &svc.RuntimeType,
 			&svc.Framework, &svc.PackageManager, &svc.BuildStrategy, &svc.BuildCommand,
@@ -2024,8 +2091,40 @@ func (s *DeploymentService) listServicesTx(ctx context.Context, tx pgx.Tx, proje
 			&svc.PublicExposed, &svc.HealthStrategy, &svc.HealthCheckPath, &svc.HealthCheckEnabled,
 			&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
 			&svc.CreatedAt, &svc.UpdatedAt,
+			&svc.Classification, &svc.Image,
+			&dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON, &docJSON,
 		)
 		if err == nil {
+			if len(dependsOnJSON) > 0 {
+				_ = json.Unmarshal(dependsOnJSON, &svc.DependsOn)
+			}
+			if svc.DependsOn == nil {
+				svc.DependsOn = []string{}
+			}
+			if len(volumesJSON) > 0 {
+				_ = json.Unmarshal(volumesJSON, &svc.Volumes)
+			}
+			if svc.Volumes == nil {
+				svc.Volumes = []models.VolumeMountConfig{}
+			}
+			if len(networksJSON) > 0 {
+				_ = json.Unmarshal(networksJSON, &svc.Networks)
+			}
+			if svc.Networks == nil {
+				svc.Networks = []string{}
+			}
+			if len(hcJSON) > 0 && string(hcJSON) != "{}" {
+				var hc models.HealthCheckConfig
+				if err := json.Unmarshal(hcJSON, &hc); err == nil {
+					svc.HealthCheckConfig = &hc
+				}
+			}
+			if len(docJSON) > 0 && string(docJSON) != "{}" {
+				_ = json.Unmarshal(docJSON, &svc.DependsOnConditions)
+			}
+			if svc.DependsOnConditions == nil {
+				svc.DependsOnConditions = map[string]string{}
+			}
 			list = append(list, svc)
 		}
 	}

@@ -82,11 +82,19 @@ export interface ConfigurableService {
   id: string;
   name: string;
   role: ServiceRole;
+  classification?: string;
+  image?: string;
+  depends_on?: string[];
+  depends_on_conditions?: Record<string, string>;
+  volumes?: any[];
+  networks?: string[];
+  healthcheck_config?: any;
+  build_context?: string;
   source_path: string;
   runtime: string;
   framework: string;
   package_manager: string;
-  build_strategy: 'auto' | 'dockerfile' | 'custom';
+  build_strategy: 'auto' | 'dockerfile' | 'custom' | 'image';
   selected_candidate_id?: string;
   build_candidates: BuildCandidate[];
   build_command: string;
@@ -111,6 +119,14 @@ function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): Confi
     id: def.id || `svc-${idx}-${Date.now()}`,
     name: def.name || (def.role === 'frontend' ? 'frontend' : def.role === 'backend' ? 'backend' : `service-${idx + 1}`),
     role: def.role || 'other',
+    classification: def.classification || 'application',
+    image: def.image || '',
+    depends_on: def.depends_on || [],
+    depends_on_conditions: def.depends_on_conditions || {},
+    volumes: def.volumes || [],
+    networks: def.networks || [],
+    healthcheck_config: def.healthcheck_config,
+    build_context: def.build_context || '.',
     source_path: def.source_path || '.',
     runtime: runtime,
     framework: framework,
@@ -121,7 +137,7 @@ function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): Confi
     build_command: def.build_command || defaultCandidate?.build_command || '',
     start_command: def.start_command || defaultCandidate?.start_command || '',
     internal_port: def.internal_port || defaultCandidate?.suggested_port || 8080,
-    dockerfile_path: def.dockerfile_path || defaultCandidate?.dockerfile_path || 'Dockerfile',
+    dockerfile_path: def.dockerfile_path || defaultCandidate?.dockerfile_path || (strategy === 'dockerfile' ? 'Dockerfile' : ''),
     health_strategy: (def.health_strategy as any) || (defaultCandidate?.health_strategy as any) || 'auto',
     health_check_path: def.health_check_path || defaultCandidate?.health_check_path || '/health',
     expanded: true,
@@ -545,7 +561,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         build_command: '',
         start_command: '',
         internal_port: 8080,
-        dockerfile_path: 'Dockerfile',
+        dockerfile_path: '',
         health_strategy: 'auto',
         health_check_path: '/health',
         expanded: true,
@@ -719,7 +735,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
               build_command: det.build_command || '',
               start_command: det.start_command || '',
               internal_port: det.suggested_port || 8080,
-              dockerfile_path: 'Dockerfile',
+              dockerfile_path: det.build_strategy === 'dockerfile' ? 'Dockerfile' : '',
               health_strategy: det.health_strategy || 'auto',
               health_check_path: det.health_check_path || '/health',
             } as any,
@@ -820,7 +836,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                   build_command: status.detection.build_command || '',
                   start_command: status.detection.start_command || '',
                   internal_port: status.detection.suggested_port || 8080,
-                  dockerfile_path: 'Dockerfile',
+                  dockerfile_path: status.detection.build_strategy === 'dockerfile' ? 'Dockerfile' : '',
                   health_strategy: status.detection.health_strategy || 'auto',
                   health_check_path: status.detection.health_check_path || '/health',
                 } as any,
@@ -1010,51 +1026,23 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           framework: svc.framework,
           package_manager: svc.package_manager,
           build_strategy: planned?.build_strategy || svc.build_strategy,
-          image: planned?.image,
-          classification: planned?.classification || 'application',
-          depends_on: planned?.depends_on || [],
-          volumes: planned?.volumes || [],
-          networks: planned?.networks || [],
-          healthcheck_config: planned?.health_check,
+          image: planned?.image || svc.image || '',
+          classification: planned?.classification || svc.classification || 'application',
+          depends_on: planned?.depends_on || svc.depends_on || [],
+          depends_on_conditions: planned?.depends_on_conditions || svc.depends_on_conditions || {},
+          volumes: planned?.volumes || svc.volumes || [],
+          networks: planned?.networks || svc.networks || [],
+          healthcheck_config: planned?.health_check || svc.healthcheck_config,
+          build_context: planned?.build_context || svc.build_context || '.',
           build_candidates: svc.build_candidates,
           build_command: svc.build_command,
           start_command: svc.start_command,
-          dockerfile_path: svc.dockerfile_path,
+          dockerfile_path: planned?.dockerfile_path !== undefined ? planned.dockerfile_path : svc.dockerfile_path,
           internal_port: Number(svc.internal_port) || 8080,
           health_strategy: svc.health_strategy,
           health_check_path: svc.health_check_path,
         };
       });
-
-      if (deploymentPlan?.services) {
-        for (const ps of deploymentPlan.services) {
-          if (!servicesPayload.some((s) => s.name === ps.name)) {
-            servicesPayload.push({
-              name: ps.name,
-              role: (ps.role as any) || 'other',
-              source_path: ps.source_path || '.',
-              runtime: ps.runtime_type || 'generic',
-              runtime_type: ps.runtime_type || 'generic',
-              framework: ps.framework || 'generic',
-              package_manager: ps.package_manager || 'generic',
-              build_strategy: ps.build_strategy,
-              image: ps.image,
-              classification: ps.classification,
-              depends_on: ps.depends_on,
-              volumes: ps.volumes,
-              networks: ps.networks || [],
-              healthcheck_config: ps.health_check,
-              build_candidates: ps.build_candidates || [],
-              build_command: ps.build_command || '',
-              start_command: ps.start_command || '',
-              dockerfile_path: ps.dockerfile_path || '',
-              internal_port: ps.internal_port || 8080,
-              health_strategy: 'auto',
-              health_check_path: '/health',
-            });
-          }
-        }
-      }
 
       if (sourceTab === 'github') {
         if (!selectedRepo) {

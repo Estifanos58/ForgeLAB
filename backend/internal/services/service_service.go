@@ -41,6 +41,7 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 		        COALESCE(classification, 'application'), COALESCE(image, ''), COALESCE(depends_on, '[]'::jsonb),
+		        COALESCE(depends_on_conditions, '{}'::jsonb),
 		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
 		 FROM services WHERE project_id = $1 ORDER BY created_at ASC`,
 		projectID,
@@ -53,7 +54,7 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 	var services []*models.Service
 	for rows.Next() {
 		svc := &models.Service{}
-		var candidatesJSON, dependsOnJSON, volumesJSON, networksJSON, hcJSON []byte
+		var candidatesJSON, dependsOnJSON, depCondsJSON, volumesJSON, networksJSON, hcJSON []byte
 
 		err := rows.Scan(
 			&svc.ID, &svc.ProjectID, &svc.SourceID, &svc.Name, &svc.Role, &svc.SourcePath, &svc.RuntimeType,
@@ -63,7 +64,7 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 			&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
 			&svc.CreatedAt, &svc.UpdatedAt,
 			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
-			&svc.Classification, &svc.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON,
+			&svc.Classification, &svc.Image, &dependsOnJSON, &depCondsJSON, &volumesJSON, &networksJSON, &hcJSON,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan service: %w", err)
@@ -80,6 +81,12 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 		}
 		if svc.DependsOn == nil {
 			svc.DependsOn = []string{}
+		}
+		if len(depCondsJSON) > 0 {
+			_ = json.Unmarshal(depCondsJSON, &svc.DependsOnConditions)
+		}
+		if svc.DependsOnConditions == nil {
+			svc.DependsOnConditions = make(map[string]string)
 		}
 		if len(volumesJSON) > 0 {
 			_ = json.Unmarshal(volumesJSON, &svc.Volumes)
@@ -122,6 +129,7 @@ func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectID
 		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 		        COALESCE(classification, 'application'), COALESCE(image, ''), COALESCE(depends_on, '[]'::jsonb),
+		        COALESCE(depends_on_conditions, '{}'::jsonb),
 		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
 		 FROM services WHERE project_id = ANY($1) ORDER BY created_at ASC`,
 		projectIDs,
@@ -133,7 +141,7 @@ func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectID
 
 	for rows.Next() {
 		svc := &models.Service{}
-		var candidatesJSON, dependsOnJSON, volumesJSON, networksJSON, hcJSON []byte
+		var candidatesJSON, dependsOnJSON, depCondsJSON, volumesJSON, networksJSON, hcJSON []byte
 
 		err := rows.Scan(
 			&svc.ID, &svc.ProjectID, &svc.SourceID, &svc.Name, &svc.Role, &svc.SourcePath, &svc.RuntimeType,
@@ -143,7 +151,7 @@ func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectID
 			&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
 			&svc.CreatedAt, &svc.UpdatedAt,
 			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
-			&svc.Classification, &svc.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON,
+			&svc.Classification, &svc.Image, &dependsOnJSON, &depCondsJSON, &volumesJSON, &networksJSON, &hcJSON,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan batch service: %w", err)
@@ -160,6 +168,12 @@ func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectID
 		}
 		if svc.DependsOn == nil {
 			svc.DependsOn = []string{}
+		}
+		if len(depCondsJSON) > 0 {
+			_ = json.Unmarshal(depCondsJSON, &svc.DependsOnConditions)
+		}
+		if svc.DependsOnConditions == nil {
+			svc.DependsOnConditions = make(map[string]string)
 		}
 		if len(volumesJSON) > 0 {
 			_ = json.Unmarshal(volumesJSON, &svc.Volumes)
@@ -245,7 +259,7 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 	}
 
 	svc := &models.Service{}
-	var candidatesJSON, dependsOnJSON, volumesJSON, networksJSON, hcJSON []byte
+	var candidatesJSON, dependsOnJSON, depCondsJSON, volumesJSON, networksJSON, hcJSON []byte
 
 	err := s.db.QueryRow(ctx,
 		`SELECT id, project_id, source_id, name, role, source_path, runtime_type, framework, package_manager,
@@ -254,6 +268,7 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 		        COALESCE(classification, 'application'), COALESCE(image, ''), COALESCE(depends_on, '[]'::jsonb),
+		        COALESCE(depends_on_conditions, '{}'::jsonb),
 		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
 		 FROM services WHERE id = $1`,
 		serviceID,
@@ -265,7 +280,7 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 		&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
 		&svc.CreatedAt, &svc.UpdatedAt,
 		&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
-		&svc.Classification, &svc.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON,
+		&svc.Classification, &svc.Image, &dependsOnJSON, &depCondsJSON, &volumesJSON, &networksJSON, &hcJSON,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -285,6 +300,12 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 	}
 	if svc.DependsOn == nil {
 		svc.DependsOn = []string{}
+	}
+	if len(depCondsJSON) > 0 {
+		_ = json.Unmarshal(depCondsJSON, &svc.DependsOnConditions)
+	}
+	if svc.DependsOnConditions == nil {
+		svc.DependsOnConditions = make(map[string]string)
 	}
 	if len(volumesJSON) > 0 {
 		_ = json.Unmarshal(volumesJSON, &svc.Volumes)
@@ -362,6 +383,10 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 	if len(dependsOnJSON) == 0 {
 		dependsOnJSON = []byte("[]")
 	}
+	depCondsJSON, _ := json.Marshal(svc.DependsOnConditions)
+	if len(depCondsJSON) == 0 {
+		depCondsJSON = []byte("{}")
+	}
 	volumesJSON, _ := json.Marshal(svc.Volumes)
 	if len(volumesJSON) == 0 {
 		volumesJSON = []byte("[]")
@@ -385,14 +410,14 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 			internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
 			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
-			classification, image, depends_on, volumes, networks, healthcheck_config
+			classification, image, depends_on, depends_on_conditions, volumes, networks, healthcheck_config
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $12, $13, $14, $15,
 			$16, $17, $18, $19, $20, $21,
 			$22, $23, $24, $25, $26, $27,
 			$28, $29, $30, $31,
-			$32, $33, $34, $35, $36, $37
+			$32, $33, $34, $35, $36, $37, $38
 		)`,
 		svc.ID, svc.ProjectID, svc.SourceID, svc.Name, svc.Role, svc.SourcePath, svc.RuntimeType,
 		svc.Framework, svc.PackageManager, svc.BuildStrategy, candidatesJSON, svc.BuildCommand,
@@ -401,7 +426,7 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 		svc.Status, svc.ContainerID, svc.ImageTag, svc.CurrentServiceDeploymentID,
 		svc.CreatedAt, svc.UpdatedAt,
 		svc.CpuMillicores, svc.MemoryMB, svc.PidsLimit, svc.EphemeralStorageMB,
-		svc.Classification, svc.Image, dependsOnJSON, volumesJSON, networksJSON, hcJSON,
+		svc.Classification, svc.Image, dependsOnJSON, depCondsJSON, volumesJSON, networksJSON, hcJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert service: %w", err)
@@ -445,6 +470,10 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 	if len(dependsOnJSON) == 0 {
 		dependsOnJSON = []byte("[]")
 	}
+	depCondsJSON, _ := json.Marshal(svc.DependsOnConditions)
+	if len(depCondsJSON) == 0 {
+		depCondsJSON = []byte("{}")
+	}
 	volumesJSON, _ := json.Marshal(svc.Volumes)
 	if len(volumesJSON) == 0 {
 		volumesJSON = []byte("[]")
@@ -468,14 +497,14 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 			internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
 			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
-			classification, image, depends_on, volumes, networks, healthcheck_config
+			classification, image, depends_on, depends_on_conditions, volumes, networks, healthcheck_config
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $12, $13, $14, $15,
 			$16, $17, $18, $19, $20, $21,
 			$22, $23, $24, $25, $26, $27,
 			$28, $29, $30, $31,
-			$32, $33, $34, $35, $36, $37
+			$32, $33, $34, $35, $36, $37, $38
 		)`,
 		svc.ID, svc.ProjectID, svc.SourceID, svc.Name, svc.Role, svc.SourcePath, svc.RuntimeType,
 		svc.Framework, svc.PackageManager, svc.BuildStrategy, candidatesJSON, svc.BuildCommand,
@@ -484,7 +513,7 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 		svc.Status, svc.ContainerID, svc.ImageTag, svc.CurrentServiceDeploymentID,
 		svc.CreatedAt, svc.UpdatedAt,
 		svc.CpuMillicores, svc.MemoryMB, svc.PidsLimit, svc.EphemeralStorageMB,
-		svc.Classification, svc.Image, dependsOnJSON, volumesJSON, networksJSON, hcJSON,
+		svc.Classification, svc.Image, dependsOnJSON, depCondsJSON, volumesJSON, networksJSON, hcJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert service in tx: %w", err)

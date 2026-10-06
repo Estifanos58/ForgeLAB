@@ -11,25 +11,32 @@ import (
 
 // ServiceDefinition represents a discovered service and its detected build candidates.
 type ServiceDefinition struct {
-	Name               string                  `json:"name"`
-	Role               string                  `json:"role"` // "frontend", "backend", "worker", "other"
-	SourcePath         string                  `json:"source_path"`
-	Runtime            string                  `json:"runtime"`
-	RuntimeType        string                  `json:"runtime_type"`
-	Framework          string                  `json:"framework"`
-	PackageManager     string                  `json:"package_manager"`
-	BuildStrategy      string                  `json:"build_strategy"`
-	BuildCandidates    []models.BuildCandidate `json:"build_candidates"`
-	BuildCommand       string                  `json:"build_command"`
-	StartCommand       string                  `json:"start_command"`
-	DockerfilePath     string                  `json:"dockerfile_path"`
-	BuildContext       string                  `json:"build_context"`
-	InternalPort       int                     `json:"internal_port"`
-	HealthStrategy     string                  `json:"health_strategy"`
-	HealthCheckPath    string                  `json:"health_check_path"`
-	HealthCheckEnabled bool                    `json:"health_check_enabled"`
-	FilesCount         int                     `json:"files_count"`
-	TotalBytes         int64                   `json:"total_bytes"`
+	Name                string                    `json:"name"`
+	Role                string                    `json:"role"` // "frontend", "backend", "worker", "other"
+	Classification      string                    `json:"classification"`
+	Image               string                    `json:"image,omitempty"`
+	DependsOn           []string                  `json:"depends_on"`
+	DependsOnConditions map[string]string         `json:"depends_on_conditions,omitempty"`
+	Volumes             []models.VolumeMountConfig `json:"volumes,omitempty"`
+	Networks            []string                  `json:"networks,omitempty"`
+	HealthCheckConfig   *models.HealthCheckConfig `json:"healthcheck_config,omitempty"`
+	SourcePath          string                    `json:"source_path"`
+	Runtime             string                    `json:"runtime"`
+	RuntimeType         string                    `json:"runtime_type"`
+	Framework           string                    `json:"framework"`
+	PackageManager      string                    `json:"package_manager"`
+	BuildStrategy       string                    `json:"build_strategy"`
+	BuildCandidates     []models.BuildCandidate   `json:"build_candidates"`
+	BuildCommand        string                    `json:"build_command"`
+	StartCommand        string                    `json:"start_command"`
+	DockerfilePath      string                    `json:"dockerfile_path"`
+	BuildContext        string                    `json:"build_context"`
+	InternalPort        int                       `json:"internal_port"`
+	HealthStrategy      string                    `json:"health_strategy"`
+	HealthCheckPath     string                    `json:"health_check_path"`
+	HealthCheckEnabled  bool                      `json:"health_check_enabled"`
+	FilesCount          int                       `json:"files_count"`
+	TotalBytes          int64                     `json:"total_bytes"`
 }
 
 // AnalysisResult represents the overall repository inspection result.
@@ -86,26 +93,42 @@ func AnalyzeRepositoryWithProgress(repoRoot string, onProgress ProgressCallback)
 
 	var services []ServiceDefinition
 	for _, s := range discResult.Services {
+		var hcConfig *models.HealthCheckConfig
+		if s.HealthCheck.Path != "" || len(s.HealthCheck.Test) > 0 {
+			hc := s.HealthCheck
+			hcConfig = &hc
+		}
+		classification := s.Classification
+		if classification == "" {
+			classification = "application"
+		}
 		services = append(services, ServiceDefinition{
-			Name:               s.Name,
-			Role:               s.Role,
-			SourcePath:         s.SourcePath,
-			Runtime:            s.Runtime,
-			RuntimeType:        s.Runtime,
-			Framework:          s.Framework,
-			PackageManager:     s.PackageManager,
-			BuildStrategy:      s.BuildStrategy,
-			BuildCandidates:    s.BuildCandidates,
-			BuildCommand:       s.BuildCommand,
-			StartCommand:       s.StartCommand,
-			DockerfilePath:     s.DockerfilePath,
-			BuildContext:       s.BuildContext,
-			InternalPort:       s.InternalPort,
-			HealthStrategy:     s.HealthStrategy,
-			HealthCheckPath:    s.HealthCheckPath,
-			HealthCheckEnabled: s.HealthCheckEnabled,
-			FilesCount:         s.FilesCount,
-			TotalBytes:         s.TotalBytes,
+			Name:                s.Name,
+			Role:                s.Role,
+			Classification:      classification,
+			Image:               s.Image,
+			DependsOn:           s.DependsOn,
+			DependsOnConditions: s.DependsOnConditions,
+			Volumes:             s.Volumes,
+			Networks:            s.Networks,
+			HealthCheckConfig:   hcConfig,
+			SourcePath:          s.SourcePath,
+			Runtime:             s.Runtime,
+			RuntimeType:         s.Runtime,
+			Framework:           s.Framework,
+			PackageManager:      s.PackageManager,
+			BuildStrategy:       s.BuildStrategy,
+			BuildCandidates:     s.BuildCandidates,
+			BuildCommand:        s.BuildCommand,
+			StartCommand:        s.StartCommand,
+			DockerfilePath:      s.DockerfilePath,
+			BuildContext:        s.BuildContext,
+			InternalPort:        s.InternalPort,
+			HealthStrategy:      s.HealthStrategy,
+			HealthCheckPath:     s.HealthCheckPath,
+			HealthCheckEnabled:  s.HealthCheckEnabled,
+			FilesCount:          s.FilesCount,
+			TotalBytes:          s.TotalBytes,
 		})
 	}
 
