@@ -23,6 +23,7 @@ import (
 
 	"github.com/forgelab/backend/internal/analyzer"
 	"github.com/forgelab/backend/internal/detector"
+	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/dockerignore"
 	"github.com/forgelab/backend/internal/envparser"
 	"github.com/forgelab/backend/internal/security"
@@ -30,22 +31,23 @@ import (
 
 // LocalSourceSession stores the in-memory mapping between an opaque source ID and the local host path
 type LocalSourceSession struct {
-	SourceID      uuid.UUID                `json:"source_id"`
-	CanonicalPath string                   `json:"-"` // Never exposed over HTTP/JSON
-	FolderName    string                   `json:"folder_name"`
-	Status        string                   `json:"status"` // "scanning", "detecting", "ready", "failed"
-	Phase         string                   `json:"phase"`  // "scanning", "detecting", "ready", "failed"
-	FilesScanned  int                      `json:"files_scanned"`
-	TotalFiles    int                      `json:"total_files"`
-	TotalBytes    int64                    `json:"total_bytes"`
-	DetectedCount int                      `json:"detected_count"`
-	Error         string                   `json:"error,omitempty"`
-	Analysis      *analyzer.AnalysisResult `json:"analysis,omitempty"`
-	CreatedAt     time.Time                `json:"created_at"`
-	UpdatedAt     time.Time                `json:"updated_at"`
-	ExpiresAt     time.Time                `json:"expires_at"`
-	Token         string                   `json:"-"`
-	mu            sync.RWMutex             `json:"-"`
+	SourceID      uuid.UUID                  `json:"source_id"`
+	CanonicalPath string                     `json:"-"` // Never exposed over HTTP/JSON
+	FolderName    string                     `json:"folder_name"`
+	Status        string                     `json:"status"` // "scanning", "detecting", "ready", "failed"
+	Phase         string                     `json:"phase"`  // "scanning", "detecting", "ready", "failed"
+	FilesScanned  int                        `json:"files_scanned"`
+	TotalFiles    int                        `json:"total_files"`
+	TotalBytes    int64                      `json:"total_bytes"`
+	DetectedCount int                        `json:"detected_count"`
+	Error         string                     `json:"error,omitempty"`
+	Analysis      *analyzer.AnalysisResult   `json:"analysis,omitempty"`
+	Discovery     *discovery.DiscoveryResult `json:"discovery,omitempty"`
+	CreatedAt     time.Time                  `json:"created_at"`
+	UpdatedAt     time.Time                  `json:"updated_at"`
+	ExpiresAt     time.Time                  `json:"expires_at"`
+	Token         string                     `json:"-"`
+	mu            sync.RWMutex               `json:"-"`
 }
 var (
 	globalSourceSessionsMu sync.RWMutex
@@ -800,6 +802,7 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 			TotalBytes:    cachedAnalysis.TotalBytes,
 			DetectedCount: len(cachedAnalysis.Services),
 			Analysis:      cachedAnalysis,
+			Discovery:     cachedAnalysis.Discovery,
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
 			ExpiresAt:     time.Now().Add(s.sessionTTL),
@@ -876,6 +879,9 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 			session.TotalBytes = analysis.TotalBytes
 			session.DetectedCount = len(analysis.Services)
 			session.Analysis = analysis
+			if analysis.Discovery != nil {
+				session.Discovery = analysis.Discovery
+			}
 			slog.Info("registered local source session",
 				"source_id", sourceID.String(),
 				"folder_name", folderName,
@@ -959,6 +965,20 @@ func (s *AgentServer) renderSessionResponse(w http.ResponseWriter, session *Loca
 
 	if session.Error != "" {
 		resp["error"] = session.Error
+	}
+
+	disc := session.Discovery
+	if disc == nil && session.Analysis != nil {
+		disc = session.Analysis.Discovery
+	}
+	if disc == nil && session.CanonicalPath != "" && (session.Status == "ready" || session.Status == "consumed") {
+		if d, err := discovery.Discover(session.CanonicalPath); err == nil {
+			disc = d
+			session.Discovery = d
+		}
+	}
+	if disc != nil {
+		resp["discovery"] = disc
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1055,6 +1075,53 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		s.mu.Unlock()
 		s.renderSessionResponse(w, session)
 
+	case "discovery":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		session.mu.RLock()
+		disc := session.Discovery
+		if disc == nil && session.Analysis != nil {
+			disc = session.Analysis.Discovery
+		}
+		status := session.Status
+		canonPath := session.CanonicalPath
+		sessErr := session.Error
+		session.mu.RUnlock()
+
+		if status == "failed" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error": fmt.Sprintf("source analysis failed: %s", sessErr),
+			})
+			return
+		}
+
+		if disc == nil && canonPath != "" {
+			var err error
+			disc, err = discovery.Discover(canonPath)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": fmt.Sprintf("discovery failed: %v", err),
+				})
+				return
+			}
+			session.mu.Lock()
+			session.Discovery = disc
+			session.mu.Unlock()
+		}
+
+		if disc == nil {
+			writeJSON(w, http.StatusAccepted, map[string]string{
+				"status":  status,
+				"message": "discovery in progress",
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, disc)
+		return
+
 	case "analyze":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1067,6 +1134,9 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		}
 		s.mu.Lock()
 		session.Analysis = analysis
+		if analysis.Discovery != nil {
+			session.Discovery = analysis.Discovery
+		}
 		session.UpdatedAt = time.Now()
 		s.mu.Unlock()
 		s.renderSessionResponse(w, session)

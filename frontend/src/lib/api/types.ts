@@ -568,6 +568,7 @@ export interface GeneratePlanRequest {
   branch?: string;
   root_dir?: string;
   agent_id?: string;
+  agent_token?: string;
   project_id?: string;
 }
 

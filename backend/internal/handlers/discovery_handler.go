@@ -28,6 +28,7 @@ type GeneratePlanRequest struct {
 	Branch          string `json:"branch"`           // git branch
 	RootDir         string `json:"root_dir"`         // optional subfolder
 	AgentID         string `json:"agent_id"`         // optional local agent ID
+	AgentToken      string `json:"agent_token"`      // optional local agent session token
 	ProjectID       string `json:"project_id"`       // optional existing project ID for env conflict checks
 }
 
@@ -74,6 +75,7 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	var discResult *discovery.DiscoveryResult
 	var workspaceDir string
 	var cleanupDir func()
 	var sourceRevision string
@@ -164,45 +166,49 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 		sourceRevision = fp
 
 	case models.SourceTypeLocalAgent:
-		if req.RepositoryPath != "" {
-			canonicalPath, valErr := h.pathValidator.ValidateSourcePath(req.RepositoryPath)
-			if valErr == nil {
-				workspaceDir = canonicalPath
-				if fp, fpErr := discovery.ComputeDirectoryContentFingerprint(canonicalPath); fpErr == nil && fp != "" {
-					sourceRevision = fp
-				}
-			}
-		}
-		if workspaceDir == "" && req.SourceReference != "" {
-			if srcUUID, parseErr := uuid.Parse(req.SourceReference); parseErr == nil {
-				if sess, ok := agent.LookupLocalSourceSession(srcUUID); ok && sess != nil && sess.CanonicalPath != "" {
-					if cPath, vErr := h.pathValidator.ValidateSourcePath(sess.CanonicalPath); vErr == nil {
-						workspaceDir = cPath
-					}
-				}
-				if workspaceDir == "" && h.sourceService != nil {
-					if p, getErr := h.sourceService.GetSourcePath(r.Context(), userID, srcUUID); getErr == nil && p != "" {
-						workspaceDir = p
-					}
-				}
-				if sourceRevision == "" && h.sourceService != nil {
-					if src, sErr := h.sourceService.GetSource(r.Context(), userID, srcUUID); sErr == nil && src != nil && src.Fingerprint != "" {
-						sourceRevision = src.Fingerprint
-					}
-				}
-			}
-		}
-		if workspaceDir == "" || workspaceDir == "." {
-			writeError(w, http.StatusBadRequest, "workspace directory cannot be resolved for local agent source: provide repository_path or a valid agent source reference")
+		if req.SourceReference == "" {
+			writeError(w, http.StatusBadRequest, "source_reference is required for local agent source")
 			return
 		}
-		if sourceRevision == "" {
-			if fp, fpErr := discovery.ComputeDirectoryContentFingerprint(workspaceDir); fpErr == nil && fp != "" {
-				sourceRevision = fp
-			} else {
-				hSha := sha256.Sum256([]byte(fmt.Sprintf("agent:%s", req.SourceReference)))
-				sourceRevision = fmt.Sprintf("fp_%s", hex.EncodeToString(hSha[:16]))
+		sourceUUID, parseErr := uuid.Parse(req.SourceReference)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid local agent source reference UUID")
+			return
+		}
+
+		var agentToken string
+		if req.AgentToken != "" {
+			agentToken = req.AgentToken
+		}
+		if agentToken == "" {
+			if sm := agent.GetGlobalSessionManager(); sm != nil {
+				if sess, err := sm.FindSessionBySourceID(sourceUUID); err == nil && sess != nil {
+					if sess.UserID == userID {
+						agentToken = sess.Token
+					}
+				}
 			}
+		}
+		if agentToken == "" && h.sourceService != nil {
+			if tok, err := h.sourceService.GetDecryptedAgentToken(r.Context(), userID, sourceUUID); err == nil && tok != "" {
+				agentToken = tok
+			}
+		}
+
+		baseURL := agent.ResolveBaseURL()
+		agentDisc, err := agent.FetchSourceDiscovery(r.Context(), baseURL, sourceUUID, agentToken)
+		if err != nil {
+			slog.Warn("failed to fetch authoritative discovery from local agent", "source_id", sourceUUID, "error", err)
+			writeError(w, http.StatusNotFound, "Local agent source session is unavailable or expired. Please reselect the folder.")
+			return
+		}
+
+		discResult = agentDisc
+		if discResult.Fingerprint != "" {
+			sourceRevision = discResult.Fingerprint
+		} else {
+			hash := sha256.Sum256([]byte(fmt.Sprintf("agent:%s:%d:%d", sourceUUID.String(), discResult.TotalFiles, discResult.TotalBytes)))
+			sourceRevision = fmt.Sprintf("fp_%s", hex.EncodeToString(hash[:16]))
 		}
 
 	default:
@@ -214,12 +220,15 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 		defer cleanupDir()
 	}
 
-	// 1. Run authoritative discovery engine
-	discResult, err := discovery.Discover(workspaceDir)
-	if err != nil {
-		slog.Error("discovery failed", "workspace", workspaceDir, "error", err)
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("discovery failed: %v", err))
-		return
+	// 1. Run authoritative discovery engine if not provided by authoritative agent
+	if discResult == nil {
+		var err error
+		discResult, err = discovery.Discover(workspaceDir)
+		if err != nil {
+			slog.Error("discovery failed", "workspace", workspaceDir, "error", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("discovery failed: %v", err))
+			return
+		}
 	}
 
 	// 2. Generate snapshot deployment plan

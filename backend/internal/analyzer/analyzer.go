@@ -41,10 +41,11 @@ type ServiceDefinition struct {
 
 // AnalysisResult represents the overall repository inspection result.
 type AnalysisResult struct {
-	RepositoryName string              `json:"repository_name"`
-	TotalFiles     int                 `json:"total_files"`
-	TotalBytes     int64               `json:"total_bytes"`
-	Services       []ServiceDefinition `json:"services"`
+	RepositoryName string                     `json:"repository_name"`
+	TotalFiles     int                        `json:"total_files"`
+	TotalBytes     int64                      `json:"total_bytes"`
+	Services       []ServiceDefinition        `json:"services"`
+	Discovery      *discovery.DiscoveryResult `json:"discovery,omitempty"`
 }
 
 // IsPrunedDir delegates to discovery.IsPrunedDir for consistent directory pruning.
@@ -141,6 +142,7 @@ func AnalyzeRepositoryWithProgress(repoRoot string, onProgress ProgressCallback)
 		TotalFiles:     discResult.TotalFiles,
 		TotalBytes:     discResult.TotalBytes,
 		Services:       services,
+		Discovery:      discResult,
 	}, nil
 }
 

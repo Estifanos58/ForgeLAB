@@ -110,6 +110,7 @@ type DiscoveryResult struct {
 	TotalFiles      int                 `json:"total_files"`
 	TotalBytes      int64               `json:"total_bytes"`
 	Dependencies    map[string][]string `json:"dependencies"` // service -> depends_on
+	Fingerprint     string              `json:"fingerprint,omitempty"`
 }
 
 // PlannedEndpoint describes a network endpoint

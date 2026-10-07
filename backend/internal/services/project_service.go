@@ -16,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"encoding/json"
-	"net"
 	"net/http"
 	"path/filepath"
 
@@ -1089,18 +1088,7 @@ func generateSlug(name string) string {
 }
 
 func resolveAgentBaseURL() string {
-	if u := os.Getenv("FORGELAB_AGENT_URL"); u != "" {
-		return strings.TrimRight(u, "/")
-	}
-	if h := os.Getenv("FORGELAB_AGENT_HOST"); h != "" {
-		return fmt.Sprintf("http://%s", h)
-	}
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:4142", 200*time.Millisecond)
-	if err == nil {
-		conn.Close()
-		return "http://127.0.0.1:4142"
-	}
-	return "http://host.docker.internal:4142"
+	return agent.ResolveBaseURL()
 }
 
 // ImportProjectEnvironment imports .env files from a local source repository into ForgeLAB's encrypted environment variable store.

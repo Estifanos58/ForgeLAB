@@ -968,6 +968,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           source_type: 'local_agent',
           source_reference: agentSession.source_id,
           agent_id: agentSession.agent_id,
+          agent_token: agentAuthSession?.token,
           branch: 'main',
           root_dir: '.',
         };

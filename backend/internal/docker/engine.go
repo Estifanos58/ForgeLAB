@@ -29,6 +29,7 @@ import (
 	"github.com/docker/go-connections/nat"
 	"github.com/google/uuid"
 
+	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/detector"
 	"github.com/forgelab/backend/internal/logging"
 	"github.com/forgelab/backend/internal/models"
@@ -2714,20 +2715,7 @@ func copyDirectory(src, dst string) error {
 
 // resolveAgentBaseURL dynamically finds the local agent URL, handling containerized backend setups
 func resolveAgentBaseURL() string {
-	if u := os.Getenv("FORGELAB_AGENT_URL"); u != "" {
-		return strings.TrimRight(u, "/")
-	}
-	if h := os.Getenv("FORGELAB_AGENT_HOST"); h != "" {
-		return fmt.Sprintf("http://%s", h)
-	}
-	// Try 127.0.0.1:4142 first (for local non-docker backend)
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:4142", 200*time.Millisecond)
-	if err == nil {
-		conn.Close()
-		return "http://127.0.0.1:4142"
-	}
-	// Fallback to host.docker.internal:4142 (for containerized backend accessing host agent)
-	return "http://host.docker.internal:4142"
+	return agent.ResolveBaseURL()
 }
 
 // verifyServiceHealth performs health verification through the correct container/network path
