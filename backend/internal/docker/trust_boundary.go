@@ -19,6 +19,9 @@ const (
 
 	MinPidsLimit = 16
 	MaxPidsLimit = 4096
+
+	MinNofileLimit = 1024
+	MaxNofileLimit = 65536
 )
 
 var (
@@ -30,6 +33,7 @@ var (
 	ErrCpuOutOfRange                = fmt.Errorf("cpu_millicores must be between %d and %d (0.1 to 16 cores)", MinCpuMillicores, MaxCpuMillicores)
 	ErrMemoryOutOfRange             = fmt.Errorf("memory_mb must be between %d and %d (64MB to 32GB)", MinMemoryMB, MaxMemoryMB)
 	ErrPidsOutOfRange               = fmt.Errorf("pids_limit must be between %d and %d", MinPidsLimit, MaxPidsLimit)
+	ErrNofileOutOfRange             = fmt.Errorf("nofile limits must be between %d and %d, with soft <= hard", MinNofileLimit, MaxNofileLimit)
 	ErrEphemeralStorageNotSupported = errors.New("ephemeral_storage_mb is not supported on this host environment; remove or leave empty")
 )
 
@@ -53,6 +57,8 @@ type ContainerSecurityOptions struct {
 	TargetCpuMillicores  int
 	TargetMemoryMB       int
 	TargetPidsLimit      int
+	TargetNofileSoft     int
+	TargetNofileHard     int
 	Binds                []string
 	NetworkMode          string
 	AllowedMountPrefixes []string
@@ -161,6 +167,28 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 		}
 	}
 
+	var ulimits []*container.Ulimit
+	if opts.TargetNofileSoft > 0 || opts.TargetNofileHard > 0 {
+		soft := opts.TargetNofileSoft
+		hard := opts.TargetNofileHard
+		if soft == 0 {
+			soft = hard
+		}
+		if hard == 0 {
+			hard = soft
+		}
+		if soft < MinNofileLimit || soft > MaxNofileLimit || hard < MinNofileLimit || hard > MaxNofileLimit || soft > hard {
+			return nil, ErrNofileOutOfRange
+		}
+		ulimits = []*container.Ulimit{
+			{
+				Name: "nofile",
+				Soft: int64(soft),
+				Hard: int64(hard),
+			},
+		}
+	}
+
 	hostConfig := &container.HostConfig{
 		PortBindings: opts.PortBindings,
 		Binds:        validatedBinds,
@@ -175,13 +203,7 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 			Memory:    memBytes,
 			NanoCPUs:  cpuNano,
 			PidsLimit: &pidsLimit,
-			Ulimits: []*container.Ulimit{
-				{
-					Name: "nofile",
-					Soft: 1024,
-					Hard: 2048,
-				},
-			},
+			Ulimits:   ulimits,
 		},
 		Tmpfs: map[string]string{
 			"/tmp": "rw,noexec,nosuid,size=64m",

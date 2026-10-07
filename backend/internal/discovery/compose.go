@@ -423,42 +423,77 @@ func inferFramework(name, image, classification string) string {
 	return "Docker Compose Service"
 }
 
-var portMappingRegex = regexp.MustCompile(`^(\d+):(\d+)`)
+func parseComposePortEntry(entry interface{}) (intPort int, hPort *int, ok bool) {
+	switch v := entry.(type) {
+	case int:
+		if v > 0 {
+			return v, nil, true
+		}
+	case string:
+		s := strings.TrimSpace(v)
+		if idx := strings.Index(s, "/"); idx != -1 {
+			s = s[:idx]
+		}
+		parts := strings.Split(s, ":")
+		switch len(parts) {
+		case 1:
+			if num, err := strconv.Atoi(parts[0]); err == nil && num > 0 {
+				return num, nil, true
+			}
+		case 2:
+			hp, err1 := strconv.Atoi(parts[0])
+			ip, err2 := strconv.Atoi(parts[1])
+			if err2 == nil && ip > 0 {
+				if err1 == nil && hp > 0 {
+					return ip, &hp, true
+				}
+				return ip, nil, true
+			}
+		case 3:
+			hp, err1 := strconv.Atoi(parts[1])
+			ip, err2 := strconv.Atoi(parts[2])
+			if err2 == nil && ip > 0 {
+				if err1 == nil && hp > 0 {
+					return ip, &hp, true
+				}
+				return ip, nil, true
+			}
+		}
+	case map[string]interface{}:
+		target, _ := v["target"].(int)
+		published, _ := v["published"].(int)
+		if target > 0 {
+			if published > 0 {
+				return target, &published, true
+			}
+			return target, nil, true
+		}
+	}
+	return 0, nil, false
+}
 
 func parsePorts(ports []interface{}, expose []interface{}, classification, role string) (internalPort int, hostPort *int, publicExposed bool) {
 	internalPort = 8080
 
 	for _, p := range ports {
-		switch v := p.(type) {
-		case string:
-			if match := portMappingRegex.FindStringSubmatch(strings.TrimSpace(v)); len(match) == 3 {
-				hp, _ := strconv.Atoi(match[1])
-				ip, _ := strconv.Atoi(match[2])
-				if ip > 0 {
-					internalPort = ip
-				}
-				if hp > 0 {
-					hostPort = &hp
-					publicExposed = true
-				}
-				return
+		if ip, hp, ok := parseComposePortEntry(p); ok {
+			if ip > 0 {
+				internalPort = ip
 			}
-			if num, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && num > 0 {
-				internalPort = num
+			if hp != nil && *hp > 0 {
+				hostPort = hp
+				publicExposed = true
 			}
-		case int:
-			internalPort = v
+			break
 		}
 	}
 
-	for _, e := range expose {
-		switch v := e.(type) {
-		case string:
-			if num, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && num > 0 {
-				internalPort = num
+	if internalPort == 8080 {
+		for _, e := range expose {
+			if ip, _, ok := parseComposePortEntry(e); ok && ip > 0 {
+				internalPort = ip
+				break
 			}
-		case int:
-			internalPort = v
 		}
 	}
 

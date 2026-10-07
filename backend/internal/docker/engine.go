@@ -382,7 +382,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		return fmt.Errorf("failed to get service %s: %w", serviceDeploy.ServiceID, err)
 	}
 
-	project, err := e.getProjectByID(ctx, service.ProjectID)
+	project, err := e.getProjectByID(execCtx, service.ProjectID)
 	if err != nil {
 		return fmt.Errorf("failed to get project %s: %w", service.ProjectID, err)
 	}
@@ -402,9 +402,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if len(serviceDeploy.EnvSnapshot) > 0 {
 			runtimeEnvMap, _, _ = e.secretService.GetEnvMapFromSnapshot(serviceDeploy.EnvSnapshot, models.EnvScopeRuntime)
 		} else {
-			runtimeEnvMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, &service.ID, models.EnvScopeRuntime)
+			runtimeEnvMap, _, _ = e.secretService.GetDecryptedEnvMap(execCtx, project.ID, &service.ID, models.EnvScopeRuntime)
 		}
-		normalArgs, secretVars, allSecrets, err := e.secretService.GetBuildVariables(ctx, project.ID, &service.ID, serviceDeploy.EnvSnapshot)
+		normalArgs, secretVars, allSecrets, err := e.secretService.GetBuildVariables(execCtx, project.ID, &service.ID, serviceDeploy.EnvSnapshot)
 		if err == nil {
 			normalBuildArgs = normalArgs
 			secretBuildVars = secretVars
@@ -560,7 +560,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 
 		if candidateImage != "" && e.dockerClient != nil {
-			if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, candidateImage); err == nil {
+			if inspect, _, err := e.dockerClient.ImageInspectWithRaw(execCtx, candidateImage); err == nil {
 				reusingExistingImage = true
 				runImage = candidateImage
 				idShort := inspect.ID
@@ -568,7 +568,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					idShort = idShort[:12]
 				}
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Execution path: reusing existing immutable image '%s' (image ID: %s). Skipping source cloning and image build.", candidateImage, idShort))
-				_ = e.dockerClient.ImageTag(ctx, candidateImage, svcTag)
+				_ = e.dockerClient.ImageTag(execCtx, candidateImage, svcTag)
 			} else {
 				// If explicitly in reuse_image mode (rollback), fail closed; do not silently rebuild from current source!
 				if serviceDeploy.ExecutionMode == models.ExecutionModeReuseImage {
@@ -612,14 +612,14 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Infrastructure / pre-built image '%s' detected for service '%s'. Pulling/verifying image...", targetImage, service.Name))
 		runImage = targetImage
 		if e.dockerClient != nil {
-			reader, pullErr := e.dockerClient.ImagePull(ctx, targetImage, dockerimage.PullOptions{})
+			reader, pullErr := e.dockerClient.ImagePull(execCtx, targetImage, dockerimage.PullOptions{})
 			if pullErr == nil && reader != nil {
 				_, _ = io.Copy(io.Discard, reader)
 				_ = reader.Close()
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' ready. Skipping source build.", targetImage))
 			} else {
 				// Image pull failed: check if image is available in local cache
-				_, _, inspectErr := e.dockerClient.ImageInspectWithRaw(ctx, targetImage)
+				_, _, inspectErr := e.dockerClient.ImageInspectWithRaw(execCtx, targetImage)
 				if inspectErr != nil {
 					reason := fmt.Sprintf("Infrastructure image '%s' could not be pulled and is not available in local cache: %v", targetImage, pullErr)
 					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
@@ -674,10 +674,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					if sharedPromise.imageTag != "" {
 						runImage = sharedPromise.imageTag
 						if e.dockerClient != nil {
-							_ = e.dockerClient.ImageTag(ctx, sharedPromise.imageTag, svcTag)
+							_ = e.dockerClient.ImageTag(execCtx, sharedPromise.imageTag, svcTag)
 							runImage = svcTag
 							if service.Image != "" {
-								_ = e.dockerClient.ImageTag(ctx, sharedPromise.imageTag, service.Image)
+								_ = e.dockerClient.ImageTag(execCtx, sharedPromise.imageTag, service.Image)
 							}
 						}
 						if sharedPromise.digest != "" && e.deploymentService != nil {
@@ -686,7 +686,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 						reusingExistingImage = true
 						emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Reusing shared build artifact '%s' (build context: '%s', dockerfile: '%s'). Skipping Docker build.", sharedPromise.imageTag, cleanCtx, cleanDF))
 					}
-				case <-ctx.Done():
+				case <-execCtx.Done():
 					reason := "Context cancelled while waiting for shared image build"
 					emitStatus(models.DeployStatusFailed, nil, &reason)
 					return errors.New(reason)
@@ -702,7 +702,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if serviceDeploy.SourceRevision != nil {
 			srcRev = *serviceDeploy.SourceRevision
 		}
-		buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, serviceDeploy.ID.String(), emitLog, srcRev)
+		buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(execCtx, project, serviceDeploy.ID.String(), emitLog, srcRev)
 		if cleanupDir != "" {
 			defer func() {
 				_ = os.RemoveAll(cleanupDir)
@@ -717,7 +717,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 		// 2. Building Docker Image
 		emitStatus(models.DeployStatusBuilding, nil, nil)
-		if err := e.verifyDockerDaemon(ctx); err != nil {
+		if err := e.verifyDockerDaemon(execCtx); err != nil {
 			reason := fmt.Sprintf("Docker daemon check failed before build: %v. Please ensure Docker Desktop is running.", err)
 			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 			emitStatus(models.DeployStatusFailed, nil, &reason)
@@ -739,7 +739,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			agentToken := ""
 			if e.sourceService != nil {
 				if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
-					tok, err := e.sourceService.GetDecryptedAgentToken(ctx, project.OwnerID, srcUUID)
+					tok, err := e.sourceService.GetDecryptedAgentToken(execCtx, project.OwnerID, srcUUID)
 					if err != nil {
 						reason := fmt.Sprintf("Local agent authorization failed: %v", err)
 						emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
@@ -763,7 +763,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				service.InternalPort,
 				url.QueryEscape(service.StartCommand),
 			)
-			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+			req, reqErr := http.NewRequestWithContext(execCtx, http.MethodGet, agentURL, nil)
 			if reqErr != nil {
 				reason := fmt.Sprintf("Failed to request agent stream context: %v", reqErr)
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
@@ -1033,9 +1033,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		for i, net := range serviceNetworks {
 			projNet := fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
 			if e.dockerClient != nil {
-				_, netErr := e.dockerClient.NetworkInspect(ctx, projNet, dockernetwork.InspectOptions{})
+				_, netErr := e.dockerClient.NetworkInspect(execCtx, projNet, dockernetwork.InspectOptions{})
 				if netErr != nil {
-					_, _ = e.dockerClient.NetworkCreate(ctx, projNet, dockernetwork.CreateOptions{
+					_, _ = e.dockerClient.NetworkCreate(execCtx, projNet, dockernetwork.CreateOptions{
 						Driver: "bridge",
 						Labels: map[string]string{
 							"forgelab.project_id": project.ID.String(),
@@ -1053,9 +1053,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	} else {
 		primaryNetworkName = fmt.Sprintf("forgelab-net-%s", project.ID.String())
 		if e.dockerClient != nil {
-			_, netErr := e.dockerClient.NetworkInspect(ctx, primaryNetworkName, dockernetwork.InspectOptions{})
+			_, netErr := e.dockerClient.NetworkInspect(execCtx, primaryNetworkName, dockernetwork.InspectOptions{})
 			if netErr != nil {
-				_, _ = e.dockerClient.NetworkCreate(ctx, primaryNetworkName, dockernetwork.CreateOptions{
+				_, _ = e.dockerClient.NetworkCreate(execCtx, primaryNetworkName, dockernetwork.CreateOptions{
 					Driver: "bridge",
 					Labels: map[string]string{
 						"forgelab.project_id": project.ID.String(),
@@ -1096,27 +1096,31 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	// Attach Compose healthcheck if configured
-	if serviceDeploy.HealthCheckConfig != nil && len(serviceDeploy.HealthCheckConfig.Test) > 0 {
-		if serviceDeploy.HealthCheckConfig.Strategy == models.HealthStrategyNone ||
-			(len(serviceDeploy.HealthCheckConfig.Test) == 1 && serviceDeploy.HealthCheckConfig.Test[0] == "NONE") {
+	hcConfig := serviceDeploy.HealthCheckConfig
+	if hcConfig == nil {
+		hcConfig = service.HealthCheckConfig
+	}
+	if hcConfig != nil && len(hcConfig.Test) > 0 {
+		if hcConfig.Strategy == models.HealthStrategyNone ||
+			(len(hcConfig.Test) == 1 && strings.EqualFold(hcConfig.Test[0], "none")) {
 			containerConfig.Healthcheck = &container.HealthConfig{
 				Test: []string{"NONE"},
 			}
 		} else {
 			containerConfig.Healthcheck = &container.HealthConfig{
-				Test: serviceDeploy.HealthCheckConfig.Test,
+				Test: hcConfig.Test,
 			}
-			if serviceDeploy.HealthCheckConfig.IntervalSeconds > 0 {
-				containerConfig.Healthcheck.Interval = time.Duration(serviceDeploy.HealthCheckConfig.IntervalSeconds) * time.Second
+			if hcConfig.IntervalSeconds > 0 {
+				containerConfig.Healthcheck.Interval = time.Duration(hcConfig.IntervalSeconds) * time.Second
 			}
-			if serviceDeploy.HealthCheckConfig.TimeoutSeconds > 0 {
-				containerConfig.Healthcheck.Timeout = time.Duration(serviceDeploy.HealthCheckConfig.TimeoutSeconds) * time.Second
+			if hcConfig.TimeoutSeconds > 0 {
+				containerConfig.Healthcheck.Timeout = time.Duration(hcConfig.TimeoutSeconds) * time.Second
 			}
-			if serviceDeploy.HealthCheckConfig.Retries > 0 {
-				containerConfig.Healthcheck.Retries = serviceDeploy.HealthCheckConfig.Retries
+			if hcConfig.Retries > 0 {
+				containerConfig.Healthcheck.Retries = hcConfig.Retries
 			}
-			if serviceDeploy.HealthCheckConfig.StartPeriodSeconds > 0 {
-				containerConfig.Healthcheck.StartPeriod = time.Duration(serviceDeploy.HealthCheckConfig.StartPeriodSeconds) * time.Second
+			if hcConfig.StartPeriodSeconds > 0 {
+				containerConfig.Healthcheck.StartPeriod = time.Duration(hcConfig.StartPeriodSeconds) * time.Second
 			}
 		}
 	}
@@ -1146,7 +1150,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if volType == models.VolumeTypeNamed || volType == "volume" {
 			volName := fmt.Sprintf("forgelab-vol-%s-%s", project.ID.String()[:8], v.Source)
 			if e.dockerClient != nil {
-				_, _ = e.dockerClient.VolumeCreate(ctx, dockervolume.CreateOptions{
+				_, _ = e.dockerClient.VolumeCreate(execCtx, dockervolume.CreateOptions{
 					Name: volName,
 					Labels: map[string]string{
 						"forgelab.project_id":  project.ID.String(),
@@ -1214,9 +1218,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		},
 	}
 
-	_ = e.dockerClient.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_ = e.dockerClient.ContainerRemove(cleanupCtx, containerName, container.RemoveOptions{Force: true})
+	cleanupCancel()
 
-	resp, err := e.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, netConfig, nil, containerName)
+	resp, err := e.dockerClient.ContainerCreate(execCtx, containerConfig, hostConfig, netConfig, nil, containerName)
 	if err != nil {
 		if hostPort != nil {
 			e.portManager.ReleasePort(*hostPort)
@@ -1230,15 +1236,17 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	// Connect to any secondary isolated project networks
 	for _, secNet := range secondaryNetworkNames {
 		if e.dockerClient != nil {
-			_ = e.dockerClient.NetworkConnect(ctx, secNet, resp.ID, &dockernetwork.EndpointSettings{
+			_ = e.dockerClient.NetworkConnect(execCtx, secNet, resp.ID, &dockernetwork.EndpointSettings{
 				Aliases: []string{service.Name},
 			})
 		}
 	}
 
 	containerID := resp.ID
-	if err := e.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+	if err := e.dockerClient.ContainerStart(execCtx, containerID, container.StartOptions{}); err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+		cleanupCancel()
 		if hostPort != nil {
 			e.portManager.ReleasePort(*hostPort)
 		}
@@ -1251,13 +1259,13 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started for service '%s'.", containerID[:12], service.Name))
 
 	// Start runtime log collector — continuously reads container stdout/stderr
-	e.startRuntimeLogCollector(ctx, containerID, serviceDeploy.ID, service.ID, project.ID, redactor, emitLog)
+	e.startRuntimeLogCollector(execCtx, containerID, serviceDeploy.ID, service.ID, project.ID, redactor, emitLog)
 
 	isJob := service.Classification == models.ClassificationJob || serviceDeploy.Classification == models.ClassificationJob
 	if isJob {
 		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Service '%s' is a one-shot job (classification: %s). Waiting for container execution to complete...", service.Name, service.Classification))
 		if e.dockerClient != nil {
-			statusCh, errCh := e.dockerClient.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+			statusCh, errCh := e.dockerClient.ContainerWait(execCtx, containerID, container.WaitConditionNotRunning)
 			select {
 			case err := <-errCh:
 				if err != nil {
@@ -1280,7 +1288,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					return errors.New(reason)
 				}
 				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Job container '%s' completed successfully with exit code 0.", service.Name))
-			case <-ctx.Done():
+			case <-execCtx.Done():
 				reason := fmt.Sprintf("Job execution timed out or was cancelled for service '%s'", service.Name)
 				emitStatus(models.DeployStatusFailed, nil, &reason)
 				return errors.New(reason)
@@ -1309,9 +1317,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	if healthStrat == "" {
 		healthStrat = serviceDeploy.HealthStrategy
 	}
-	if (serviceDeploy.HealthCheckConfig != nil && serviceDeploy.HealthCheckConfig.Strategy == models.HealthStrategyNone) ||
-		(service.HealthCheckConfig != nil && service.HealthCheckConfig.Strategy == models.HealthStrategyNone) {
-		healthStrat = models.HealthStrategyNone
+	if hcConfig != nil && hcConfig.Strategy != "" {
+		healthStrat = hcConfig.Strategy
 	} else if healthStrat == "" {
 		healthStrat = models.HealthStrategyAuto
 	}
@@ -1320,8 +1327,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		healthPath = *service.HealthCheckPath
 	}
 
-	svcHealthy, _ := e.verifyServiceHealth(
-		ctx,
+	svcHealthy, healthReason := e.verifyServiceHealth(
+		execCtx,
 		containerID,
 		intPort,
 		hostPort,
@@ -1329,36 +1336,43 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		healthPath,
 		func(msg string) { emitLog(models.LogPhaseHealth, models.LogStreamSystem, msg) },
 		func(msg string) { emitLog(models.LogPhaseHealth, models.LogStreamStderr, msg) },
+		hcConfig,
 	)
 
 	if !svcHealthy {
 		// Health check failed - ENFORCE SAFETY INVARIANT:
+		// Capture and log original health failure reason BEFORE stopping container / cleanup!
+		detailedReason := fmt.Sprintf("Health verification failed for service '%s': %s", service.Name, healthReason)
+		emitLog(models.LogPhaseHealth, models.LogStreamStderr, detailedReason)
+
 		// Destroy newly spawned broken container and preserve previously healthy container intact!
 		e.StopLogCollector(serviceDeploy.ID)
-		_ = e.dockerClient.ContainerStop(ctx, containerID, container.StopOptions{})
-		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
+		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+		cleanupCancel()
 		if hostPort != nil {
 			e.portManager.ReleasePort(*hostPort)
 		}
 
-		reason := fmt.Sprintf("Health check failed for service '%s' after retries", service.Name)
-		emitLog(models.LogPhaseHealth, models.LogStreamStderr, reason)
 		if hasPreviousHealthy {
 			emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("SAFETY INVARIANT ENFORCED: New deployment for '%s' failed health check. Previous healthy container remains active!", service.Name))
 		}
-		emitStatus(models.DeployStatusFailed, nil, &reason)
-		return errors.New(reason)
+		emitStatus(models.DeployStatusFailed, nil, &detailedReason)
+		return errors.New(detailedReason)
 	}
 
 	// 5. Promote service
-	err = e.serviceService.PromoteServiceDeployment(ctx, service.ID, serviceDeploy.ID, containerID, svcTag, hostPort)
+	err = e.serviceService.PromoteServiceDeployment(execCtx, service.ID, serviceDeploy.ID, containerID, svcTag, hostPort)
 	if err != nil {
 		// Promotion failed - ENFORCE SAFETY INVARIANT:
 		// The new container must not replace the previous current deployment,
 		// the new deployment must become failed, and the old container must remain intact.
 		e.StopLogCollector(serviceDeploy.ID)
-		_ = e.dockerClient.ContainerStop(ctx, containerID, container.StopOptions{})
-		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
+		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+		cleanupCancel()
 		if hostPort != nil {
 			e.portManager.ReleasePort(*hostPort)
 		}
@@ -1372,8 +1386,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		return fmt.Errorf("failed to promote service deployment: %w", err)
 	}
 
-	_ = e.deploymentService.UpdateServiceDeploymentContainer(ctx, serviceDeploy.ID, containerID, hostPort)
-	_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, models.DeployStatusRunning, nil)
+	_ = e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort)
+	_ = e.deploymentService.UpdateServiceDeploymentStatus(execCtx, serviceDeploy.ID, models.DeployStatusRunning, nil)
 	emitStatus(models.DeployStatusRunning, hostPort, nil)
 
 	// 6. Cleanup previous container for this service if different
@@ -1382,13 +1396,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if previousDeploymentID != nil {
 			e.StopLogCollector(*previousDeploymentID)
 		}
-		_ = e.dockerClient.ContainerStop(ctx, *previousContainerID, container.StopOptions{})
-		_ = e.dockerClient.ContainerRemove(ctx, *previousContainerID, container.RemoveOptions{Force: true})
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = e.dockerClient.ContainerStop(cleanupCtx, *previousContainerID, container.StopOptions{})
+		_ = e.dockerClient.ContainerRemove(cleanupCtx, *previousContainerID, container.RemoveOptions{Force: true})
+		cleanupCancel()
 	}
 
 	// Update project port if this service is public or frontend
 	if hostPort != nil && (service.Role == models.RoleFrontend || service.PublicExposed) {
-		_, _ = e.projectService.UpdateProjectPort(ctx, project.ID, *hostPort)
+		_, _ = e.projectService.UpdateProjectPort(execCtx, project.ID, *hostPort)
 	}
 
 	emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Service '%s' deployment #%d is now RUNNING and live!", service.Name, serviceDeploy.DeployNumber))
@@ -1526,6 +1542,13 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	serviceHealthy := make(map[string]bool)
 
 	for tierIdx, tier := range tiers {
+		if execCtx.Err() != nil {
+			mu.Lock()
+			allHealthy = false
+			errList = append(errList, fmt.Sprintf("Deployment cancelled: %v", execCtx.Err()))
+			mu.Unlock()
+			break
+		}
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Executing Tier %d (%d service(s))...", tierIdx+1, len(tier)))
 		var tierWg sync.WaitGroup
 		for _, sd := range tier {
@@ -1586,7 +1609,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 				defer tierWg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				if execErr := e.ExecuteServiceDeployment(ctx, sdItem.ID); execErr != nil {
+				if execErr := e.ExecuteServiceDeployment(execCtx, sdItem.ID); execErr != nil {
 					mu.Lock()
 					allHealthy = false
 					failedServices[sdItem.ServiceName] = true
@@ -2047,7 +2070,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		healthStrat = project.HealthStrategy
 	}
 
-	healthy, _ := e.verifyServiceHealth(
+	healthy, healthReason := e.verifyServiceHealth(
 		ctx,
 		containerID,
 		intPort,
@@ -2059,14 +2082,16 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	)
 
 	if !healthy {
-		_ = e.dockerClient.ContainerStop(ctx, containerID, container.StopOptions{})
-		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+		detailedReason := fmt.Sprintf("Health verification failed: %s", healthReason)
+		emitLog(models.LogPhaseHealth, models.LogStreamStderr, detailedReason)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
+		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+		cleanupCancel()
 		e.portManager.ReleasePort(allocatedPort)
-		reason := "Health check failed after 10 retries"
-		emitLog(models.LogPhaseHealth, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
+		updateStatus(models.DeployStatusFailed, &detailedReason)
 		emitLog(models.LogPhaseHealth, models.LogStreamSystem, "SAFETY INVARIANT ENFORCED: New deployment failed health check. Previous healthy release remains active!")
-		return errors.New(reason)
+		return errors.New(detailedReason)
 	}
 
 	updateStatus(models.DeployStatusRunning, nil)
@@ -2747,6 +2772,79 @@ func resolveAgentBaseURL() string {
 	return agent.ResolveBaseURL()
 }
 
+// fetchRecentContainerLogs retrieves the most recent stdout/stderr lines from a container for health diagnostics.
+func (e *Engine) fetchRecentContainerLogs(ctx context.Context, containerID string, tailLines int) string {
+	if e.dockerClient == nil {
+		return ""
+	}
+	logCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	reader, err := e.dockerClient.ContainerLogs(logCtx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       fmt.Sprintf("%d", tailLines),
+	})
+	if err != nil {
+		return ""
+	}
+	defer reader.Close()
+
+	var lines []string
+	_ = DemuxDockerStream(logCtx, reader, func(stream string, line string) {
+		clean := strings.TrimSpace(line)
+		if clean != "" {
+			lines = append(lines, fmt.Sprintf("[%s] %s", stream, clean))
+		}
+	})
+	if len(lines) == 0 {
+		return ""
+	}
+	if len(lines) > tailLines {
+		lines = lines[len(lines)-tailLines:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// buildContainerExitDiagnostics collects rich diagnostic state from an exited container.
+func (e *Engine) buildContainerExitDiagnostics(ctx context.Context, containerID string, state *types.ContainerState) string {
+	if state == nil {
+		return "state=unknown"
+	}
+	var parts []string
+	parts = append(parts, fmt.Sprintf("exit_code=%d", state.ExitCode))
+	parts = append(parts, fmt.Sprintf("status=%s", state.Status))
+	parts = append(parts, fmt.Sprintf("oom_killed=%t", state.OOMKilled))
+	if state.Error != "" {
+		parts = append(parts, fmt.Sprintf("error=%q", state.Error))
+	}
+	if state.FinishedAt != "" {
+		parts = append(parts, fmt.Sprintf("finished_at=%s", state.FinishedAt))
+	}
+	if state.Health != nil {
+		parts = append(parts, fmt.Sprintf("health_status=%s", state.Health.Status))
+		if len(state.Health.Log) > 0 {
+			var logSnippets []string
+			startIdx := 0
+			if len(state.Health.Log) > 3 {
+				startIdx = len(state.Health.Log) - 3
+			}
+			for _, entry := range state.Health.Log[startIdx:] {
+				cleanOut := strings.TrimSpace(entry.Output)
+				if len(cleanOut) > 120 {
+					cleanOut = cleanOut[:120] + "..."
+				}
+				logSnippets = append(logSnippets, fmt.Sprintf("[exit=%d] %s", entry.ExitCode, cleanOut))
+			}
+			parts = append(parts, fmt.Sprintf("recent_health_logs=[%s]", strings.Join(logSnippets, "; ")))
+		}
+	}
+	recentLogs := e.fetchRecentContainerLogs(ctx, containerID, 15)
+	if recentLogs != "" {
+		parts = append(parts, fmt.Sprintf("recent_logs=\n%s", recentLogs))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // verifyServiceHealth performs health verification through the correct container/network path
 // working seamlessly whether ForgeLAB runs directly on the host or inside Docker Compose.
 func (e *Engine) verifyServiceHealth(
@@ -2758,11 +2856,15 @@ func (e *Engine) verifyServiceHealth(
 	healthPath string,
 	logFn func(msg string),
 	errLogFn func(msg string),
+	hcConfigs ...*models.HealthCheckConfig,
 ) (bool, string) {
 	if healthStrategy == models.HealthStrategyNone {
 		cJSON, err := e.dockerClient.ContainerInspect(ctx, containerID)
 		if err == nil && cJSON.State != nil && cJSON.State.Running {
 			return true, "container verified running"
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return false, "health check cancelled"
 		}
 		return false, "container is not running"
 	}
@@ -2771,58 +2873,164 @@ func (e *Engine) verifyServiceHealth(
 		healthPath = "/"
 	}
 
+	var hcConfig *models.HealthCheckConfig
+	if len(hcConfigs) > 0 && hcConfigs[0] != nil {
+		hcConfig = hcConfigs[0]
+	}
+
+	// Calculate overall health check budget respecting Compose timing
+	expectedBudget := 60 * time.Second
+	pollInterval := 1500 * time.Millisecond
+
+	if hcConfig != nil {
+		startPeriod := time.Duration(hcConfig.StartPeriodSeconds) * time.Second
+		interval := time.Duration(hcConfig.IntervalSeconds) * time.Second
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		timeout := time.Duration(hcConfig.TimeoutSeconds) * time.Second
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		retries := hcConfig.Retries
+		if retries <= 0 {
+			retries = 3
+		}
+		calcBudget := startPeriod + time.Duration(retries)*(interval+timeout) + 15*time.Second
+		if calcBudget > expectedBudget {
+			expectedBudget = calcBudget
+		}
+		if interval < pollInterval {
+			pollInterval = interval
+		}
+	}
+
 	httpClient := &http.Client{Timeout: 2 * time.Second}
 
-	// Bounded 60-second startup/health-check timeout limit
-	checkCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
+	startTime := time.Now()
 
-	for attempt := 1; attempt <= 15; attempt++ {
-		select {
-		case <-checkCtx.Done():
-			return false, "health check timed out after 60s"
-		case <-time.After(2 * time.Second):
+	for attempt := 1; ; attempt++ {
+		// 1. Check context cancellation / timeout
+		if errors.Is(ctx.Err(), context.Canceled) {
+			errLogFn("Health check cancelled: deployment context cancelled")
+			return false, "health check cancelled"
+		}
+		if time.Since(startTime) >= expectedBudget {
+			errLogFn(fmt.Sprintf("Health check timed out after %v", expectedBudget))
+			return false, fmt.Sprintf("health check timed out after %v", expectedBudget)
 		}
 
-		cJSON, err := e.dockerClient.ContainerInspect(checkCtx, containerID)
-		if err != nil || (cJSON.State != nil && !cJSON.State.Running) {
-			errLogFn("Container exited unexpectedly during health check")
-			return false, "container exited unexpectedly"
-		}
-
-		// Check Docker native HEALTHCHECK if configured
-		if cJSON.State != nil && cJSON.State.Health != nil {
-			if cJSON.State.Health.Status == "healthy" {
-				logFn(fmt.Sprintf("Docker native health check reported healthy on attempt %d.", attempt))
-				return true, "healthy"
+		// 2. Inspect container with bounded timeout
+		inspectCtx, inspectCancel := context.WithTimeout(ctx, 5*time.Second)
+		cJSON, err := e.dockerClient.ContainerInspect(inspectCtx, containerID)
+		inspectCancel()
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+				errLogFn("Health check cancelled: deployment context cancelled")
+				return false, "health check cancelled"
 			}
-			if cJSON.State.Health.Status == "unhealthy" {
-				diag := ""
-				if len(cJSON.State.Health.Log) > 0 {
-					lastEntry := cJSON.State.Health.Log[len(cJSON.State.Health.Log)-1]
-					diag = strings.TrimSpace(lastEntry.Output)
+			if time.Since(startTime) >= expectedBudget {
+				errLogFn(fmt.Sprintf("Health check timed out after %v", expectedBudget))
+				return false, fmt.Sprintf("health check timed out after %v", expectedBudget)
+			}
+			// Temporary Docker API / inspect error: do NOT report as container exit!
+			logFn(fmt.Sprintf("Docker inspect attempt %d returned temporary error (will retry): %v", attempt, err))
+			select {
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.Canceled) {
+					errLogFn("Health check cancelled: deployment context cancelled")
+					return false, "health check cancelled"
 				}
-				msg := fmt.Sprintf("Docker native health check reported unhealthy on attempt %d", attempt)
-				if diag != "" {
-					msg = fmt.Sprintf("%s: %s", msg, diag)
+				return false, "health check cancelled"
+			case <-time.After(pollInterval):
+				continue
+			}
+		}
+
+		// 3. Check if container actually exited
+		if cJSON.State == nil || !cJSON.State.Running {
+			diag := e.buildContainerExitDiagnostics(ctx, containerID, cJSON.State)
+			errLogFn(fmt.Sprintf("Container exited unexpectedly during health check: %s", diag))
+			return false, fmt.Sprintf("container exited unexpectedly: %s", diag)
+		}
+
+		// Dynamically discover Docker native HealthConfig from cJSON if hcConfig was not supplied
+		if hcConfig == nil && cJSON.Config != nil && cJSON.Config.Healthcheck != nil {
+			ch := cJSON.Config.Healthcheck
+			retries := ch.Retries
+			if retries <= 0 {
+				retries = 3
+			}
+			interval := ch.Interval
+			if interval <= 0 {
+				interval = 5 * time.Second
+			}
+			timeout := ch.Timeout
+			if timeout <= 0 {
+				timeout = 5 * time.Second
+			}
+			calcBudget := ch.StartPeriod + time.Duration(retries)*(interval+timeout) + 15*time.Second
+			if calcBudget > expectedBudget {
+				expectedBudget = calcBudget
+			}
+		}
+
+		// 4. Check Docker-native health check
+		hasNativeHealth := (cJSON.State.Health != nil) || (healthStrategy == models.HealthStrategyDocker)
+		if hasNativeHealth {
+			if cJSON.State.Health != nil {
+				status := cJSON.State.Health.Status
+				if status == "healthy" {
+					logFn(fmt.Sprintf("Docker native health check reported healthy on attempt %d.", attempt))
+					return true, "healthy"
 				}
-				errLogFn(msg)
-				return false, fmt.Sprintf("docker native health check reported unhealthy%s", func() string {
-					if diag != "" {
-						return ": " + diag
+				if status == "unhealthy" {
+					diag := ""
+					if len(cJSON.State.Health.Log) > 0 {
+						lastEntry := cJSON.State.Health.Log[len(cJSON.State.Health.Log)-1]
+						diag = strings.TrimSpace(lastEntry.Output)
 					}
-					return ""
-				}())
+					recentLogs := e.fetchRecentContainerLogs(ctx, containerID, 10)
+					msg := fmt.Sprintf("Health verification failed: docker health status=unhealthy (attempt %d)", attempt)
+					if diag != "" {
+						msg = fmt.Sprintf("%s: %s", msg, diag)
+					}
+					if recentLogs != "" {
+						msg = fmt.Sprintf("%s\nRecent container logs:\n%s", msg, recentLogs)
+					}
+					errLogFn(msg)
+					return false, msg
+				}
+				// status == "starting" (or initializing): KEEP WAITING
+				if attempt == 1 || attempt%5 == 0 {
+					logFn(fmt.Sprintf("Docker native health check status is '%s' for %s (attempt %d)... waiting", status, containerID[:12], attempt))
+				}
+			} else {
+				if attempt == 1 || attempt%5 == 0 {
+					logFn(fmt.Sprintf("Waiting for Docker native health check monitor to initialize for %s (attempt %d)...", containerID[:12], attempt))
+				}
+			}
+
+			// For Docker-native health check services, DO NOT fall through to TCP/HTTP!
+			select {
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.Canceled) {
+					errLogFn("Health check cancelled: deployment context cancelled")
+					return false, "health check cancelled"
+				}
+				return false, "health check cancelled"
+			case <-time.After(pollInterval):
+				if time.Since(startTime) >= expectedBudget {
+					msg := fmt.Sprintf("Health verification failed: docker health check timed out after %v while waiting to become healthy", expectedBudget)
+					errLogFn(msg)
+					return false, msg
+				}
+				continue
 			}
 		}
 
-		// Discover reachable network targets in order of priority:
-		// 1. Container internal network IP (works when ForgeLAB is inside Docker or on Linux bridge)
-		// 2. Host port on 127.0.0.1 / localhost (works when ForgeLAB runs on host)
-		// 3. host.docker.internal / Docker gateway (works when ForgeLAB is in Docker Compose accessing published host port)
+		// 5. Fallback TCP / HTTP verification for services WITHOUT a Docker-native health check
 		var targets []string
-
-		// 1. Container IP on attached networks
 		if cJSON.NetworkSettings != nil {
 			for _, netSettings := range cJSON.NetworkSettings.Networks {
 				if netSettings != nil && netSettings.IPAddress != "" && internalPort > 0 {
@@ -2834,12 +3042,9 @@ func (e *Engine) verifyServiceHealth(
 			}
 		}
 
-		// 2. Host Port on host loopback
 		if hostPort != nil && *hostPort > 0 {
 			targets = append(targets, fmt.Sprintf("127.0.0.1:%d", *hostPort))
 			targets = append(targets, fmt.Sprintf("localhost:%d", *hostPort))
-
-			// 3. Host Port on Docker host/gateway
 			if os.Getenv("FORGELAB_IN_DOCKER") != "" || os.Getenv("DOCKER_CONTAINER") != "" {
 				targets = append(targets, fmt.Sprintf("host.docker.internal:%d", *hostPort))
 				if cJSON.NetworkSettings != nil && cJSON.NetworkSettings.Gateway != "" {
@@ -2848,24 +3053,28 @@ func (e *Engine) verifyServiceHealth(
 			}
 		}
 
-		// Try HTTP / TCP verification on discovered targets
 		for _, target := range targets {
 			if healthStrategy != models.HealthStrategyTCP {
 				reqURL := fmt.Sprintf("http://%s%s", target, healthPath)
-				req, reqErr := http.NewRequestWithContext(checkCtx, http.MethodGet, reqURL, nil)
+				reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
+				req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
 				if reqErr == nil {
 					res, doErr := httpClient.Do(req)
 					if doErr == nil {
 						res.Body.Close()
+						reqCancel()
 						if res.StatusCode < 500 {
 							logFn(fmt.Sprintf("Health check passed via %s (HTTP %d) on attempt %d.", target, res.StatusCode, attempt))
 							return true, "healthy"
 						}
+					} else {
+						reqCancel()
 					}
+				} else {
+					reqCancel()
 				}
 			}
 
-			// TCP check
 			conn, tcpErr := net.DialTimeout("tcp", target, 1*time.Second)
 			if tcpErr == nil {
 				conn.Close()
@@ -2874,16 +3083,28 @@ func (e *Engine) verifyServiceHealth(
 			}
 		}
 
-		// For internal services without public port, only accept running stably if container does NOT have Docker native health check configured
-		if hostPort == nil && attempt >= 4 && cJSON.State != nil && cJSON.State.Running {
-			if cJSON.State.Health == nil {
-				logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
-				return true, "healthy"
+		// Internal service without public port and NO native health check
+		if hostPort == nil && attempt >= 4 && cJSON.State.Running && cJSON.State.Health == nil {
+			logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
+			return true, "healthy"
+		}
+
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				errLogFn("Health check cancelled: deployment context cancelled")
+				return false, "health check cancelled"
 			}
+			errLogFn(fmt.Sprintf("Health verification timed out after %v", expectedBudget))
+			return false, fmt.Sprintf("health check timed out after %v", expectedBudget)
+		case <-time.After(pollInterval):
+			if time.Since(startTime) >= expectedBudget {
+				errLogFn(fmt.Sprintf("Health verification timed out after %v", expectedBudget))
+				return false, fmt.Sprintf("health check timed out after %v", expectedBudget)
+			}
+			continue
 		}
 	}
-
-	return false, "health check failed after all attempts"
 }
 
 // buildServiceDeploymentTiers partitions service deployments into dependency execution tiers (DAG)
