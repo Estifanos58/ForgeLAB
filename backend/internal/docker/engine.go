@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"unicode"
@@ -67,6 +68,7 @@ type Engine struct {
 	activeLogCollectors sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
 	activeCancels       sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
 	sharedBuildArtifacts sync.Map    // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
+	cachedBuilderVer     atomic.Value // stores types.BuilderVersion advertised by Docker daemon
 }
 
 func NewEngine(
@@ -723,6 +725,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			emitStatus(models.DeployStatusFailed, nil, &reason)
 			return errors.New(reason)
 		}
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker daemon available")
+		if bv, ok := e.getCachedBuilderVersion(); ok && bv == types.BuilderBuildKit {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 2 / BuildKit")
+		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv == types.BuilderV1 {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 1 / legacy")
+		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv != "" {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Builder version: %s", bv))
+		} else {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 1 / legacy")
+		}
 		relDockerPath := "Dockerfile"
 		var tarArchive io.ReadCloser
 
@@ -922,7 +934,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			}
 			reason := err.Error()
 			cat := ClassifyDockerBuildError(err)
-			if cat == CategoryStorageDaemon || cat == CategoryDaemonUnreachable {
+			if cat == CategoryStorageDaemon || cat == CategoryDaemonUnreachable || cat == CategoryBuildKitRequired {
 				diag := e.formatDockerDiagnostic(ctx, err, cat)
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, diag)
 			} else {
@@ -1780,6 +1792,16 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			updateStatus(models.DeployStatusFailed, &reason)
 			return errors.New(reason)
 		}
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker daemon available")
+		if bv, ok := e.getCachedBuilderVersion(); ok && bv == types.BuilderBuildKit {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 2 / BuildKit")
+		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv == types.BuilderV1 {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 1 / legacy")
+		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv != "" {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Builder version: %s", bv))
+		} else {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 1 / legacy")
+		}
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Preparing build for image '%s'...", *deployment.ImageTag))
 
 		buildStrategy := deployment.BuildStrategy
@@ -1945,7 +1967,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		}); err != nil {
 			reason := err.Error()
 			cat := ClassifyDockerBuildError(err)
-			if cat == CategoryStorageDaemon || cat == CategoryDaemonUnreachable {
+			if cat == CategoryStorageDaemon || cat == CategoryDaemonUnreachable || cat == CategoryBuildKitRequired {
 				diag := e.formatDockerDiagnostic(ctx, err, cat)
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, diag)
 			} else {
@@ -2624,8 +2646,12 @@ func (e *Engine) verifyDockerDaemon(ctx context.Context) error {
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	_, err := e.dockerClient.Ping(pingCtx)
-	return err
+	ping, err := e.dockerClient.Ping(pingCtx)
+	if err != nil {
+		return err
+	}
+	e.setCachedBuilderVersion(ping.BuilderVersion)
+	return nil
 }
 
 func (e *Engine) buildImage(
@@ -2634,8 +2660,11 @@ func (e *Engine) buildImage(
 	options types.ImageBuildOptions,
 	onLogLine func(string),
 ) error {
-	if tarArchive != nil {
-		defer tarArchive.Close()
+	var currentArchive io.ReadCloser = tarArchive
+	if currentArchive != nil {
+		defer func() {
+			_ = currentArchive.Close()
+		}()
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -2657,15 +2686,34 @@ func (e *Engine) buildImage(
 	}
 	defer releaseSlot()
 
-	slog.Info("docker image build started", "tags", options.Tags)
+	// 3. Inspect Dockerfile and resolve builder capability
+	var dfContent []byte
+	var buildReader io.Reader = currentArchive
+	if currentArchive != nil {
+		buf := &bytes.Buffer{}
+		if _, err := io.Copy(buf, currentArchive); err != nil {
+			return fmt.Errorf("failed to read build context archive: %w", err)
+		}
+		rawBytes := buf.Bytes()
+		buildReader = bytes.NewReader(rawBytes)
+		dfContent, _ = extractDockerfileFromTar(bytes.NewReader(rawBytes), options.Dockerfile)
+	}
+
+	requiresBuildKit, _ := DetectDockerfileRequiresBuildKit(dfContent)
+	_, hasCachedVer := e.getCachedBuilderVersion()
+
+	if requiresBuildKit || hasCachedVer || options.Version != "" || (len(dfContent) > 0 && e.dockerClient != nil) {
+		resolvedOptions, builderErr := e.resolveBuilder(ctx, dfContent, options, nil)
+		if builderErr != nil {
+			return builderErr
+		}
+		options = resolvedOptions
+	}
+
+	slog.Info("docker image build started", "tags", options.Tags, "builder_version", options.Version)
 
 	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer buildCancel()
-
-	var buildReader io.Reader = tarArchive
-	if tarArchive != nil {
-		buildReader = io.NopCloser(tarArchive)
-	}
 
 	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, buildReader, options)
 	if err != nil {

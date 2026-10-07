@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	dockernetwork "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -22,7 +24,7 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 		t.Skip("Skipping live Docker deployment test")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -179,6 +181,42 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	// -------------------------------------------------------------------------
 	// TIER 2: migrate
 	// -------------------------------------------------------------------------
+	t.Log("--- Tier 2: Building backend image for migrate via BuildKit ---")
+	backendDir := ""
+	for _, candidate := range []string{".", "..", filepath.Join("..", ".."), filepath.Join("..", "backend"), "backend"} {
+		if fi, err := os.Stat(filepath.Join(candidate, "Dockerfile")); err == nil && !fi.IsDir() {
+			backendDir, _ = filepath.Abs(candidate)
+			break
+		}
+	}
+	require.NotEmpty(t, backendDir, "must locate backend directory containing Dockerfile")
+	t.Logf("Using backend directory: %s", backendDir)
+
+	matcher, err := LoadDockerignore(backendDir)
+	if err != nil || matcher == nil {
+		matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
+	}
+
+	tarArchive := StreamBuildContext(ctx, TarStreamerOptions{
+		BuildContextDir: backendDir,
+		Matcher:         matcher,
+		EmitLog: func(phase, stream, msg string) {
+			t.Logf("[%s] %s", stream, msg)
+		},
+	})
+
+	buildOpts := types.ImageBuildOptions{
+		Tags:       []string{"forgelab-backend:latest"},
+		Dockerfile: "Dockerfile",
+		Remove:     true,
+	}
+
+	buildErr := eng.buildImage(ctx, tarArchive, buildOpts, func(msg string) {
+		t.Logf("[build] %s", msg)
+	})
+	require.NoError(t, buildErr, "backend image build with BuildKit must succeed")
+	t.Log("migrate -> BuildKit Docker build succeeds")
+
 	t.Log("--- Tier 2: Running migrate job ---")
 	migHostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{})
 	require.NoError(t, err)

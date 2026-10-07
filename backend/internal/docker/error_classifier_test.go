@@ -46,6 +46,16 @@ func TestClassifyDockerBuildError(t *testing.T) {
 			expected: CategoryContextCancelled,
 		},
 		{
+			name:     "buildkit mount required error",
+			err:      errors.New("Docker build error: the --mount option requires BuildKit"),
+			expected: CategoryBuildKitRequired,
+		},
+		{
+			name:     "generic buildkit required error",
+			err:      errors.New("syntax error: feature requires buildkit"),
+			expected: CategoryBuildKitRequired,
+		},
+		{
 			name:     "application compilation error",
 			err:      errors.New("The command '/bin/sh -c npm run build' returned a non-zero code: 1"),
 			expected: CategoryGeneric,

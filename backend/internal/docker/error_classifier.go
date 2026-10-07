@@ -19,6 +19,8 @@ const (
 	CategoryContextCancelled DockerErrorCategory = "context_cancelled"
 	// CategoryApplicationBuild represents application build failures (e.g. exit code non-zero in RUN steps).
 	CategoryApplicationBuild DockerErrorCategory = "application_build"
+	// CategoryBuildKitRequired represents errors caused by Dockerfiles requiring BuildKit on legacy daemons.
+	CategoryBuildKitRequired DockerErrorCategory = "buildkit_required"
 	// CategoryGeneric represents unclassified Docker errors.
 	CategoryGeneric DockerErrorCategory = "generic"
 )
@@ -29,6 +31,13 @@ func ClassifyDockerBuildError(err error) DockerErrorCategory {
 		return ""
 	}
 	msg := strings.ToLower(err.Error())
+
+	// BuildKit required failures
+	if strings.Contains(msg, "the --mount option requires buildkit") ||
+		strings.Contains(msg, "requires buildkit") ||
+		strings.Contains(msg, "buildkit is required") {
+		return CategoryBuildKitRequired
+	}
 
 	// Storage layer / containerd / layer export failures
 	if strings.Contains(msg, "failed to export layer") ||
@@ -67,6 +76,9 @@ func (e *Engine) formatDockerDiagnostic(ctx context.Context, origErr error, cat 
 	var sb strings.Builder
 
 	switch cat {
+	case CategoryBuildKitRequired:
+		sb.WriteString("BuildKit is required by Dockerfile features (e.g. RUN --mount=...), but the Docker daemon did not execute the build with BuildKit.\n")
+		sb.WriteString("Ensure Docker BuildKit is enabled on the Docker daemon.\n\n")
 	case CategoryStorageDaemon:
 		sb.WriteString("Docker daemon failed while exporting the image layer.\n")
 		sb.WriteString("This appears to be a Docker/containerd storage failure rather than an application build error.\n")
