@@ -56,6 +56,7 @@ type ContainerSecurityOptions struct {
 	Binds                []string
 	NetworkMode          string
 	AllowedMountPrefixes []string
+	CapAdd               []string
 }
 
 // ValidateAndBuildSecureHostConfig creates a centralized, strictly validated Docker HostConfig
@@ -135,12 +136,38 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 	pidsLimit := int64(pidsLimitVal)
 
 	// 4. Construct secure HostConfig with defense-in-depth isolation
+	// Standard safe capabilities required by unprivileged container switch tools (e.g. gosu, su-exec, setpriv)
+	// used by official daemon images like postgres:16-alpine and redis:7-alpine to drop root privileges safely.
+	safeCaps := []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
+	if len(opts.CapAdd) > 0 {
+		dangerousCaps := map[string]bool{
+			"SYS_ADMIN": true, "NET_ADMIN": true, "SYS_PTRACE": true,
+			"SYS_RAWIO": true, "SYS_MODULE": true, "DAC_READ_SEARCH": true,
+		}
+		for _, c := range opts.CapAdd {
+			upper := strings.ToUpper(strings.TrimSpace(c))
+			if upper != "" && !dangerousCaps[upper] {
+				found := false
+				for _, sc := range safeCaps {
+					if sc == upper {
+						found = true
+						break
+					}
+				}
+				if !found {
+					safeCaps = append(safeCaps, upper)
+				}
+			}
+		}
+	}
+
 	hostConfig := &container.HostConfig{
 		PortBindings: opts.PortBindings,
 		Binds:        validatedBinds,
 		Privileged:   false, // NEVER privileged
 		SecurityOpt:  []string{"no-new-privileges:true"},
 		CapDrop:      []string{"ALL"},
+		CapAdd:       safeCaps,
 		RestartPolicy: container.RestartPolicy{
 			Name: "unless-stopped",
 		},

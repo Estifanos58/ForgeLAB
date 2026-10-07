@@ -2202,6 +2202,7 @@ func (s *DeploymentService) ReconcileQueuedDeployments(ctx context.Context, q De
 		`SELECT id, service_id, created_at
 		 FROM service_deployments
 		 WHERE status = $1
+		   AND deployment_id IS NULL
 		   AND created_at < NOW() - $2::interval
 		 ORDER BY created_at ASC`,
 		models.DeployStatusQueued, minAge.String(),
@@ -2276,6 +2277,7 @@ func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Co
 		`SELECT id, service_id, status, created_at, started_at
 		 FROM service_deployments
 		 WHERE status IN ($1, $2, $3, $4)
+		   AND deployment_id IS NULL
 		   AND COALESCE(started_at, created_at) < NOW() - $5::interval
 		 ORDER BY created_at ASC`,
 		models.DeployStatusCloning, models.DeployStatusBuilding,
@@ -2363,6 +2365,7 @@ func (s *DeploymentService) ReconcileOrphanedDeployments(ctx context.Context, st
 		 finished_at = NOW(),
 		 duration_ms = EXTRACT(EPOCH FROM (NOW() - COALESCE(started_at, created_at))) * 1000
 		 WHERE status IN ($3, $4, $5, $6, $7)
+		   AND deployment_id IS NULL
 		   AND created_at < NOW() - $8::interval`,
 		models.DeployStatusFailed, reason,
 		models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,

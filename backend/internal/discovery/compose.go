@@ -71,6 +71,26 @@ type RawComposeHealthCheck struct {
 	Disable     bool        `yaml:"disable"`
 }
 
+var composeEnvRegex = regexp.MustCompile(`\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::-([^}]*))?\}`)
+
+func expandComposeEnv(content string) string {
+	return composeEnvRegex.ReplaceAllStringFunc(content, func(match string) string {
+		sub := composeEnvRegex.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		varName := sub[1]
+		defaultVal := ""
+		if len(sub) >= 3 {
+			defaultVal = sub[2]
+		}
+		if val, ok := os.LookupEnv(varName); ok && val != "" {
+			return val
+		}
+		return defaultVal
+	})
+}
+
 // ParseComposeFile parses a compose file into DiscoveredServices and DiscoveredTopology
 func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []DiscoveredService, error) {
 	data, err := os.ReadFile(filePath)
@@ -78,8 +98,10 @@ func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []Discove
 		return nil, nil, fmt.Errorf("failed to read compose file: %w", err)
 	}
 
+	expandedData := expandComposeEnv(string(data))
+
 	var raw RawComposeData
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := yaml.Unmarshal([]byte(expandedData), &raw); err != nil {
 		return nil, nil, fmt.Errorf("failed to parse compose YAML: %w", err)
 	}
 
@@ -134,6 +156,44 @@ func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []Discove
 		rawSvc := raw.Services[name]
 		svc := parseComposeService(name, rawSvc, repoRoot, composeDir, declaredVolMap)
 		services = append(services, svc)
+	}
+
+	// Link services that share an image with another service that defines a build context/Dockerfile.
+	// For example: migrate defines image: forgelab-backend:latest without build:,
+	// while backend defines image: forgelab-backend:latest with build: context: ./backend, dockerfile: Dockerfile.
+	// Migrate must share the build context and artifact as backend instead of assuming the image exists in an external registry.
+	imageBuildMap := make(map[string]DiscoveredService)
+	for _, s := range services {
+		if s.Image != "" && (s.BuildStrategy == models.BuildStrategyDockerfile || s.DockerfilePath != "") {
+			imageBuildMap[s.Image] = s
+		}
+	}
+
+	for i := range services {
+		s := &services[i]
+		if s.Image != "" && (s.BuildStrategy == "image" || s.BuildStrategy == models.BuildStrategyImage) {
+			if buildSvc, ok := imageBuildMap[s.Image]; ok {
+				s.BuildStrategy = models.BuildStrategyDockerfile
+				s.BuildContext = buildSvc.BuildContext
+				s.DockerfilePath = buildSvc.DockerfilePath
+				s.SourcePath = buildSvc.SourcePath
+
+				// Update candidates
+				s.BuildCandidates = []models.BuildCandidate{
+					{
+						ID:              "dockerfile",
+						Strategy:        models.BuildStrategyDockerfile,
+						Name:            fmt.Sprintf("Shared Build Artifact: %s", s.Image),
+						Description:     fmt.Sprintf("Build using %s in %s (shared with %s)", s.DockerfilePath, s.BuildContext, buildSvc.Name),
+						Confidence:      0.95,
+						DockerfilePath:  s.DockerfilePath,
+						SuggestedPort:   s.InternalPort,
+						HealthStrategy:  s.HealthStrategy,
+						HealthCheckPath: s.HealthCheckPath,
+					},
+				}
+			}
+		}
 	}
 
 	topology := &DiscoveredTopology{

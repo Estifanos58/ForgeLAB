@@ -2,8 +2,11 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -409,14 +412,15 @@ func TestDAGExecution_TiersAndConditions(t *testing.T) {
 
 // 8. Verify deployment path with ForgeLAB's own Compose project
 func TestForgeLAB_OwnComposePipeline(t *testing.T) {
-	// Root of repo is two directories up from backend/internal/docker
-	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
-	require.NoError(t, err)
-
-	composeFile := filepath.Join(repoRoot, "docker-compose.yml")
-	if _, err := os.Stat(composeFile); os.IsNotExist(err) {
-		t.Skip("docker-compose.yml not found at repo root")
+	// Root of repo contains docker-compose.yml
+	var repoRoot string
+	for _, cand := range []string{"/workspace", filepath.Join("..", ".."), filepath.Join("..", "..", ".."), "..", "."} {
+		if _, err := os.Stat(filepath.Join(cand, "docker-compose.yml")); err == nil {
+			repoRoot, _ = filepath.Abs(cand)
+			break
+		}
 	}
+	require.NotEmpty(t, repoRoot, "docker-compose.yml must be found at repo root")
 
 	res, err := analyzer.AnalyzeRepository(repoRoot)
 	require.NoError(t, err)
@@ -525,5 +529,193 @@ func TestForgeLAB_OwnComposePipeline(t *testing.T) {
 	assert.Equal(t, "migrate", tiers[1][0].ServiceName)
 	assert.Equal(t, "backend", tiers[2][0].ServiceName)
 	assert.Equal(t, "frontend", tiers[3][0].ServiceName)
+}
+
+// 9. Independent service deployment validation vs release validation
+func TestPreflightValidation_IndependentServiceVsReleaseDeployment(t *testing.T) {
+	tempRoot := t.TempDir()
+	pv := security.NewPathValidator([]string{tempRoot})
+	require.NoError(t, os.WriteFile(filepath.Join(tempRoot, "Dockerfile"), []byte("FROM alpine\n"), 0644))
+
+	proj := &models.Project{
+		ID:             uuid.New(),
+		RepositoryPath: tempRoot,
+		SourceType:     models.SourceTypeLocalDirectory,
+	}
+
+	servicesInProject := map[string]*models.Service{
+		"postgres": {Name: "postgres"},
+		"redis":    {Name: "redis"},
+		"migrate":  {Name: "migrate"},
+		"backend":  {Name: "backend"},
+		"frontend": {Name: "frontend"},
+	}
+
+	// 1. Independent service deployment for backend (only backend in Deployments)
+	// Depends on postgres, redis, migrate which are NOT in Deployments, but ARE in project (ServicesMap).
+	t.Run("ExecuteServiceDeployment allows dependencies that exist in project", func(t *testing.T) {
+		err := ValidateDeploymentPreflight(context.Background(), PreflightOptions{
+			Project: proj,
+			Deployments: []*models.ServiceDeployment{
+				{
+					ServiceName:    "backend",
+					BuildStrategy:  models.BuildStrategyDockerfile,
+					DockerfilePath: "Dockerfile",
+					InternalPort:   8080,
+					DependsOn:      []string{"postgres", "redis", "migrate"},
+				},
+			},
+			ServicesMap:         servicesInProject,
+			PathValidator:       pv,
+			IsServiceDeployment: true,
+		})
+		require.NoError(t, err, "independent service deployment must not reject valid project dependencies")
+	})
+
+	// 2. Independent service deployment with dependency that does NOT exist in project
+	t.Run("ExecuteServiceDeployment rejects missing project dependency", func(t *testing.T) {
+		err := ValidateDeploymentPreflight(context.Background(), PreflightOptions{
+			Project: proj,
+			Deployments: []*models.ServiceDeployment{
+				{
+					ServiceName:    "backend",
+					BuildStrategy:  models.BuildStrategyDockerfile,
+					DockerfilePath: "Dockerfile",
+					InternalPort:   8080,
+					DependsOn:      []string{"nonexistent-service"},
+				},
+			},
+			ServicesMap:         servicesInProject,
+			PathValidator:       pv,
+			IsServiceDeployment: true,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dependency 'nonexistent-service' does not exist in project")
+	})
+
+	// 3. Project release deployment requires all dependencies to be part of the deployment plan
+	t.Run("Project release requires dependencies in deployment plan", func(t *testing.T) {
+		err := ValidateDeploymentPreflight(context.Background(), PreflightOptions{
+			Project: proj,
+			Deployments: []*models.ServiceDeployment{
+				{
+					ServiceName:    "backend",
+					BuildStrategy:  models.BuildStrategyDockerfile,
+					DockerfilePath: "Dockerfile",
+					InternalPort:   8080,
+					DependsOn:      []string{"postgres"},
+				},
+			},
+			ServicesMap:         servicesInProject,
+			PathValidator:       pv,
+			IsServiceDeployment: false, // Release deployment
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dependency 'postgres' does not exist in deployment plan")
+	})
+}
+
+// 10. Unhealthy infrastructure is not promoted to healthy/running
+func TestUnhealthyInfrastructure_NotPromotedToHealthy(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/test-pg/json") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ID": "test-pg",
+				"State": map[string]interface{}{
+					"Status":  "running",
+					"Running": true,
+					"Health": map[string]interface{}{
+						"Status": "unhealthy",
+						"Log": []map[string]interface{}{
+							{
+								"Output":   "FATAL: database files are incompatible with server\n",
+								"ExitCode": 1,
+							},
+						},
+					},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	eng := &Engine{dockerClient: cli}
+
+	var emittedErrors []string
+	var emittedLogs []string
+	logFn := func(message string) {
+		emittedLogs = append(emittedLogs, message)
+	}
+	errLogFn := func(message string) {
+		emittedErrors = append(emittedErrors, message)
+	}
+
+	healthy, _ := eng.verifyServiceHealth(
+		context.Background(),
+		"test-pg",
+		5432,
+		nil,
+		models.HealthStrategyAuto,
+		"/health",
+		logFn,
+		errLogFn,
+	)
+	assert.False(t, healthy, "unhealthy Docker container must NEVER be promoted to healthy")
+
+	foundFatalDiagnostic := false
+	for _, msg := range emittedErrors {
+		if strings.Contains(msg, "database files are incompatible with server") {
+			foundFatalDiagnostic = true
+			break
+		}
+	}
+	assert.True(t, foundFatalDiagnostic, "failure diagnostics from Docker health check must be preserved in deployment logs")
+}
+
+// 11. Compose shared build artifact linking: migrate inherits build from backend
+func TestSharedBuildArtifact_MigrateBackendLinking(t *testing.T) {
+	tempDir := t.TempDir()
+	backendDir := filepath.Join(tempDir, "backend")
+	require.NoError(t, os.MkdirAll(backendDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(backendDir, "Dockerfile"), []byte("FROM golang:alpine\n"), 0644))
+
+	composeYAML := `
+services:
+  migrate:
+    image: forgelab-backend:latest
+    command: ["./forgelab-migrate", "up"]
+  backend:
+    image: forgelab-backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+`
+	require.NoError(t, os.WriteFile(filepath.Join(tempDir, "docker-compose.yml"), []byte(composeYAML), 0644))
+
+	res, err := analyzer.AnalyzeRepository(tempDir)
+	require.NoError(t, err)
+	require.Len(t, res.Services, 2)
+
+	servicesMap := make(map[string]analyzer.ServiceDefinition)
+	for _, s := range res.Services {
+		servicesMap[s.Name] = s
+	}
+
+	be := servicesMap["backend"]
+	mig := servicesMap["migrate"]
+
+	assert.Equal(t, models.BuildStrategyDockerfile, be.BuildStrategy)
+	assert.Equal(t, "./backend", be.BuildContext)
+	assert.Equal(t, "Dockerfile", be.DockerfilePath)
+
+	assert.Equal(t, models.BuildStrategyDockerfile, mig.BuildStrategy, "migrate should adopt dockerfile build strategy from backend")
+	assert.Equal(t, be.BuildContext, mig.BuildContext, "migrate should share build context with backend")
+	assert.Equal(t, be.DockerfilePath, mig.DockerfilePath, "migrate should share dockerfile with backend")
 }
 

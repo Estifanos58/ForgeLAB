@@ -329,7 +329,16 @@ export interface GitHubStatus {
   connected: boolean;
   username?: string;
   scopes?: string[];
+  needs_reauth?: boolean;
   updated_at?: string;
+}
+
+export interface ListRepositoriesResponse {
+  repositories: GitHubRepo[];
+  page: number;
+  per_page: number;
+  has_more?: boolean;
+  needs_reauth?: boolean;
 }
 
 export interface GitHubRepo {

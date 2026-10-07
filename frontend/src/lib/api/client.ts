@@ -12,6 +12,7 @@ import {
   GitHubBranch,
   GitHubRepo,
   GitHubStatus,
+  ListRepositoriesResponse,
   LocalPathValidationResult,
   Project,
   Service,
@@ -376,8 +377,8 @@ export const api = {
         });
       },
 
-      async listRepositories(page = 1, perPage = 30): Promise<{ repositories: GitHubRepo[]; page: number; per_page: number }> {
-        return apiFetch<{ repositories: GitHubRepo[]; page: number; per_page: number }>(
+      async listRepositories(page = 1, perPage = 30): Promise<ListRepositoriesResponse> {
+        return apiFetch<ListRepositoriesResponse>(
           `/api/integrations/github/repositories?page=${page}&per_page=${perPage}`
         );
       },

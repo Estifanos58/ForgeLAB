@@ -32,10 +32,11 @@ func (e *PreflightValidationError) Error() string {
 
 // PreflightOptions contains parameters for validating a release or service deployment.
 type PreflightOptions struct {
-	Project       *models.Project
-	Deployments   []*models.ServiceDeployment
-	ServicesMap   map[string]*models.Service
-	PathValidator *security.PathValidator
+	Project             *models.Project
+	Deployments         []*models.ServiceDeployment
+	ServicesMap         map[string]*models.Service
+	PathValidator       *security.PathValidator
+	IsServiceDeployment bool
 }
 
 // ValidateDeploymentPreflight inspects the entire deployment plan before any build or container action begins.
@@ -90,34 +91,49 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 					Message:     "self-dependency is not allowed",
 				}
 			}
-			_, inPlan := nameMap[strings.ToLower(trimmedDep)]
-			inProject := false
-			if opts.ServicesMap != nil {
-				_, inProject = opts.ServicesMap[trimmedDep]
-				if !inProject {
-					for sName := range opts.ServicesMap {
-						if strings.EqualFold(sName, trimmedDep) {
-							inProject = true
-							break
+
+			if opts.IsServiceDeployment {
+				// Independent service deployment: verify that every dependency exists in the project
+				inProject := false
+				if opts.ServicesMap != nil {
+					_, inProject = opts.ServicesMap[trimmedDep]
+					if !inProject {
+						for sName := range opts.ServicesMap {
+							if strings.EqualFold(sName, trimmedDep) {
+								inProject = true
+								break
+							}
 						}
 					}
 				}
-			}
-			if !inPlan && !inProject {
-				return &PreflightValidationError{
-					ServiceName: sd.ServiceName,
-					Field:       "depends_on",
-					Message:     fmt.Sprintf("dependency '%s' does not exist in deployment plan", dep),
+				if !inProject {
+					return &PreflightValidationError{
+						ServiceName: sd.ServiceName,
+						Field:       "depends_on",
+						Message:     fmt.Sprintf("dependency '%s' does not exist in project", dep),
+					}
+				}
+			} else {
+				// Release deployment: verify that every dependency exists in the deployment plan
+				_, inPlan := nameMap[strings.ToLower(trimmedDep)]
+				if !inPlan {
+					return &PreflightValidationError{
+						ServiceName: sd.ServiceName,
+						Field:       "depends_on",
+						Message:     fmt.Sprintf("dependency '%s' does not exist in deployment plan", dep),
+					}
 				}
 			}
 		}
 	}
 
-	// 3. Dependency cycle detection (DFS 3-color graph)
-	if cycle := detectDependencyCycle(depGraph); len(cycle) > 0 {
-		return &PreflightValidationError{
-			Field:   "depends_on",
-			Message: fmt.Sprintf("dependency cycle detected: %s", strings.Join(cycle, " -> ")),
+	// 3. Dependency cycle detection (DFS 3-color graph) - mandatory for release deployments
+	if !opts.IsServiceDeployment {
+		if cycle := detectDependencyCycle(depGraph); len(cycle) > 0 {
+			return &PreflightValidationError{
+				Field:   "depends_on",
+				Message: fmt.Sprintf("dependency cycle detected: %s", strings.Join(cycle, " -> ")),
+			}
 		}
 	}
 
@@ -253,11 +269,12 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 			}
 
 			// Validate host path for bind mounts
+			isDockerSocket := vol.Source == "/var/run/docker.sock" || vol.Source == `\\.\pipe\docker_engine`
 			isBind := vol.Type == models.VolumeTypeBind || vol.Type == "bind" ||
 				strings.HasPrefix(vol.Source, ".") || strings.HasPrefix(vol.Source, "/") ||
 				strings.HasPrefix(vol.Source, "~") || strings.Contains(vol.Source, "/") || strings.Contains(vol.Source, "\\")
 
-			if isBind && opts.Project != nil && opts.Project.RepositoryPath != "" && opts.Project.SourceType != models.SourceTypeLocalAgent {
+			if isBind && !isDockerSocket && opts.Project != nil && opts.Project.RepositoryPath != "" && opts.Project.SourceType != models.SourceTypeLocalAgent {
 				hostPath := vol.Source
 				if !filepath.IsAbs(hostPath) {
 					hostPath = filepath.Join(opts.Project.RepositoryPath, hostPath)

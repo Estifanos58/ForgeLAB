@@ -523,12 +523,22 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Starting service deployment #%d for '%s' (role: %s, runtime: %s)...", serviceDeploy.DeployNumber, service.Name, service.Role, service.RuntimeType))
 
-	// Preflight validation for single service deployment
+	allProjectServices, err := e.serviceService.ListServices(execCtx, project.ID)
+	if err != nil {
+		allProjectServices = []*models.Service{service}
+	}
+	servicesMap := make(map[string]*models.Service, len(allProjectServices))
+	for _, s := range allProjectServices {
+		servicesMap[s.Name] = s
+	}
+
+	// Preflight validation for single service deployment: verifies service config and that dependencies exist in project
 	if err := ValidateDeploymentPreflight(execCtx, PreflightOptions{
-		Project:       project,
-		Deployments:   []*models.ServiceDeployment{serviceDeploy},
-		ServicesMap:   map[string]*models.Service{service.Name: service},
-		PathValidator: e.pathValidator,
+		Project:             project,
+		Deployments:         []*models.ServiceDeployment{serviceDeploy},
+		ServicesMap:         servicesMap,
+		PathValidator:       e.pathValidator,
+		IsServiceDeployment: true,
 	}); err != nil {
 		reason := fmt.Sprintf("Preflight validation failed: %v", err)
 		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
@@ -666,6 +676,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 						if e.dockerClient != nil {
 							_ = e.dockerClient.ImageTag(ctx, sharedPromise.imageTag, svcTag)
 							runImage = svcTag
+							if service.Image != "" {
+								_ = e.dockerClient.ImageTag(ctx, sharedPromise.imageTag, service.Image)
+							}
 						}
 						if sharedPromise.digest != "" && e.deploymentService != nil {
 							_ = e.deploymentService.UpdateServiceDeploymentImageDigest(ctx, serviceDeploy.ID, sharedPromise.digest)
@@ -939,6 +952,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			sharedPromise.digest = digest
 			close(sharedPromise.done)
 		}
+		if service.Image != "" && e.dockerClient != nil {
+			_ = e.dockerClient.ImageTag(ctx, svcTag, service.Image)
+		}
 		runImage = svcTag
 	}
 
@@ -955,7 +971,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	var portBindings nat.PortMap
 	targetPortStr := fmt.Sprintf("%d/tcp", intPort)
 
-	allProjectServices, _ := e.serviceService.ListServices(ctx, project.ID)
+	allProjectServices, _ = e.serviceService.ListServices(ctx, project.ID)
 	// Internal infrastructure, workers, and non-public services do not allocate host ports when part of multi-service project
 	isInternalService := service.Classification == models.ClassificationInfrastructure ||
 		service.Classification == models.ClassificationWorker ||
@@ -1507,6 +1523,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 
 	failedServices := make(map[string]bool)
 	serviceExitCodes := make(map[string]int)
+	serviceHealthy := make(map[string]bool)
 
 	for tierIdx, tier := range tiers {
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Executing Tier %d (%d service(s))...", tierIdx+1, len(tier)))
@@ -1541,12 +1558,22 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 						break
 					}
 				}
+
+				if reqCondition == "service_healthy" {
+					if !serviceHealthy[dep] {
+						hasFailedDep = true
+						failedDepName = dep
+						failedCondition = reqCondition
+						break
+					}
+				}
 			}
 			if hasFailedDep {
 				mu.Lock()
 				allHealthy = false
 				failedServices[sd.ServiceName] = true
 				serviceExitCodes[sd.ServiceName] = 1
+				serviceHealthy[sd.ServiceName] = false
 				errList = append(errList, fmt.Sprintf("%s: skipped because dependency '%s' failed condition '%s'", sd.ServiceName, failedDepName, failedCondition))
 				mu.Unlock()
 				reason := fmt.Sprintf("Skipped because dependency '%s' failed condition '%s'", failedDepName, failedCondition)
@@ -1564,12 +1591,14 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					allHealthy = false
 					failedServices[sdItem.ServiceName] = true
 					serviceExitCodes[sdItem.ServiceName] = 1
+					serviceHealthy[sdItem.ServiceName] = false
 					errList = append(errList, fmt.Sprintf("%s: %v", sdItem.ServiceName, execErr))
 					mu.Unlock()
 				} else {
 					mu.Lock()
 					anyHealthy = true
 					serviceExitCodes[sdItem.ServiceName] = 0
+					serviceHealthy[sdItem.ServiceName] = true
 					mu.Unlock()
 				}
 			}(sd)
@@ -2761,14 +2790,29 @@ func (e *Engine) verifyServiceHealth(
 			return false, "container exited unexpectedly"
 		}
 
-		// Check Docker native HEALTHCHECK if configured and healthy
+		// Check Docker native HEALTHCHECK if configured
 		if cJSON.State != nil && cJSON.State.Health != nil {
 			if cJSON.State.Health.Status == "healthy" {
 				logFn(fmt.Sprintf("Docker native health check reported healthy on attempt %d.", attempt))
 				return true, "healthy"
 			}
 			if cJSON.State.Health.Status == "unhealthy" {
-				errLogFn(fmt.Sprintf("Docker native health check reported unhealthy on attempt %d.", attempt))
+				diag := ""
+				if len(cJSON.State.Health.Log) > 0 {
+					lastEntry := cJSON.State.Health.Log[len(cJSON.State.Health.Log)-1]
+					diag = strings.TrimSpace(lastEntry.Output)
+				}
+				msg := fmt.Sprintf("Docker native health check reported unhealthy on attempt %d", attempt)
+				if diag != "" {
+					msg = fmt.Sprintf("%s: %s", msg, diag)
+				}
+				errLogFn(msg)
+				return false, fmt.Sprintf("docker native health check reported unhealthy%s", func() string {
+					if diag != "" {
+						return ": " + diag
+					}
+					return ""
+				}())
 			}
 		}
 
@@ -2830,10 +2874,12 @@ func (e *Engine) verifyServiceHealth(
 			}
 		}
 
-		// For internal services without public port, if container has been running cleanly for > 4 attempts, accept as healthy
+		// For internal services without public port, only accept running stably if container does NOT have Docker native health check configured
 		if hostPort == nil && attempt >= 4 && cJSON.State != nil && cJSON.State.Running {
-			logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
-			return true, "healthy"
+			if cJSON.State.Health == nil {
+				logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
+				return true, "healthy"
+			}
 		}
 	}
 

@@ -163,6 +163,9 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   const [loadingGhStatus, setLoadingGhStatus] = useState(false);
   const [repos, setRepos] = useState<GitHubRepo[]>([]);
   const [loadingRepos, setLoadingRepos] = useState(false);
+  const [repoPage, setRepoPage] = useState(1);
+  const [hasMoreRepos, setHasMoreRepos] = useState(false);
+  const [loadingMoreRepos, setLoadingMoreRepos] = useState(false);
   const [repoSearch, setRepoSearch] = useState('');
   const [selectedRepo, setSelectedRepo] = useState<GitHubRepo | null>(null);
   const [branches, setBranches] = useState<GitHubBranch[]>([]);
@@ -666,15 +669,37 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     }
   };
 
-  const loadRepositories = async () => {
-    setLoadingRepos(true);
+  const loadRepositories = async (page = 1, append = false) => {
+    if (append) {
+      setLoadingMoreRepos(true);
+    } else {
+      setLoadingRepos(true);
+      setRepoPage(1);
+    }
+    setError(null);
     try {
-      const res = await api.integrations.github.listRepositories(1, 100);
-      setRepos(res.repositories || []);
+      const res = await api.integrations.github.listRepositories(page, 30);
+      if (append) {
+        setRepos((prev) => [...prev, ...(res.repositories || [])]);
+      } else {
+        setRepos(res.repositories || []);
+      }
+      setRepoPage(page);
+      setHasMoreRepos(Boolean(res.has_more));
     } catch (err: any) {
+      if (err.needs_reauth || err.message?.toLowerCase().includes('re-authoriz')) {
+        setGhStatus((prev) => (prev ? { ...prev, needs_reauth: true } : prev));
+      }
       setError(err.message || 'Failed to load GitHub repositories');
     } finally {
       setLoadingRepos(false);
+      setLoadingMoreRepos(false);
+    }
+  };
+
+  const handleLoadMoreRepos = () => {
+    if (!loadingMoreRepos && hasMoreRepos) {
+      loadRepositories(repoPage + 1, true);
     }
   };
 
@@ -1868,6 +1893,30 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 </div>
               ) : (
                 <div className="space-y-3">
+                  {ghStatus.needs_reauth && (
+                    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-200 flex items-start gap-2.5">
+                      <AlertCircle className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
+                      <div className="flex-1 space-y-2">
+                        <div>
+                          <strong className="text-white block font-medium">Re-authorization Required for Private Repositories</strong>
+                          <span className="text-amber-300/80 text-[11px] leading-tight block mt-0.5">
+                            Your connected GitHub account is missing repository permissions. Re-authorize to access your private repositories.
+                          </span>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          onClick={handleConnectGitHub}
+                          icon={<Github className="w-3.5 h-3.5" />}
+                          className="text-xs h-7 px-2.5 border-amber-500/40 hover:bg-amber-500/20"
+                        >
+                          Re-authorize GitHub
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-neutral-400 flex items-center gap-1.5 font-mono">
                       <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />
@@ -1875,7 +1924,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                     </span>
                     <button
                       type="button"
-                      onClick={loadRepositories}
+                      onClick={() => loadRepositories(1, false)}
                       disabled={loadingRepos}
                       className="text-neutral-400 hover:text-white flex items-center gap-1 transition-colors text-[11px]"
                     >
@@ -1952,6 +2001,25 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                           </div>
                         );
                       })
+                    )}
+                    {hasMoreRepos && (
+                      <div className="p-2 text-center border-t border-surface-border">
+                        <button
+                          type="button"
+                          onClick={handleLoadMoreRepos}
+                          disabled={loadingMoreRepos}
+                          className="w-full py-1 text-xs text-neutral-400 hover:text-white flex items-center justify-center gap-1.5 transition-colors disabled:opacity-50"
+                        >
+                          {loadingMoreRepos ? (
+                            <>
+                              <RefreshCw className="w-3 h-3 animate-spin" />
+                              Loading more repositories...
+                            </>
+                          ) : (
+                            'Load more repositories...'
+                          )}
+                        </button>
+                      </div>
                     )}
                   </div>
 

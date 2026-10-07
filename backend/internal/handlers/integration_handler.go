@@ -168,8 +168,15 @@ func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Req
 		perPage = pp
 	}
 
-	repos, err := h.githubService.ListRepositories(r.Context(), userID, page, perPage)
+	repos, hasMore, err := h.githubService.ListRepositories(r.Context(), userID, page, perPage)
 	if err != nil {
+		if errors.Is(err, services.ErrGitHubNeedsReauth) {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":        "GitHub connection requires re-authorization for repository access. Please re-authorize GitHub.",
+				"needs_reauth": true,
+			})
+			return
+		}
 		if errors.Is(err, services.ErrGitHubNotConnected) {
 			writeError(w, http.StatusForbidden, "github repository access has not been granted. Please connect GitHub repository permissions.")
 			return
@@ -178,7 +185,7 @@ func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusTooManyRequests, "github api rate limit exceeded")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to list github repositories")
+		writeError(w, http.StatusInternalServerError, "failed to list github repositories: "+err.Error())
 		return
 	}
 
@@ -186,6 +193,7 @@ func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Req
 		"repositories": repos,
 		"page":         page,
 		"per_page":     perPage,
+		"has_more":     hasMore,
 	})
 }
 
