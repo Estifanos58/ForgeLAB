@@ -592,6 +592,31 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 	}
 
+	// Detect if this service shares an image with another project service that defines a build configuration
+	// (e.g. migrate shares forgelab-backend:latest with backend)
+	if service.Image != "" && (service.DockerfilePath == "" || service.BuildContext == "" || service.BuildStrategy == models.BuildStrategyImage || serviceDeploy.BuildStrategy == models.BuildStrategyImage) && e.serviceService != nil {
+		if allSvcs, err := e.serviceService.ListServices(execCtx, project.ID); err == nil {
+			for _, other := range allSvcs {
+				if other.ID != service.ID && strings.TrimSpace(other.Image) == strings.TrimSpace(service.Image) && (other.DockerfilePath != "" || other.BuildContext != "" || other.BuildStrategy == models.BuildStrategyDockerfile) {
+					service.BuildStrategy = models.BuildStrategyDockerfile
+					serviceDeploy.BuildStrategy = models.BuildStrategyDockerfile
+					if service.BuildContext == "" || service.BuildContext == "." {
+						service.BuildContext = other.BuildContext
+						serviceDeploy.BuildContext = other.BuildContext
+					}
+					if service.DockerfilePath == "" {
+						service.DockerfilePath = other.DockerfilePath
+						serviceDeploy.DockerfilePath = other.DockerfilePath
+					}
+					if service.SourcePath == "" || service.SourcePath == "." {
+						service.SourcePath = other.SourcePath
+					}
+					break
+				}
+			}
+		}
+	}
+
 	// Strict image build-strategy enforcement: image strategy NEVER attempts source or Dockerfile build
 	isImageStrategy := service.Classification == models.ClassificationInfrastructure ||
 		serviceDeploy.Classification == models.ClassificationInfrastructure ||
@@ -642,18 +667,20 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if serviceDeploy.SourceRevision != nil {
 			srcRev = *serviceDeploy.SourceRevision
 		}
-		cleanCtx := strings.TrimSpace(service.BuildContext)
-		if cleanCtx == "" {
-			cleanCtx = strings.TrimSpace(serviceDeploy.BuildContext)
+		rawCtx := strings.TrimSpace(service.BuildContext)
+		if rawCtx == "" {
+			rawCtx = strings.TrimSpace(serviceDeploy.BuildContext)
 		}
+		cleanCtx := filepath.Clean(rawCtx)
 		if cleanCtx == "" {
 			cleanCtx = "."
 		}
-		cleanDF := strings.TrimSpace(service.DockerfilePath)
-		if cleanDF == "" {
-			cleanDF = strings.TrimSpace(serviceDeploy.DockerfilePath)
+		rawDF := strings.TrimSpace(service.DockerfilePath)
+		if rawDF == "" {
+			rawDF = strings.TrimSpace(serviceDeploy.DockerfilePath)
 		}
-		if cleanDF == "" {
+		cleanDF := filepath.Clean(rawDF)
+		if cleanDF == "" || cleanDF == "." {
 			cleanDF = "Dockerfile"
 		}
 
@@ -737,6 +764,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 		relDockerPath := "Dockerfile"
 		var tarArchive io.ReadCloser
+		var dfContent []byte
 
 		if project.SourceType == models.SourceTypeLocalAgent {
 			cleanRelPath, pathErr := e.pathValidator.ValidateRelativeServicePath(service.SourcePath)
@@ -878,12 +906,21 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				}
 			}
 
+			// Pre-read Dockerfile content to resolve builder before streaming
+			if isAuto {
+				dfContent = virtualFiles["Dockerfile.forgelab"]
+			} else if svcContextDir != "" && relDockerPath != "" {
+				if b, err := os.ReadFile(filepath.Join(svcContextDir, relDockerPath)); err == nil {
+					dfContent = b
+				}
+			}
+
 			matcher, _ := LoadDockerignore(svcContextDir)
 			if matcher == nil {
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 			}
 
-			tarArchive = StreamBuildContext(ctx, TarStreamerOptions{
+			tarArchive = StreamBuildContext(execCtx, TarStreamerOptions{
 				BuildContextDir: svcContextDir,
 				Matcher:         matcher,
 				VirtualFiles:    virtualFiles,
@@ -892,8 +929,6 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				},
 			})
 		}
-
-		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Building Docker image '%s'...", svcTag))
 
 		buildArgs := make(map[string]*string)
 		for k, v := range normalBuildArgs {
@@ -924,7 +959,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			Labels:     buildLabels,
 		}
 
-		if err := e.buildImage(ctx, tarArchive, buildOpts, func(msg string) {
+		// Pre-resolve builder capability before starting build
+		if resolvedOpts, err := e.resolveBuilder(execCtx, dfContent, buildOpts, nil); err == nil {
+			buildOpts = resolvedOpts
+		}
+
+		if err := e.buildImage(execCtx, tarArchive, buildOpts, func(msg string) {
 			emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 		}); err != nil {
 			if sharedPromise != nil {
@@ -1584,9 +1624,16 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					break
 				}
 
+				code, exists := serviceExitCodes[dep]
+				if !exists {
+					hasFailedDep = true
+					failedDepName = dep
+					failedCondition = reqCondition
+					break
+				}
+
 				if reqCondition == "service_completed_successfully" {
-					code, exists := serviceExitCodes[dep]
-					if !exists || code != 0 {
+					if code != 0 {
 						hasFailedDep = true
 						failedDepName = dep
 						failedCondition = reqCondition
@@ -1815,6 +1862,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 
 		var relDockerPath string
 		var tarStream io.ReadCloser
+		var dfContent []byte
 
 		if project.SourceType == models.SourceTypeLocalAgent {
 			cleanRelPath, pathErr := e.pathValidator.ValidateRelativeServicePath(project.BuildContext)
@@ -1923,6 +1971,14 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				}
 			}
 
+			if len(virtualFiles) > 0 {
+				dfContent = virtualFiles["Dockerfile.forgelab"]
+			} else if buildContextDir != "" && relDockerPath != "" {
+				if b, err := os.ReadFile(filepath.Join(buildContextDir, relDockerPath)); err == nil {
+					dfContent = b
+				}
+			}
+
 			matcher, _ := LoadDockerignore(buildContextDir)
 			if matcher == nil {
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
@@ -1960,6 +2016,10 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				"forgelab.project_id":    project.ID.String(),
 				"forgelab.deployment_id": deployment.ID.String(),
 			},
+		}
+
+		if resolvedOpts, err := e.resolveBuilder(ctx, dfContent, buildOpts, nil); err == nil {
+			buildOpts = resolvedOpts
 		}
 
 		if err := e.buildImage(ctx, tarStream, buildOpts, func(msg string) {
@@ -2680,29 +2740,30 @@ func (e *Engine) buildImage(
 	defer e.buildMaintenanceMu.RUnlock()
 
 	// 2. Acquire Docker build slot under configurable concurrency limit (BuildSemaphore)
+	if onLogLine != nil {
+		onLogLine("Waiting for Docker build slot...")
+	}
 	releaseSlot, err := e.acquireBuildSlot(ctx)
 	if err != nil {
 		return fmt.Errorf("Docker build concurrency limit wait cancelled: %w", err)
 	}
 	defer releaseSlot()
+	if onLogLine != nil {
+		onLogLine("Docker build slot acquired.")
+	}
 
-	// 3. Inspect Dockerfile and resolve builder capability
+	// 3. Inspect Dockerfile and resolve builder capability if not already resolved
+	// If currentArchive supports seeking (e.g. tests passing *bytes.Reader), inspect without consuming
 	var dfContent []byte
-	var buildReader io.Reader = currentArchive
-	if currentArchive != nil {
-		buf := &bytes.Buffer{}
-		if _, err := io.Copy(buf, currentArchive); err != nil {
-			return fmt.Errorf("failed to read build context archive: %w", err)
-		}
-		rawBytes := buf.Bytes()
-		buildReader = bytes.NewReader(rawBytes)
-		dfContent, _ = extractDockerfileFromTar(bytes.NewReader(rawBytes), options.Dockerfile)
+	if seeker, ok := currentArchive.(io.ReadSeeker); ok {
+		dfContent, _ = extractDockerfileFromTar(seeker, options.Dockerfile)
+		_, _ = seeker.Seek(0, io.SeekStart)
 	}
 
 	requiresBuildKit, _ := DetectDockerfileRequiresBuildKit(dfContent)
 	_, hasCachedVer := e.getCachedBuilderVersion()
 
-	if requiresBuildKit || hasCachedVer || options.Version != "" || (len(dfContent) > 0 && e.dockerClient != nil) {
+	if requiresBuildKit || hasCachedVer || options.Version != "" || (len(dfContent) > 0 && e.dockerClient != nil) || options.Version == "" {
 		resolvedOptions, builderErr := e.resolveBuilder(ctx, dfContent, options, nil)
 		if builderErr != nil {
 			return builderErr
@@ -2710,18 +2771,36 @@ func (e *Engine) buildImage(
 		options = resolvedOptions
 	}
 
+	if onLogLine != nil {
+		onLogLine("Streaming build context...")
+	}
+
 	slog.Info("docker image build started", "tags", options.Tags, "builder_version", options.Version)
 
 	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer buildCancel()
 
-	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, buildReader, options)
+	if onLogLine != nil {
+		onLogLine("Docker build started.")
+	}
+
+	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, currentArchive, options)
 	if err != nil {
+		if tracker, ok := currentArchive.(TarStreamTracker); ok {
+			if streamErr := tracker.StreamError(); streamErr != nil {
+				return fmt.Errorf("Docker build failed due to build-context streaming error: %w", streamErr)
+			}
+		}
 		return fmt.Errorf("Docker build failed: %w", err)
 	}
 	defer buildResponse.Body.Close()
 
 	if err := e.parseDockerStream(buildResponse.Body, onLogLine); err != nil {
+		if tracker, ok := currentArchive.(TarStreamTracker); ok {
+			if streamErr := tracker.StreamError(); streamErr != nil {
+				return fmt.Errorf("Docker build error due to build-context streaming error: %w", streamErr)
+			}
+		}
 		return fmt.Errorf("Docker build error: %w", err)
 	}
 

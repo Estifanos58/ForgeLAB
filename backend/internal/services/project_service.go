@@ -174,6 +174,9 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			if err != nil || !status.Connected {
 				return nil, ErrGitHubNotConnected
 			}
+			if status.NeedsReauth {
+				return nil, ErrGitHubNeedsReauth
+			}
 		}
 	case models.SourceTypeLocalAgent:
 		if sourceRef == "" {

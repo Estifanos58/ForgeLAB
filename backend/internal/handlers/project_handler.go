@@ -74,6 +74,13 @@ func (h *ProjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
+		if errors.Is(err, services.ErrGitHubNeedsReauth) {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":        "GitHub connection requires re-authorization for repository access. Please re-authorize GitHub.",
+				"needs_reauth": true,
+			})
+			return
+		}
 		if errors.Is(err, services.ErrGitHubNotConnected) {
 			writeError(w, http.StatusForbidden, "GitHub repository access has not been granted. Please authorize repository permissions.")
 			return

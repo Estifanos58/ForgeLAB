@@ -129,7 +129,7 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		workspaceDir = canonicalPath
-		fp, fpErr := discovery.ComputeDirectoryContentFingerprint(canonicalPath)
+		fp, fpErr := discovery.ComputeLightweightDirectoryFingerprint(canonicalPath)
 		if fpErr != nil {
 			slog.Warn("failed to compute deterministic directory fingerprint", "path", canonicalPath, "error", fpErr)
 			hash := sha256.Sum256([]byte(fmt.Sprintf("dir:%s", canonicalPath)))

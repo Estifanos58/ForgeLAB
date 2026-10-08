@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,48 @@ var (
 	ErrBuildContextAccessDenied = errors.New("build context file access denied or security violation during traversal")
 	ErrSymlinkEscape            = errors.New("build context contains a symlink pointing outside the build context boundary")
 )
+
+// TarStreamTracker exposes tracking metrics and the underlying stream error.
+type TarStreamTracker interface {
+	io.ReadCloser
+	StreamError() error
+	FilesProcessed() int
+	BytesProcessed() int64
+	CurrentPath() string
+}
+
+type tarStreamTracker struct {
+	*io.PipeReader
+	mu             sync.Mutex
+	streamErr      error
+	filesProcessed int
+	bytesProcessed int64
+	currentPath    string
+}
+
+func (t *tarStreamTracker) StreamError() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.streamErr
+}
+
+func (t *tarStreamTracker) FilesProcessed() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.filesProcessed
+}
+
+func (t *tarStreamTracker) BytesProcessed() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.bytesProcessed
+}
+
+func (t *tarStreamTracker) CurrentPath() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.currentPath
+}
 
 // TarStreamerOptions configures the streaming build context generator.
 type TarStreamerOptions struct {
@@ -58,6 +101,7 @@ func getEnvInt(key string, fallback int) int {
 // it immediately, closes the pipe, and terminates without leaking resources.
 func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadCloser {
 	pr, pw := io.Pipe()
+	tracker := &tarStreamTracker{PipeReader: pr}
 
 	maxTotalBytes := opts.MaxTotalBytes
 	if maxTotalBytes <= 0 {
@@ -82,7 +126,17 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 		tw := tar.NewWriter(pw)
 		defer func() {
 			if streamErr != nil {
-				_ = pw.CloseWithError(streamErr)
+				tracker.mu.Lock()
+				curPath := tracker.currentPath
+				filesCount := tracker.filesProcessed
+				bytesCount := tracker.bytesProcessed
+				diagErr := fmt.Errorf("build context streaming failed at path '%s' (processed %d files, %d bytes): %w", curPath, filesCount, bytesCount, streamErr)
+				tracker.streamErr = diagErr
+				tracker.mu.Unlock()
+				if opts.EmitLog != nil {
+					opts.EmitLog("build", "stderr", diagErr.Error())
+				}
+				_ = pw.CloseWithError(diagErr)
 			} else {
 				_ = tw.Close()
 				_ = pw.Close()
@@ -114,6 +168,12 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 			}
 
 			totalBytes += vSize
+			tracker.mu.Lock()
+			tracker.currentPath = vName
+			tracker.filesProcessed = fileCount
+			tracker.bytesProcessed = totalBytes
+			tracker.mu.Unlock()
+
 			if totalBytes > maxTotalBytes {
 				streamErr = fmt.Errorf("%w: total size exceeds limit of %d bytes", ErrBuildContextTooLarge, maxTotalBytes)
 				return
@@ -255,6 +315,12 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 				return err
 			}
 
+			tracker.mu.Lock()
+			tracker.currentPath = slashRelPath
+			tracker.filesProcessed = fileCount
+			tracker.bytesProcessed = totalBytes
+			tracker.mu.Unlock()
+
 			// Stream regular file content
 			if info.Mode().IsRegular() {
 				file, err := os.Open(path)
@@ -283,5 +349,5 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 		})
 	}()
 
-	return pr
+	return tracker
 }

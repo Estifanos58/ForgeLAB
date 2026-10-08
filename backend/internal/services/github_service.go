@@ -36,8 +36,24 @@ var (
 	ErrGitHubNeedsReauth  = errors.New("github connection requires re-authorization for repository access")
 	ErrGitHubRateLimited  = errors.New("github api rate limit exceeded")
 	ErrGitHubRepoNotFound = errors.New("github repository not found or access denied")
-	ErrGitHubOAuthFailed  = errors.New("github authorization failed")
 )
+
+// parseOAuthScopes splits comma- and/or whitespace-separated OAuth scopes reliably.
+func parseOAuthScopes(scopeStr string) []string {
+	fields := strings.FieldsFunc(scopeStr, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	var result []string
+	seen := make(map[string]bool)
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		if f != "" && !seen[f] {
+			seen[f] = true
+			result = append(result, f)
+		}
+	}
+	return result
+}
 
 type GitHubRepo struct {
 	ID            int64  `json:"id"`
@@ -133,12 +149,12 @@ func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHu
 		return &GitHubStatus{Connected: false}, nil
 	}
 
-	scopes := strings.Split(scope, ",")
+	scopes := parseOAuthScopes(scope)
 	hasRepoScope := false
-	for i := range scopes {
-		scopes[i] = strings.TrimSpace(scopes[i])
-		if scopes[i] == "repo" {
+	for _, sc := range scopes {
+		if sc == "repo" {
 			hasRepoScope = true
+			break
 		}
 	}
 
@@ -410,10 +426,10 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 	}
 
 	// Verify that the OAuth authorization contains repo scope
-	scopes := strings.Split(scope, ",")
+	scopes := parseOAuthScopes(scope)
 	hasRepoScope := false
 	for _, sc := range scopes {
-		if strings.TrimSpace(sc) == "repo" {
+		if sc == "repo" {
 			hasRepoScope = true
 			break
 		}
@@ -454,7 +470,13 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
 			return nil, false, ErrGitHubRateLimited
 		}
+		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
+			return nil, false, fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubNeedsReauth, sso)
+		}
 		return nil, false, ErrGitHubNeedsReauth
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, ErrGitHubRepoNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("github api returned status %d", resp.StatusCode)
@@ -462,10 +484,10 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 
 	// Check returned X-OAuth-Scopes header if present
 	if oauthScopes := resp.Header.Get("X-OAuth-Scopes"); oauthScopes != "" {
-		parts := strings.Split(oauthScopes, ",")
+		parts := parseOAuthScopes(oauthScopes)
 		hasRepo := false
 		for _, p := range parts {
-			if strings.TrimSpace(p) == "repo" {
+			if p == "repo" {
 				hasRepo = true
 				break
 			}
@@ -596,16 +618,23 @@ func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner,
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrGitHubNotConnected
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			return nil, ErrGitHubRateLimited
+		}
+		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
+			return nil, fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubNeedsReauth, sso)
+		}
+		return nil, ErrGitHubNeedsReauth
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrGitHubRepoNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
-		// Fallback to generic detection if contents cannot be listed
-		return &detector.DetectionResult{
-			Runtime:         "generic",
-			Framework:       "Generic Application",
-			BuildStrategy:   "auto",
-			SuggestedPort:   8080,
-			HealthCheckPath: "/health",
-			HealthStrategy:  "auto",
-		}, nil
+		return nil, fmt.Errorf("github api returned status %d: %s", resp.StatusCode, resp.Status)
 	}
 
 	var items []struct {
@@ -731,6 +760,12 @@ func (s *GitHubService) AnalyzeRepo(ctx context.Context, userID uuid.UUID, owner
 			res.RepositoryName = repo
 			return res, nil
 		}
+	} else {
+		// If authorization/permission error, fail immediately without silent fallback
+		if errors.Is(err, ErrGitHubNotConnected) || errors.Is(err, ErrGitHubNeedsReauth) ||
+			errors.Is(err, ErrGitHubRateLimited) || errors.Is(err, ErrGitHubRepoNotFound) {
+			return nil, err
+		}
 	}
 
 	// Fallback to lightweight file-based detection if tarball download fails
@@ -818,7 +853,43 @@ func (s *GitHubService) AnalyzeRepo(ctx context.Context, userID uuid.UUID, owner
 	}, nil
 }
 
+// copyDirectoryContents copies files from src into dst without leaking temp files.
+func copyDirectoryContents(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." || rel == ".complete" {
+			return nil
+		}
+		targetPath := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(targetPath, 0755)
+		}
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return err
+		}
+		outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+		if err != nil {
+			return err
+		}
+		defer outFile.Close()
+		inFile, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer inFile.Close()
+		_, err = io.Copy(outFile, inFile)
+		return err
+	})
+}
+
 // AcquireRepoTarball downloads and safely extracts an authorized GitHub repository tarball.
+// It caches extracted snapshots pinned to commit SHA to avoid re-downloading identical revisions.
 func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID, owner, repo, branch, targetDir string) error {
 	token, err := s.getDecryptedToken(ctx, userID)
 	if err != nil {
@@ -827,6 +898,27 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 
 	if branch == "" {
 		branch = "main"
+	}
+
+	destClean := filepath.Clean(targetDir)
+	_ = os.MkdirAll(destClean, 0755)
+
+	// Check if this revision can be resolved to an immutable commit SHA for snapshot reuse
+	resolvedSHA := ""
+	if len(branch) == 40 && !strings.ContainsAny(branch, "/ \t\n") {
+		resolvedSHA = branch
+	} else if sha, err := s.ResolveCommitSHA(ctx, userID, owner, repo, branch); err == nil && len(sha) == 40 {
+		resolvedSHA = sha
+	}
+
+	var cacheDir string
+	if resolvedSHA != "" {
+		cacheDir = filepath.Join(os.TempDir(), "forgelab_gh_cache", owner, repo, resolvedSHA)
+		completeMarker := filepath.Join(cacheDir, ".complete")
+		if fi, err := os.Stat(completeMarker); err == nil && !fi.IsDir() {
+			slog.Info("reusing cached github snapshot", "owner", owner, "repo", repo, "sha", resolvedSHA)
+			return copyDirectoryContents(cacheDir, destClean)
+		}
 	}
 
 	tarURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/tarball/%s",
@@ -846,6 +938,21 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		return ErrGitHubNotConnected
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			return ErrGitHubRateLimited
+		}
+		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
+			return fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubNeedsReauth, sso)
+		}
+		return ErrGitHubNeedsReauth
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrGitHubRepoNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("github returned HTTP %d when downloading repository archive", resp.StatusCode)
 	}
@@ -857,9 +964,6 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	defer gzReader.Close()
 
 	tarReader := tar.NewReader(gzReader)
-	destClean := filepath.Clean(targetDir)
-	_ = os.MkdirAll(destClean, 0755)
-
 	var rootPrefix string
 
 	for {
@@ -909,6 +1013,13 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 			}
 			outFile.Close()
 		}
+	}
+
+	// Populate disk cache for future reuse if pinned to an immutable SHA
+	if cacheDir != "" {
+		_ = os.MkdirAll(cacheDir, 0755)
+		_ = copyDirectoryContents(destClean, cacheDir)
+		_ = os.WriteFile(filepath.Join(cacheDir, ".complete"), []byte(resolvedSHA), 0644)
 	}
 
 	return nil

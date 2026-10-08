@@ -119,7 +119,7 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 			depMap, _, _ := BuildDAG(services)
 
 			totalFiles, totalBytes := quickStatScan(cleanRoot)
-			fp, _ := ComputeDirectoryContentFingerprint(cleanRoot)
+			fp, _ := ComputeLightweightDirectoryFingerprint(cleanRoot)
 			return &DiscoveryResult{
 				RepositoryName:  repoName,
 				Topology:        *topology,
@@ -181,7 +181,7 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 		depMap[s.Name] = s.DependsOn
 	}
 
-	fp, _ := ComputeDirectoryContentFingerprint(cleanRoot)
+	fp, _ := ComputeLightweightDirectoryFingerprint(cleanRoot)
 	return &DiscoveryResult{
 		RepositoryName: repoName,
 		Topology: DiscoveredTopology{

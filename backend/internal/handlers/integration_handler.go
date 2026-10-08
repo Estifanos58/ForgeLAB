@@ -214,12 +214,23 @@ func (h *IntegrationHandler) ListBranches(w http.ResponseWriter, r *http.Request
 
 	branches, err := h.githubService.ListBranches(r.Context(), userID, owner, repo)
 	if err != nil {
+		if errors.Is(err, services.ErrGitHubNeedsReauth) {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":        "GitHub connection requires re-authorization for repository access. Please re-authorize GitHub.",
+				"needs_reauth": true,
+			})
+			return
+		}
 		if errors.Is(err, services.ErrGitHubNotConnected) {
 			writeError(w, http.StatusForbidden, "github repository access has not been granted")
 			return
 		}
 		if errors.Is(err, services.ErrGitHubRepoNotFound) {
 			writeError(w, http.StatusNotFound, "github repository not found or access denied")
+			return
+		}
+		if errors.Is(err, services.ErrGitHubRateLimited) {
+			writeError(w, http.StatusTooManyRequests, "github api rate limit exceeded")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to list branches")
@@ -264,8 +275,23 @@ func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Req
 
 	analysis, err := h.githubService.AnalyzeRepo(r.Context(), userID, owner, repo, branch, rootDir)
 	if err != nil {
+		if errors.Is(err, services.ErrGitHubNeedsReauth) {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"error":        "GitHub connection requires re-authorization for repository access. Please re-authorize GitHub.",
+				"needs_reauth": true,
+			})
+			return
+		}
 		if errors.Is(err, services.ErrGitHubNotConnected) {
 			writeError(w, http.StatusForbidden, "github repository access has not been granted")
+			return
+		}
+		if errors.Is(err, services.ErrGitHubRepoNotFound) {
+			writeError(w, http.StatusNotFound, "github repository not found or access denied")
+			return
+		}
+		if errors.Is(err, services.ErrGitHubRateLimited) {
+			writeError(w, http.StatusTooManyRequests, "github api rate limit exceeded")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to inspect repository for detection: "+err.Error())
