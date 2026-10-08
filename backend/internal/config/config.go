@@ -219,7 +219,7 @@ func Load() (*Config, error) {
 			AllowedSourceRoots:  getEnv("FORGELAB_ALLOWED_SOURCE_ROOTS", ""),
 			HostSourceRoot:      getEnv("FORGELAB_HOST_SOURCE_ROOT", ""),
 			ContainerSourceRoot: getEnv("FORGELAB_CONTAINER_SOURCE_ROOT", "/host-projects"),
-			LocalBuildMode:      getEnv("FORGELAB_LOCAL_BUILD_MODE", "direct"),
+			LocalBuildMode:      getEnv("FORGELAB_LOCAL_BUILD_MODE", "snapshot"),
 			MaxConcurrentBuilds: parseIntEnv("FORGELAB_MAX_CONCURRENT_BUILDS", parseIntEnv("FORGELAB_MAX_DOCKER_BUILDS", 1)),
 			QueueWorkerCount:    parseIntEnv("FORGELAB_QUEUE_WORKERS", 4),
 			PruneInterval:       parseDurationEnv("FORGELAB_IMAGE_PRUNE_INTERVAL", parseDurationEnv("FORGELAB_PRUNE_INTERVAL", 1*time.Hour)),

@@ -37,6 +37,7 @@ import (
 	"github.com/forgelab/backend/internal/network"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
+	"github.com/forgelab/backend/internal/tararchive"
 	ws "github.com/forgelab/backend/internal/websocket"
 )
 
@@ -100,7 +101,7 @@ func NewEngine(
 		pathValidator:       pathValidator,
 		wsHub:               wsHub,
 		workDir:             workDir,
-		localBuildMode:      "direct",
+		localBuildMode:      "snapshot",
 		maxConcurrentBuilds: 1,
 		buildSem:            NewBuildSemaphore(1),
 	}
@@ -255,7 +256,6 @@ func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Pro
 			ref = "main"
 		}
 
-		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (revision: %s)...", project.SourceReference, ref))
 		parts := strings.Split(project.SourceReference, "/")
 		if len(parts) != 2 {
 			return "", cleanupDir, fmt.Errorf("invalid GitHub repository reference '%s'. Expected format 'owner/repo'", project.SourceReference)
@@ -263,6 +263,12 @@ func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Pro
 		if e.githubService == nil {
 			return "", cleanupDir, errors.New("GitHub integration service is not available")
 		}
+		if len(ref) != 40 {
+			if sha, err := e.githubService.ResolveCommitSHA(ctx, project.OwnerID, parts[0], parts[1], ref); err == nil && len(sha) == 40 {
+				ref = sha
+			}
+		}
+		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (revision: %s)...", project.SourceReference, ref))
 		if err := e.githubService.AcquireRepoTarball(ctx, project.OwnerID, parts[0], parts[1], ref, snapshotDir); err != nil {
 			return "", cleanupDir, fmt.Errorf("failed to acquire GitHub repository archive: %w", err)
 		}
@@ -293,7 +299,7 @@ func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Pro
 
 		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Using local directory: %s", project.RepositoryPath))
 
-		if e.localBuildMode == "snapshot" {
+		if e.localBuildMode != "direct" {
 			emitLog(models.LogPhaseSource, models.LogStreamSystem, "Using snapshot filesystem build mode.")
 			snapshotDir := filepath.Join(e.workDir, execID)
 			_ = os.MkdirAll(snapshotDir, 0755)
@@ -920,14 +926,21 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 			}
 
-			tarArchive = StreamBuildContext(execCtx, TarStreamerOptions{
+			archFile, archErr := tararchive.CreateCompletedArchiveFile(execCtx, e.workDir, tararchive.BuildContextOptions{
 				BuildContextDir: svcContextDir,
 				Matcher:         matcher,
 				VirtualFiles:    virtualFiles,
 				EmitLog: func(phase, stream, msg string) {
 					emitLog(phase, stream, msg)
 				},
-			})
+			}, relDockerPath)
+			if archErr != nil {
+				reason := fmt.Sprintf("Build context generation failed: %v", archErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
+			}
+			tarArchive = archFile
 		}
 
 		buildArgs := make(map[string]*string)
@@ -1984,14 +1997,21 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 			}
 
-			tarStream = StreamBuildContext(ctx, TarStreamerOptions{
+			archFile, archErr := tararchive.CreateCompletedArchiveFile(ctx, e.workDir, tararchive.BuildContextOptions{
 				BuildContextDir: buildContextDir,
 				Matcher:         matcher,
 				VirtualFiles:    virtualFiles,
 				EmitLog: func(phase, stream, msg string) {
 					emitLog(phase, stream, msg)
 				},
-			})
+			}, relDockerPath)
+			if archErr != nil {
+				reason := fmt.Sprintf("Build context generation failed: %v", archErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
+			tarStream = archFile
 		}
 
 		buildArgs := make(map[string]*string)
@@ -2752,13 +2772,48 @@ func (e *Engine) buildImage(
 		onLogLine("Docker build slot acquired.")
 	}
 
-	// 3. Inspect Dockerfile and resolve builder capability if not already resolved
-	// If currentArchive supports seeking (e.g. tests passing *bytes.Reader), inspect without consuming
-	var dfContent []byte
-	if seeker, ok := currentArchive.(io.ReadSeeker); ok {
-		dfContent, _ = extractDockerfileFromTar(seeker, options.Dockerfile)
-		_, _ = seeker.Seek(0, io.SeekStart)
+	// 3. Stage and validate build context archive onto disk
+	var validatedArchiveFile *os.File
+	var stagedCleanup string
+
+	if file, ok := currentArchive.(*os.File); ok {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to rewind build context file: %w", err)
+		}
+		if err := tararchive.ValidateTarArchive(file, options.Dockerfile); err != nil {
+			return fmt.Errorf("Build context validation failed: %w", err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to rewind build context file after validation: %w", err)
+		}
+		validatedArchiveFile = file
+	} else {
+		if onLogLine != nil {
+			onLogLine("Receiving and validating build context archive...")
+		}
+		stagedFile, err := tararchive.StageAndValidateArchiveStream(ctx, e.workDir, currentArchive, options.Dockerfile)
+		if err != nil {
+			if tracker, ok := currentArchive.(TarStreamTracker); ok {
+				if streamErr := tracker.StreamError(); streamErr != nil {
+					return fmt.Errorf("Build context generation failed: %w", streamErr)
+				}
+			}
+			return fmt.Errorf("Build context generation failed: %w", err)
+		}
+		validatedArchiveFile = stagedFile
+		stagedCleanup = stagedFile.Name()
+		defer func() {
+			_ = stagedFile.Close()
+			if stagedCleanup != "" {
+				_ = os.Remove(stagedCleanup)
+			}
+		}()
 	}
+
+	// 4. Inspect Dockerfile and resolve builder capability
+	var dfContent []byte
+	dfContent, _ = extractDockerfileFromTar(validatedArchiveFile, options.Dockerfile)
+	_, _ = validatedArchiveFile.Seek(0, io.SeekStart)
 
 	requiresBuildKit, _ := DetectDockerfileRequiresBuildKit(dfContent)
 	_, hasCachedVer := e.getCachedBuilderVersion()
@@ -2771,10 +2826,6 @@ func (e *Engine) buildImage(
 		options = resolvedOptions
 	}
 
-	if onLogLine != nil {
-		onLogLine("Streaming build context...")
-	}
-
 	slog.Info("docker image build started", "tags", options.Tags, "builder_version", options.Version)
 
 	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
@@ -2784,24 +2835,37 @@ func (e *Engine) buildImage(
 		onLogLine("Docker build started.")
 	}
 
-	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, currentArchive, options)
+	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, validatedArchiveFile, options)
 	if err != nil {
-		if tracker, ok := currentArchive.(TarStreamTracker); ok {
-			if streamErr := tracker.StreamError(); streamErr != nil {
-				return fmt.Errorf("Docker build failed due to build-context streaming error: %w", streamErr)
-			}
-		}
 		return fmt.Errorf("Docker build failed: %w", err)
 	}
 	defer buildResponse.Body.Close()
 
-	if err := e.parseDockerStream(buildResponse.Body, onLogLine); err != nil {
-		if tracker, ok := currentArchive.(TarStreamTracker); ok {
-			if streamErr := tracker.StreamError(); streamErr != nil {
-				return fmt.Errorf("Docker build error due to build-context streaming error: %w", streamErr)
+	if parseErr := e.parseDockerStream(buildResponse.Body, onLogLine); parseErr != nil {
+		// If BuildKit was used and rejected the tar header, attempt fallback to standard builder
+		if options.Version == types.BuilderBuildKit && strings.Contains(parseErr.Error(), "archive/tar: invalid tar header") {
+			slog.Warn("buildkit rejected tar build context; retrying with standard builder", "error", parseErr)
+			if onLogLine != nil {
+				onLogLine("BuildKit rejected tar build context header. Retrying with standard Docker builder...")
+			}
+			if _, seekErr := validatedArchiveFile.Seek(0, io.SeekStart); seekErr == nil {
+				fallbackOpts := options
+				fallbackOpts.Version = ""
+				retryCtx, retryCancel := context.WithTimeout(ctx, 15*time.Minute)
+				defer retryCancel()
+				retryResp, retryErr := e.dockerClient.ImageBuild(retryCtx, validatedArchiveFile, fallbackOpts)
+				if retryErr == nil {
+					defer retryResp.Body.Close()
+					if retryParseErr := e.parseDockerStream(retryResp.Body, onLogLine); retryParseErr == nil {
+						slog.Info("docker image build completed using fallback standard builder", "tags", fallbackOpts.Tags)
+						return nil
+					} else {
+						return fmt.Errorf("Docker build error: %w", retryParseErr)
+					}
+				}
 			}
 		}
-		return fmt.Errorf("Docker build error: %w", err)
+		return fmt.Errorf("Docker build error: %w", parseErr)
 	}
 
 	slog.Info("docker image build completed", "tags", options.Tags)

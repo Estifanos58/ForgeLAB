@@ -34,6 +34,7 @@ import (
 var (
 	ErrGitHubNotConnected = errors.New("github repository access is not authorized")
 	ErrGitHubNeedsReauth  = errors.New("github connection requires re-authorization for repository access")
+	ErrGitHubSSORequired  = errors.New("github organization saml sso authorization required")
 	ErrGitHubRateLimited  = errors.New("github api rate limit exceeded")
 	ErrGitHubRepoNotFound = errors.New("github repository not found or access denied")
 )
@@ -418,24 +419,84 @@ func (s *GitHubService) getDecryptedToken(ctx context.Context, userID uuid.UUID)
 	return tok, err
 }
 
-// ListRepositories retrieves repositories accessible to the user via their GitHub authorization.
-func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, page, perPage int) ([]GitHubRepo, bool, error) {
-	token, scope, err := s.getDecryptedTokenAndScope(ctx, userID)
+// GetRepo verifies access and fetches metadata for a specific repository.
+func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, repo string) (*GitHubRepo, error) {
+	token, err := s.getDecryptedToken(ctx, userID)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	// Verify that the OAuth authorization contains repo scope
-	scopes := parseOAuthScopes(scope)
-	hasRepoScope := false
-	for _, sc := range scopes {
-		if sc == "repo" {
-			hasRepoScope = true
-			break
-		}
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s", url.PathEscape(owner), url.PathEscape(repo))
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, err
 	}
-	if !hasRepoScope && scope != "" {
-		return nil, false, ErrGitHubNeedsReauth
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "ForgeLAB-App")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get repository: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		_ = s.Disconnect(ctx, userID)
+		return nil, ErrGitHubNotConnected
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			return nil, ErrGitHubRateLimited
+		}
+		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
+			return nil, fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubSSORequired, sso)
+		}
+		return nil, ErrGitHubNeedsReauth
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrGitHubRepoNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("github api returned status %d", resp.StatusCode)
+	}
+
+	var rawRepo struct {
+		ID            int64  `json:"id"`
+		Name          string `json:"name"`
+		FullName      string `json:"full_name"`
+		Private       bool   `json:"private"`
+		DefaultBranch string `json:"default_branch"`
+		Description   string `json:"description"`
+		HTMLURL       string `json:"html_url"`
+		UpdatedAt     string `json:"updated_at"`
+		Owner         struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&rawRepo); err != nil {
+		return nil, fmt.Errorf("failed to decode repo: %w", err)
+	}
+
+	return &GitHubRepo{
+		ID:            rawRepo.ID,
+		Name:          rawRepo.Name,
+		FullName:      rawRepo.FullName,
+		Owner:         rawRepo.Owner.Login,
+		Private:       rawRepo.Private,
+		DefaultBranch: rawRepo.DefaultBranch,
+		Description:   rawRepo.Description,
+		HTMLURL:       rawRepo.HTMLURL,
+		UpdatedAt:     rawRepo.UpdatedAt,
+	}, nil
+}
+
+// ListRepositories retrieves repositories accessible to the user via their GitHub authorization.
+func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, page, perPage int) ([]GitHubRepo, bool, error) {
+	token, _, err := s.getDecryptedTokenAndScope(ctx, userID)
+	if err != nil {
+		return nil, false, err
 	}
 
 	if page < 1 {
@@ -471,7 +532,7 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 			return nil, false, ErrGitHubRateLimited
 		}
 		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
-			return nil, false, fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubNeedsReauth, sso)
+			return nil, false, fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubSSORequired, sso)
 		}
 		return nil, false, ErrGitHubNeedsReauth
 	}
@@ -480,21 +541,6 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("github api returned status %d", resp.StatusCode)
-	}
-
-	// Check returned X-OAuth-Scopes header if present
-	if oauthScopes := resp.Header.Get("X-OAuth-Scopes"); oauthScopes != "" {
-		parts := parseOAuthScopes(oauthScopes)
-		hasRepo := false
-		for _, p := range parts {
-			if p == "repo" {
-				hasRepo = true
-				break
-			}
-		}
-		if !hasRepo {
-			return nil, false, ErrGitHubNeedsReauth
-		}
 	}
 
 	var rawRepos []struct {
@@ -556,12 +602,21 @@ func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owne
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrGitHubRepoNotFound
-	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		_ = s.Disconnect(ctx, userID)
 		return nil, ErrGitHubNotConnected
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			return nil, ErrGitHubRateLimited
+		}
+		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
+			return nil, fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubSSORequired, sso)
+		}
+		return nil, ErrGitHubNeedsReauth
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrGitHubRepoNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("github api returned status %d", resp.StatusCode)
@@ -701,6 +756,22 @@ func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, 
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		_ = s.Disconnect(ctx, userID)
+		return "", ErrGitHubNotConnected
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			return "", ErrGitHubRateLimited
+		}
+		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
+			return "", fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubSSORequired, sso)
+		}
+		return "", ErrGitHubNeedsReauth
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return "", ErrGitHubRepoNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("github returned HTTP %d when resolving commit for %s", resp.StatusCode, ref)
 	}
@@ -916,9 +987,13 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 		cacheDir = filepath.Join(os.TempDir(), "forgelab_gh_cache", owner, repo, resolvedSHA)
 		completeMarker := filepath.Join(cacheDir, ".complete")
 		if fi, err := os.Stat(completeMarker); err == nil && !fi.IsDir() {
-			slog.Info("reusing cached github snapshot", "owner", owner, "repo", repo, "sha", resolvedSHA)
-			return copyDirectoryContents(cacheDir, destClean)
+			if content, readErr := os.ReadFile(completeMarker); readErr == nil && strings.TrimSpace(string(content)) == resolvedSHA {
+				slog.Info("reusing cached github snapshot", "owner", owner, "repo", repo, "sha", resolvedSHA)
+				return copyDirectoryContents(cacheDir, destClean)
+			}
 		}
+		// Purge incomplete or corrupt cache directory
+		_ = os.RemoveAll(cacheDir)
 	}
 
 	tarURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/tarball/%s",
@@ -946,7 +1021,7 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 			return ErrGitHubRateLimited
 		}
 		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
-			return fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubNeedsReauth, sso)
+			return fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubSSORequired, sso)
 		}
 		return ErrGitHubNeedsReauth
 	}
@@ -962,6 +1037,17 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 		return fmt.Errorf("failed to decompress gzip stream: %w", err)
 	}
 	defer gzReader.Close()
+
+	// Extract into an isolated staging directory first
+	stagingDir, err := os.MkdirTemp("", fmt.Sprintf("forgelab-extract-%s-%s-*", owner, repo))
+	if err != nil {
+		stagingDir = filepath.Join(os.TempDir(), fmt.Sprintf("forgelab-extract-%s-%s-%s", owner, repo, resolvedSHA))
+		_ = os.RemoveAll(stagingDir)
+		_ = os.MkdirAll(stagingDir, 0755)
+	}
+	defer func() {
+		_ = os.RemoveAll(stagingDir)
+	}()
 
 	tarReader := tar.NewReader(gzReader)
 	var rootPrefix string
@@ -986,10 +1072,10 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 			continue
 		}
 		relPath := strings.Join(parts[1:], string(filepath.Separator))
-		targetPath := filepath.Join(destClean, relPath)
+		targetPath := filepath.Join(stagingDir, relPath)
 
 		// Security: prevent Zip Slip / Tar Slip path traversal
-		if !strings.HasPrefix(filepath.Clean(targetPath), destClean+string(filepath.Separator)) {
+		if !strings.HasPrefix(filepath.Clean(targetPath), stagingDir+string(filepath.Separator)) {
 			slog.Warn("skipping malicious file in tarball", "path", header.Name)
 			continue
 		}
@@ -1015,10 +1101,15 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 		}
 	}
 
-	// Populate disk cache for future reuse if pinned to an immutable SHA
+	// Copy staging directory contents to final target directory
+	if err := copyDirectoryContents(stagingDir, destClean); err != nil {
+		return fmt.Errorf("failed to materialize extracted repository snapshot: %w", err)
+	}
+
+	// Populate disk cache for future reuse only when pinned to an immutable SHA and fully extracted
 	if cacheDir != "" {
 		_ = os.MkdirAll(cacheDir, 0755)
-		_ = copyDirectoryContents(destClean, cacheDir)
+		_ = copyDirectoryContents(stagingDir, cacheDir)
 		_ = os.WriteFile(filepath.Join(cacheDir, ".complete"), []byte(resolvedSHA), 0644)
 	}
 

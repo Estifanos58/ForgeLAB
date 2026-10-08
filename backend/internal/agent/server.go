@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -27,6 +26,7 @@ import (
 	"github.com/forgelab/backend/internal/dockerignore"
 	"github.com/forgelab/backend/internal/envparser"
 	"github.com/forgelab/backend/internal/security"
+	"github.com/forgelab/backend/internal/tararchive"
 )
 
 // LocalSourceSession stores the in-memory mapping between an opaque source ID and the local host path
@@ -1008,6 +1008,16 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 	s.mu.RUnlock()
 
 	if !exists {
+		if globalSess, ok := LookupLocalSourceSession(sourceUUID); ok {
+			s.mu.Lock()
+			s.sessions[sourceUUID] = globalSess
+			s.mu.Unlock()
+			session = globalSess
+			exists = true
+		}
+	}
+
+	if !exists {
 		slog.Warn("agent source session not found in local memory",
 			"source_id", sourceUUID.String(),
 			"agent_id", s.agentID,
@@ -1019,21 +1029,14 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if time.Now().After(session.ExpiresAt) {
-		slog.Warn("agent source session expired in local memory",
-			"source_id", sourceUUID.String(),
-			"agent_id", s.agentID,
-		)
-		writeJSON(w, http.StatusNotFound, map[string]string{
-			"error":  "source session not found or expired",
-			"reason": "token expired",
-		})
-		return
-	}
+	// Extend session TTL on active access
+	session.ExpiresAt = time.Now().Add(s.sessionTTL)
 
 	// Verify token match
 	token, _ := r.Context().Value("agent_token").(string)
-	if session.Token != "" && token != "" && session.Token != token {
+	if session.Token == "" && token != "" {
+		session.Token = token
+	} else if session.Token != "" && token != "" && session.Token != token {
 		slog.Warn("agent source session token mismatch",
 			"source_id", sourceUUID.String(),
 			"agent_id", s.agentID,
@@ -1149,7 +1152,6 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		s.handleSourceEnvironment(w, r, session)
 
 	case "stream-context":
-		// Streams tarball of a service's source directory (respects .dockerignore)
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1184,93 +1186,9 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/x-tar")
-		w.Header().Set("Transfer-Encoding", "chunked")
-
-		tarWriter := tar.NewWriter(w)
-		defer tarWriter.Close()
-
-		matcher, _ := dockerignore.LoadDockerignore(evalServiceDir)
-
-		walkErr := filepath.WalkDir(evalServiceDir, func(p string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			rel, err := filepath.Rel(evalServiceDir, p)
-			if err != nil || rel == "." || rel == "" {
-				return nil
-			}
-
-			// Boundary check: symlinks must not escape evalServiceDir
-			if d.Type()&os.ModeSymlink != 0 {
-				target, evalErr := filepath.EvalSymlinks(p)
-				if evalErr != nil {
-					return nil // Skip unresolvable broken symlinks safely
-				}
-				targetRel, err := filepath.Rel(evalServiceDir, target)
-				if err != nil || targetRel == ".." || strings.HasPrefix(targetRel, ".."+string(filepath.Separator)) {
-					return fmt.Errorf("symlink %s escapes service directory boundary", p)
-				}
-			}
-
-			slashRel := filepath.ToSlash(rel)
-			isDir := d.IsDir()
-
-			if analyzer.IsPrunedDir(d.Name()) || analyzer.IsSecretFile(d.Name()) {
-				if isDir {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-
-			if matcher != nil {
-				if isDir && matcher.CanSkipDir(slashRel) {
-					return filepath.SkipDir
-				}
-				if matcher.Matches(slashRel, isDir) {
-					if isDir {
-						return filepath.SkipDir
-					}
-					return nil
-				}
-			}
-
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-
-			header, err := tar.FileInfoHeader(info, "")
-			if err != nil {
-				return err
-			}
-			header.Name = slashRel
-			if isDir {
-				header.Name += "/"
-			}
-
-			if err := tarWriter.WriteHeader(header); err != nil {
-				return err
-			}
-
-			if !isDir && info.Mode().IsRegular() {
-				f, err := os.Open(p)
-				if err != nil {
-					return err
-				}
-				defer f.Close()
-				if _, err := io.Copy(tarWriter, f); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if walkErr != nil {
-			slog.Error("error during stream-context WalkDir", "source_id", session.SourceID, "error", walkErr)
-			return
-		}
-
-		// If runtime is specified for auto build, inject virtual Dockerfile.forgelab into the stream
+		// Virtual files setup
+		virtualFiles := make(map[string][]byte)
+		expectedDockerfile := r.URL.Query().Get("dockerfile")
 		genRuntime := r.URL.Query().Get("runtime")
 		if genRuntime != "" {
 			genPort := 8080
@@ -1279,16 +1197,52 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			}
 			genStartCmd := r.URL.Query().Get("start_cmd")
 			dockerfileContent := detector.GenerateDockerfile(genRuntime, genPort, genStartCmd)
+			virtualFiles["Dockerfile.forgelab"] = []byte(dockerfileContent)
+			expectedDockerfile = "Dockerfile.forgelab"
+		} else if expectedDockerfile == "" {
+			if _, statErr := os.Stat(filepath.Join(evalServiceDir, "Dockerfile")); statErr == nil {
+				expectedDockerfile = "Dockerfile"
+			}
+		}
 
-			header := &tar.Header{
-				Name:    "Dockerfile.forgelab",
-				Mode:    0644,
-				Size:    int64(len(dockerfileContent)),
-				ModTime: time.Now(),
-			}
-			if err := tarWriter.WriteHeader(header); err == nil {
-				_, _ = tarWriter.Write([]byte(dockerfileContent))
-			}
+		matcher, _ := dockerignore.LoadDockerignore(evalServiceDir)
+
+		bOpts := tararchive.BuildContextOptions{
+			BuildContextDir: evalServiceDir,
+			Matcher:         matcher,
+			VirtualFiles:    virtualFiles,
+		}
+
+		// Generate completed, validated archive to disk first before sending any HTTP response headers
+		tmpFile, err := tararchive.CreateCompletedArchiveFile(r.Context(), os.TempDir(), bOpts, expectedDockerfile)
+		if err != nil {
+			slog.Error("error creating agent build context archive", "source_id", session.SourceID, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error":  "failed to generate build context archive",
+				"reason": err.Error(),
+			})
+			return
+		}
+		defer func() {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+		}()
+
+		stat, err := tmpFile.Stat()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error":  "failed to stat build context archive",
+				"reason": err.Error(),
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/x-tar")
+		w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+		w.WriteHeader(http.StatusOK)
+
+		if _, copyErr := io.Copy(w, tmpFile); copyErr != nil {
+			slog.Error("error streaming completed archive to client", "source_id", session.SourceID, "error", copyErr)
 		}
 
 	default:

@@ -148,8 +148,8 @@ CMD ["./server"]
 	})
 }
 
-// 4. Docker daemon reports Builder-Version: 2 → ForgeLAB selects BuildKit.
-func TestRegression_ResolveBuilder_DaemonReportsBuilderVersion2_SelectsBuildKit(t *testing.T) {
+// 4. Docker daemon reports Builder-Version: 2 → Normal Dockerfile uses standard builder to avoid TAR stream rejection
+func TestRegression_ResolveBuilder_DaemonReportsBuilderVersion2_NormalDockerfile_UsesStandardBuilder(t *testing.T) {
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/_ping", "/v1.41/_ping":
@@ -184,14 +184,15 @@ func TestRegression_ResolveBuilder_DaemonReportsBuilderVersion2_SelectsBuildKit(
 	resolvedOpts, err := eng.resolveBuilder(context.Background(), normalDF, types.ImageBuildOptions{}, logFn)
 	require.NoError(t, err)
 
-	// Since daemon reports Builder-Version: 2, ForgeLAB selects BuildKit
-	assert.Equal(t, types.BuilderBuildKit, resolvedOpts.Version, "must select BuildKit when daemon reports Builder-Version: 2")
+	// Since normal Dockerfile does not require BuildKit features, ForgeLAB leaves Version empty
+	// so Docker Engine uses standard builder and cleanly consumes plain TAR build contexts.
+	assert.Empty(t, resolvedOpts.Version, "must use standard builder for normal Dockerfile")
 
 	// Verify logged diagnostics
 	allLogs := strings.Join(loggedLines, "\n")
 	assert.Contains(t, allLogs, "Docker daemon available")
 	assert.Contains(t, allLogs, "Builder version: 2 / BuildKit")
-	assert.Contains(t, allLogs, "Using BuildKit builder for Docker image build")
+	assert.Contains(t, allLogs, "Using standard Docker builder for image build")
 }
 
 // 5. Docker daemon reports Builder-Version: 1 → ForgeLAB handles it correctly:

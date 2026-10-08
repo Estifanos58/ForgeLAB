@@ -275,21 +275,19 @@ func (e *Engine) resolveBuilder(
 		return options, nil
 	}
 
-	// Select builder based on daemon advertised capability
-	if daemonBuilderVer == types.BuilderBuildKit {
-		options.Version = types.BuilderBuildKit
-		if onLogLine != nil {
-			onLogLine("Using BuildKit builder for Docker image build")
-		}
-	} else if daemonBuilderVer == types.BuilderV1 {
+	// Select builder based on daemon advertised capability.
+	// Note: Docker Engine REST API does not accept plain tar build contexts when Version=BuilderBuildKit
+	// without a BuildKit control session, returning "failed to read dockerfile: archive/tar: invalid tar header".
+	// For standard Dockerfiles that do not require BuildKit-specific features, leave options.Version empty
+	// (or BuilderV1 if legacy) so Docker Engine's standard builder natively consumes the TAR context.
+	if daemonBuilderVer == types.BuilderV1 {
 		options.Version = types.BuilderV1
 		if onLogLine != nil {
 			onLogLine("Using legacy builder for Docker image build")
 		}
 	} else {
-		// Older daemon or unknown; do not force BuildKit
 		if onLogLine != nil {
-			onLogLine("Using default Docker builder for image build")
+			onLogLine("Using standard Docker builder for image build")
 		}
 	}
 

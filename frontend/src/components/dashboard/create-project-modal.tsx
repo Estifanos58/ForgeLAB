@@ -172,6 +172,14 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [selectedBranch, setSelectedBranch] = useState('main');
   const [rootDir, setRootDir] = useState('.');
+  const [ghErrorState, setGhErrorState] = useState<{
+    message: string;
+    needs_reauth?: boolean;
+    sso_required?: boolean;
+    rate_limited?: boolean;
+    not_connected?: boolean;
+    not_found?: boolean;
+  } | null>(null);
 
   // Local Agent State
   const [localMode, setLocalMode] = useState<LocalMode>('agent');
@@ -652,9 +660,36 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     setConfiguredServices((prev) => [...prev, newSvc]);
   };
 
+  const handleGitHubErrorResponse = (err: any, fallbackMsg: string) => {
+    const isReauth = Boolean(err?.needs_reauth || err?.message?.toLowerCase().includes('re-authoriz'));
+    const isSSO = Boolean(err?.sso_required || err?.message?.toLowerCase().includes('sso'));
+    const isRateLimited = Boolean(err?.rate_limited || err?.status === 429 || err?.message?.toLowerCase().includes('rate limit'));
+    const isNotConnected = Boolean(err?.not_connected || err?.message?.toLowerCase().includes('not been granted'));
+    const isNotFound = Boolean(err?.not_found || err?.status === 404);
+
+    if (isReauth) {
+      setGhStatus((prev) => (prev ? { ...prev, needs_reauth: true } : prev));
+    }
+    if (isNotConnected) {
+      setGhStatus((prev) => (prev ? { ...prev, connected: false } : prev));
+    }
+
+    const state = {
+      message: err?.message || fallbackMsg,
+      needs_reauth: isReauth,
+      sso_required: isSSO,
+      rate_limited: isRateLimited,
+      not_connected: isNotConnected,
+      not_found: isNotFound,
+    };
+    setGhErrorState(state);
+    setError(state.message);
+  };
+
   // GitHub integration handlers
   const checkGitHubStatus = async () => {
     setLoadingGhStatus(true);
+    setGhErrorState(null);
     setError(null);
     try {
       const status = await api.integrations.github.getStatus();
@@ -663,7 +698,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         loadRepositories();
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to check GitHub integration status');
+      handleGitHubErrorResponse(err, 'Failed to check GitHub integration status');
     } finally {
       setLoadingGhStatus(false);
     }
@@ -676,6 +711,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       setLoadingRepos(true);
       setRepoPage(1);
     }
+    setGhErrorState(null);
     setError(null);
     try {
       const res = await api.integrations.github.listRepositories(page, 30);
@@ -687,10 +723,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       setRepoPage(page);
       setHasMoreRepos(Boolean(res.has_more));
     } catch (err: any) {
-      if (err.needs_reauth || err.message?.toLowerCase().includes('re-authoriz')) {
-        setGhStatus((prev) => (prev ? { ...prev, needs_reauth: true } : prev));
-      }
-      setError(err.message || 'Failed to load GitHub repositories');
+      handleGitHubErrorResponse(err, 'Failed to load GitHub repositories');
     } finally {
       setLoadingRepos(false);
       setLoadingMoreRepos(false);
@@ -704,12 +737,13 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   };
 
   const handleConnectGitHub = async () => {
+    setGhErrorState(null);
     setError(null);
     try {
       const { url } = await api.integrations.github.getConnectURL();
       window.location.href = url;
     } catch (err: any) {
-      setError(err.message || 'Failed to initiate GitHub authorization');
+      handleGitHubErrorResponse(err, 'Failed to initiate GitHub authorization');
     }
   };
 
@@ -717,14 +751,16 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     setSelectedRepo(repo);
     setSelectedBranch(repo.default_branch || 'main');
     setLoadingBranches(true);
+    setGhErrorState(null);
     setError(null);
 
     try {
       const [owner, name] = repo.full_name.split('/');
       const bRes = await api.integrations.github.listBranches(owner, name);
       setBranches(bRes.branches || []);
-    } catch {
+    } catch (err: any) {
       setBranches([{ name: repo.default_branch || 'main', commit_sha: '' }]);
+      handleGitHubErrorResponse(err, 'Failed to load repository branches');
     } finally {
       setLoadingBranches(false);
     }
@@ -733,6 +769,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   const handleAnalyzeGitHub = async () => {
     if (!selectedRepo) return;
     setLoading(true);
+    setGhErrorState(null);
     setError(null);
 
     const [owner, name] = selectedRepo.full_name.split('/');
@@ -771,7 +808,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       setConfiguredServices(svcs);
       setStep('config');
     } catch (err: any) {
-      setError(err.message || 'Failed to analyze repository');
+      handleGitHubErrorResponse(err, 'Failed to analyze repository');
     } finally {
       setLoading(false);
     }
@@ -1893,14 +1930,14 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {ghStatus.needs_reauth && (
+                  {(ghStatus.needs_reauth || ghErrorState?.needs_reauth) && (
                     <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-200 flex items-start gap-2.5">
                       <AlertCircle className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
                       <div className="flex-1 space-y-2">
                         <div>
-                          <strong className="text-white block font-medium">Re-authorization Required for Private Repositories</strong>
+                          <strong className="text-white block font-medium">Re-authorization Required for Repository Access</strong>
                           <span className="text-amber-300/80 text-[11px] leading-tight block mt-0.5">
-                            Your connected GitHub account is missing repository permissions. Re-authorize to access your private repositories.
+                            Your connected GitHub authorization has expired or is missing repository permissions. Re-authorize ForgeLAB to access your public and private repositories.
                           </span>
                         </div>
                         <Button
@@ -1913,6 +1950,54 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                         >
                           Re-authorize GitHub
                         </Button>
+                      </div>
+                    </div>
+                  )}
+
+                  {ghErrorState?.sso_required && (
+                    <div className="rounded-lg border border-purple-500/40 bg-purple-500/10 p-3.5 text-xs text-purple-200 flex items-start gap-2.5">
+                      <AlertCircle className="w-4 h-4 text-purple-400 mt-0.5 flex-shrink-0" />
+                      <div className="flex-1 space-y-2">
+                        <div>
+                          <strong className="text-white block font-medium">Organization SAML / SSO Authorization Required</strong>
+                          <span className="text-purple-300/80 text-[11px] leading-tight block mt-0.5">
+                            This repository belongs to an organization protected by SAML Single Sign-On (SSO). Please grant ForgeLAB access in your GitHub organization settings or re-authorize with SSO.
+                          </span>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          onClick={handleConnectGitHub}
+                          icon={<Github className="w-3.5 h-3.5" />}
+                          className="text-xs h-7 px-2.5 border-purple-500/40 hover:bg-purple-500/20"
+                        >
+                          Authorize Organization via GitHub
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
+                  {ghErrorState?.rate_limited && (
+                    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-200 flex items-start gap-2.5">
+                      <AlertCircle className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
+                      <div className="flex-1 space-y-1">
+                        <strong className="text-white block font-medium">GitHub API Rate Limit Exceeded</strong>
+                        <span className="text-amber-300/80 text-[11px] leading-tight block mt-0.5">
+                          GitHub API rate limit exceeded. Please wait a moment before refreshing or trying again.
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {ghErrorState?.not_found && (
+                    <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-3.5 text-xs text-red-200 flex items-start gap-2.5">
+                      <AlertCircle className="w-4 h-4 text-red-400 mt-0.5 flex-shrink-0" />
+                      <div className="flex-1 space-y-1">
+                        <strong className="text-white block font-medium">Repository Not Found or Access Denied</strong>
+                        <span className="text-red-300/80 text-[11px] leading-tight block mt-0.5">
+                          The repository could not be found or your account does not have read access to it.
+                        </span>
                       </div>
                     </div>
                   )}

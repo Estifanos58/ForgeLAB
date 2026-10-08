@@ -361,6 +361,7 @@ func main() {
 					r.Post("/connect", integrationHandler.ConnectGitHub)
 					r.Post("/disconnect", integrationHandler.DisconnectGitHub)
 					r.Get("/repositories", integrationHandler.ListRepositories)
+					r.Get("/repositories/{owner}/{repo}", integrationHandler.GetRepository)
 					r.Get("/repositories/{owner}/{repo}/branches", integrationHandler.ListBranches)
 					r.Get("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
 					r.Post("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)

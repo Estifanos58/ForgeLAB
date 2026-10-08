@@ -24,12 +24,27 @@ import {
   User,
 } from './types';
 
-class ApiClientError extends Error {
+export class ApiClientError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  data?: any;
+  needs_reauth?: boolean;
+  sso_required?: boolean;
+  rate_limited?: boolean;
+  not_found?: boolean;
+  not_connected?: boolean;
+
+  constructor(message: string, status: number, data?: any) {
     super(message);
     this.name = 'ApiClientError';
     this.status = status;
+    this.data = data;
+    if (typeof data === 'object' && data !== null) {
+      this.needs_reauth = Boolean(data.needs_reauth);
+      this.sso_required = Boolean(data.sso_required);
+      this.rate_limited = Boolean(data.rate_limited);
+      this.not_found = Boolean(data.not_found);
+      this.not_connected = Boolean(data.not_connected);
+    }
   }
 }
 
@@ -94,7 +109,8 @@ async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {}): Pro
     url.includes('/api/auth/login') ||
     url.includes('/api/auth/register') ||
     url.includes('/api/auth/refresh') ||
-    url.includes('/api/auth/logout');
+    url.includes('/api/auth/logout') ||
+    url.includes('/api/integrations/github');
 
   if (response.status === 401 && !options._retry && !isAuthEndpoint) {
     try {
@@ -124,7 +140,7 @@ async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {}): Pro
   if (!response.ok) {
     const errorMsg =
       typeof data === 'object' && data?.error ? data.error : `Request failed with status ${response.status}`;
-    throw new ApiClientError(errorMsg, response.status);
+    throw new ApiClientError(errorMsg, response.status, data);
   }
 
   return data as T;
@@ -383,10 +399,23 @@ export const api = {
         );
       },
 
+      async getRepo(owner: string, repo: string): Promise<GitHubRepo> {
+        return apiFetch<GitHubRepo>(
+          `/api/integrations/github/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
+        );
+      },
+
       async listBranches(owner: string, repo: string): Promise<{ branches: GitHubBranch[] }> {
-        return apiFetch<{ branches: GitHubBranch[] }>(
+        const res = await apiFetch<any>(
           `/api/integrations/github/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`
         );
+        if (Array.isArray(res)) {
+          return { branches: res };
+        }
+        if (res && Array.isArray(res.branches)) {
+          return res;
+        }
+        return { branches: [] };
       },
 
       async detect(

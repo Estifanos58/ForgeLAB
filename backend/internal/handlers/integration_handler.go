@@ -151,6 +151,71 @@ func (h *IntegrationHandler) DisconnectGitHub(w http.ResponseWriter, r *http.Req
 	})
 }
 
+func (h *IntegrationHandler) handleGitHubError(w http.ResponseWriter, err error, defaultMsg string) {
+	if errors.Is(err, services.ErrGitHubNeedsReauth) {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{
+			"error":        "GitHub connection requires re-authorization for repository access. Please re-authorize GitHub.",
+			"needs_reauth": true,
+		})
+		return
+	}
+	if errors.Is(err, services.ErrGitHubSSORequired) {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{
+			"error":        "Organization SAML/SSO authorization is required to access this repository. Please authorize ForgeLAB in your GitHub organization settings.",
+			"sso_required": true,
+		})
+		return
+	}
+	if errors.Is(err, services.ErrGitHubNotConnected) {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{
+			"error":         "GitHub repository access has not been granted. Please connect your GitHub account with repository permissions.",
+			"not_connected": true,
+		})
+		return
+	}
+	if errors.Is(err, services.ErrGitHubRepoNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]interface{}{
+			"error":     "GitHub repository not found or access denied.",
+			"not_found": true,
+		})
+		return
+	}
+	if errors.Is(err, services.ErrGitHubRateLimited) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]interface{}{
+			"error":        "GitHub API rate limit exceeded. Please wait a moment or try again later.",
+			"rate_limited": true,
+		})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+		"error": fmt.Sprintf("%s: %v", defaultMsg, err),
+	})
+}
+
+// GetRepository handles GET /api/integrations/github/repositories/{owner}/{repo}
+func (h *IntegrationHandler) GetRepository(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	owner := chi.URLParam(r, "owner")
+	repo := chi.URLParam(r, "repo")
+	if owner == "" || repo == "" {
+		writeError(w, http.StatusBadRequest, "owner and repo parameters are required")
+		return
+	}
+
+	repository, err := h.githubService.GetRepo(r.Context(), userID, owner, repo)
+	if err != nil {
+		h.handleGitHubError(w, err, "failed to get github repository")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, repository)
+}
+
 // ListRepositories handles GET /api/integrations/github/repositories
 func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Request) {
 	userID, ok := getUserIDFromContext(r)
@@ -170,22 +235,7 @@ func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Req
 
 	repos, hasMore, err := h.githubService.ListRepositories(r.Context(), userID, page, perPage)
 	if err != nil {
-		if errors.Is(err, services.ErrGitHubNeedsReauth) {
-			writeJSON(w, http.StatusForbidden, map[string]interface{}{
-				"error":        "GitHub connection requires re-authorization for repository access. Please re-authorize GitHub.",
-				"needs_reauth": true,
-			})
-			return
-		}
-		if errors.Is(err, services.ErrGitHubNotConnected) {
-			writeError(w, http.StatusForbidden, "github repository access has not been granted. Please connect GitHub repository permissions.")
-			return
-		}
-		if errors.Is(err, services.ErrGitHubRateLimited) {
-			writeError(w, http.StatusTooManyRequests, "github api rate limit exceeded")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to list github repositories: "+err.Error())
+		h.handleGitHubError(w, err, "failed to list github repositories")
 		return
 	}
 
@@ -214,30 +264,13 @@ func (h *IntegrationHandler) ListBranches(w http.ResponseWriter, r *http.Request
 
 	branches, err := h.githubService.ListBranches(r.Context(), userID, owner, repo)
 	if err != nil {
-		if errors.Is(err, services.ErrGitHubNeedsReauth) {
-			writeJSON(w, http.StatusForbidden, map[string]interface{}{
-				"error":        "GitHub connection requires re-authorization for repository access. Please re-authorize GitHub.",
-				"needs_reauth": true,
-			})
-			return
-		}
-		if errors.Is(err, services.ErrGitHubNotConnected) {
-			writeError(w, http.StatusForbidden, "github repository access has not been granted")
-			return
-		}
-		if errors.Is(err, services.ErrGitHubRepoNotFound) {
-			writeError(w, http.StatusNotFound, "github repository not found or access denied")
-			return
-		}
-		if errors.Is(err, services.ErrGitHubRateLimited) {
-			writeError(w, http.StatusTooManyRequests, "github api rate limit exceeded")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to list branches")
+		h.handleGitHubError(w, err, "failed to list branches")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, branches)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"branches": branches,
+	})
 }
 
 // DetectRepository handles GET /api/integrations/github/repositories/{owner}/{repo}/detect
@@ -275,26 +308,7 @@ func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Req
 
 	analysis, err := h.githubService.AnalyzeRepo(r.Context(), userID, owner, repo, branch, rootDir)
 	if err != nil {
-		if errors.Is(err, services.ErrGitHubNeedsReauth) {
-			writeJSON(w, http.StatusForbidden, map[string]interface{}{
-				"error":        "GitHub connection requires re-authorization for repository access. Please re-authorize GitHub.",
-				"needs_reauth": true,
-			})
-			return
-		}
-		if errors.Is(err, services.ErrGitHubNotConnected) {
-			writeError(w, http.StatusForbidden, "github repository access has not been granted")
-			return
-		}
-		if errors.Is(err, services.ErrGitHubRepoNotFound) {
-			writeError(w, http.StatusNotFound, "github repository not found or access denied")
-			return
-		}
-		if errors.Is(err, services.ErrGitHubRateLimited) {
-			writeError(w, http.StatusTooManyRequests, "github api rate limit exceeded")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to inspect repository for detection: "+err.Error())
+		h.handleGitHubError(w, err, "failed to inspect repository for detection")
 		return
 	}
 
