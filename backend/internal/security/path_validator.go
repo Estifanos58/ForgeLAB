@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -24,6 +25,8 @@ type PathValidator struct {
 	allowedRoots        []string
 	hostSourceRoot      string
 	containerSourceRoot string
+	daemonSourceRoot    string
+	mu                  sync.RWMutex
 }
 
 // NewPathValidator creates a new PathValidator with configured allowed root directories.
@@ -63,6 +66,7 @@ func NewPathValidatorWithMapping(allowedRoots []string, hostSourceRoot, containe
 		allowedRoots:        cleanRoots,
 		hostSourceRoot:      cleanHost,
 		containerSourceRoot: cleanContainer,
+		daemonSourceRoot:    cleanHost,
 	}
 }
 
@@ -74,16 +78,25 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 		return "", ErrPathNotExist
 	}
 
-	if v.hostSourceRoot == "" || v.containerSourceRoot == "" {
+	if v == nil {
+		return trimmed, nil
+	}
+
+	v.mu.RLock()
+	hostRoot := v.hostSourceRoot
+	containerRoot := v.containerSourceRoot
+	v.mu.RUnlock()
+
+	if hostRoot == "" || containerRoot == "" {
 		return trimmed, nil
 	}
 
 	// Normalize paths for comparison (supporting both Windows and POSIX path separators)
-	normHostRoot := normalizePathForPrefix(v.hostSourceRoot)
+	normHostRoot := normalizePathForPrefix(hostRoot)
 	normCandidate := normalizePathForPrefix(trimmed)
 
-	if normCandidate == normHostRoot {
-		return v.containerSourceRoot, nil
+	if strings.EqualFold(normCandidate, normHostRoot) {
+		return containerRoot, nil
 	}
 
 	prefixWithSep := normHostRoot
@@ -98,12 +111,12 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 		if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
 			return "", ErrPathNotAllowed
 		}
-		return filepath.Join(v.containerSourceRoot, cleanRel), nil
+		return filepath.Join(containerRoot, cleanRel), nil
 	}
 
 	// Check if path is already inside containerSourceRoot
-	normContainerRoot := normalizePathForPrefix(v.containerSourceRoot)
-	if normCandidate == normContainerRoot || strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(normContainerRoot+"/")) {
+	normContainerRoot := normalizePathForPrefix(containerRoot)
+	if strings.EqualFold(normCandidate, normContainerRoot) || strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(normContainerRoot+"/")) {
 		return trimmed, nil
 	}
 
@@ -115,6 +128,8 @@ func (v *PathValidator) HostSourceRoot() string {
 	if v == nil {
 		return ""
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.hostSourceRoot
 }
 
@@ -123,7 +138,42 @@ func (v *PathValidator) ContainerSourceRoot() string {
 	if v == nil {
 		return ""
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.containerSourceRoot
+}
+
+// DaemonSourceRoot returns the configured Docker daemon source root directory.
+func (v *PathValidator) DaemonSourceRoot() string {
+	if v == nil {
+		return ""
+	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.daemonSourceRoot != "" {
+		return v.daemonSourceRoot
+	}
+	return v.hostSourceRoot
+}
+
+// SetHostSourceRoot dynamically updates the configured host source root directory.
+func (v *PathValidator) SetHostSourceRoot(root string) {
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.hostSourceRoot = strings.TrimSpace(root)
+}
+
+// SetDaemonSourceRoot dynamically updates the configured Docker daemon source root directory.
+func (v *PathValidator) SetDaemonSourceRoot(root string) {
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.daemonSourceRoot = strings.TrimSpace(root)
 }
 
 // AllowedRoots returns a copy of configured allowed source roots.
@@ -131,6 +181,8 @@ func (v *PathValidator) AllowedRoots() []string {
 	if v == nil {
 		return nil
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return append([]string(nil), v.allowedRoots...)
 }
 
@@ -141,15 +193,28 @@ func (v *PathValidator) TranslateContainerToHost(candidatePath string) (string, 
 		return "", ErrPathNotExist
 	}
 
-	if v.hostSourceRoot == "" || v.containerSourceRoot == "" {
+	if v == nil {
 		return trimmed, nil
 	}
 
-	normContainerRoot := normalizePathForPrefix(v.containerSourceRoot)
+	v.mu.RLock()
+	hostRoot := v.hostSourceRoot
+	containerRoot := v.containerSourceRoot
+	daemonRoot := v.daemonSourceRoot
+	if daemonRoot == "" {
+		daemonRoot = hostRoot
+	}
+	v.mu.RUnlock()
+
+	if hostRoot == "" || containerRoot == "" {
+		return trimmed, nil
+	}
+
+	normContainerRoot := normalizePathForPrefix(containerRoot)
 	normCandidate := normalizePathForPrefix(trimmed)
 
-	if normCandidate == normContainerRoot {
-		return v.hostSourceRoot, nil
+	if strings.EqualFold(normCandidate, normContainerRoot) {
+		return daemonRoot, nil
 	}
 
 	prefixWithSep := normContainerRoot
@@ -163,11 +228,29 @@ func (v *PathValidator) TranslateContainerToHost(candidatePath string) (string, 
 		if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
 			return "", ErrPathNotAllowed
 		}
-		// Join with hostSourceRoot preserving host format
-		return filepath.Join(v.hostSourceRoot, cleanRel), nil
+		// Join with daemonRoot preserving host format
+		return joinHostPath(daemonRoot, cleanRel), nil
 	}
 
 	return trimmed, nil
+}
+
+func joinHostPath(base, rel string) string {
+	cleanRel := strings.TrimPrefix(filepath.ToSlash(rel), "/")
+	cleanRel = path.Clean(cleanRel)
+	if cleanRel == "" || cleanRel == "." {
+		return base
+	}
+	cleanRel = strings.TrimPrefix(cleanRel, "/")
+
+	if strings.Contains(base, "\\") || (len(base) >= 2 && unicode.IsLetter(rune(base[0])) && base[1] == ':') {
+		baseClean := strings.TrimRight(strings.ReplaceAll(base, "/", "\\"), "\\")
+		relClean := strings.ReplaceAll(cleanRel, "/", "\\")
+		return baseClean + "\\" + relClean
+	}
+
+	baseClean := strings.TrimRight(filepath.ToSlash(base), "/")
+	return baseClean + "/" + cleanRel
 }
 
 func normalizePathForPrefix(p string) string {

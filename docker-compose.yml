@@ -64,6 +64,7 @@ services:
       FORGELAB_WORK_DIR: /app/data/builds
       FORGELAB_SOURCES_DIR: /app/data/sources
       FORGELAB_ALLOWED_SOURCE_ROOTS: ${FORGELAB_ALLOWED_SOURCE_ROOTS:-}
+      # Host source root directory for bind mounts; if left empty, ForgeLAB auto-derives the Docker-daemon-visible root from the container mount below
       FORGELAB_HOST_SOURCE_ROOT: ${FORGELAB_HOST_SOURCE_ROOT:-}
       FORGELAB_CONTAINER_SOURCE_ROOT: /host-projects
       FORGELAB_LOCAL_BUILD_MODE: ${FORGELAB_LOCAL_BUILD_MODE:-direct}

@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/docker/docker/client"
+
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
@@ -37,6 +39,7 @@ type PreflightOptions struct {
 	ServicesMap         map[string]*models.Service
 	PathValidator       *security.PathValidator
 	SourceService       *services.SourceService
+	DockerClient        client.CommonAPIClient
 	IsServiceDeployment bool
 }
 
@@ -262,7 +265,7 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 			}
 
 			// Validate and resolve volume mount using unified source-aware resolver
-			_, err := ResolveAndValidateVolumeMount(ctx, opts.Project, vol, opts.SourceService, opts.PathValidator)
+			_, err := ResolveAndValidateVolumeMount(ctx, opts.Project, vol, opts.SourceService, opts.PathValidator, opts.DockerClient)
 			if err != nil {
 				return &PreflightValidationError{
 					ServiceName: sd.ServiceName,

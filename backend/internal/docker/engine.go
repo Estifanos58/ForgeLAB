@@ -558,6 +558,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		ServicesMap:         servicesMap,
 		PathValidator:       e.pathValidator,
 		SourceService:       e.sourceService,
+		DockerClient:        e.dockerClient,
 		IsServiceDeployment: true,
 	}); err != nil {
 		reason := fmt.Sprintf("Preflight validation failed: %v", err)
@@ -1275,8 +1276,18 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 	}
 
-	// Resolve project source root for allowlisting
-	if hostRoot, containerRoot, err := ResolveProjectSourceRoot(execCtx, project, e.sourceService, e.pathValidator); err == nil {
+	// Resolve project source paths for allowlisting across namespaces
+	if paths, err := ResolveProjectSourcePaths(execCtx, project, e.sourceService, e.pathValidator, e.dockerClient); err == nil {
+		if paths.DaemonPath != "" {
+			allowedMountPrefixes = append(allowedMountPrefixes, paths.DaemonPath)
+		}
+		if paths.BackendPath != "" && paths.BackendPath != paths.DaemonPath {
+			allowedMountPrefixes = append(allowedMountPrefixes, paths.BackendPath)
+		}
+		if paths.AgentPath != "" && paths.AgentPath != paths.DaemonPath && paths.AgentPath != paths.BackendPath {
+			allowedMountPrefixes = append(allowedMountPrefixes, paths.AgentPath)
+		}
+	} else if hostRoot, containerRoot, err := ResolveProjectSourceRoot(execCtx, project, e.sourceService, e.pathValidator); err == nil {
 		if hostRoot != "" {
 			allowedMountPrefixes = append(allowedMountPrefixes, hostRoot)
 		}
@@ -1290,7 +1301,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			continue
 		}
 
-		resolvedVol, err := ResolveAndValidateVolumeMount(execCtx, project, v, e.sourceService, e.pathValidator)
+		resolvedVol, err := ResolveAndValidateVolumeMount(execCtx, project, v, e.sourceService, e.pathValidator, e.dockerClient)
 		if err != nil {
 			reason := err.Error()
 			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
@@ -1323,9 +1334,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			}
 			binds = append(binds, bindEntry)
 		} else {
-			hostPath := filepath.Clean(resolvedVol.HostPath)
-			allowedMountPrefixes = append(allowedMountPrefixes, hostPath)
-			bindEntry := fmt.Sprintf("%s:%s", hostPath, resolvedVol.ContainerPath)
+			daemonPath := resolvedVol.DaemonPath
+			if daemonPath == "" {
+				daemonPath = resolvedVol.HostPath
+			}
+			allowedMountPrefixes = append(allowedMountPrefixes, daemonPath)
+			bindEntry := fmt.Sprintf("%s:%s", daemonPath, resolvedVol.ContainerPath)
 			if resolvedVol.ReadOnly {
 				bindEntry += ":ro"
 			}
@@ -1675,6 +1689,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		ServicesMap:   servicesMap,
 		PathValidator: e.pathValidator,
 		SourceService: e.sourceService,
+		DockerClient:  e.dockerClient,
 	}); err != nil {
 		reason := fmt.Sprintf("Preflight validation failed: %v", err)
 		updateReleaseStatus(models.DeployStatusFailed, &reason)

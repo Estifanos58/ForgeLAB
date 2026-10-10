@@ -118,13 +118,17 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 			return nil, ErrDockerSocketMountRejected
 		}
 
+		normHostPath := strings.ReplaceAll(lowerHostPath, "\\", "/")
+
 		// Check against sensitive paths
 		for _, restricted := range restrictedHostMounts {
 			if opts.AllowDockerSocket && (strings.Contains(restricted, "docker.sock") || strings.Contains(restricted, "docker_engine")) {
 				continue
 			}
 			cleanRestricted := strings.ToLower(filepath.Clean(restricted))
-			if lowerHostPath == cleanRestricted || strings.HasPrefix(lowerHostPath, cleanRestricted+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanRestricted+"/") {
+			normRestricted := strings.ReplaceAll(cleanRestricted, "\\", "/")
+			if normHostPath == normRestricted || strings.HasPrefix(normHostPath, normRestricted+"/") ||
+				lowerHostPath == cleanRestricted || strings.HasPrefix(lowerHostPath, cleanRestricted+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanRestricted+"/") {
 				return nil, fmt.Errorf("%w: %s", ErrSensitiveHostMountRejected, hostPath)
 			}
 		}
@@ -134,8 +138,13 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 		if !isNamedVolume && len(opts.AllowedMountPrefixes) > 0 {
 			allowed := false
 			for _, prefix := range opts.AllowedMountPrefixes {
+				if strings.TrimSpace(prefix) == "" {
+					continue
+				}
 				cleanPrefix := strings.ToLower(filepath.Clean(prefix))
-				if lowerHostPath == cleanPrefix || strings.HasPrefix(lowerHostPath, cleanPrefix+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanPrefix+"/") {
+				normPrefix := strings.ReplaceAll(cleanPrefix, "\\", "/")
+				if normHostPath == normPrefix || strings.HasPrefix(normHostPath, normPrefix+"/") ||
+					lowerHostPath == cleanPrefix || strings.HasPrefix(lowerHostPath, cleanPrefix+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanPrefix+"/") {
 					allowed = true
 					break
 				}

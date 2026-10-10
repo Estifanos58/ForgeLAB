@@ -118,11 +118,26 @@ func main() {
 	if cfg.Docker.AllowedSourceRoots != "" {
 		allowedRoots = strings.Split(cfg.Docker.AllowedSourceRoots, ",")
 	}
+
+	// Auto-detect host source root from Docker container mount metadata if running in container and not explicitly configured
+	if cfg.Docker.HostSourceRoot == "" && dockerCli != nil {
+		if mountInfo, err := docker.DetectBackendContainerMount(ctx, dockerCli, cfg.Docker.ContainerSourceRoot); err == nil && mountInfo != nil {
+			slog.Info("auto-detected host source root from Docker container mount metadata",
+				"daemon_source_root", mountInfo.DaemonSource,
+				"container_source_root", mountInfo.ContainerTarget,
+			)
+			cfg.Docker.HostSourceRoot = mountInfo.DaemonSource
+		}
+	}
+
 	pathValidator := security.NewPathValidatorWithMapping(
 		allowedRoots,
 		cfg.Docker.HostSourceRoot,
 		cfg.Docker.ContainerSourceRoot,
 	)
+	if cfg.Docker.HostSourceRoot != "" {
+		pathValidator.SetDaemonSourceRoot(cfg.Docker.HostSourceRoot)
+	}
 	portManager := network.NewPortManager(10000, 60000)
 
 	encryptor, err := crypto.NewEncryptor(cfg.Encryption.Key)
