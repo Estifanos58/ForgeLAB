@@ -541,6 +541,7 @@ func (h *SourceHandler) ValidateAgentSession(w http.ResponseWriter, r *http.Requ
 		SourceID   string `json:"source_id"`
 		AgentID    string `json:"agent_id"`
 		FolderName string `json:"folder_name"`
+		SourcePath string `json:"source_path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Token) == "" {
 		writeError(w, http.StatusBadRequest, "valid session token is required")
@@ -562,8 +563,11 @@ func (h *SourceHandler) ValidateAgentSession(w http.ResponseWriter, r *http.Requ
 		if err != nil {
 			// If not bound yet and session is unconsumed, allow initial binding (e.g. from folder registration)
 			if unconsumedSess, valErr := sm.ValidateToken(req.Token); valErr == nil && unconsumedSess.SourceID == nil {
-				session, err = sm.BindSource(req.Token, sourceUUID, req.FolderName, req.AgentID)
+				session, err = sm.BindSourceWithPath(req.Token, sourceUUID, req.FolderName, req.AgentID, req.SourcePath)
 			}
+		}
+		if session != nil && req.SourcePath != "" && session.SourcePath == "" {
+			session, _ = sm.BindSourceWithPath(req.Token, sourceUUID, req.FolderName, req.AgentID, req.SourcePath)
 		}
 	} else {
 		session, err = sm.ValidateToken(req.Token)
@@ -606,6 +610,9 @@ func (h *SourceHandler) ValidateAgentSession(w http.ResponseWriter, r *http.Requ
 	}
 	if session.SourceID != nil {
 		resp["source_id"] = session.SourceID.String()
+	}
+	if session.SourcePath != "" {
+		resp["source_path"] = session.SourcePath
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -674,6 +681,12 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 		if sess.FolderName != "" {
 			folderName = sess.FolderName
 		}
+		if sess.SourcePath != "" && (req.Metadata == nil || req.Metadata["source_path"] == nil || req.Metadata["source_path"] == "") {
+			if req.Metadata == nil {
+				req.Metadata = make(map[string]interface{})
+			}
+			req.Metadata["source_path"] = sess.SourcePath
+		}
 
 		// Reject forged client-provided IDs if they do not match the session
 		if req.SourceID != "" && req.SourceID != verifiedSourceID.String() {
@@ -722,6 +735,11 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 	delete(meta, "session_token")
 	delete(meta, "token")
 	meta["folder_name"] = folderName
+	if meta["source_path"] == nil || meta["source_path"] == "" {
+		if locSess, ok := agent.LookupLocalSourceSession(verifiedSourceID); ok && locSess.CanonicalPath != "" {
+			meta["source_path"] = locSess.CanonicalPath
+		}
+	}
 
 	// Store verified token encrypted
 	var encryptedToken []byte

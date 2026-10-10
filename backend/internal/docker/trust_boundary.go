@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/go-connections/nat"
@@ -62,7 +63,36 @@ type ContainerSecurityOptions struct {
 	Binds                []string
 	NetworkMode          string
 	AllowedMountPrefixes []string
+	AllowDockerSocket    bool
 	CapAdd               []string
+}
+
+func splitDockerBind(bind string) (hostPath, containerPath, mode string) {
+	s := strings.TrimSpace(bind)
+	if s == "" {
+		return "", "", ""
+	}
+
+	start := 0
+	if len(s) >= 3 && unicode.IsLetter(rune(s[0])) && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {
+		start = 2
+	}
+
+	firstColon := strings.Index(s[start:], ":")
+	if firstColon == -1 {
+		return s, "", ""
+	}
+	actualFirstColon := start + firstColon
+
+	hostPart := s[:actualFirstColon]
+	rest := s[actualFirstColon+1:]
+
+	secondColon := strings.Index(rest, ":")
+	if secondColon == -1 {
+		return hostPart, rest, ""
+	}
+
+	return hostPart, rest[:secondColon], rest[secondColon+1:]
 }
 
 // ValidateAndBuildSecureHostConfig creates a centralized, strictly validated Docker HostConfig
@@ -76,33 +106,36 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 	// 2. Validate Binds: Ensure zero access to docker socket or sensitive host paths
 	validatedBinds := make([]string, 0, len(opts.Binds))
 	for _, bind := range opts.Binds {
-		parts := strings.Split(bind, ":")
-		if len(parts) < 2 {
+		host, containerPath, _ := splitDockerBind(bind)
+		if host == "" || containerPath == "" {
 			continue
 		}
-		hostPath := filepath.Clean(parts[0])
+		hostPath := filepath.Clean(host)
 		lowerHostPath := strings.ToLower(hostPath)
 
 		// Check against Docker socket (Unix socket and Windows named pipe)
-		if strings.Contains(lowerHostPath, "docker.sock") || strings.Contains(lowerHostPath, "docker_engine") {
+		if !opts.AllowDockerSocket && (strings.Contains(lowerHostPath, "docker.sock") || strings.Contains(lowerHostPath, "docker_engine")) {
 			return nil, ErrDockerSocketMountRejected
 		}
 
 		// Check against sensitive paths
 		for _, restricted := range restrictedHostMounts {
+			if opts.AllowDockerSocket && (strings.Contains(restricted, "docker.sock") || strings.Contains(restricted, "docker_engine")) {
+				continue
+			}
 			cleanRestricted := strings.ToLower(filepath.Clean(restricted))
-			if lowerHostPath == cleanRestricted || strings.HasPrefix(lowerHostPath, cleanRestricted+string(filepath.Separator)) {
+			if lowerHostPath == cleanRestricted || strings.HasPrefix(lowerHostPath, cleanRestricted+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanRestricted+"/") {
 				return nil, fmt.Errorf("%w: %s", ErrSensitiveHostMountRejected, hostPath)
 			}
 		}
 
 		// Check against allowlist if configured (only for host bind paths, not Docker named volumes)
-		isNamedVolume := !filepath.IsAbs(parts[0]) && !strings.Contains(parts[0], "/") && !strings.Contains(parts[0], "\\") && !strings.HasPrefix(parts[0], ".")
+		isNamedVolume := !filepath.IsAbs(host) && !strings.Contains(host, "/") && !strings.Contains(host, "\\") && !strings.HasPrefix(host, ".")
 		if !isNamedVolume && len(opts.AllowedMountPrefixes) > 0 {
 			allowed := false
 			for _, prefix := range opts.AllowedMountPrefixes {
 				cleanPrefix := strings.ToLower(filepath.Clean(prefix))
-				if lowerHostPath == cleanPrefix || strings.HasPrefix(lowerHostPath, cleanPrefix+string(filepath.Separator)) {
+				if lowerHostPath == cleanPrefix || strings.HasPrefix(lowerHostPath, cleanPrefix+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanPrefix+"/") {
 					allowed = true
 					break
 				}

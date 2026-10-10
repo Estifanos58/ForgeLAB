@@ -715,7 +715,7 @@ func (s *AgentServer) handleSelectPath(w http.ResponseWriter, r *http.Request) {
 	s.renderSessionResponse(w, session)
 }
 
-func (s *AgentServer) notifyBackendSession(token string, sourceID uuid.UUID, folderName string) {
+func (s *AgentServer) notifyBackendSession(token string, sourceID uuid.UUID, folderName string, sourcePath string) {
 	if s.backendURL == "" {
 		return
 	}
@@ -725,6 +725,7 @@ func (s *AgentServer) notifyBackendSession(token string, sourceID uuid.UUID, fol
 		"source_id":   sourceID.String(),
 		"agent_id":    s.agentID,
 		"folder_name": folderName,
+		"source_path": sourcePath,
 	})
 	req, err := http.NewRequest(http.MethodPost, validateURL, bytes.NewReader(payload))
 	if err == nil {
@@ -815,9 +816,9 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 
 		if token != "" {
 			if sm := GetGlobalSessionManager(); sm != nil {
-				_, _ = sm.BindSource(token, sourceID, folderName, s.agentID)
+				_, _ = sm.BindSourceWithPath(token, sourceID, folderName, s.agentID, canonicalPath)
 			}
-			s.notifyBackendSession(token, sourceID, folderName)
+			s.notifyBackendSession(token, sourceID, folderName, canonicalPath)
 		}
 		return session, nil
 	}
@@ -842,9 +843,9 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 	// Bind source and folder on backend session
 	if token != "" {
 		if sm := GetGlobalSessionManager(); sm != nil {
-			_, _ = sm.BindSource(token, sourceID, folderName, s.agentID)
+			_, _ = sm.BindSourceWithPath(token, sourceID, folderName, s.agentID, canonicalPath)
 		}
-		s.notifyBackendSession(token, sourceID, folderName)
+		s.notifyBackendSession(token, sourceID, folderName, canonicalPath)
 	}
 
 	// Channel to signal quick completion
@@ -945,6 +946,7 @@ func (s *AgentServer) renderSessionResponse(w http.ResponseWriter, session *Loca
 			"source_reference": session.SourceID.String(),
 			"agent_id":         s.agentID,
 			"folder_name":      session.FolderName,
+			"source_path":      session.CanonicalPath,
 			"status":           status,
 			"phase":            phase,
 			"total_files":      totalFiles,
@@ -953,6 +955,7 @@ func (s *AgentServer) renderSessionResponse(w http.ResponseWriter, session *Loca
 		"source_id":      session.SourceID.String(),
 		"agent_id":       s.agentID,
 		"folder_name":    session.FolderName,
+		"source_path":    session.CanonicalPath,
 		"status":         status,
 		"phase":          phase,
 		"files_scanned":  session.FilesScanned,
@@ -1143,6 +1146,20 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		session.UpdatedAt = time.Now()
 		s.mu.Unlock()
 		s.renderSessionResponse(w, session)
+
+	case "path", "source-path":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		session.mu.RLock()
+		canonPath := session.CanonicalPath
+		session.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]string{
+			"source_id":   sourceUUID.String(),
+			"source_path": canonPath,
+		})
+		return
 
 	case "environment", "env":
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {

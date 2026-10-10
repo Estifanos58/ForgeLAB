@@ -110,6 +110,66 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 	return trimmed, nil
 }
 
+// HostSourceRoot returns the configured host source root directory.
+func (v *PathValidator) HostSourceRoot() string {
+	if v == nil {
+		return ""
+	}
+	return v.hostSourceRoot
+}
+
+// ContainerSourceRoot returns the configured container source root directory.
+func (v *PathValidator) ContainerSourceRoot() string {
+	if v == nil {
+		return ""
+	}
+	return v.containerSourceRoot
+}
+
+// AllowedRoots returns a copy of configured allowed source roots.
+func (v *PathValidator) AllowedRoots() []string {
+	if v == nil {
+		return nil
+	}
+	return append([]string(nil), v.allowedRoots...)
+}
+
+// TranslateContainerToHost translates a container path to its host-mapped path if host and container source roots are configured.
+func (v *PathValidator) TranslateContainerToHost(candidatePath string) (string, error) {
+	trimmed := strings.TrimSpace(candidatePath)
+	if trimmed == "" {
+		return "", ErrPathNotExist
+	}
+
+	if v.hostSourceRoot == "" || v.containerSourceRoot == "" {
+		return trimmed, nil
+	}
+
+	normContainerRoot := normalizePathForPrefix(v.containerSourceRoot)
+	normCandidate := normalizePathForPrefix(trimmed)
+
+	if normCandidate == normContainerRoot {
+		return v.hostSourceRoot, nil
+	}
+
+	prefixWithSep := normContainerRoot
+	if !strings.HasSuffix(prefixWithSep, "/") {
+		prefixWithSep += "/"
+	}
+
+	if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
+		rel := normCandidate[len(prefixWithSep):]
+		cleanRel := filepath.Clean(filepath.FromSlash(rel))
+		if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+			return "", ErrPathNotAllowed
+		}
+		// Join with hostSourceRoot preserving host format
+		return filepath.Join(v.hostSourceRoot, cleanRel), nil
+	}
+
+	return trimmed, nil
+}
+
 func normalizePathForPrefix(p string) string {
 	s := strings.TrimSpace(p)
 	s = strings.ReplaceAll(s, "\\", "/")

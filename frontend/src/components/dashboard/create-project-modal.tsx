@@ -1137,6 +1137,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             agent_id: agentSession.agent_id,
             folder_name: agentSession.folder_name,
             metadata: {
+              source_path: (agentSession as any).source_path || (agentSession as any).canonical_path,
               total_files: agentSession.total_files,
               total_bytes: agentSession.total_bytes,
             },

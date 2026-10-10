@@ -122,3 +122,76 @@ func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUI
 
 	return nil, ErrAgentSessionUnavailable
 }
+
+// FetchSourcePath contacts the running local agent and retrieves the authoritative local source path for a source.
+func FetchSourcePath(ctx context.Context, baseURL string, sourceID uuid.UUID, token string) (string, error) {
+	if baseURL == "" {
+		baseURL = ResolveBaseURL()
+	}
+	cleanBase := strings.TrimRight(baseURL, "/")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// 1. Try GET /api/agent/sources/{source_id}
+	agentURL := fmt.Sprintf("%s/api/agent/sources/%s", cleanBase, sourceID.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create agent path request: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Agent-Session-Token", token)
+	}
+
+	resp, err := client.Do(req)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			var sessionResp struct {
+				SourcePath    string                 `json:"source_path"`
+				CanonicalPath string                 `json:"canonical_path"`
+				Source        map[string]interface{} `json:"source"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&sessionResp); err == nil {
+				if sessionResp.SourcePath != "" {
+					return sessionResp.SourcePath, nil
+				}
+				if sessionResp.CanonicalPath != "" {
+					return sessionResp.CanonicalPath, nil
+				}
+				if sessionResp.Source != nil {
+					if sp, ok := sessionResp.Source["source_path"].(string); ok && sp != "" {
+						return sp, nil
+					}
+					if cp, ok := sessionResp.Source["canonical_path"].(string); ok && cp != "" {
+						return cp, nil
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Try GET /api/agent/sources/{source_id}/path
+	pathURL := fmt.Sprintf("%s/api/agent/sources/%s/path", cleanBase, sourceID.String())
+	reqPath, err := http.NewRequestWithContext(ctx, http.MethodGet, pathURL, nil)
+	if err == nil {
+		if token != "" {
+			reqPath.Header.Set("Authorization", "Bearer "+token)
+			reqPath.Header.Set("X-Agent-Session-Token", token)
+		}
+		respPath, err := client.Do(reqPath)
+		if err == nil {
+			defer respPath.Body.Close()
+			if respPath.StatusCode == http.StatusOK {
+				var pathResp struct {
+					SourcePath string `json:"source_path"`
+				}
+				if err := json.NewDecoder(respPath.Body).Decode(&pathResp); err == nil && pathResp.SourcePath != "" {
+					return pathResp.SourcePath, nil
+				}
+			}
+		}
+	}
+
+	return "", ErrAgentSessionUnavailable
+}

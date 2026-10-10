@@ -32,6 +32,7 @@ type AgentSession struct {
 	AgentID    string     `json:"agent_id"`
 	SourceID   *uuid.UUID `json:"source_id,omitempty"`
 	FolderName string     `json:"folder_name,omitempty"`
+	SourcePath string     `json:"source_path,omitempty"`
 	Consumed   bool       `json:"consumed"`
 	ExpiresAt  time.Time  `json:"expires_at"`
 	CreatedAt  time.Time  `json:"created_at"`
@@ -196,6 +197,11 @@ func (sm *SessionManager) ValidateToken(token string) (*AgentSession, error) {
 
 // BindSource associates an authenticated session with a source ID and folder name
 func (sm *SessionManager) BindSource(token string, sourceID uuid.UUID, folderName string, agentID string) (*AgentSession, error) {
+	return sm.BindSourceWithPath(token, sourceID, folderName, agentID, "")
+}
+
+// BindSourceWithPath associates an authenticated session with a source ID, folder name, and optional source path
+func (sm *SessionManager) BindSourceWithPath(token string, sourceID uuid.UUID, folderName string, agentID string, sourcePath string) (*AgentSession, error) {
 	cleanToken := strings.TrimSpace(token)
 	if cleanToken == "" {
 		return nil, ErrInvalidToken
@@ -235,6 +241,9 @@ func (sm *SessionManager) BindSource(token string, sourceID uuid.UUID, folderNam
 
 	session.SourceID = &sourceID
 	session.FolderName = folderName
+	if strings.TrimSpace(sourcePath) != "" {
+		session.SourcePath = strings.TrimSpace(sourcePath)
+	}
 	return session.Snapshot(), nil
 }
 

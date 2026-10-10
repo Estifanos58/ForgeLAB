@@ -3,12 +3,12 @@ package docker
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
+	"github.com/forgelab/backend/internal/services"
 )
 
 var validNetworkNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-]+$`)
@@ -36,6 +36,7 @@ type PreflightOptions struct {
 	Deployments         []*models.ServiceDeployment
 	ServicesMap         map[string]*models.Service
 	PathValidator       *security.PathValidator
+	SourceService       *services.SourceService
 	IsServiceDeployment bool
 }
 
@@ -259,45 +260,14 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 					Message:     "volume target path cannot be empty",
 				}
 			}
-			// Target inside container must be an absolute path
-			if !strings.HasPrefix(filepath.ToSlash(vol.Target), "/") {
+
+			// Validate and resolve volume mount using unified source-aware resolver
+			_, err := ResolveAndValidateVolumeMount(ctx, opts.Project, vol, opts.SourceService, opts.PathValidator)
+			if err != nil {
 				return &PreflightValidationError{
 					ServiceName: sd.ServiceName,
 					Field:       "volumes",
-					Message:     fmt.Sprintf("container volume target '%s' must be an absolute path starting with '/'", vol.Target),
-				}
-			}
-
-			// Validate host path for bind mounts
-			isDockerSocket := vol.Source == "/var/run/docker.sock" || vol.Source == `\\.\pipe\docker_engine`
-			isBind := vol.Type == models.VolumeTypeBind || vol.Type == "bind" ||
-				strings.HasPrefix(vol.Source, ".") || strings.HasPrefix(vol.Source, "/") ||
-				strings.HasPrefix(vol.Source, "~") || strings.Contains(vol.Source, "/") || strings.Contains(vol.Source, "\\")
-
-			if isBind && !isDockerSocket && opts.Project != nil {
-				if opts.Project.SourceType == models.SourceTypeGitHub || opts.Project.SourceType == models.SourceTypeLocalAgent {
-					if !filepath.IsAbs(vol.Source) {
-						return &PreflightValidationError{
-							ServiceName: sd.ServiceName,
-							Field:       "volumes",
-							Message:     fmt.Sprintf("relative bind mount '%s' is not supported for remote/agent source type '%s'. Use a named volume or absolute host path.", vol.Source, opts.Project.SourceType),
-						}
-					}
-				} else if opts.Project.RepositoryPath != "" && opts.Project.SourceType != models.SourceTypeLocalAgent {
-					hostPath := vol.Source
-					if !filepath.IsAbs(hostPath) {
-						hostPath = filepath.Join(opts.Project.RepositoryPath, hostPath)
-					}
-					cleanHost := filepath.Clean(hostPath)
-					cleanRepo := filepath.Clean(opts.Project.RepositoryPath)
-					rel, err := filepath.Rel(cleanRepo, cleanHost)
-					if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
-						return &PreflightValidationError{
-							ServiceName: sd.ServiceName,
-							Field:       "volumes",
-							Message:     fmt.Sprintf("bind mount source '%s' escapes repository boundary", vol.Source),
-						}
-					}
+					Message:     err.Error(),
 				}
 			}
 		}

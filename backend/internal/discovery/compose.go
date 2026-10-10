@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 
@@ -266,7 +267,7 @@ func parseComposeService(name string, raw RawComposeService, repoRoot, composeDi
 	dependsOn, depConditions := parseDependsOn(raw.DependsOn)
 
 	// Parse volumes
-	volumes := parseVolumes(raw.Volumes, declaredVolumes)
+	volumes := parseVolumes(raw.Volumes, declaredVolumes, repoRoot, composeDir)
 
 	// Parse networks
 	networks := parseNetworks(raw.Networks)
@@ -621,22 +622,91 @@ func parseDependsOn(dep interface{}) ([]string, map[string]string) {
 	return result, conditions
 }
 
-func parseVolumes(vols []interface{}, declaredVolumes map[string]bool) []VolumeMountConfig {
+func splitComposeVolumeSpec(spec string) (source, target, mode string) {
+	s := strings.TrimSpace(spec)
+	if s == "" {
+		return "", "", ""
+	}
+
+	start := 0
+	if len(s) >= 3 && unicode.IsLetter(rune(s[0])) && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {
+		start = 2
+	}
+
+	firstColon := strings.Index(s[start:], ":")
+	if firstColon == -1 {
+		return s, "", ""
+	}
+	actualFirstColon := start + firstColon
+
+	source = s[:actualFirstColon]
+	rest := s[actualFirstColon+1:]
+
+	secondColon := strings.Index(rest, ":")
+	if secondColon == -1 {
+		return source, rest, ""
+	}
+
+	return source, rest[:secondColon], rest[secondColon+1:]
+}
+
+func isNamedComposeVolume(source string, declaredVolumes map[string]bool) bool {
+	if declaredVolumes != nil && declaredVolumes[source] {
+		return true
+	}
+	if strings.HasPrefix(source, ".") || strings.HasPrefix(source, "/") || strings.HasPrefix(source, "\\") || strings.HasPrefix(source, "~") {
+		return false
+	}
+	if len(source) >= 2 && unicode.IsLetter(rune(source[0])) && source[1] == ':' {
+		return false
+	}
+	if strings.Contains(source, "/") || strings.Contains(source, "\\") {
+		return false
+	}
+	return true
+}
+
+func normalizeRelativeComposeBind(source, repoRoot, composeDir string) string {
+	if filepath.IsAbs(source) {
+		return source
+	}
+	if len(source) >= 2 && unicode.IsLetter(rune(source[0])) && source[1] == ':' {
+		return source
+	}
+	if strings.HasPrefix(source, "/") || strings.HasPrefix(source, "\\") {
+		return source
+	}
+
+	if composeDir != "" {
+		absSource := filepath.Clean(filepath.Join(composeDir, filepath.FromSlash(source)))
+		if repoRoot != "" {
+			relToRepo, err := filepath.Rel(repoRoot, absSource)
+			if err == nil && !strings.HasPrefix(relToRepo, "..") && relToRepo != ".." {
+				return filepath.ToSlash(relToRepo)
+			}
+		}
+		return filepath.ToSlash(filepath.Clean(source))
+	}
+	clean := filepath.ToSlash(filepath.Clean(source))
+	if clean == "" || clean == "." {
+		return "."
+	}
+	return clean
+}
+
+func parseVolumes(vols []interface{}, declaredVolumes map[string]bool, repoRoot, composeDir string) []VolumeMountConfig {
 	var mounts []VolumeMountConfig
 	for _, v := range vols {
 		switch item := v.(type) {
 		case string:
-			parts := strings.Split(item, ":")
-			if len(parts) >= 2 {
-				source := parts[0]
-				target := parts[1]
-				readOnly := false
-				if len(parts) >= 3 && strings.Contains(parts[2], "ro") {
-					readOnly = true
-				}
+			source, target, mode := splitComposeVolumeSpec(item)
+			if target != "" {
+				readOnly := strings.Contains(strings.ToLower(mode), "ro")
 				volType := "bind"
-				if declaredVolumes[source] || (!strings.HasPrefix(source, ".") && !strings.HasPrefix(source, "/") && !strings.Contains(source, "/") && !strings.Contains(source, "\\")) {
+				if isNamedComposeVolume(source, declaredVolumes) {
 					volType = "volume"
+				} else {
+					source = normalizeRelativeComposeBind(source, repoRoot, composeDir)
 				}
 				mounts = append(mounts, VolumeMountConfig{
 					Source:   source,
@@ -644,11 +714,16 @@ func parseVolumes(vols []interface{}, declaredVolumes map[string]bool) []VolumeM
 					Type:     volType,
 					ReadOnly: readOnly,
 				})
-			} else if len(parts) == 1 && parts[0] != "" {
+			} else if source != "" {
+				volType := "volume"
+				if !isNamedComposeVolume(source, declaredVolumes) {
+					volType = "bind"
+					source = normalizeRelativeComposeBind(source, repoRoot, composeDir)
+				}
 				mounts = append(mounts, VolumeMountConfig{
-					Source:   parts[0],
-					Target:   parts[0],
-					Type:     "volume",
+					Source:   source,
+					Target:   source,
+					Type:     volType,
 					ReadOnly: false,
 				})
 			}
@@ -660,11 +735,16 @@ func parseVolumes(vols []interface{}, declaredVolumes map[string]bool) []VolumeM
 			if ro, ok := item["read_only"].(bool); ok {
 				readOnly = ro
 			}
-			if vType == "" {
-				if declaredVolumes[source] || (!strings.HasPrefix(source, ".") && !strings.HasPrefix(source, "/") && !strings.Contains(source, "/") && !strings.Contains(source, "\\")) {
+			if isNamedComposeVolume(source, declaredVolumes) {
+				if vType == "" {
 					vType = "volume"
-				} else {
+				}
+			} else {
+				if vType == "" {
 					vType = "bind"
+				}
+				if vType == "bind" {
+					source = normalizeRelativeComposeBind(source, repoRoot, composeDir)
 				}
 			}
 			if target != "" {

@@ -1615,3 +1615,46 @@ func (s *SourceService) GetSource(ctx context.Context, id, ownerID uuid.UUID) (*
 
 	return nil, ErrSourceDirNotFound
 }
+
+// GetSourceByID retrieves a source record strictly by source ID without owner filtering.
+func (s *SourceService) GetSourceByID(ctx context.Context, id uuid.UUID) (*models.Source, error) {
+	if s.db != nil {
+		src := &models.Source{}
+		var metaJSON []byte
+		err := s.db.QueryRow(ctx,
+			`SELECT id, owner_id, source_type, source_reference, agent_id, fingerprint, metadata, encrypted_session_token, created_at, updated_at
+			 FROM sources WHERE id = $1`,
+			id,
+		).Scan(&src.ID, &src.OwnerID, &src.SourceType, &src.SourceReference, &src.AgentID, &src.Fingerprint, &metaJSON, &src.EncryptedSessionToken, &src.CreatedAt, &src.UpdatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrSourceDirNotFound
+			}
+			return nil, err
+		}
+		if len(metaJSON) > 0 {
+			_ = json.Unmarshal(metaJSON, &src.Metadata)
+		}
+		s.sourceRecords.Store(src.ID, src)
+		return src, nil
+	}
+
+	if val, ok := s.sourceRecords.Load(id); ok {
+		return val.(*models.Source), nil
+	}
+
+	return nil, ErrSourceDirNotFound
+}
+
+// UpdateSourceMetadataField updates a specific metadata key in the sources record.
+func (s *SourceService) UpdateSourceMetadataField(ctx context.Context, sourceID uuid.UUID, key string, value interface{}) error {
+	src, err := s.GetSourceByID(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	if src.Metadata == nil {
+		src.Metadata = make(map[string]interface{})
+	}
+	src.Metadata[key] = value
+	return s.SaveSource(ctx, src)
+}

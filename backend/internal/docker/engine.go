@@ -557,6 +557,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		Deployments:         []*models.ServiceDeployment{serviceDeploy},
 		ServicesMap:         servicesMap,
 		PathValidator:       e.pathValidator,
+		SourceService:       e.sourceService,
 		IsServiceDeployment: true,
 	}); err != nil {
 		reason := fmt.Sprintf("Preflight validation failed: %v", err)
@@ -1257,65 +1258,75 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	// Prepare volume mounts: preserve named volume vs bind mount semantics with strict security boundary validation
 	var binds []string
 	var allowedMountPrefixes []string
-	projectRoot := project.RepositoryPath
-	if projectRoot != "" {
-		allowedMountPrefixes = append(allowedMountPrefixes, projectRoot)
+	hasDockerSocketBind := false
+
+	// Populate allowed mount prefixes from configured roots
+	if e.pathValidator != nil {
+		for _, r := range e.pathValidator.AllowedRoots() {
+			if r != "" {
+				allowedMountPrefixes = append(allowedMountPrefixes, r)
+			}
+		}
+		if e.pathValidator.HostSourceRoot() != "" {
+			allowedMountPrefixes = append(allowedMountPrefixes, e.pathValidator.HostSourceRoot())
+		}
+		if e.pathValidator.ContainerSourceRoot() != "" {
+			allowedMountPrefixes = append(allowedMountPrefixes, e.pathValidator.ContainerSourceRoot())
+		}
+	}
+
+	// Resolve project source root for allowlisting
+	if hostRoot, containerRoot, err := ResolveProjectSourceRoot(execCtx, project, e.sourceService, e.pathValidator); err == nil {
+		if hostRoot != "" {
+			allowedMountPrefixes = append(allowedMountPrefixes, hostRoot)
+		}
+		if containerRoot != "" && containerRoot != hostRoot {
+			allowedMountPrefixes = append(allowedMountPrefixes, containerRoot)
+		}
 	}
 
 	for _, v := range serviceDeploy.Volumes {
-		if v.Target == "" {
+		if strings.TrimSpace(v.Target) == "" {
 			continue
 		}
 
-		volType := v.Type
-		if volType == "" {
-			if strings.HasPrefix(v.Source, ".") || strings.HasPrefix(v.Source, "/") || strings.HasPrefix(v.Source, "~") || strings.Contains(v.Source, string(filepath.Separator)) || strings.Contains(v.Source, "/") {
-				volType = models.VolumeTypeBind
-			} else {
-				volType = models.VolumeTypeNamed
-			}
+		resolvedVol, err := ResolveAndValidateVolumeMount(execCtx, project, v, e.sourceService, e.pathValidator)
+		if err != nil {
+			reason := err.Error()
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return err
 		}
 
-		if volType == models.VolumeTypeNamed || volType == "volume" {
-			volName := fmt.Sprintf("forgelab-vol-%s-%s", project.ID.String()[:8], v.Source)
+		if resolvedVol.IsNamedVolume {
+			volName := fmt.Sprintf("forgelab-vol-%s-%s", project.ID.String()[:8], resolvedVol.VolumeName)
 			if e.dockerClient != nil {
 				_, _ = e.dockerClient.VolumeCreate(execCtx, dockervolume.CreateOptions{
 					Name: volName,
 					Labels: map[string]string{
 						"forgelab.project_id":  project.ID.String(),
-						"forgelab.volume_name": v.Source,
+						"forgelab.volume_name": resolvedVol.VolumeName,
 					},
 				})
 			}
-			bindEntry := fmt.Sprintf("%s:%s", volName, v.Target)
-			if v.ReadOnly {
+			bindEntry := fmt.Sprintf("%s:%s", volName, resolvedVol.ContainerPath)
+			if resolvedVol.ReadOnly {
 				bindEntry += ":ro"
 			}
 			binds = append(binds, bindEntry)
-		} else if volType == models.VolumeTypeBind || volType == "bind" {
-			if !filepath.IsAbs(v.Source) && (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeLocalAgent) {
-				reason := fmt.Sprintf("Relative bind mount '%s' is not supported for remote/agent source '%s'. Use a named volume or absolute host path.", v.Source, project.SourceType)
-				emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
-				emitStatus(models.DeployStatusFailed, nil, &reason)
-				return errors.New(reason)
+		} else if resolvedVol.IsDockerSocket {
+			hasDockerSocketBind = true
+			allowedMountPrefixes = append(allowedMountPrefixes, resolvedVol.HostPath)
+			bindEntry := fmt.Sprintf("%s:%s", resolvedVol.HostPath, resolvedVol.ContainerPath)
+			if resolvedVol.ReadOnly {
+				bindEntry += ":ro"
 			}
-
-			hostPath := v.Source
-			if !filepath.IsAbs(hostPath) {
-				if projectRoot != "" {
-					hostPath = filepath.Join(projectRoot, hostPath)
-				} else if project.SourceType == models.SourceTypeLocalUpload && e.sourceService != nil {
-					if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
-						if p, err := e.sourceService.GetSourcePath(execCtx, project.OwnerID, srcUUID); err == nil {
-							hostPath = filepath.Join(p, hostPath)
-							allowedMountPrefixes = append(allowedMountPrefixes, p)
-						}
-					}
-				}
-			}
-			hostPath = filepath.Clean(hostPath)
-			bindEntry := fmt.Sprintf("%s:%s", hostPath, v.Target)
-			if v.ReadOnly {
+			binds = append(binds, bindEntry)
+		} else {
+			hostPath := filepath.Clean(resolvedVol.HostPath)
+			allowedMountPrefixes = append(allowedMountPrefixes, hostPath)
+			bindEntry := fmt.Sprintf("%s:%s", hostPath, resolvedVol.ContainerPath)
+			if resolvedVol.ReadOnly {
 				bindEntry += ":ro"
 			}
 			binds = append(binds, bindEntry)
@@ -1344,6 +1355,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		Binds:                binds,
 		NetworkMode:          "",
 		AllowedMountPrefixes: allowedMountPrefixes,
+		AllowDockerSocket:    hasDockerSocketBind,
 	})
 	if err != nil {
 		if hostPort != nil {
@@ -1662,6 +1674,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		Deployments:   svcDeploys,
 		ServicesMap:   servicesMap,
 		PathValidator: e.pathValidator,
+		SourceService: e.sourceService,
 	}); err != nil {
 		reason := fmt.Sprintf("Preflight validation failed: %v", err)
 		updateReleaseStatus(models.DeployStatusFailed, &reason)
