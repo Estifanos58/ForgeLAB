@@ -23,11 +23,29 @@ var ErrAgentSessionUnavailable = errors.New("Local agent source session is unava
 // ResolveBaseURL dynamically resolves the local agent URL, handling containerized backend setups.
 func ResolveBaseURL() string {
 	if u := os.Getenv("FORGELAB_AGENT_URL"); u != "" {
-		return strings.TrimRight(u, "/")
+		trimmed := strings.TrimRight(strings.TrimSpace(u), "/")
+		if !strings.HasPrefix(trimmed, "http://") && !strings.HasPrefix(trimmed, "https://") {
+			trimmed = "http://" + trimmed
+		}
+		return trimmed
 	}
 	if h := os.Getenv("FORGELAB_AGENT_HOST"); h != "" {
-		return fmt.Sprintf("http://%s", h)
+		trimmed := strings.TrimRight(strings.TrimSpace(h), "/")
+		if !strings.HasPrefix(trimmed, "http://") && !strings.HasPrefix(trimmed, "https://") {
+			trimmed = "http://" + trimmed
+		}
+		return trimmed
 	}
+
+	// Check if running inside container (/.dockerenv exists)
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		conn, err := net.DialTimeout("tcp", "host.docker.internal:4142", 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return "http://host.docker.internal:4142"
+		}
+	}
+
 	// Try 127.0.0.1:4142 first (for local non-docker backend)
 	conn, err := net.DialTimeout("tcp", "127.0.0.1:4142", 200*time.Millisecond)
 	if err == nil {

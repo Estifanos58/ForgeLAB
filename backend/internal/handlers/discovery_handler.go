@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -222,10 +223,24 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 
 	// 1. Run authoritative discovery engine if not provided by authoritative agent
 	if discResult == nil {
+		targetDiscoveryDir := workspaceDir
+		if req.RootDir != "" && req.RootDir != "." {
+			cleanRoot := filepath.Clean(filepath.FromSlash(req.RootDir))
+			if strings.HasPrefix(cleanRoot, "..") || cleanRoot == ".." || filepath.IsAbs(cleanRoot) {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid root_dir path traversal: %s", req.RootDir))
+				return
+			}
+			targetDiscoveryDir = filepath.Join(workspaceDir, cleanRoot)
+			if fi, err := os.Stat(targetDiscoveryDir); err != nil || !fi.IsDir() {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("root_dir '%s' does not exist in source repository", req.RootDir))
+				return
+			}
+		}
+
 		var err error
-		discResult, err = discovery.Discover(workspaceDir)
+		discResult, err = discovery.Discover(targetDiscoveryDir)
 		if err != nil {
-			slog.Error("discovery failed", "workspace", workspaceDir, "error", err)
+			slog.Error("discovery failed", "workspace", targetDiscoveryDir, "error", err)
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("discovery failed: %v", err))
 			return
 		}

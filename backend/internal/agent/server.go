@@ -1190,7 +1190,10 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		virtualFiles := make(map[string][]byte)
 		expectedDockerfile := r.URL.Query().Get("dockerfile")
 		genRuntime := r.URL.Query().Get("runtime")
-		if genRuntime != "" {
+		if expectedDockerfile != "" {
+			// Specific Dockerfile requested (e.g. models.BuildStrategyDockerfile)
+			// Do not generate synthetic Dockerfile; preserve project's real Dockerfile.
+		} else if genRuntime != "" {
 			genPort := 8080
 			if p, err := strconv.Atoi(r.URL.Query().Get("port")); err == nil && p > 0 {
 				genPort = p
@@ -1199,7 +1202,7 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			dockerfileContent := detector.GenerateDockerfile(genRuntime, genPort, genStartCmd)
 			virtualFiles["Dockerfile.forgelab"] = []byte(dockerfileContent)
 			expectedDockerfile = "Dockerfile.forgelab"
-		} else if expectedDockerfile == "" {
+		} else {
 			if _, statErr := os.Stat(filepath.Join(evalServiceDir, "Dockerfile")); statErr == nil {
 				expectedDockerfile = "Dockerfile"
 			}

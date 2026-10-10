@@ -338,13 +338,34 @@ func (v *PathValidator) ValidateServiceBuildPaths(
 		}
 		targetContextDir = absCtx
 	} else {
-		// Resolve relative to service dir first, fallback to source root
-		cand1 := filepath.Join(canonicalServiceDir, cleanBuildContext)
-		cand2 := filepath.Join(cleanRoot, cleanBuildContext)
-		if _, err := os.Stat(cand1); err == nil {
-			targetContextDir = cand1
+		cleanRel := filepath.Clean(filepath.FromSlash(cleanBuildContext))
+		if strings.HasPrefix(cleanRel, "..") {
+			return "", "", errors.New("build context escapes repository boundary")
+		}
+
+		// Primary resolution: buildContext relative to repository / workspace root
+		candRoot := filepath.Join(cleanRoot, cleanRel)
+		if fi, err := os.Stat(candRoot); err == nil && fi.IsDir() {
+			targetContextDir = candRoot
+		} else if canonicalServiceDir != cleanRoot {
+			// Secondary resolution: if not found directly under cleanRoot, check relative to service directory
+			candSvc := filepath.Join(canonicalServiceDir, cleanRel)
+			if fi, err := os.Stat(candSvc); err == nil && fi.IsDir() {
+				relSvc, err := filepath.Rel(cleanRoot, candSvc)
+				if err == nil && !strings.HasPrefix(relSvc, "..") {
+					targetContextDir = candSvc
+				} else {
+					return "", "", errors.New("build context escapes repository boundary")
+				}
+			} else if cleanRel == "." {
+				targetContextDir = canonicalServiceDir
+			} else {
+				return "", "", fmt.Errorf("build context directory does not exist: %s", cleanBuildContext)
+			}
+		} else if cleanRel == "." {
+			targetContextDir = cleanRoot
 		} else {
-			targetContextDir = cand2
+			return "", "", fmt.Errorf("build context directory does not exist: %s", cleanBuildContext)
 		}
 	}
 

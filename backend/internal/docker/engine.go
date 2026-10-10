@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -530,6 +531,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Starting service deployment #%d for '%s' (role: %s, runtime: %s)...", serviceDeploy.DeployNumber, service.Name, service.Role, service.RuntimeType))
+	emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Diagnostic context: source_type='%s', source_ref='%s', root_dir='%s', build_strategy='%s', internal_port=%d", project.SourceType, project.SourceReference, project.BuildContext, service.BuildStrategy, service.InternalPort))
+	slog.Info("executing service deployment",
+		"service_deployment_id", serviceDeploy.ID,
+		"service_id", service.ID,
+		"project_id", project.ID,
+		"source_type", project.SourceType,
+		"source_reference", project.SourceReference,
+		"root_dir", project.BuildContext,
+		"build_strategy", service.BuildStrategy,
+	)
 
 	allProjectServices, err := e.serviceService.ListServices(execCtx, project.ID)
 	if err != nil {
@@ -677,7 +688,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if rawCtx == "" {
 			rawCtx = strings.TrimSpace(serviceDeploy.BuildContext)
 		}
-		cleanCtx := filepath.Clean(rawCtx)
+		cleanCtx := filepath.ToSlash(filepath.Clean(filepath.FromSlash(rawCtx)))
 		if cleanCtx == "" {
 			cleanCtx = "."
 		}
@@ -685,7 +696,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if rawDF == "" {
 			rawDF = strings.TrimSpace(serviceDeploy.DockerfilePath)
 		}
-		cleanDF := filepath.Clean(rawDF)
+		cleanDF := filepath.ToSlash(filepath.Clean(filepath.FromSlash(rawDF)))
 		if cleanDF == "" || cleanDF == "." {
 			cleanDF = "Dockerfile"
 		}
@@ -773,7 +784,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		var dfContent []byte
 
 		if project.SourceType == models.SourceTypeLocalAgent {
-			cleanRelPath, pathErr := e.pathValidator.ValidateRelativeServicePath(service.SourcePath)
+			effPath := service.SourcePath
+			if project.BuildContext != "" && project.BuildContext != "." && !strings.HasPrefix(service.SourcePath, project.BuildContext) {
+				effPath = filepath.ToSlash(filepath.Clean(filepath.Join(filepath.FromSlash(project.BuildContext), filepath.FromSlash(service.SourcePath))))
+			}
+			cleanRelPath, pathErr := e.pathValidator.ValidateRelativeServicePath(effPath)
 			if pathErr != nil {
 				reason := fmt.Sprintf("Path isolation security violation: invalid service path: %v", pathErr)
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
@@ -801,13 +816,26 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				emitStatus(models.DeployStatusFailed, nil, &reason)
 				return errors.New(reason)
 			}
-			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s",
+
+			agentQuery := url.Values{}
+			agentQuery.Set("service_path", cleanRelPath)
+			if service.BuildStrategy == models.BuildStrategyDockerfile {
+				dfPath := service.DockerfilePath
+				if dfPath == "" {
+					dfPath = "Dockerfile"
+				}
+				agentQuery.Set("dockerfile", dfPath)
+			} else {
+				agentQuery.Set("runtime", service.RuntimeType)
+				agentQuery.Set("port", strconv.Itoa(service.InternalPort))
+				if service.StartCommand != "" {
+					agentQuery.Set("start_cmd", service.StartCommand)
+				}
+			}
+			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?%s",
 				baseURL,
 				project.SourceReference,
-				url.QueryEscape(cleanRelPath),
-				url.QueryEscape(service.RuntimeType),
-				service.InternalPort,
-				url.QueryEscape(service.StartCommand),
+				agentQuery.Encode(),
 			)
 			req, reqErr := http.NewRequestWithContext(execCtx, http.MethodGet, agentURL, nil)
 			if reqErr != nil {
@@ -883,15 +911,36 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			}
 		} else {
 			// For non-local-agent sources: local_directory, local_upload, github
-			// Validate build paths against canonical project root using PathValidator
+			// Determine effective source root using user-selected root_dir (project.BuildContext) if configured
+			effectiveSourceRoot := buildSourceDir
+			if project.BuildContext != "" && project.BuildContext != "." {
+				cleanProjRoot := filepath.Clean(filepath.FromSlash(project.BuildContext))
+				if !strings.HasPrefix(cleanProjRoot, "..") && !filepath.IsAbs(cleanProjRoot) {
+					subDir := filepath.Join(buildSourceDir, cleanProjRoot)
+					if fi, err := os.Stat(subDir); err == nil && fi.IsDir() {
+						effectiveSourceRoot = subDir
+					}
+				}
+			}
+
 			isAuto := service.BuildStrategy == models.BuildStrategyAuto
 			svcContextDir, resolvedDockerPath, valErr := e.pathValidator.ValidateServiceBuildPaths(
-				buildSourceDir,
+				effectiveSourceRoot,
 				service.SourcePath,
 				service.BuildContext,
 				service.DockerfilePath,
 				isAuto,
 			)
+			if valErr != nil && effectiveSourceRoot != buildSourceDir {
+				// Fallback to repository root if the build context was declared relative to repo root (e.g. Compose)
+				svcContextDir, resolvedDockerPath, valErr = e.pathValidator.ValidateServiceBuildPaths(
+					buildSourceDir,
+					service.SourcePath,
+					service.BuildContext,
+					service.DockerfilePath,
+					isAuto,
+				)
+			}
 			if valErr != nil {
 				reason := fmt.Sprintf("Path isolation security violation: %v", valErr)
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
@@ -1115,18 +1164,33 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				secondaryNetworkNames = append(secondaryNetworkNames, projNet)
 			}
 		}
+	}
+
+	// Always ensure common project network is present so all services in the project can resolve each other via DNS aliases
+	commonProjectNet := fmt.Sprintf("forgelab-net-%s", project.ID.String())
+	if e.dockerClient != nil {
+		_, netErr := e.dockerClient.NetworkInspect(execCtx, commonProjectNet, dockernetwork.InspectOptions{})
+		if netErr != nil {
+			_, _ = e.dockerClient.NetworkCreate(execCtx, commonProjectNet, dockernetwork.CreateOptions{
+				Driver: "bridge",
+				Labels: map[string]string{
+					"forgelab.project_id": project.ID.String(),
+				},
+			})
+		}
+	}
+	if primaryNetworkName == "" {
+		primaryNetworkName = commonProjectNet
 	} else {
-		primaryNetworkName = fmt.Sprintf("forgelab-net-%s", project.ID.String())
-		if e.dockerClient != nil {
-			_, netErr := e.dockerClient.NetworkInspect(execCtx, primaryNetworkName, dockernetwork.InspectOptions{})
-			if netErr != nil {
-				_, _ = e.dockerClient.NetworkCreate(execCtx, primaryNetworkName, dockernetwork.CreateOptions{
-					Driver: "bridge",
-					Labels: map[string]string{
-						"forgelab.project_id": project.ID.String(),
-					},
-				})
+		foundCommon := false
+		for _, sn := range secondaryNetworkNames {
+			if sn == commonProjectNet {
+				foundCommon = true
+				break
 			}
+		}
+		if !foundCommon && primaryNetworkName != commonProjectNet {
+			secondaryNetworkNames = append(secondaryNetworkNames, commonProjectNet)
 		}
 	}
 
@@ -1229,9 +1293,25 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			}
 			binds = append(binds, bindEntry)
 		} else if volType == models.VolumeTypeBind || volType == "bind" {
+			if !filepath.IsAbs(v.Source) && (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeLocalAgent) {
+				reason := fmt.Sprintf("Relative bind mount '%s' is not supported for remote/agent source '%s'. Use a named volume or absolute host path.", v.Source, project.SourceType)
+				emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
+			}
+
 			hostPath := v.Source
-			if !filepath.IsAbs(hostPath) && projectRoot != "" {
-				hostPath = filepath.Join(projectRoot, hostPath)
+			if !filepath.IsAbs(hostPath) {
+				if projectRoot != "" {
+					hostPath = filepath.Join(projectRoot, hostPath)
+				} else if project.SourceType == models.SourceTypeLocalUpload && e.sourceService != nil {
+					if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
+						if p, err := e.sourceService.GetSourcePath(execCtx, project.OwnerID, srcUUID); err == nil {
+							hostPath = filepath.Join(p, hostPath)
+							allowedMountPrefixes = append(allowedMountPrefixes, p)
+						}
+					}
+				}
 			}
 			hostPath = filepath.Clean(hostPath)
 			bindEntry := fmt.Sprintf("%s:%s", hostPath, v.Target)

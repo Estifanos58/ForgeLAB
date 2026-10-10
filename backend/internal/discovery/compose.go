@@ -219,21 +219,38 @@ func parseComposeService(name string, raw RawComposeService, repoRoot, composeDi
 
 	if raw.Build != nil {
 		dockerfilePath = "Dockerfile"
+		rawBuildContext := "."
 		switch b := raw.Build.(type) {
 		case string:
-			buildContext = b
-			sourcePath = b
+			rawBuildContext = b
 			buildStrategy = models.BuildStrategyDockerfile
 		case map[string]interface{}:
 			if ctxVal, ok := b["context"].(string); ok && ctxVal != "" {
-				buildContext = ctxVal
-				sourcePath = ctxVal
+				rawBuildContext = ctxVal
 			}
 			if dfVal, ok := b["dockerfile"].(string); ok && dfVal != "" {
 				dockerfilePath = dfVal
 			}
 			buildStrategy = models.BuildStrategyDockerfile
 		}
+
+		// Resolve absolute build context from composeDir and compute relative path to repoRoot
+		absCtx := filepath.Clean(filepath.Join(composeDir, filepath.FromSlash(rawBuildContext)))
+		relToRepo, err := filepath.Rel(repoRoot, absCtx)
+		if err == nil && !strings.HasPrefix(relToRepo, "..") {
+			buildContext = filepath.ToSlash(relToRepo)
+			sourcePath = filepath.ToSlash(relToRepo)
+		} else {
+			buildContext = filepath.ToSlash(rawBuildContext)
+			sourcePath = filepath.ToSlash(rawBuildContext)
+		}
+
+		// Dockerfile path is relative to the build context
+		cleanDF := filepath.ToSlash(filepath.Clean(filepath.FromSlash(dockerfilePath)))
+		if strings.HasPrefix(cleanDF, "/") || strings.HasPrefix(cleanDF, "\\") {
+			cleanDF = strings.TrimLeft(cleanDF, "/\\")
+		}
+		dockerfilePath = cleanDF
 	} else if raw.Image != "" {
 		buildStrategy = "image"
 		dockerfilePath = ""

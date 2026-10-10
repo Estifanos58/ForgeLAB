@@ -28,4 +28,18 @@ backend/tmp/
 backend/scratch/
 *.exe
 forgelab-agent.exe
+*~
+*.bak
 
+# Credentials and sensitive session dumps
+cookies.txt
+*cookies*.txt
+*.cookie
+*.cookies
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+token.json
+session.json

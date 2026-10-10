@@ -28,7 +28,6 @@ import (
 	"github.com/forgelab/backend/internal/config"
 	"github.com/forgelab/backend/internal/crypto"
 	"github.com/forgelab/backend/internal/detector"
-	"github.com/forgelab/backend/internal/models"
 )
 
 var (
@@ -308,16 +307,25 @@ func (s *GitHubService) HandleCallback(ctx context.Context, code, state, nonce s
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return uuid.Nil, ErrCodeExchangeFailed
+		return uuid.Nil, fmt.Errorf("%w: GitHub token endpoint returned HTTP %d", ErrCodeExchangeFailed, resp.StatusCode)
 	}
 
 	var tokenRes struct {
-		AccessToken string `json:"access_token"`
-		Scope       string `json:"scope"`
-		Error       string `json:"error"`
+		AccessToken      string `json:"access_token"`
+		Scope            string `json:"scope"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+		ErrorURI         string `json:"error_uri"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tokenRes); err != nil || tokenRes.AccessToken == "" {
-		return uuid.Nil, ErrCodeExchangeFailed
+	if err := json.NewDecoder(resp.Body).Decode(&tokenRes); err != nil {
+		return uuid.Nil, fmt.Errorf("%w: failed to decode GitHub token response: %v", ErrCodeExchangeFailed, err)
+	}
+	if tokenRes.Error != "" {
+		return uuid.Nil, fmt.Errorf("%w: GitHub returned '%s' (%s). Verify that GITHUB_REPO_REDIRECT_URL in .env matches the Authorization callback URL in your GitHub OAuth App settings (expected callback: %s)",
+			ErrCodeExchangeFailed, tokenRes.Error, tokenRes.ErrorDescription, redirectURL)
+	}
+	if tokenRes.AccessToken == "" {
+		return uuid.Nil, fmt.Errorf("%w: empty access token returned by GitHub", ErrCodeExchangeFailed)
 	}
 
 	// 2. Fetch authenticated GitHub user identity
@@ -788,14 +796,16 @@ func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, 
 // MaterializeGitHubSnapshot downloads and extracts an isolated source snapshot pinned to exact commit SHA.
 func (s *GitHubService) MaterializeGitHubSnapshot(ctx context.Context, userID uuid.UUID, owner, repo, ref, destDir string) (string, error) {
 	sha, err := s.ResolveCommitSHA(ctx, userID, owner, repo, ref)
-	pinnedRef := ref
-	if err == nil && sha != "" {
-		pinnedRef = sha
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve commit SHA for %s/%s@%s: %w", owner, repo, ref, err)
 	}
-	if err := s.AcquireRepoTarball(ctx, userID, owner, repo, pinnedRef, destDir); err != nil {
+	if len(sha) != 40 {
+		return "", fmt.Errorf("invalid commit SHA resolved for %s/%s@%s: %s", owner, repo, ref, sha)
+	}
+	if err := s.AcquireRepoTarball(ctx, userID, owner, repo, sha, destDir); err != nil {
 		return "", err
 	}
-	return pinnedRef, nil
+	return sha, nil
 }
 
 // AnalyzeRepo acquires the repository archive and runs analyzer.AnalyzeRepository to produce normalized services.
@@ -806,125 +816,48 @@ func (s *GitHubService) AnalyzeRepo(ctx context.Context, userID uuid.UUID, owner
 	}
 
 	// Resolve exact commit SHA to pin analyzed revision
-	commitSHA, _ := s.ResolveCommitSHA(ctx, userID, owner, repo, branch)
-	revision := branch
-	if commitSHA != "" {
-		revision = commitSHA
+	commitSHA, err := s.ResolveCommitSHA(ctx, userID, owner, repo, branch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve commit for repository %s/%s@%s: %w", owner, repo, branch, err)
 	}
+	if len(commitSHA) != 40 {
+		return nil, fmt.Errorf("invalid commit SHA for repository %s/%s@%s: %s", owner, repo, branch, commitSHA)
+	}
+	revision := commitSHA
 
 	targetDir, err := os.MkdirTemp("", fmt.Sprintf("forgelab-gh-%s-%s-*", owner, repo))
 	if err != nil {
-		targetDir = filepath.Join(os.TempDir(), fmt.Sprintf("forgelab-gh-%s-%s-%s", owner, repo, branch))
+		targetDir = filepath.Join(os.TempDir(), fmt.Sprintf("forgelab-gh-%s-%s-%s", owner, repo, revision))
 		_ = os.RemoveAll(targetDir)
 		_ = os.MkdirAll(targetDir, 0755)
 	}
 	defer os.RemoveAll(targetDir) // Clean up temporary GitHub analysis workspace correctly
 
 	err = s.AcquireRepoTarball(ctx, userID, owner, repo, revision, targetDir)
-	if err == nil {
-		analysisDir := targetDir
-		if rootDir != "" && rootDir != "." {
-			analysisDir = filepath.Join(targetDir, rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire repository archive for %s/%s@%s: %w", owner, repo, revision, err)
+	}
+
+	analysisDir := targetDir
+	if rootDir != "" && rootDir != "." {
+		cleanRoot := filepath.Clean(filepath.FromSlash(rootDir))
+		if strings.HasPrefix(cleanRoot, "..") || cleanRoot == ".." || filepath.IsAbs(cleanRoot) {
+			return nil, fmt.Errorf("invalid root_dir path traversal: %s", rootDir)
 		}
-		res, aErr := analyzer.AnalyzeRepository(analysisDir)
-		if aErr == nil && res != nil && len(res.Services) > 0 {
-			res.RepositoryName = repo
-			return res, nil
-		}
-	} else {
-		// If authorization/permission error, fail immediately without silent fallback
-		if errors.Is(err, ErrGitHubNotConnected) || errors.Is(err, ErrGitHubNeedsReauth) ||
-			errors.Is(err, ErrGitHubRateLimited) || errors.Is(err, ErrGitHubRepoNotFound) {
-			return nil, err
+		analysisDir = filepath.Join(targetDir, cleanRoot)
+		if fi, sErr := os.Stat(analysisDir); sErr != nil || !fi.IsDir() {
+			return nil, fmt.Errorf("root_dir '%s' does not exist in repository %s/%s", rootDir, owner, repo)
 		}
 	}
-
-	// Fallback to lightweight file-based detection if tarball download fails
-	det, detErr := s.DetectRepo(ctx, userID, owner, repo, branch, rootDir)
-	if detErr != nil {
-		if err != nil {
-			return nil, fmt.Errorf("failed to analyze repository: %w (fallback: %v)", err, detErr)
-		}
-		return nil, detErr
+	res, aErr := analyzer.AnalyzeRepository(analysisDir)
+	if aErr != nil || res == nil || len(res.Services) == 0 {
+		return nil, fmt.Errorf("failed to analyze repository in directory '%s': %v", rootDir, aErr)
 	}
-
-	// Convert single detection result into normalized AnalysisResult with build candidates
-	candidates := []models.BuildCandidate{
-		{
-			ID:              "auto",
-			Strategy:        "auto",
-			Name:            fmt.Sprintf("ForgeLAB %s Build", det.Framework),
-			Description:     fmt.Sprintf("ForgeLAB optimized multi-stage build for %s", det.Framework),
-			Confidence:      0.85,
-			BuildCommand:    det.BuildCommand,
-			StartCommand:    det.StartCommand,
-			SuggestedPort:   det.SuggestedPort,
-			HealthCheckPath: det.HealthCheckPath,
-			HealthStrategy:  det.HealthStrategy,
-		},
-		{
-			ID:              "dockerfile",
-			Strategy:        "dockerfile",
-			Name:            "Existing Dockerfile",
-			Description:     "Build using the repository Dockerfile",
-			Confidence:      0.80,
-			DockerfilePath:  "Dockerfile",
-			SuggestedPort:   det.SuggestedPort,
-			HealthCheckPath: det.HealthCheckPath,
-			HealthStrategy:  det.HealthStrategy,
-		},
-		{
-			ID:              "custom",
-			Strategy:        "custom",
-			Name:            "Custom Build",
-			Description:     "Specify custom build and startup commands",
-			Confidence:      0.50,
-			BuildCommand:    det.BuildCommand,
-			StartCommand:    det.StartCommand,
-			SuggestedPort:   det.SuggestedPort,
-			HealthCheckPath: det.HealthCheckPath,
-			HealthStrategy:  det.HealthStrategy,
-		},
-	}
-
-	strat := det.BuildStrategy
-	if strat == "" {
-		strat = "auto"
-	}
-
-	sourcePath := rootDir
-	if sourcePath == "" {
-		sourcePath = "."
-	}
-
-	return &analyzer.AnalysisResult{
-		RepositoryName: repo,
-		TotalFiles:     1,
-		TotalBytes:     1024,
-		Services: []analyzer.ServiceDefinition{
-			{
-				Name:               repo,
-				Role:               models.RoleOther,
-				SourcePath:         sourcePath,
-				Runtime:            det.Runtime,
-				RuntimeType:        det.Runtime,
-				Framework:          det.Framework,
-				BuildStrategy:      strat,
-				BuildCandidates:    candidates,
-				BuildCommand:       det.BuildCommand,
-				StartCommand:       det.StartCommand,
-				DockerfilePath:     "Dockerfile",
-				BuildContext:       sourcePath,
-				InternalPort:       det.SuggestedPort,
-				HealthStrategy:     det.HealthStrategy,
-				HealthCheckPath:    det.HealthCheckPath,
-				HealthCheckEnabled: true,
-			},
-		},
-	}, nil
+	res.RepositoryName = repo
+	return res, nil
 }
 
-// copyDirectoryContents copies files from src into dst without leaking temp files.
+// copyDirectoryContents copies files from src into dst without leaking file descriptors.
 func copyDirectoryContents(src, dst string) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -944,23 +877,32 @@ func copyDirectoryContents(src, dst string) error {
 		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 			return err
 		}
-		outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
-		if err != nil {
-			return err
-		}
-		defer outFile.Close()
+
 		inFile, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		defer inFile.Close()
-		_, err = io.Copy(outFile, inFile)
-		return err
+		outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+		if err != nil {
+			inFile.Close()
+			return err
+		}
+		_, copyErr := io.Copy(outFile, inFile)
+		cErr1 := inFile.Close()
+		cErr2 := outFile.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if cErr1 != nil {
+			return cErr1
+		}
+		return cErr2
 	})
 }
 
 // AcquireRepoTarball downloads and safely extracts an authorized GitHub repository tarball.
-// It caches extracted snapshots pinned to commit SHA to avoid re-downloading identical revisions.
+// It verifies repository authorization before serving cached or newly downloaded snapshots.
+// Private repository snapshots are strictly isolated per ForgeLAB user.
 func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID, owner, repo, branch, targetDir string) error {
 	token, err := s.getDecryptedToken(ctx, userID)
 	if err != nil {
@@ -974,30 +916,43 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	destClean := filepath.Clean(targetDir)
 	_ = os.MkdirAll(destClean, 0755)
 
-	// Check if this revision can be resolved to an immutable commit SHA for snapshot reuse
-	resolvedSHA := ""
-	if len(branch) == 40 && !strings.ContainsAny(branch, "/ \t\n") {
-		resolvedSHA = branch
-	} else if sha, err := s.ResolveCommitSHA(ctx, userID, owner, repo, branch); err == nil && len(sha) == 40 {
-		resolvedSHA = sha
+	// Security requirement: Always verify that the requesting user's credentials are authorized
+	// to access this specific repository BEFORE returning any cached data or downloading anew.
+	repoMeta, err := s.GetRepo(ctx, userID, owner, repo)
+	if err != nil {
+		return fmt.Errorf("authorization check failed for repository %s/%s: %w", owner, repo, err)
 	}
 
-	var cacheDir string
-	if resolvedSHA != "" {
-		cacheDir = filepath.Join(os.TempDir(), "forgelab_gh_cache", owner, repo, resolvedSHA)
-		completeMarker := filepath.Join(cacheDir, ".complete")
-		if fi, err := os.Stat(completeMarker); err == nil && !fi.IsDir() {
-			if content, readErr := os.ReadFile(completeMarker); readErr == nil && strings.TrimSpace(string(content)) == resolvedSHA {
-				slog.Info("reusing cached github snapshot", "owner", owner, "repo", repo, "sha", resolvedSHA)
-				return copyDirectoryContents(cacheDir, destClean)
-			}
-		}
-		// Purge incomplete or corrupt cache directory
-		_ = os.RemoveAll(cacheDir)
+	// Always resolve exact commit SHA to guarantee reproducibility and prevent SHA bypass.
+	resolvedSHA, err := s.ResolveCommitSHA(ctx, userID, owner, repo, branch)
+	if err != nil {
+		return fmt.Errorf("failed to resolve commit SHA for %s/%s@%s: %w", owner, repo, branch, err)
 	}
+	if len(resolvedSHA) != 40 {
+		return fmt.Errorf("invalid commit SHA resolved for %s/%s@%s: %s", owner, repo, branch, resolvedSHA)
+	}
+
+	// Authorization boundary isolation:
+	// Private snapshots are isolated by user ID so another user cannot retrieve cached private code.
+	var cacheDir string
+	if repoMeta.Private {
+		cacheDir = filepath.Join(os.TempDir(), "forgelab_gh_cache", "private", userID.String(), owner, repo, resolvedSHA)
+	} else {
+		cacheDir = filepath.Join(os.TempDir(), "forgelab_gh_cache", "public", owner, repo, resolvedSHA)
+	}
+
+	completeMarker := filepath.Join(cacheDir, ".complete")
+	if fi, err := os.Stat(completeMarker); err == nil && !fi.IsDir() {
+		if content, readErr := os.ReadFile(completeMarker); readErr == nil && strings.TrimSpace(string(content)) == resolvedSHA {
+			slog.Info("reusing authorized cached github snapshot", "owner", owner, "repo", repo, "sha", resolvedSHA, "private", repoMeta.Private, "user_id", userID)
+			return copyDirectoryContents(cacheDir, destClean)
+		}
+	}
+	// Purge incomplete or corrupt cache directory
+	_ = os.RemoveAll(cacheDir)
 
 	tarURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/tarball/%s",
-		url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(branch))
+		url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(resolvedSHA))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", tarURL, nil)
 	if err != nil {

@@ -274,19 +274,29 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 				strings.HasPrefix(vol.Source, ".") || strings.HasPrefix(vol.Source, "/") ||
 				strings.HasPrefix(vol.Source, "~") || strings.Contains(vol.Source, "/") || strings.Contains(vol.Source, "\\")
 
-			if isBind && !isDockerSocket && opts.Project != nil && opts.Project.RepositoryPath != "" && opts.Project.SourceType != models.SourceTypeLocalAgent {
-				hostPath := vol.Source
-				if !filepath.IsAbs(hostPath) {
-					hostPath = filepath.Join(opts.Project.RepositoryPath, hostPath)
-				}
-				cleanHost := filepath.Clean(hostPath)
-				cleanRepo := filepath.Clean(opts.Project.RepositoryPath)
-				rel, err := filepath.Rel(cleanRepo, cleanHost)
-				if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
-					return &PreflightValidationError{
-						ServiceName: sd.ServiceName,
-						Field:       "volumes",
-						Message:     fmt.Sprintf("bind mount source '%s' escapes repository boundary", vol.Source),
+			if isBind && !isDockerSocket && opts.Project != nil {
+				if opts.Project.SourceType == models.SourceTypeGitHub || opts.Project.SourceType == models.SourceTypeLocalAgent {
+					if !filepath.IsAbs(vol.Source) {
+						return &PreflightValidationError{
+							ServiceName: sd.ServiceName,
+							Field:       "volumes",
+							Message:     fmt.Sprintf("relative bind mount '%s' is not supported for remote/agent source type '%s'. Use a named volume or absolute host path.", vol.Source, opts.Project.SourceType),
+						}
+					}
+				} else if opts.Project.RepositoryPath != "" && opts.Project.SourceType != models.SourceTypeLocalAgent {
+					hostPath := vol.Source
+					if !filepath.IsAbs(hostPath) {
+						hostPath = filepath.Join(opts.Project.RepositoryPath, hostPath)
+					}
+					cleanHost := filepath.Clean(hostPath)
+					cleanRepo := filepath.Clean(opts.Project.RepositoryPath)
+					rel, err := filepath.Rel(cleanRepo, cleanHost)
+					if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+						return &PreflightValidationError{
+							ServiceName: sd.ServiceName,
+							Field:       "volumes",
+							Message:     fmt.Sprintf("bind mount source '%s' escapes repository boundary", vol.Source),
+						}
 					}
 				}
 			}
