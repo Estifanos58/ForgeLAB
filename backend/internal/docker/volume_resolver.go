@@ -84,8 +84,10 @@ func isNamedVolumeSource(source, volType string) bool {
 	return true
 }
 
-// normalizePathForComparison cleans a path and normalizes separators to '/' in lowercase for robust comparison.
-func normalizePathForComparison(p string) string {
+// CanonicalizePathForComparison normalizes a path into a drive-neutral representation for cross-namespace comparison.
+// It maps Docker Desktop daemon mount paths (/run/desktop/mnt/host/c/..., /host_mnt/c/..., /mnt/c/...)
+// and Windows paths (C:\...) to the same canonical form (c:/...).
+func CanonicalizePathForComparison(p string) string {
 	s := strings.TrimSpace(p)
 	if s == "" {
 		return ""
@@ -93,13 +95,127 @@ func normalizePathForComparison(p string) string {
 	s = strings.ReplaceAll(s, "\\", "/")
 	s = path.Clean(s)
 	s = strings.TrimRight(s, "/")
-	return strings.ToLower(s)
+
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "/run/desktop/mnt/host/") {
+		rest := strings.TrimPrefix(lower, "/run/desktop/mnt/host/")
+		if len(rest) > 0 && unicode.IsLetter(rune(rest[0])) {
+			return rest[0:1] + ":/" + strings.TrimPrefix(rest[1:], "/")
+		}
+	}
+	if strings.HasPrefix(lower, "/host_mnt/") {
+		rest := strings.TrimPrefix(lower, "/host_mnt/")
+		if len(rest) > 0 && unicode.IsLetter(rune(rest[0])) {
+			return rest[0:1] + ":/" + strings.TrimPrefix(rest[1:], "/")
+		}
+	}
+	if strings.HasPrefix(lower, "/mnt/") && len(lower) >= 6 && unicode.IsLetter(rune(lower[5])) && (len(lower) == 6 || lower[6] == '/') {
+		rest := strings.TrimPrefix(lower, "/mnt/")
+		return rest[0:1] + ":/" + strings.TrimPrefix(rest[1:], "/")
+	}
+	if len(lower) >= 3 && lower[0] == '/' && unicode.IsLetter(rune(lower[1])) && lower[2] == '/' {
+		return lower[1:2] + ":/" + strings.TrimPrefix(lower[3:], "/")
+	}
+
+	return lower
+}
+
+// normalizePathForComparison cleans a path and normalizes separators to '/' in lowercase for robust comparison.
+func normalizePathForComparison(p string) string {
+	return CanonicalizePathForComparison(p)
+}
+
+// DaemonPathToHostPath converts a Docker daemon-visible path to a canonical host/agent path.
+// For Docker Desktop environments on Windows (WSL2 / Hyper-V), it translates daemon mount
+// representations (e.g. /run/desktop/mnt/host/c/..., /host_mnt/c/..., /mnt/c/...) to Windows drive paths (C:\...).
+// On standard Linux environments, it returns the cleaned path as-is.
+func DaemonPathToHostPath(daemonPath string) string {
+	s := strings.TrimSpace(daemonPath)
+	if s == "" {
+		return ""
+	}
+	slash := filepath.ToSlash(s)
+
+	if strings.HasPrefix(slash, "/run/desktop/mnt/host/") {
+		rest := strings.TrimPrefix(slash, "/run/desktop/mnt/host/")
+		return driveSubpathToWindows(rest)
+	}
+
+	if strings.HasPrefix(slash, "/host_mnt/") {
+		rest := strings.TrimPrefix(slash, "/host_mnt/")
+		return driveSubpathToWindows(rest)
+	}
+
+	if strings.HasPrefix(slash, "/mnt/") && len(slash) >= 6 && unicode.IsLetter(rune(slash[5])) && (len(slash) == 6 || slash[6] == '/') {
+		rest := strings.TrimPrefix(slash, "/mnt/")
+		return driveSubpathToWindows(rest)
+	}
+
+	if len(slash) >= 3 && slash[0] == '/' && unicode.IsLetter(rune(slash[1])) && slash[2] == '/' {
+		return driveSubpathToWindows(slash[1:])
+	}
+
+	if len(s) >= 2 && unicode.IsLetter(rune(s[0])) && s[1] == ':' {
+		return filepath.Clean(filepath.FromSlash(s))
+	}
+
+	return filepath.Clean(s)
+}
+
+func driveSubpathToWindows(rest string) string {
+	if len(rest) == 0 {
+		return ""
+	}
+	driveLetter := unicode.ToUpper(rune(rest[0]))
+	if !unicode.IsLetter(driveLetter) {
+		return "/" + rest
+	}
+	sub := ""
+	if len(rest) > 1 {
+		sub = strings.TrimPrefix(rest[1:], "/")
+	}
+	if sub == "" {
+		return fmt.Sprintf("%c:\\", driveLetter)
+	}
+	return fmt.Sprintf("%c:\\%s", driveLetter, filepath.FromSlash(sub))
+}
+
+// HostPathToDaemonPath converts a host/agent path to a Docker daemon-visible path.
+// If a known daemonRoot is provided, it maps hostPath relative to daemonRoot.
+func HostPathToDaemonPath(hostPath string, daemonRoot string) string {
+	cleanHost := strings.TrimSpace(hostPath)
+	if cleanHost == "" {
+		return ""
+	}
+	daemonRoot = strings.TrimSpace(daemonRoot)
+	if daemonRoot != "" {
+		if rel, ok := getRelativePathCrossPlatform(DaemonPathToHostPath(daemonRoot), cleanHost); ok {
+			return joinHostPath(daemonRoot, rel)
+		}
+		if rel, ok := getRelativePathCrossPlatform(daemonRoot, cleanHost); ok {
+			return joinHostPath(daemonRoot, rel)
+		}
+	}
+
+	if len(cleanHost) >= 2 && unicode.IsLetter(rune(cleanHost[0])) && cleanHost[1] == ':' {
+		drive := strings.ToLower(string(cleanHost[0]))
+		rest := strings.TrimPrefix(filepath.ToSlash(cleanHost[2:]), "/")
+		if strings.HasPrefix(filepath.ToSlash(daemonRoot), "/host_mnt/") {
+			return fmt.Sprintf("/host_mnt/%s/%s", drive, rest)
+		}
+		if strings.HasPrefix(filepath.ToSlash(daemonRoot), "/mnt/") {
+			return fmt.Sprintf("/mnt/%s/%s", drive, rest)
+		}
+		return fmt.Sprintf("/run/desktop/mnt/host/%s/%s", drive, rest)
+	}
+
+	return filepath.Clean(cleanHost)
 }
 
 // getRelativePathCrossPlatform calculates the relative subpath of target beneath root, handling mixed Windows and POSIX formats.
 func getRelativePathCrossPlatform(root, target string) (string, bool) {
-	normRoot := normalizePathForComparison(root)
-	normTarget := normalizePathForComparison(target)
+	normRoot := CanonicalizePathForComparison(root)
+	normTarget := CanonicalizePathForComparison(target)
 
 	if normRoot == "" || normTarget == "" {
 		return "", false
@@ -257,7 +373,7 @@ func ResolveProjectSourcePaths(
 	// Dynamically resolve backend container mount if hostSourceRoot is not yet populated
 	if pathValidator != nil && pathValidator.HostSourceRoot() == "" && cli != nil {
 		if mountInfo, err := DetectBackendContainerMount(ctx, cli, pathValidator.ContainerSourceRoot()); err == nil && mountInfo != nil {
-			pathValidator.SetHostSourceRoot(mountInfo.DaemonSource)
+			pathValidator.SetHostSourceRoot(DaemonPathToHostPath(mountInfo.DaemonSource))
 			pathValidator.SetDaemonSourceRoot(mountInfo.DaemonSource)
 		}
 	}
@@ -331,6 +447,9 @@ func ResolveProjectSourcePaths(
 
 			if hostRoot != "" {
 				rel, matches := getRelativePathCrossPlatform(hostRoot, agentPath)
+				if !matches && daemonRoot != "" {
+					rel, matches = getRelativePathCrossPlatform(daemonRoot, agentPath)
+				}
 				if matches {
 					backendPath = joinContainerPath(containerRoot, rel)
 					daemonPath = joinHostPath(daemonRoot, rel)
@@ -573,11 +692,22 @@ func ResolveAndValidateVolumeMount(
 		if !accessible {
 			if project.SourceType == models.SourceTypeLocalAgent {
 				hostRoot := ""
+				daemonRoot := ""
 				if pathValidator != nil {
 					hostRoot = pathValidator.HostSourceRoot()
+					daemonRoot = pathValidator.DaemonSourceRoot()
 				}
 				if hostRoot != "" {
-					if _, ok := getRelativePathCrossPlatform(hostRoot, paths.AgentPath); !ok {
+					matchesHost := false
+					if _, ok := getRelativePathCrossPlatform(hostRoot, paths.AgentPath); ok {
+						matchesHost = true
+					}
+					if !matchesHost && daemonRoot != "" {
+						if _, ok := getRelativePathCrossPlatform(daemonRoot, paths.AgentPath); ok {
+							matchesHost = true
+						}
+					}
+					if !matchesHost {
 						return nil, fmt.Errorf("bind mount source directory '%s' (project root '%s') is outside the backend's mounted host source root ('%s'); relative bind mounts require the project to be located within the configured FORGELAB_HOST_SOURCE_ROOT or backend container mount", vol.Source, paths.AgentPath, hostRoot)
 					}
 				}
@@ -653,9 +783,19 @@ func validateRestrictedHostMount(p string) error {
 	lowerHost := strings.ToLower(cleanHost)
 	normHost := strings.ReplaceAll(lowerHost, "\\", "/")
 
+	isDockerDesktop := strings.HasPrefix(normHost, "/run/desktop/mnt/host") ||
+		strings.HasPrefix(normHost, "/run/desktop/mnt/") ||
+		strings.HasPrefix(normHost, "/host_mnt/")
+
 	for _, restricted := range restrictedHostMounts {
 		cleanRestricted := strings.ToLower(filepath.Clean(restricted))
 		normRestricted := strings.ReplaceAll(cleanRestricted, "\\", "/")
+
+		// Exempt Docker Desktop host mount paths from the /run system directory check
+		if isDockerDesktop && (normRestricted == "/run" || (normRestricted == "/run/docker.sock" && !strings.Contains(normHost, "docker.sock"))) {
+			continue
+		}
+
 		if normHost == normRestricted || strings.HasPrefix(normHost, normRestricted+"/") ||
 			lowerHost == cleanRestricted || strings.HasPrefix(lowerHost, cleanRestricted+string(filepath.Separator)) || strings.HasPrefix(lowerHost, cleanRestricted+"/") {
 			return fmt.Errorf("%w: %s", ErrSensitiveHostMountRejected, cleanHost)

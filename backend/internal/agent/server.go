@@ -1216,7 +1216,43 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 				genPort = p
 			}
 			genStartCmd := r.URL.Query().Get("start_cmd")
-			dockerfileContent := detector.GenerateDockerfile(genRuntime, genPort, genStartCmd)
+			genPkgManager := r.URL.Query().Get("package_manager")
+			if genPkgManager == "" {
+				genPkgManager = r.URL.Query().Get("pkg_manager")
+			}
+			if genPkgManager == "" {
+				// Inspect evalServiceDir for lockfiles
+				if _, err := os.Stat(filepath.Join(evalServiceDir, "pnpm-lock.yaml")); err == nil {
+					genPkgManager = "pnpm"
+				} else if _, err := os.Stat(filepath.Join(evalServiceDir, "yarn.lock")); err == nil {
+					genPkgManager = "yarn"
+				} else if _, err := os.Stat(filepath.Join(evalServiceDir, "bun.lockb")); err == nil {
+					genPkgManager = "bun"
+				} else if _, err := os.Stat(filepath.Join(evalServiceDir, "bun.lock")); err == nil {
+					genPkgManager = "bun"
+				} else if _, err := os.Stat(filepath.Join(evalServiceDir, "package-lock.json")); err == nil {
+					genPkgManager = "npm"
+				} else if _, err := os.Stat(filepath.Join(evalServiceDir, "npm-shrinkwrap.json")); err == nil {
+					genPkgManager = "npm"
+				} else if pkgRaw, err := os.ReadFile(filepath.Join(evalServiceDir, "package.json")); err == nil {
+					var pkg struct {
+						PackageManager string `json:"packageManager"`
+					}
+					if err := json.Unmarshal(pkgRaw, &pkg); err == nil && pkg.PackageManager != "" {
+						pmDecl := strings.ToLower(pkg.PackageManager)
+						if strings.HasPrefix(pmDecl, "pnpm") {
+							genPkgManager = "pnpm"
+						} else if strings.HasPrefix(pmDecl, "yarn") {
+							genPkgManager = "yarn"
+						} else if strings.HasPrefix(pmDecl, "bun") {
+							genPkgManager = "bun"
+						} else if strings.HasPrefix(pmDecl, "npm") {
+							genPkgManager = "npm"
+						}
+					}
+				}
+			}
+			dockerfileContent := detector.GenerateDockerfile(genRuntime, genPort, genStartCmd, genPkgManager)
 			virtualFiles["Dockerfile.forgelab"] = []byte(dockerfileContent)
 			expectedDockerfile = "Dockerfile.forgelab"
 		} else {

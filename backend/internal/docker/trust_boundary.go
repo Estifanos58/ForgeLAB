@@ -119,6 +119,9 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 		}
 
 		normHostPath := strings.ReplaceAll(lowerHostPath, "\\", "/")
+		isDockerDesktop := strings.HasPrefix(normHostPath, "/run/desktop/mnt/host") ||
+			strings.HasPrefix(normHostPath, "/run/desktop/mnt/") ||
+			strings.HasPrefix(normHostPath, "/host_mnt/")
 
 		// Check against sensitive paths
 		for _, restricted := range restrictedHostMounts {
@@ -127,6 +130,12 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 			}
 			cleanRestricted := strings.ToLower(filepath.Clean(restricted))
 			normRestricted := strings.ReplaceAll(cleanRestricted, "\\", "/")
+
+			// Exempt Docker Desktop host mount paths from the /run system directory check
+			if isDockerDesktop && (normRestricted == "/run" || (normRestricted == "/run/docker.sock" && !strings.Contains(normHostPath, "docker.sock"))) {
+				continue
+			}
+
 			if normHostPath == normRestricted || strings.HasPrefix(normHostPath, normRestricted+"/") ||
 				lowerHostPath == cleanRestricted || strings.HasPrefix(lowerHostPath, cleanRestricted+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanRestricted+"/") {
 				return nil, fmt.Errorf("%w: %s", ErrSensitiveHostMountRejected, hostPath)
@@ -145,6 +154,11 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 				normPrefix := strings.ReplaceAll(cleanPrefix, "\\", "/")
 				if normHostPath == normPrefix || strings.HasPrefix(normHostPath, normPrefix+"/") ||
 					lowerHostPath == cleanPrefix || strings.HasPrefix(lowerHostPath, cleanPrefix+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanPrefix+"/") {
+					allowed = true
+					break
+				}
+				// Cross-namespace allowlist check (e.g. Windows host path prefix vs Docker daemon path)
+				if rel, ok := getRelativePathCrossPlatform(prefix, host); ok && !strings.HasPrefix(rel, "..") {
 					allowed = true
 					break
 				}

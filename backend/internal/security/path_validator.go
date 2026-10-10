@@ -70,8 +70,8 @@ func NewPathValidatorWithMapping(allowedRoots []string, hostSourceRoot, containe
 	}
 }
 
-// TranslateHostToContainer translates a host path to its container-mapped path if host and container source roots are configured.
-// If mapping is not configured or the path does not match hostSourceRoot, returns candidatePath.
+// TranslateHostToContainer translates a host or daemon path to its container-mapped path if roots are configured.
+// If mapping is not configured or the path does not match hostSourceRoot/daemonSourceRoot, returns candidatePath.
 func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, error) {
 	trimmed := strings.TrimSpace(candidatePath)
 	if trimmed == "" {
@@ -85,39 +85,63 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 	v.mu.RLock()
 	hostRoot := v.hostSourceRoot
 	containerRoot := v.containerSourceRoot
+	daemonRoot := v.daemonSourceRoot
 	v.mu.RUnlock()
 
-	if hostRoot == "" || containerRoot == "" {
+	if containerRoot == "" {
 		return trimmed, nil
 	}
 
-	// Normalize paths for comparison (supporting both Windows and POSIX path separators)
-	normHostRoot := normalizePathForPrefix(hostRoot)
 	normCandidate := normalizePathForPrefix(trimmed)
-
-	if strings.EqualFold(normCandidate, normHostRoot) {
-		return containerRoot, nil
-	}
-
-	prefixWithSep := normHostRoot
-	if !strings.HasSuffix(prefixWithSep, "/") {
-		prefixWithSep += "/"
-	}
-
-	if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
-		rel := normCandidate[len(prefixWithSep):]
-		// Prevent traversal within relative portion
-		cleanRel := filepath.Clean(filepath.FromSlash(rel))
-		if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
-			return "", ErrPathNotAllowed
-		}
-		return filepath.Join(containerRoot, cleanRel), nil
-	}
 
 	// Check if path is already inside containerSourceRoot
 	normContainerRoot := normalizePathForPrefix(containerRoot)
 	if strings.EqualFold(normCandidate, normContainerRoot) || strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(normContainerRoot+"/")) {
 		return trimmed, nil
+	}
+
+	// 1. Check against hostRoot
+	if hostRoot != "" {
+		normHostRoot := normalizePathForPrefix(hostRoot)
+		if strings.EqualFold(normCandidate, normHostRoot) {
+			return containerRoot, nil
+		}
+
+		prefixWithSep := normHostRoot
+		if !strings.HasSuffix(prefixWithSep, "/") {
+			prefixWithSep += "/"
+		}
+
+		if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
+			rel := normCandidate[len(prefixWithSep):]
+			cleanRel := filepath.Clean(filepath.FromSlash(rel))
+			if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+				return "", ErrPathNotAllowed
+			}
+			return filepath.Join(containerRoot, cleanRel), nil
+		}
+	}
+
+	// 2. Check against daemonRoot
+	if daemonRoot != "" && daemonRoot != hostRoot {
+		normDaemonRoot := normalizePathForPrefix(daemonRoot)
+		if strings.EqualFold(normCandidate, normDaemonRoot) {
+			return containerRoot, nil
+		}
+
+		prefixWithSep := normDaemonRoot
+		if !strings.HasSuffix(prefixWithSep, "/") {
+			prefixWithSep += "/"
+		}
+
+		if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
+			rel := normCandidate[len(prefixWithSep):]
+			cleanRel := filepath.Clean(filepath.FromSlash(rel))
+			if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+				return "", ErrPathNotAllowed
+			}
+			return filepath.Join(containerRoot, cleanRel), nil
+		}
 	}
 
 	return trimmed, nil
@@ -186,8 +210,53 @@ func (v *PathValidator) AllowedRoots() []string {
 	return append([]string(nil), v.allowedRoots...)
 }
 
-// TranslateContainerToHost translates a container path to its host-mapped path if host and container source roots are configured.
+// TranslateContainerToHost translates a container path to its canonical host/agent path.
 func (v *PathValidator) TranslateContainerToHost(candidatePath string) (string, error) {
+	trimmed := strings.TrimSpace(candidatePath)
+	if trimmed == "" {
+		return "", ErrPathNotExist
+	}
+
+	if v == nil {
+		return trimmed, nil
+	}
+
+	v.mu.RLock()
+	hostRoot := v.hostSourceRoot
+	containerRoot := v.containerSourceRoot
+	v.mu.RUnlock()
+
+	if hostRoot == "" || containerRoot == "" {
+		return trimmed, nil
+	}
+
+	normContainerRoot := normalizePathForPrefix(containerRoot)
+	normCandidate := normalizePathForPrefix(trimmed)
+
+	if strings.EqualFold(normCandidate, normContainerRoot) {
+		return hostRoot, nil
+	}
+
+	prefixWithSep := normContainerRoot
+	if !strings.HasSuffix(prefixWithSep, "/") {
+		prefixWithSep += "/"
+	}
+
+	if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
+		rel := normCandidate[len(prefixWithSep):]
+		cleanRel := filepath.Clean(filepath.FromSlash(rel))
+		if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+			return "", ErrPathNotAllowed
+		}
+		// Join with hostRoot preserving host format
+		return joinHostPath(hostRoot, cleanRel), nil
+	}
+
+	return trimmed, nil
+}
+
+// TranslateContainerToDaemon translates a container path to its Docker daemon mount source path.
+func (v *PathValidator) TranslateContainerToDaemon(candidatePath string) (string, error) {
 	trimmed := strings.TrimSpace(candidatePath)
 	if trimmed == "" {
 		return "", ErrPathNotExist
@@ -206,7 +275,7 @@ func (v *PathValidator) TranslateContainerToHost(candidatePath string) (string, 
 	}
 	v.mu.RUnlock()
 
-	if hostRoot == "" || containerRoot == "" {
+	if daemonRoot == "" || containerRoot == "" {
 		return trimmed, nil
 	}
 
@@ -486,29 +555,19 @@ func (v *PathValidator) ValidateServiceBuildPaths(
 			return "", "", errors.New("build context escapes repository boundary")
 		}
 
-		// Primary resolution: buildContext relative to repository / workspace root
-		candRoot := filepath.Join(cleanRoot, cleanRel)
-		if fi, err := os.Stat(candRoot); err == nil && fi.IsDir() {
-			targetContextDir = candRoot
-		} else if canonicalServiceDir != cleanRoot {
-			// Secondary resolution: if not found directly under cleanRoot, check relative to service directory
+		if cleanRel == "." || cleanRel == "" {
+			targetContextDir = canonicalServiceDir
+		} else {
+			// Resolve relative to service dir first, fallback to source root
 			candSvc := filepath.Join(canonicalServiceDir, cleanRel)
+			candRoot := filepath.Join(cleanRoot, cleanRel)
 			if fi, err := os.Stat(candSvc); err == nil && fi.IsDir() {
-				relSvc, err := filepath.Rel(cleanRoot, candSvc)
-				if err == nil && !strings.HasPrefix(relSvc, "..") {
-					targetContextDir = candSvc
-				} else {
-					return "", "", errors.New("build context escapes repository boundary")
-				}
-			} else if cleanRel == "." {
-				targetContextDir = canonicalServiceDir
+				targetContextDir = candSvc
+			} else if fi, err := os.Stat(candRoot); err == nil && fi.IsDir() {
+				targetContextDir = candRoot
 			} else {
 				return "", "", fmt.Errorf("build context directory does not exist: %s", cleanBuildContext)
 			}
-		} else if cleanRel == "." {
-			targetContextDir = cleanRoot
-		} else {
-			return "", "", fmt.Errorf("build context directory does not exist: %s", cleanBuildContext)
 		}
 	}
 

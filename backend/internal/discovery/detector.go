@@ -47,23 +47,58 @@ func DetectTechnology(files map[string][]byte) (runtime, framework, pkgManager s
 		healthPath = "/"
 		healthStrat = models.HealthStrategyHTTP
 
+		var pkg struct {
+			Scripts         map[string]string `json:"scripts"`
+			Dependencies    map[string]string `json:"dependencies"`
+			DevDependencies map[string]string `json:"devDependencies"`
+			Main            string            `json:"main"`
+			PackageManager  string            `json:"packageManager"`
+		}
+		_ = json.Unmarshal(pkgRaw, &pkg)
+
 		if _, ok := files["pnpm-lock.yaml"]; ok {
 			pkgManager = "pnpm"
 		} else if _, ok := files["yarn.lock"]; ok {
 			pkgManager = "yarn"
 		} else if _, ok := files["bun.lockb"]; ok || hasKey(files, "bun.lock") {
 			pkgManager = "bun"
-		} else {
+		} else if _, ok := files["package-lock.json"]; ok || hasKey(files, "npm-shrinkwrap.json") {
 			pkgManager = "npm"
+		} else {
+			// Check relative paths in files map
+			for f := range files {
+				base := strings.ToLower(filepath.Base(f))
+				if base == "pnpm-lock.yaml" {
+					pkgManager = "pnpm"
+					break
+				} else if base == "yarn.lock" {
+					pkgManager = "yarn"
+					break
+				} else if base == "bun.lockb" || base == "bun.lock" {
+					pkgManager = "bun"
+					break
+				} else if base == "package-lock.json" || base == "npm-shrinkwrap.json" {
+					pkgManager = "npm"
+					break
+				}
+			}
+			// If still not determined, check packageManager field in package.json
+			if pkgManager == "" && pkg.PackageManager != "" {
+				pmDecl := strings.ToLower(pkg.PackageManager)
+				if strings.HasPrefix(pmDecl, "pnpm") {
+					pkgManager = "pnpm"
+				} else if strings.HasPrefix(pmDecl, "yarn") {
+					pkgManager = "yarn"
+				} else if strings.HasPrefix(pmDecl, "bun") {
+					pkgManager = "bun"
+				} else if strings.HasPrefix(pmDecl, "npm") {
+					pkgManager = "npm"
+				}
+			}
+			if pkgManager == "" {
+				pkgManager = "npm"
+			}
 		}
-
-		var pkg struct {
-			Scripts         map[string]string `json:"scripts"`
-			Dependencies    map[string]string `json:"dependencies"`
-			DevDependencies map[string]string `json:"devDependencies"`
-			Main            string            `json:"main"`
-		}
-		_ = json.Unmarshal(pkgRaw, &pkg)
 
 		allDeps := make(map[string]string)
 		for k, v := range pkg.Dependencies {
@@ -364,28 +399,44 @@ func DetectTechnology(files map[string][]byte) (runtime, framework, pkgManager s
 	return
 }
 
-// GenerateDockerfile produces an optimized multi-stage Dockerfile based on runtime, port, and commands
+// GenerateDockerfile produces an optimized multi-stage Dockerfile based on runtime, port, commands, and package manager
 func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) string {
 	if port <= 0 {
 		port = 8080
 	}
 
-	installCmd := "npm install"
+	installCmd := "if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi"
 	runBuildCmd := "npm run build"
 	runStartCmd := "npm start"
+	runnerSetup := ""
+	builderImage := "node:20-alpine"
+	runnerImage := "node:20-alpine"
 
-	if pkgManager == "pnpm" {
-		installCmd = "corepack enable && pnpm install --frozen-lockfile || pnpm install"
+	switch pkgManager {
+	case "pnpm":
+		installCmd = "corepack enable && pnpm install --frozen-lockfile"
 		runBuildCmd = "pnpm run build"
 		runStartCmd = "pnpm start"
-	} else if pkgManager == "yarn" {
-		installCmd = "yarn install"
+		runnerSetup = "RUN corepack enable\n"
+	case "yarn":
+		installCmd = "corepack enable && (yarn install --immutable || yarn install --frozen-lockfile)"
 		runBuildCmd = "yarn build"
 		runStartCmd = "yarn start"
-	} else if pkgManager == "bun" {
-		installCmd = "bun install"
+		runnerSetup = "RUN corepack enable\n"
+	case "bun":
+		builderImage = "oven/bun:1-alpine"
+		runnerImage = "oven/bun:1-alpine"
+		installCmd = "bun install --frozen-lockfile"
 		runBuildCmd = "bun run build"
 		runStartCmd = "bun run start"
+	case "npm":
+		installCmd = "if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi"
+		runBuildCmd = "npm run build"
+		runStartCmd = "npm start"
+	}
+
+	if startCmd != "" {
+		runStartCmd = startCmd
 	}
 
 	switch runtime {
@@ -398,27 +449,27 @@ CMD ["nginx", "-g", "daemon off;"]
 `, port)
 
 	case "nextjs":
-		return fmt.Sprintf(`FROM node:20-alpine AS builder
+		return fmt.Sprintf(`FROM %s AS builder
 WORKDIR /app
-COPY package*.json pnpm-lock.yaml* yarn.lock* bun.lock* ./
+COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
 RUN %s
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN %s
 
-FROM node:20-alpine AS runner
+FROM %s AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=%d
 COPY --from=builder /app ./
-EXPOSE %d
+%sEXPOSE %d
 CMD ["sh", "-c", "%s"]
-`, installCmd, runBuildCmd, port, port, runStartCmd)
+`, builderImage, installCmd, runBuildCmd, runnerImage, port, runnerSetup, port, runStartCmd)
 
 	case "react-vite", "vue-vite", "svelte-vite":
-		return fmt.Sprintf(`FROM node:20-alpine AS builder
+		return fmt.Sprintf(`FROM %s AS builder
 WORKDIR /app
-COPY package*.json pnpm-lock.yaml* yarn.lock* bun.lock* ./
+COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
 RUN %s
 COPY . .
 RUN %s
@@ -430,22 +481,19 @@ COPY --from=builder /app/dist ./dist
 ENV PORT=%d
 EXPOSE %d
 CMD ["serve", "-s", "dist", "-l", "%d"]
-`, installCmd, runBuildCmd, port, port, port)
+`, builderImage, installCmd, runBuildCmd, port, port, port)
 
 	case "nodejs", "express", "fastify", "nestjs":
 		cmd := runStartCmd
-		if startCmd != "" {
-			cmd = startCmd
-		}
-		return fmt.Sprintf(`FROM node:20-alpine
+		return fmt.Sprintf(`FROM %s
 WORKDIR /app
-COPY package*.json pnpm-lock.yaml* yarn.lock* bun.lock* ./
-RUN %s
+COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
+%sRUN %s
 COPY . .
 ENV PORT=%d
 EXPOSE %d
 CMD ["sh", "-c", "%s"]
-`, installCmd, port, port, cmd)
+`, builderImage, runnerSetup, installCmd, port, port, cmd)
 
 	case "python-fastapi":
 		return fmt.Sprintf(`FROM python:3.11-slim

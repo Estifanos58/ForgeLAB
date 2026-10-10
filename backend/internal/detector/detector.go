@@ -15,6 +15,7 @@ import (
 type DetectionResult struct {
 	Runtime         string   `json:"runtime"`
 	Framework       string   `json:"framework"`
+	PackageManager  string   `json:"package_manager,omitempty"`
 	BuildStrategy   string   `json:"build_strategy"`
 	SuggestedPort   int      `json:"suggested_port"`
 	BuildCommand    string   `json:"build_command"`
@@ -63,7 +64,9 @@ func Detect(sourceDir string) (*DetectionResult, error) {
 func isIndicatorFile(name string) bool {
 	lower := strings.ToLower(name)
 	indicators := []string{
-		"dockerfile", "package.json", "next.config.js", "next.config.mjs", "next.config.ts",
+		"dockerfile", "package.json", "pnpm-lock.yaml", "yarn.lock", "package-lock.json",
+		"npm-shrinkwrap.json", "bun.lockb", "bun.lock", "cargo.lock", "gemfile.lock",
+		"composer.lock", "poetry.lock", "next.config.js", "next.config.mjs", "next.config.ts",
 		"vite.config.js", "vite.config.ts", "vite.config.mjs", "requirements.txt",
 		"pyproject.toml", "pipfile", "go.mod", "pom.xml", "build.gradle",
 		"build.gradle.kts", "cargo.toml", "gemfile", "composer.json", "main.go",
@@ -110,7 +113,7 @@ func DetectFromFiles(files map[string][]byte) *DetectionResult {
 		}
 	}
 
-	runtime, framework, _, port, healthPath, healthStrat, buildCmd, startCmd := discovery.DetectTechnology(files)
+	runtime, framework, pkgManager, port, healthPath, healthStrat, buildCmd, startCmd := discovery.DetectTechnology(files)
 
 	strat := "auto"
 	if runtime == "dockerfile" {
@@ -120,6 +123,7 @@ func DetectFromFiles(files map[string][]byte) *DetectionResult {
 	return &DetectionResult{
 		Runtime:         runtime,
 		Framework:       framework,
+		PackageManager:  pkgManager,
 		BuildStrategy:   strat,
 		SuggestedPort:   port,
 		BuildCommand:    buildCmd,
@@ -130,7 +134,11 @@ func DetectFromFiles(files map[string][]byte) *DetectionResult {
 	}
 }
 
-// GenerateDockerfile produces an optimized multi-stage Dockerfile string based on the detected runtime.
-func GenerateDockerfile(runtime string, port int, startCmd string) string {
-	return discovery.GenerateDockerfile(runtime, port, startCmd, "")
+// GenerateDockerfile produces an optimized multi-stage Dockerfile string based on the detected runtime and optional package manager.
+func GenerateDockerfile(runtime string, port int, startCmd string, pkgManager ...string) string {
+	pm := ""
+	if len(pkgManager) > 0 {
+		pm = pkgManager[0]
+	}
+	return discovery.GenerateDockerfile(runtime, port, startCmd, pm)
 }

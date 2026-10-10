@@ -528,3 +528,39 @@ func TestRegression_TrustBoundary_SecurityModelPreserved(t *testing.T) {
 	_, err = ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{Binds: []string{"/proc:/proc"}})
 	assert.ErrorIs(t, err, ErrSensitiveHostMountRejected)
 }
+
+// 11. Container definitively not found (404 / No such container) -> terminates immediately without retrying or timing out.
+func TestRegression_HealthCheck_ContainerDefinitivelyNotFound_FailsImmediately(t *testing.T) {
+	var inspectCalls atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inspectCalls.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"No such container: c-disappeared-123"}`))
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	eng := &Engine{dockerClient: cli}
+
+	var errLogs []string
+	start := time.Now()
+	healthy, reason := eng.verifyServiceHealth(
+		context.Background(),
+		"c-disappeared-123",
+		8080,
+		nil,
+		models.HealthStrategyHTTP,
+		"/",
+		func(msg string) {},
+		func(msg string) { errLogs = append(errLogs, msg) },
+	)
+
+	elapsed := time.Since(start)
+	assert.False(t, healthy, "health check must fail immediately when container is not found")
+	assert.Contains(t, reason, "definitively not found", "reason must state container is definitively not found")
+	assert.NotContains(t, reason, "timed out", "must not mask container disappearance as health check timeout")
+	assert.Equal(t, int32(1), inspectCalls.Load(), "must not retry when container is definitively not found")
+	assert.Less(t, elapsed, 2*time.Second, "must fail immediately without waiting for budget timeout")
+}
+

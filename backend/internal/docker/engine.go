@@ -833,6 +833,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				if service.StartCommand != "" {
 					agentQuery.Set("start_cmd", service.StartCommand)
 				}
+				if service.PackageManager != "" {
+					agentQuery.Set("package_manager", service.PackageManager)
+				}
 			}
 			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?%s",
 				baseURL,
@@ -957,7 +960,21 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				if intPort <= 0 {
 					intPort = 8080
 				}
-				generatedContent := detector.GenerateDockerfile(service.RuntimeType, intPort, service.StartCommand)
+				pkgManager := service.PackageManager
+				if pkgManager == "" && svcContextDir != "" {
+					if _, err := os.Stat(filepath.Join(svcContextDir, "pnpm-lock.yaml")); err == nil {
+						pkgManager = "pnpm"
+					} else if _, err := os.Stat(filepath.Join(svcContextDir, "yarn.lock")); err == nil {
+						pkgManager = "yarn"
+					} else if _, err := os.Stat(filepath.Join(svcContextDir, "bun.lockb")); err == nil {
+						pkgManager = "bun"
+					} else if _, err := os.Stat(filepath.Join(svcContextDir, "bun.lock")); err == nil {
+						pkgManager = "bun"
+					} else if _, err := os.Stat(filepath.Join(svcContextDir, "package-lock.json")); err == nil {
+						pkgManager = "npm"
+					}
+				}
+				generatedContent := detector.GenerateDockerfile(service.RuntimeType, intPort, service.StartCommand, pkgManager)
 				virtualFiles = map[string][]byte{
 					"Dockerfile.forgelab": []byte(generatedContent),
 				}
@@ -1270,6 +1287,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 		if e.pathValidator.HostSourceRoot() != "" {
 			allowedMountPrefixes = append(allowedMountPrefixes, e.pathValidator.HostSourceRoot())
+		}
+		if e.pathValidator.DaemonSourceRoot() != "" {
+			allowedMountPrefixes = append(allowedMountPrefixes, e.pathValidator.DaemonSourceRoot())
 		}
 		if e.pathValidator.ContainerSourceRoot() != "" {
 			allowedMountPrefixes = append(allowedMountPrefixes, e.pathValidator.ContainerSourceRoot())
@@ -2007,13 +2027,18 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				updateStatus(models.DeployStatusFailed, &reason)
 				return errors.New(reason)
 			}
-			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s",
+			pkgManager := ""
+			if len(project.Services) > 0 && project.Services[0] != nil {
+				pkgManager = project.Services[0].PackageManager
+			}
+			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s&package_manager=%s",
 				baseURL,
 				project.SourceReference,
 				url.QueryEscape(cleanRelPath),
 				url.QueryEscape(deployment.RuntimeType),
 				deployment.InternalPort,
 				url.QueryEscape(deployment.StartCommand),
+				url.QueryEscape(pkgManager),
 			)
 			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
 			if reqErr != nil {
@@ -2085,7 +2110,21 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				if startCmd == "" {
 					startCmd = project.StartCommand
 				}
-				dockerfileContent := detector.GenerateDockerfile(deployment.RuntimeType, port, startCmd)
+				pkgManager := ""
+				if buildContextDir != "" {
+					if _, err := os.Stat(filepath.Join(buildContextDir, "pnpm-lock.yaml")); err == nil {
+						pkgManager = "pnpm"
+					} else if _, err := os.Stat(filepath.Join(buildContextDir, "yarn.lock")); err == nil {
+						pkgManager = "yarn"
+					} else if _, err := os.Stat(filepath.Join(buildContextDir, "bun.lockb")); err == nil {
+						pkgManager = "bun"
+					} else if _, err := os.Stat(filepath.Join(buildContextDir, "bun.lock")); err == nil {
+						pkgManager = "bun"
+					} else if _, err := os.Stat(filepath.Join(buildContextDir, "package-lock.json")); err == nil {
+						pkgManager = "npm"
+					}
+				}
+				dockerfileContent := detector.GenerateDockerfile(deployment.RuntimeType, port, startCmd, pkgManager)
 				relDockerPath = "Dockerfile.forgelab"
 				virtualFiles = map[string][]byte{
 					"Dockerfile.forgelab": []byte(dockerfileContent),
@@ -3144,6 +3183,26 @@ func (e *Engine) buildContainerExitDiagnostics(ctx context.Context, containerID 
 	return strings.Join(parts, ", ")
 }
 
+func isContainerNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if client.IsErrNotFound(err) {
+		return true
+	}
+	type notFound interface {
+		NotFound() bool
+	}
+	if nfe, ok := err.(notFound); ok && nfe.NotFound() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such container") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "code 404") ||
+		strings.Contains(msg, "status 404")
+}
+
 // verifyServiceHealth performs health verification through the correct container/network path
 // working seamlessly whether ForgeLAB runs directly on the host or inside Docker Compose.
 func (e *Engine) verifyServiceHealth(
@@ -3227,6 +3286,10 @@ func (e *Engine) verifyServiceHealth(
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 				errLogFn("Health check cancelled: deployment context cancelled")
 				return false, "health check cancelled"
+			}
+			if isContainerNotFoundError(err) {
+				errLogFn(fmt.Sprintf("Container %s definitively not found during health check: %v", containerID, err))
+				return false, fmt.Sprintf("container %s definitively not found: %v", containerID, err)
 			}
 			if time.Since(startTime) >= expectedBudget {
 				errLogFn(fmt.Sprintf("Health check timed out after %v", expectedBudget))

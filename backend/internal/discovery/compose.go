@@ -677,19 +677,32 @@ func normalizeRelativeComposeBind(source, repoRoot, composeDir string) string {
 		return source
 	}
 
+	hadDotSlash := strings.HasPrefix(source, "./") || strings.HasPrefix(source, ".\\")
+
 	if composeDir != "" {
 		absSource := filepath.Clean(filepath.Join(composeDir, filepath.FromSlash(source)))
 		if repoRoot != "" {
 			relToRepo, err := filepath.Rel(repoRoot, absSource)
 			if err == nil && !strings.HasPrefix(relToRepo, "..") && relToRepo != ".." {
-				return filepath.ToSlash(relToRepo)
+				res := filepath.ToSlash(relToRepo)
+				if hadDotSlash && !strings.HasPrefix(res, "./") && res != "." {
+					return "./" + res
+				}
+				return res
 			}
 		}
-		return filepath.ToSlash(filepath.Clean(source))
+		clean := filepath.ToSlash(filepath.Clean(source))
+		if hadDotSlash && !strings.HasPrefix(clean, "./") && clean != "." {
+			return "./" + clean
+		}
+		return clean
 	}
 	clean := filepath.ToSlash(filepath.Clean(source))
 	if clean == "" || clean == "." {
 		return "."
+	}
+	if hadDotSlash && !strings.HasPrefix(clean, "./") {
+		return "./" + clean
 	}
 	return clean
 }

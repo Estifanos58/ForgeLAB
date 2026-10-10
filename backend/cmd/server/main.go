@@ -120,14 +120,18 @@ func main() {
 	}
 
 	// Auto-detect host source root from Docker container mount metadata if running in container and not explicitly configured
+	var daemonSourceRoot string
 	if cfg.Docker.HostSourceRoot == "" && dockerCli != nil {
 		if mountInfo, err := docker.DetectBackendContainerMount(ctx, dockerCli, cfg.Docker.ContainerSourceRoot); err == nil && mountInfo != nil {
 			slog.Info("auto-detected host source root from Docker container mount metadata",
 				"daemon_source_root", mountInfo.DaemonSource,
 				"container_source_root", mountInfo.ContainerTarget,
 			)
-			cfg.Docker.HostSourceRoot = mountInfo.DaemonSource
+			daemonSourceRoot = mountInfo.DaemonSource
+			cfg.Docker.HostSourceRoot = docker.DaemonPathToHostPath(mountInfo.DaemonSource)
 		}
+	} else if cfg.Docker.HostSourceRoot != "" {
+		daemonSourceRoot = docker.HostPathToDaemonPath(cfg.Docker.HostSourceRoot, "")
 	}
 
 	pathValidator := security.NewPathValidatorWithMapping(
@@ -135,8 +139,8 @@ func main() {
 		cfg.Docker.HostSourceRoot,
 		cfg.Docker.ContainerSourceRoot,
 	)
-	if cfg.Docker.HostSourceRoot != "" {
-		pathValidator.SetDaemonSourceRoot(cfg.Docker.HostSourceRoot)
+	if daemonSourceRoot != "" {
+		pathValidator.SetDaemonSourceRoot(daemonSourceRoot)
 	}
 	portManager := network.NewPortManager(10000, 60000)
 
