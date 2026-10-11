@@ -853,6 +853,19 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		var tarArchive io.ReadCloser
 		var dfContent []byte
 
+		var releaseSlot func()
+		var slotReleased bool
+		var slotRelMu sync.Mutex
+		doReleaseSlot := func() {
+			slotRelMu.Lock()
+			defer slotRelMu.Unlock()
+			if !slotReleased && releaseSlot != nil {
+				slotReleased = true
+				releaseSlot()
+			}
+		}
+		defer doReleaseSlot()
+
 		if project.SourceType == models.SourceTypeLocalAgent {
 			effPath := service.SourcePath
 			if project.BuildContext != "" && project.BuildContext != "." && !strings.HasPrefix(service.SourcePath, project.BuildContext) {
@@ -923,7 +936,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				Phase:               "waiting_for_build_slot",
 			}
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Service '%s' waiting for Docker build slot...", service.Name))
-			releaseSlot, slotErr := e.acquireBuildSlotWithInfo(execCtx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+			acquiredSlot, slotErr := e.acquireBuildSlotWithInfo(execCtx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
 				var ownerDesc string
 				if len(actSlots) > 0 {
 					ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
@@ -936,7 +949,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				emitStatus(models.DeployStatusFailed, nil, &reason)
 				return errors.New(reason)
 			}
-			defer releaseSlot()
+			releaseSlot = acquiredSlot
 			e.buildSem.UpdatePhase(slotID, "context_transfer")
 			execCtx = context.WithValue(execCtx, buildSlotContextKey, slotID)
 
@@ -1111,7 +1124,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					Phase:               "waiting_for_build_slot",
 				}
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Service '%s' waiting for Docker build slot...", service.Name))
-				releaseSlot, slotErr := e.acquireBuildSlotWithInfo(execCtx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+				acquiredSlot, slotErr := e.acquireBuildSlotWithInfo(execCtx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
 					var ownerDesc string
 					if len(actSlots) > 0 {
 						ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
@@ -1124,7 +1137,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					emitStatus(models.DeployStatusFailed, nil, &reason)
 					return errors.New(reason)
 				}
-				defer releaseSlot()
+				releaseSlot = acquiredSlot
 				e.buildSem.UpdatePhase(slotID, "archive_generation")
 				execCtx = context.WithValue(execCtx, buildSlotContextKey, slotID)
 			}
@@ -1224,6 +1237,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			_ = e.dockerClient.ImageTag(ctx, svcTag, service.Image)
 		}
 		runImage = svcTag
+		doReleaseSlot() // Release Docker build slot immediately after image build completes
 	}
 
 	// 3. Container Startup
@@ -1264,12 +1278,21 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 	}
 
-	svcEnv := make([]string, 0, len(runtimeEnvMap)+len(allProjectServices)*3+2)
+	svcEnv := make([]string, 0, len(runtimeEnvMap)+len(allProjectServices)*4+4)
 	for k, v := range runtimeEnvMap {
 		svcEnv = append(svcEnv, fmt.Sprintf("%s=%s", k, v))
 	}
 	svcEnv = append(svcEnv, fmt.Sprintf("PORT=%d", intPort))
 	svcEnv = append(svcEnv, fmt.Sprintf("SERVICE_NAME=%s", service.Name))
+
+	var hasExplicitDatabaseURL bool
+	var hasExplicitRedisURL bool
+	if _, ok := runtimeEnvMap["DATABASE_URL"]; ok {
+		hasExplicitDatabaseURL = true
+	}
+	if _, ok := runtimeEnvMap["REDIS_URL"]; ok {
+		hasExplicitRedisURL = true
+	}
 
 	for _, peer := range allProjectServices {
 		peerIntPort := peer.InternalPort
@@ -1279,7 +1302,50 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		upperName := strings.ToUpper(strings.ReplaceAll(peer.Name, "-", "_"))
 		svcEnv = append(svcEnv, fmt.Sprintf("%s_HOST=%s", upperName, peer.Name))
 		svcEnv = append(svcEnv, fmt.Sprintf("%s_PORT=%d", upperName, peerIntPort))
-		svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=http://%s:%d", upperName, peer.Name, peerIntPort))
+
+		peerNameLower := strings.ToLower(peer.Name)
+		peerImageLower := strings.ToLower(peer.Image)
+		isPostgres := strings.Contains(peerNameLower, "postgres") || strings.Contains(peerImageLower, "postgres")
+		isRedis := strings.Contains(peerNameLower, "redis") || strings.Contains(peerImageLower, "redis")
+		isMySQL := strings.Contains(peerNameLower, "mysql") || strings.Contains(peerNameLower, "mariadb") || strings.Contains(peerImageLower, "mysql")
+		isMongo := strings.Contains(peerNameLower, "mongo") || strings.Contains(peerImageLower, "mongo")
+
+		if isRedis {
+			redisURL := fmt.Sprintf("redis://%s:%d/0", peer.Name, peerIntPort)
+			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, redisURL))
+			if !hasExplicitRedisURL {
+				svcEnv = append(svcEnv, fmt.Sprintf("REDIS_URL=%s", redisURL))
+				hasExplicitRedisURL = true
+			}
+		} else if isPostgres {
+			pgUser := "forgelab"
+			pgPass := "forgelab_dev_password"
+			pgDB := "forgelab"
+			if u, ok := runtimeEnvMap["POSTGRES_USER"]; ok && u != "" {
+				pgUser = u
+			}
+			if p, ok := runtimeEnvMap["POSTGRES_PASSWORD"]; ok && p != "" {
+				pgPass = p
+			}
+			if d, ok := runtimeEnvMap["POSTGRES_DB"]; ok && d != "" {
+				pgDB = d
+			}
+			dbURL := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable", pgUser, pgPass, peer.Name, peerIntPort, pgDB)
+			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
+			if !hasExplicitDatabaseURL {
+				svcEnv = append(svcEnv, fmt.Sprintf("DATABASE_URL=%s", dbURL))
+				hasExplicitDatabaseURL = true
+			}
+		} else if isMySQL {
+			dbURL := fmt.Sprintf("mysql://root:root@%s:%d/", peer.Name, peerIntPort)
+			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
+		} else if isMongo {
+			dbURL := fmt.Sprintf("mongodb://%s:%d", peer.Name, peerIntPort)
+			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
+		} else {
+			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=http://%s:%d", upperName, peer.Name, peerIntPort))
+		}
+
 		if peer.Role == models.RoleBackend {
 			svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_URL=http://%s:%d", peer.Name, peerIntPort))
 			svcEnv = append(svcEnv, fmt.Sprintf("API_URL=http://%s:%d", peer.Name, peerIntPort))
@@ -2144,6 +2210,19 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		var tarStream io.ReadCloser
 		var dfContent []byte
 
+		var releaseSlot func()
+		var slotReleased bool
+		var slotRelMu sync.Mutex
+		doReleaseSlot := func() {
+			slotRelMu.Lock()
+			defer slotRelMu.Unlock()
+			if !slotReleased && releaseSlot != nil {
+				slotReleased = true
+				releaseSlot()
+			}
+		}
+		defer doReleaseSlot()
+
 		if project.SourceType == models.SourceTypeLocalAgent {
 			cleanRelPath, pathErr := e.pathValidator.ValidateRelativeServicePath(project.BuildContext)
 			if pathErr != nil {
@@ -2186,7 +2265,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				Phase:        "waiting_for_build_slot",
 			}
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Waiting for Docker build slot...")
-			releaseSlot, slotErr := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+			acquiredSlot, slotErr := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
 				var ownerDesc string
 				if len(actSlots) > 0 {
 					ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
@@ -2199,7 +2278,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				updateStatus(models.DeployStatusFailed, &reason)
 				return errors.New(reason)
 			}
-			defer releaseSlot()
+			releaseSlot = acquiredSlot
 			e.buildSem.UpdatePhase(slotID, "context_transfer")
 			ctx = context.WithValue(ctx, buildSlotContextKey, slotID)
 
@@ -2325,7 +2404,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 					Phase:        "waiting_for_build_slot",
 				}
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Waiting for Docker build slot...")
-				releaseSlot, slotErr := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+				acquiredSlot, slotErr := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
 					var ownerDesc string
 					if len(actSlots) > 0 {
 						ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
@@ -2338,7 +2417,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 					updateStatus(models.DeployStatusFailed, &reason)
 					return errors.New(reason)
 				}
-				defer releaseSlot()
+				releaseSlot = acquiredSlot
 				e.buildSem.UpdatePhase(slotID, "archive_generation")
 				ctx = context.WithValue(ctx, buildSlotContextKey, slotID)
 			}
@@ -2415,6 +2494,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			}
 		}
 		runImage = *deployment.ImageTag
+		doReleaseSlot() // Release Docker build slot immediately after image build completes
 	}
 
 	updateStatus(models.DeployStatusStarting, nil)

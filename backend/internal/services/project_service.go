@@ -1169,12 +1169,19 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 						Services map[string]map[string]string `json:"services"`
 					}
 					if err := json.NewDecoder(resp.Body).Decode(&envResp); err == nil {
-						// Service-specific .env first (higher precedence)
+						// Service-specific .env and Compose declarations first (higher precedence)
 						for _, svc := range project.Services {
-							if svcEnv, ok := envResp.Services[svc.SourcePath]; ok {
-								svcID := svc.ID
+							svcID := svc.ID
+							if svcEnv, ok := envResp.Services[svc.Name]; ok {
 								for k, v := range svcEnv {
 									addEntry(&svcID, k, v)
+								}
+							}
+							if svc.SourcePath != "" && svc.SourcePath != "." {
+								if svcEnv, ok := envResp.Services[svc.SourcePath]; ok {
+									for k, v := range svcEnv {
+										addEntry(&svcID, k, v)
+									}
 								}
 							}
 						}

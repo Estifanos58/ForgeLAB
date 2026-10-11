@@ -414,7 +414,7 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 
 	switch pkgManager {
 	case "pnpm":
-		installCmd = "corepack enable && (npm pkg delete scripts.prepare 2>/dev/null || true) && pnpm install --frozen-lockfile"
+		installCmd = "corepack enable && (npm pkg delete scripts.prepare 2>/dev/null || true) && (pnpm install --frozen-lockfile --dangerously-allow-all-builds 2>/dev/null || pnpm install --frozen-lockfile)"
 		runBuildCmd = "pnpm run build"
 		runStartCmd = "pnpm start"
 		runnerSetup = "RUN corepack enable\n"

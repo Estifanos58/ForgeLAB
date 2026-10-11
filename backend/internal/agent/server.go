@@ -1348,7 +1348,33 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 		Services: make(map[string]map[string]string),
 	}
 
-	// 1. Root .env
+	// 1. Compose file declarations (docker-compose.yml / compose.yaml)
+	if composePath, found := discovery.FindComposeFile(session.CanonicalPath); found {
+		if _, composeSvcs, err := discovery.ParseComposeFile(composePath, session.CanonicalPath); err == nil {
+			for _, cs := range composeSvcs {
+				if len(cs.Environment) > 0 {
+					if _, ok := resp.Services[cs.Name]; !ok {
+						resp.Services[cs.Name] = make(map[string]string)
+					}
+					for _, envDef := range cs.Environment {
+						resp.Services[cs.Name][envDef.Key] = envDef.Value
+					}
+					if cs.SourcePath != "" && cs.SourcePath != "." {
+						if _, ok := resp.Services[cs.SourcePath]; !ok {
+							resp.Services[cs.SourcePath] = make(map[string]string)
+						}
+						for _, envDef := range cs.Environment {
+							resp.Services[cs.SourcePath][envDef.Key] = envDef.Value
+						}
+					}
+				}
+			}
+		} else {
+			slog.Warn("error parsing compose file for environment", "source_id", session.SourceID, "path", composePath, "error", err)
+		}
+	}
+
+	// 2. Root .env
 	rootEnvPath := filepath.Join(session.CanonicalPath, ".env")
 	if fi, err := os.Stat(rootEnvPath); err == nil && !fi.IsDir() {
 		if rootVars, err := envparser.ParseFile(rootEnvPath); err == nil {
@@ -1358,7 +1384,7 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// 2. Service-specific .env
+	// 3. Service-specific .env
 	servicePaths := r.URL.Query()["service_path"]
 	if len(servicePaths) == 0 {
 		if sp := r.URL.Query().Get("service_paths"); sp != "" {

@@ -29,7 +29,45 @@ func main() {
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		databaseURL = "postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable"
+		databaseURL = os.Getenv("POSTGRES_URL")
+	}
+	if databaseURL == "" {
+		host := os.Getenv("POSTGRES_HOST")
+		if host == "" {
+			host = os.Getenv("DB_HOST")
+		}
+		if host == "" {
+			host = "localhost"
+		}
+		port := os.Getenv("POSTGRES_PORT")
+		if port == "" {
+			port = os.Getenv("DB_PORT")
+		}
+		if port == "" {
+			port = "5432"
+		}
+		user := os.Getenv("POSTGRES_USER")
+		if user == "" {
+			user = os.Getenv("DB_USER")
+		}
+		if user == "" {
+			user = "forgelab"
+		}
+		password := os.Getenv("POSTGRES_PASSWORD")
+		if password == "" {
+			password = os.Getenv("DB_PASSWORD")
+		}
+		if password == "" {
+			password = "forgelab_dev_password"
+		}
+		dbName := os.Getenv("POSTGRES_DB")
+		if dbName == "" {
+			dbName = os.Getenv("DB_NAME")
+		}
+		if dbName == "" {
+			dbName = "forgelab"
+		}
+		databaseURL = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, password, host, port, dbName)
 	}
 
 	migrationsPath := "file://migrations"

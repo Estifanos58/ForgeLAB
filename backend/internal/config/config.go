@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -220,7 +221,7 @@ func Load() (*Config, error) {
 			HostSourceRoot:      getEnv("FORGELAB_HOST_SOURCE_ROOT", ""),
 			ContainerSourceRoot: getEnv("FORGELAB_CONTAINER_SOURCE_ROOT", "/host-projects"),
 			LocalBuildMode:      getEnv("FORGELAB_LOCAL_BUILD_MODE", "snapshot"),
-			MaxConcurrentBuilds: parseIntEnv("FORGELAB_MAX_CONCURRENT_BUILDS", parseIntEnv("FORGELAB_MAX_DOCKER_BUILDS", 1)),
+			MaxConcurrentBuilds: parseIntEnv("FORGELAB_MAX_CONCURRENT_BUILDS", parseIntEnv("FORGELAB_MAX_DOCKER_BUILDS", defaultMaxConcurrentBuilds())),
 			QueueWorkerCount:    parseIntEnv("FORGELAB_QUEUE_WORKERS", 4),
 			PruneInterval:       parseDurationEnv("FORGELAB_IMAGE_PRUNE_INTERVAL", parseDurationEnv("FORGELAB_PRUNE_INTERVAL", 1*time.Hour)),
 			PruneFilterLabel:    getEnv("FORGELAB_PRUNE_FILTER_LABEL", ""),
@@ -302,4 +303,15 @@ func parseStringSlice(s string) []string {
 		}
 	}
 	return res
+}
+
+func defaultMaxConcurrentBuilds() int {
+	n := runtime.NumCPU() / 2
+	if n < 2 {
+		return 2
+	}
+	if n > 4 {
+		return 4
+	}
+	return n
 }

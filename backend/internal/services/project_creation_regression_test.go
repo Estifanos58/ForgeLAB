@@ -69,9 +69,9 @@ func TestMigration_Version14To15Ordering(t *testing.T) {
 	defer m.Close()
 
 	// Ensure we are at migration 15 first
-	err = m.Up()
+	err = m.Migrate(15)
 	if err != nil && err != migrate.ErrNoChange {
-		require.NoError(t, err, "migrating up failed")
+		require.NoError(t, err, "migrating to version 15 failed")
 	}
 
 	version, dirty, err := m.Version()
@@ -131,6 +131,7 @@ func TestMigration_Version14To15Ordering(t *testing.T) {
 	`).Scan(&colCount)
 	require.NoError(t, err)
 	assert.Equal(t, 1, colCount, "networks column must exist on service_deployments at migration 15")
+	_ = m.Up()
 }
 
 func TestProjectCreation_WithComposeSemanticsRegression(t *testing.T) {
@@ -300,14 +301,14 @@ func TestMigration_FreshDatabaseAppliesAllMigrations(t *testing.T) {
 	require.NoError(t, err, "failed to initialize migrate on fresh database")
 	defer m.Close()
 
-	// Apply migrations 1 through 15
+	// Apply migrations 1 through latest
 	err = m.Up()
-	require.NoError(t, err, "fresh database migrations 1 through 15 must succeed")
+	require.NoError(t, err, "fresh database migrations must succeed")
 
 	version, dirty, err := m.Version()
 	require.NoError(t, err)
 	assert.False(t, dirty, "migration state must not be dirty")
-	assert.Equal(t, uint(15), version, "latest migration version must be 15")
+	assert.Equal(t, uint(16), version, "latest migration version must be 16")
 }
 
 func TestProjectCreation_NormalLocalProject_NoFailedToCreateProjectError(t *testing.T) {
