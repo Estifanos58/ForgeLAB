@@ -827,6 +827,7 @@ func parseEnvironment(env interface{}, serviceName string) []EnvironmentProvenan
 			result = append(result, EnvironmentProvenance{
 				Key:                k,
 				Value:              val,
+				RawValue:           valStr,
 				IsSecret:           isSecret,
 				Scope:              models.EnvScopeRuntime,
 				SourceFile:         "compose.yaml",
@@ -846,12 +847,14 @@ func parseEnvironment(env interface{}, serviceName string) []EnvironmentProvenan
 				val = parts[1]
 			}
 			isSecret := IsSecretEnvKey(key)
+			displayVal := val
 			if isSecret {
-				val = "[REDACTED]"
+				displayVal = "[REDACTED]"
 			}
 			result = append(result, EnvironmentProvenance{
 				Key:                key,
-				Value:              val,
+				Value:              displayVal,
+				RawValue:           val,
 				IsSecret:           isSecret,
 				Scope:              models.EnvScopeRuntime,
 				SourceFile:         "compose.yaml",
@@ -935,6 +938,7 @@ func parseEnvFiles(envFile interface{}, repoRoot, composeDir, serviceName string
 			results = append(results, EnvironmentProvenance{
 				Key:                k,
 				Value:              val,
+				RawValue:           v,
 				IsSecret:           isSecret,
 				Scope:              models.EnvScopeRuntime,
 				SourceFile:         relPath,

@@ -670,6 +670,7 @@ func scanEnvFileProvenance(dir string, envFiles []string) []EnvironmentProvenanc
 			results = append(results, EnvironmentProvenance{
 				Key:                k,
 				Value:              val,
+				RawValue:           v,
 				IsSecret:           isSecret,
 				Scope:              models.EnvScopeRuntime,
 				SourceFile:         ef,

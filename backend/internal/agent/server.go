@@ -905,11 +905,11 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 		close(doneCh)
 	}()
 
-	// Grace window: if analysis finishes quickly (< 120ms), return ready immediately;
+	// Grace window: if analysis finishes quickly (< 1000ms), return ready immediately;
 	// otherwise return initial scanning session and let frontend poll
 	select {
 	case <-doneCh:
-	case <-time.After(120 * time.Millisecond):
+	case <-time.After(1000 * time.Millisecond):
 	}
 
 	return session, nil
@@ -1357,14 +1357,26 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 						resp.Services[cs.Name] = make(map[string]string)
 					}
 					for _, envDef := range cs.Environment {
-						resp.Services[cs.Name][envDef.Key] = envDef.Value
+						val := envDef.RawValue
+						if val == "" && envDef.Value != "[REDACTED]" {
+							val = envDef.Value
+						}
+						if val != "" && val != "[REDACTED]" {
+							resp.Services[cs.Name][envDef.Key] = val
+						}
 					}
 					if cs.SourcePath != "" && cs.SourcePath != "." {
 						if _, ok := resp.Services[cs.SourcePath]; !ok {
 							resp.Services[cs.SourcePath] = make(map[string]string)
 						}
 						for _, envDef := range cs.Environment {
-							resp.Services[cs.SourcePath][envDef.Key] = envDef.Value
+							val := envDef.RawValue
+							if val == "" && envDef.Value != "[REDACTED]" {
+								val = envDef.Value
+							}
+							if val != "" && val != "[REDACTED]" {
+								resp.Services[cs.SourcePath][envDef.Key] = val
+							}
 						}
 					}
 				}

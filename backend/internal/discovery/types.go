@@ -48,6 +48,7 @@ type NetworkConfig struct {
 type EnvironmentProvenance struct {
 	Key                string `json:"key"`
 	Value              string `json:"value"` // masked if secret
+	RawValue           string `json:"-"`     // unmasked raw value for internal service import/runtime
 	IsSecret           bool   `json:"is_secret"`
 	Scope              string `json:"scope"`                 // "runtime", "build", "both"
 	SourceFile         string `json:"source_file,omitempty"` // e.g. ".env", "docker-compose.yml"

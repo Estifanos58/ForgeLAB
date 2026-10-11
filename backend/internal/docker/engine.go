@@ -1280,6 +1280,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	svcEnv := make([]string, 0, len(runtimeEnvMap)+len(allProjectServices)*4+4)
 	for k, v := range runtimeEnvMap {
+		trimmedV := strings.TrimSpace(v)
+		if (k == "DATABASE_URL" || k == "REDIS_URL" || strings.HasSuffix(k, "_URL")) && (trimmedV == "[REDACTED]" || !strings.Contains(trimmedV, "://")) {
+			continue
+		}
 		svcEnv = append(svcEnv, fmt.Sprintf("%s=%s", k, v))
 	}
 	svcEnv = append(svcEnv, fmt.Sprintf("PORT=%d", intPort))
@@ -1287,10 +1291,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	var hasExplicitDatabaseURL bool
 	var hasExplicitRedisURL bool
-	if _, ok := runtimeEnvMap["DATABASE_URL"]; ok {
+	if v, ok := runtimeEnvMap["DATABASE_URL"]; ok && strings.TrimSpace(v) != "" && strings.TrimSpace(v) != "[REDACTED]" && strings.Contains(v, "://") {
 		hasExplicitDatabaseURL = true
 	}
-	if _, ok := runtimeEnvMap["REDIS_URL"]; ok {
+	if v, ok := runtimeEnvMap["REDIS_URL"]; ok && strings.TrimSpace(v) != "" && strings.TrimSpace(v) != "[REDACTED]" && strings.Contains(v, "://") {
 		hasExplicitRedisURL = true
 	}
 
@@ -1321,13 +1325,13 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			pgUser := "forgelab"
 			pgPass := "forgelab_dev_password"
 			pgDB := "forgelab"
-			if u, ok := runtimeEnvMap["POSTGRES_USER"]; ok && u != "" {
+			if u, ok := runtimeEnvMap["POSTGRES_USER"]; ok && u != "" && u != "[REDACTED]" {
 				pgUser = u
 			}
-			if p, ok := runtimeEnvMap["POSTGRES_PASSWORD"]; ok && p != "" {
+			if p, ok := runtimeEnvMap["POSTGRES_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
 				pgPass = p
 			}
-			if d, ok := runtimeEnvMap["POSTGRES_DB"]; ok && d != "" {
+			if d, ok := runtimeEnvMap["POSTGRES_DB"]; ok && d != "" && d != "[REDACTED]" {
 				pgDB = d
 			}
 			dbURL := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable", pgUser, pgPass, peer.Name, peerIntPort, pgDB)
@@ -3752,8 +3756,9 @@ func (e *Engine) verifyServiceHealth(
 		// 3. Check if container actually exited or entered a restart/crash loop
 		if cJSON.State == nil || !cJSON.State.Running || cJSON.State.Restarting {
 			if cJSON.State != nil && cJSON.State.Restarting {
-				errLogFn(fmt.Sprintf("Container is in crash loop (state=restarting, restart_count=%d)", cJSON.RestartCount))
-				return false, fmt.Sprintf("container in crash loop (restart_count=%d)", cJSON.RestartCount)
+				diag := e.buildContainerExitDiagnostics(ctx, containerID, cJSON.State)
+				errLogFn(fmt.Sprintf("Container is in crash loop (state=restarting, restart_count=%d): %s", cJSON.RestartCount, diag))
+				return false, fmt.Sprintf("container in crash loop (restart_count=%d): %s", cJSON.RestartCount, diag)
 			}
 			diag := e.buildContainerExitDiagnostics(ctx, containerID, cJSON.State)
 			errLogFn(fmt.Sprintf("Container exited unexpectedly during health check: %s", diag))

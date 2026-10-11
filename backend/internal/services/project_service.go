@@ -1109,7 +1109,8 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 
 	addEntry := func(svcID *uuid.UUID, key, val string) {
 		trimmedKey := strings.TrimSpace(key)
-		if trimmedKey == "" {
+		trimmedVal := strings.TrimSpace(val)
+		if trimmedKey == "" || trimmedVal == "" || trimmedVal == "[REDACTED]" {
 			return
 		}
 		svcKey := "project"
@@ -1122,7 +1123,7 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 			entries = append(entries, ImportEnvVarEntry{
 				ServiceID: svcID,
 				Key:       trimmedKey,
-				Value:     val,
+				Value:     trimmedVal,
 				Scope:     models.EnvScopeRuntime,
 			})
 		}
@@ -1246,7 +1247,13 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 							if cs.Name == svc.Name {
 								svcID := svc.ID
 								for _, envDef := range cs.Environment {
-									addEntry(&svcID, envDef.Key, envDef.Value)
+									val := envDef.RawValue
+									if val == "" && envDef.Value != "[REDACTED]" {
+										val = envDef.Value
+									}
+									if val != "" && val != "[REDACTED]" {
+										addEntry(&svcID, envDef.Key, val)
+									}
 								}
 								break
 							}
@@ -1263,7 +1270,13 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 								if cs.Name == svc.Name {
 									svcID := svc.ID
 									for _, envDef := range cs.Environment {
-										addEntry(&svcID, envDef.Key, envDef.Value)
+										val := envDef.RawValue
+										if val == "" && envDef.Value != "[REDACTED]" {
+											val = envDef.Value
+										}
+										if val != "" && val != "[REDACTED]" {
+											addEntry(&svcID, envDef.Key, val)
+										}
 									}
 									break
 								}

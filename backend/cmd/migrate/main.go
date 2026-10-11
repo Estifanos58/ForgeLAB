@@ -4,7 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -28,16 +30,20 @@ func main() {
 	}
 
 	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
+	if databaseURL == "" || databaseURL == "[REDACTED]" || !strings.Contains(databaseURL, "://") {
 		databaseURL = os.Getenv("POSTGRES_URL")
 	}
-	if databaseURL == "" {
+	if databaseURL == "" || databaseURL == "[REDACTED]" || !strings.Contains(databaseURL, "://") {
 		host := os.Getenv("POSTGRES_HOST")
 		if host == "" {
 			host = os.Getenv("DB_HOST")
 		}
 		if host == "" {
-			host = "localhost"
+			if _, err := net.LookupHost("postgres"); err == nil {
+				host = "postgres"
+			} else {
+				host = "localhost"
+			}
 		}
 		port := os.Getenv("POSTGRES_PORT")
 		if port == "" {
@@ -47,24 +53,24 @@ func main() {
 			port = "5432"
 		}
 		user := os.Getenv("POSTGRES_USER")
-		if user == "" {
+		if user == "" || user == "[REDACTED]" {
 			user = os.Getenv("DB_USER")
 		}
-		if user == "" {
+		if user == "" || user == "[REDACTED]" {
 			user = "forgelab"
 		}
 		password := os.Getenv("POSTGRES_PASSWORD")
-		if password == "" {
+		if password == "" || password == "[REDACTED]" {
 			password = os.Getenv("DB_PASSWORD")
 		}
-		if password == "" {
+		if password == "" || password == "[REDACTED]" {
 			password = "forgelab_dev_password"
 		}
 		dbName := os.Getenv("POSTGRES_DB")
-		if dbName == "" {
+		if dbName == "" || dbName == "[REDACTED]" {
 			dbName = os.Getenv("DB_NAME")
 		}
-		if dbName == "" {
+		if dbName == "" || dbName == "[REDACTED]" {
 			dbName = "forgelab"
 		}
 		databaseURL = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, password, host, port, dbName)
