@@ -114,7 +114,8 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 		lowerHostPath := strings.ToLower(hostPath)
 
 		// Check against Docker socket (Unix socket and Windows named pipe)
-		if !opts.AllowDockerSocket && (strings.Contains(lowerHostPath, "docker.sock") || strings.Contains(lowerHostPath, "docker_engine")) {
+		isDockerSocketPath := strings.Contains(lowerHostPath, "docker.sock") || strings.Contains(lowerHostPath, "docker_engine")
+		if !opts.AllowDockerSocket && isDockerSocketPath {
 			return nil, ErrDockerSocketMountRejected
 		}
 
@@ -123,22 +124,26 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 			strings.HasPrefix(normHostPath, "/run/desktop/mnt/") ||
 			strings.HasPrefix(normHostPath, "/host_mnt/")
 
-		// Check against sensitive paths
-		for _, restricted := range restrictedHostMounts {
-			if opts.AllowDockerSocket && (strings.Contains(restricted, "docker.sock") || strings.Contains(restricted, "docker_engine")) {
-				continue
-			}
-			cleanRestricted := strings.ToLower(filepath.Clean(restricted))
-			normRestricted := strings.ReplaceAll(cleanRestricted, "\\", "/")
+		// Check against sensitive paths.
+		// If Docker socket mount is allowed and this mount is the Docker socket itself,
+		// skip the restrictedHostMounts check (which would otherwise reject it due to /var/run or /run parent paths).
+		if !(opts.AllowDockerSocket && isDockerSocketPath) {
+			for _, restricted := range restrictedHostMounts {
+				if opts.AllowDockerSocket && (strings.Contains(restricted, "docker.sock") || strings.Contains(restricted, "docker_engine")) {
+					continue
+				}
+				cleanRestricted := strings.ToLower(filepath.Clean(restricted))
+				normRestricted := strings.ReplaceAll(cleanRestricted, "\\", "/")
 
-			// Exempt Docker Desktop host mount paths from the /run system directory check
-			if isDockerDesktop && (normRestricted == "/run" || (normRestricted == "/run/docker.sock" && !strings.Contains(normHostPath, "docker.sock"))) {
-				continue
-			}
+				// Exempt Docker Desktop host mount paths from the /run system directory check
+				if isDockerDesktop && (normRestricted == "/run" || (normRestricted == "/run/docker.sock" && !strings.Contains(normHostPath, "docker.sock"))) {
+					continue
+				}
 
-			if normHostPath == normRestricted || strings.HasPrefix(normHostPath, normRestricted+"/") ||
-				lowerHostPath == cleanRestricted || strings.HasPrefix(lowerHostPath, cleanRestricted+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanRestricted+"/") {
-				return nil, fmt.Errorf("%w: %s", ErrSensitiveHostMountRejected, hostPath)
+				if normHostPath == normRestricted || strings.HasPrefix(normHostPath, normRestricted+"/") ||
+					lowerHostPath == cleanRestricted || strings.HasPrefix(lowerHostPath, cleanRestricted+string(filepath.Separator)) || strings.HasPrefix(lowerHostPath, cleanRestricted+"/") {
+					return nil, fmt.Errorf("%w: %s", ErrSensitiveHostMountRejected, hostPath)
+				}
 			}
 		}
 

@@ -28,6 +28,53 @@ func TestTrustBoundary_RejectsDockerSocketMount(t *testing.T) {
 	}
 }
 
+func TestTrustBoundary_AllowsDockerSocketWhenPermitted(t *testing.T) {
+	// Unix socket allowed when AllowDockerSocket is true
+	optsUnix := ContainerSecurityOptions{
+		AllowDockerSocket: true,
+		Binds:             []string{"/var/run/docker.sock:/var/run/docker.sock"},
+	}
+	cfg, err := ValidateAndBuildSecureHostConfig(optsUnix)
+	if err != nil {
+		t.Fatalf("expected /var/run/docker.sock to be allowed when AllowDockerSocket is true, got: %v", err)
+	}
+	if len(cfg.Binds) != 1 || cfg.Binds[0] != "/var/run/docker.sock:/var/run/docker.sock" {
+		t.Errorf("expected binds to contain docker socket, got %v", cfg.Binds)
+	}
+
+	// Windows named pipe allowed when AllowDockerSocket is true
+	optsWin := ContainerSecurityOptions{
+		AllowDockerSocket: true,
+		Binds:             []string{"\\\\.\\pipe\\docker_engine:\\\\.\\pipe\\docker_engine"},
+	}
+	cfgWin, err := ValidateAndBuildSecureHostConfig(optsWin)
+	if err != nil {
+		t.Fatalf("expected named pipe to be allowed when AllowDockerSocket is true, got: %v", err)
+	}
+	if len(cfgWin.Binds) != 1 {
+		t.Errorf("expected binds to contain named pipe, got %v", cfgWin.Binds)
+	}
+
+	// Sensitive paths must STILL be rejected even if AllowDockerSocket is true
+	optsSensitive := ContainerSecurityOptions{
+		AllowDockerSocket: true,
+		Binds:             []string{"/var/run:/host/var/run"},
+	}
+	_, err = ValidateAndBuildSecureHostConfig(optsSensitive)
+	if err == nil || !errors.Is(err, ErrSensitiveHostMountRejected) {
+		t.Errorf("expected /var/run to be rejected even with AllowDockerSocket=true, got: %v", err)
+	}
+
+	optsProc := ContainerSecurityOptions{
+		AllowDockerSocket: true,
+		Binds:             []string{"/proc:/host/proc"},
+	}
+	_, err = ValidateAndBuildSecureHostConfig(optsProc)
+	if err == nil || !errors.Is(err, ErrSensitiveHostMountRejected) {
+		t.Errorf("expected /proc to be rejected even with AllowDockerSocket=true, got: %v", err)
+	}
+}
+
 func TestTrustBoundary_RejectsSensitiveHostMounts(t *testing.T) {
 	sensitiveMounts := []string{
 		"/proc:/host/proc",

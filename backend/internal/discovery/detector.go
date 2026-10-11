@@ -414,12 +414,12 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 
 	switch pkgManager {
 	case "pnpm":
-		installCmd = "corepack enable && (npm pkg delete scripts.prepare 2>/dev/null || true) && (pnpm install --frozen-lockfile --dangerously-allow-all-builds 2>/dev/null || pnpm install --frozen-lockfile)"
+		installCmd = "corepack enable && pnpm config set fetch-retries 5 && pnpm config set fetch-retry-maxtimeout 180000 && (npm pkg delete scripts.prepare 2>/dev/null || true) && (pnpm install --frozen-lockfile --dangerously-allow-all-builds 2>/dev/null || pnpm install --frozen-lockfile)"
 		runBuildCmd = "pnpm run build"
 		runStartCmd = "pnpm start"
 		runnerSetup = "RUN corepack enable\n"
 	case "yarn":
-		installCmd = "corepack enable && (npm pkg delete scripts.prepare 2>/dev/null || true) && (yarn install --immutable || yarn install --frozen-lockfile)"
+		installCmd = "corepack enable && (yarn config set network-timeout 300000 2>/dev/null || true) && (npm pkg delete scripts.prepare 2>/dev/null || true) && (yarn install --immutable || yarn install --frozen-lockfile)"
 		runBuildCmd = "yarn build"
 		runStartCmd = "yarn start"
 		runnerSetup = "RUN corepack enable\n"
@@ -430,7 +430,7 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 		runBuildCmd = "bun run build"
 		runStartCmd = "bun run start"
 	case "npm":
-		installCmd = "(npm pkg delete scripts.prepare 2>/dev/null || true) && (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi)"
+		installCmd = "npm config set fetch-retries 5 && npm config set fetch-retry-maxtimeout 180000 && (npm pkg delete scripts.prepare 2>/dev/null || true) && (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi)"
 		runBuildCmd = "npm run build"
 		runStartCmd = "npm start"
 	}

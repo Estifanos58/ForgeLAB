@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useRef, useEffect, useState } from 'react';
-import { DeploymentLog } from '@/lib/api/types';
+import { DeploymentLog, Service } from '@/lib/api/types';
 import { Terminal, Copy, Trash2, ArrowDown, Check } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
@@ -14,16 +14,59 @@ interface TerminalViewerProps {
   onClear?: () => void;
   deploymentNumber?: number;
   deploymentId?: string;
+  services?: Service[];
+  selectedServiceId?: string | null;
 }
 
 const MAX_RENDERED_LOGS = 1500;
 
-export function TerminalViewer({ logs, connected, connectionState, onClear, deploymentNumber, deploymentId }: TerminalViewerProps) {
+export function TerminalViewer({
+  logs,
+  connected,
+  connectionState,
+  onClear,
+  deploymentNumber,
+  deploymentId,
+  services,
+  selectedServiceId,
+}: TerminalViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [copied, setCopied] = useState(false);
   const isAtBottomRef = useRef(true);
   const rafIdRef = useRef<number | null>(null);
+
+  const isAllServicesView = selectedServiceId === null || selectedServiceId === undefined;
+
+  const getLogServiceName = (log: DeploymentLog): string | null => {
+    if (log.service_name) {
+      return log.service_name;
+    }
+    if (log.service_id && services && services.length > 0) {
+      const match = services.find((s) => s.id === log.service_id);
+      if (match) return match.name;
+    }
+    return null;
+  };
+
+  const getServiceBadgeStyle = (name: string) => {
+    const palette = [
+      'text-sky-400 border-sky-800/50 bg-sky-950/40',
+      'text-emerald-400 border-emerald-800/50 bg-emerald-950/40',
+      'text-violet-400 border-violet-800/50 bg-violet-950/40',
+      'text-amber-400 border-amber-800/50 bg-amber-950/40',
+      'text-teal-400 border-teal-800/50 bg-teal-950/40',
+      'text-rose-400 border-rose-800/50 bg-rose-950/40',
+      'text-indigo-400 border-indigo-800/50 bg-indigo-950/40',
+      'text-cyan-400 border-cyan-800/50 bg-cyan-950/40',
+    ];
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) {
+      hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    const idx = Math.abs(hash) % palette.length;
+    return palette[idx];
+  };
 
   // Scroll to bottom using requestAnimationFrame
   const scrollToBottom = (immediate = false) => {
@@ -102,7 +145,11 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
 
   const handleCopyLogs = () => {
     const text = logs
-      .map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.phase}] [${l.stream}] ${l.message}`)
+      .map((l) => {
+        const svc = getLogServiceName(l);
+        const svcTag = svc ? ` [${svc}]` : '';
+        return `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.phase}] [${l.stream}]${svcTag} ${l.message}`;
+      })
       .join('\n');
     navigator.clipboard.writeText(text);
     setCopied(true);
@@ -238,26 +285,41 @@ export function TerminalViewer({ logs, connected, connectionState, onClear, depl
             <p>No log records for this release. Trigger a deployment to view telemetry.</p>
           </div>
         ) : (
-          displayedLogs.map((log, idx) => (
-            <div key={log.id || `${log.timestamp}-${idx}`} className="flex items-start gap-2 hover:bg-white/[0.02] px-1 rounded">
-              <span className="text-neutral-600 shrink-0 select-none text-[10px]">
-                {new Date(log.timestamp).toLocaleTimeString()}
-              </span>
+          displayedLogs.map((log, idx) => {
+            const serviceName = getLogServiceName(log);
+            return (
+              <div key={log.id || `${log.timestamp}-${idx}`} className="flex items-start gap-2 hover:bg-white/[0.02] px-1 rounded">
+                <span className="text-neutral-600 shrink-0 select-none text-[10px]">
+                  {new Date(log.timestamp).toLocaleTimeString()}
+                </span>
 
-              <span
-                className={cn(
-                  'px-1 py-0.2 rounded border text-[9px] uppercase tracking-wider shrink-0',
-                  getPhaseColor(log.phase)
+                <span
+                  className={cn(
+                    'px-1 py-0.2 rounded border text-[9px] uppercase tracking-wider shrink-0',
+                    getPhaseColor(log.phase)
+                  )}
+                >
+                  {log.phase}
+                </span>
+
+                <span className={cn('break-all whitespace-pre-wrap flex-1', getStreamColor(log.stream))}>
+                  {log.message}
+                </span>
+
+                {isAllServicesView && serviceName && (
+                  <span
+                    className={cn(
+                      'shrink-0 ml-auto self-start px-1.5 py-0.5 rounded border text-[9px] font-mono tracking-wide',
+                      getServiceBadgeStyle(serviceName)
+                    )}
+                    title={`Service: ${serviceName}`}
+                  >
+                    {serviceName}
+                  </span>
                 )}
-              >
-                {log.phase}
-              </span>
-
-              <span className={cn('break-all whitespace-pre-wrap flex-1', getStreamColor(log.stream))}>
-                {log.message}
-              </span>
-            </div>
-          ))
+              </div>
+            );
+          })
         )}
       </div>
     </div>

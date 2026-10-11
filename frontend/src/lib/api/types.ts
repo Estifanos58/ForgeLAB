@@ -245,6 +245,7 @@ export interface DeploymentLog {
   deployment_id?: string | null;
   service_deployment_id?: string | null;
   service_id?: string | null;
+  service_name?: string | null;
   timestamp: string;
   phase: 'source' | 'build' | 'startup' | 'health' | 'runtime';
   stream: 'stdout' | 'stderr' | 'system';

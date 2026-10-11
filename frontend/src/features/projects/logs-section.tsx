@@ -180,6 +180,8 @@ export function LogsSection({
         onClear={onClearLogs}
         deploymentNumber={currentDeployNumber}
         deploymentId={currentDeployId}
+        services={services}
+        selectedServiceId={selectedServiceId}
       />
     </div>
   );

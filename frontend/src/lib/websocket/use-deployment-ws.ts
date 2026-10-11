@@ -37,6 +37,7 @@ export function parseWSLogEntry(data: any, channel: string | null): DeploymentLo
     deployment_id: data.deployment_id || fallbackReleaseDeploymentId || null,
     service_deployment_id: data.service_deployment_id || fallbackServiceDeploymentId || null,
     service_id: data.service_id || null,
+    service_name: data.service_name || null,
     timestamp: data.timestamp || new Date().toISOString(),
     phase: data.phase || 'runtime',
     stream: data.stream || 'stdout',
