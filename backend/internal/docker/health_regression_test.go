@@ -564,3 +564,54 @@ func TestRegression_HealthCheck_ContainerDefinitivelyNotFound_FailsImmediately(t
 	assert.Less(t, elapsed, 2*time.Second, "must fail immediately without waiting for budget timeout")
 }
 
+// 12. Container in Restarting state (crash loop) -> terminates immediately and reports crash loop without false-positive healthy.
+func TestRegression_HealthCheck_RestartingState_ReportsCrashLoop(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.ContainerJSON{
+			ContainerJSONBase: &types.ContainerJSONBase{
+				RestartCount: 3,
+				State: &types.ContainerState{
+					Running:    false,
+					Restarting: true,
+				},
+			},
+		})
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	eng := &Engine{dockerClient: cli}
+
+	var errLogs []string
+	healthy, reason := eng.verifyServiceHealth(
+		context.Background(),
+		"c-crashing-backend",
+		8000,
+		nil,
+		models.HealthStrategyHTTP,
+		"/",
+		func(msg string) {},
+		func(msg string) { errLogs = append(errLogs, msg) },
+	)
+
+	assert.False(t, healthy, "health check must fail when container is in crash loop")
+	assert.Contains(t, reason, "crash loop", "reason must clearly state container is in crash loop")
+	assert.Contains(t, reason, "restart_count=3")
+}
+
+// 13. ReconcileDaemonContainers protects actively tracked containers and containers within 15-minute grace period.
+func TestRegression_Reconciler_PreservesTrackedAndRecentContainers(t *testing.T) {
+	eng := &Engine{}
+
+	cID := "c-newly-deployed-postgres-12345"
+	eng.trackActiveContainer(cID)
+
+	assert.True(t, eng.isContainerTracked(cID), "full container ID must be tracked")
+	assert.True(t, eng.isContainerTracked(cID[:12]), "short container ID must also be tracked")
+
+	eng.untrackActiveContainer(cID)
+	assert.False(t, eng.isContainerTracked(cID), "untracked container must not be tracked")
+}
+

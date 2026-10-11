@@ -882,6 +882,42 @@ func (s *DeploymentService) ListActiveDeployments(ctx context.Context) ([]*model
 	return deployments, rows.Err()
 }
 
+// ListActiveServiceDeployments retrieves all service deployments that are currently active or have an associated container.
+func (s *DeploymentService) ListActiveServiceDeployments(ctx context.Context) ([]*models.ServiceDeployment, error) {
+	if s.db == nil {
+		return []*models.ServiceDeployment{}, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, service_id, deploy_number, status, container_id, host_port, internal_port
+		 FROM service_deployments
+		 WHERE status IN ('queued', 'cloning', 'building', 'starting', 'health_checking', 'running')
+		    OR container_id IS NOT NULL`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active service deployments: %w", err)
+	}
+	defer rows.Close()
+
+	var sds []*models.ServiceDeployment
+	for rows.Next() {
+		sd := &models.ServiceDeployment{}
+		err := rows.Scan(
+			&sd.ID, &sd.ServiceID, &sd.DeployNumber, &sd.Status,
+			&sd.ContainerID, &sd.HostPort, &sd.InternalPort,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan active service deployment: %w", err)
+		}
+		sds = append(sds, sd)
+	}
+
+	if sds == nil {
+		sds = []*models.ServiceDeployment{}
+	}
+	return sds, rows.Err()
+}
+
 // GetPreviousSuccessfulDeployment finds the most recent RUNNING or STOPPED deployment
 // before the given deployment for rollback purposes.
 func (s *DeploymentService) GetPreviousSuccessfulDeployment(ctx context.Context, projectID uuid.UUID, beforeDeployNumber int) (*models.Deployment, error) {

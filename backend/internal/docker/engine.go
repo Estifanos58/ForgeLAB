@@ -69,8 +69,45 @@ type Engine struct {
 	pruneFilterLabel    string       // optional label filter for scoped image pruning
 	activeLogCollectors sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
 	activeCancels       sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	activeContainers    sync.Map     // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
 	sharedBuildArtifacts sync.Map    // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
 	cachedBuilderVer     atomic.Value // stores types.BuilderVersion advertised by Docker daemon
+}
+
+func (e *Engine) trackActiveContainer(id string) {
+	if id == "" {
+		return
+	}
+	now := time.Now()
+	e.activeContainers.Store(id, now)
+	if len(id) > 12 {
+		e.activeContainers.Store(id[:12], now)
+	}
+}
+
+func (e *Engine) untrackActiveContainer(id string) {
+	if id == "" {
+		return
+	}
+	e.activeContainers.Delete(id)
+	if len(id) > 12 {
+		e.activeContainers.Delete(id[:12])
+	}
+}
+
+func (e *Engine) isContainerTracked(id string) bool {
+	if id == "" {
+		return false
+	}
+	if _, ok := e.activeContainers.Load(id); ok {
+		return true
+	}
+	if len(id) > 12 {
+		if _, ok := e.activeContainers.Load(id[:12]); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func NewEngine(
@@ -1532,6 +1569,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	containerID := resp.ID
+	e.trackActiveContainer(containerID)
+	defer e.untrackActiveContainer(containerID)
+	_ = e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort)
+
 	if err := e.dockerClient.ContainerStart(execCtx, containerID, container.StartOptions{}); err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
@@ -2452,6 +2493,8 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	}
 
 	containerID := resp.ID
+	e.trackActiveContainer(containerID)
+	defer e.untrackActiveContainer(containerID)
 	_ = e.deploymentService.UpdateDeploymentContainer(ctx, deployment.ID, containerID)
 
 	if err := e.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
@@ -2862,6 +2905,42 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 		}
 	}
 
+	// 2b. Reconcile active service deployments (in-flight or running)
+	if e.deploymentService != nil {
+		activeSDs, err := e.deploymentService.ListActiveServiceDeployments(ctx)
+		if err != nil {
+			slog.Warn("reconciliation: failed to list active service deployments", "error", err)
+		} else {
+			for _, sd := range activeSDs {
+				if sd.ContainerID == nil || *sd.ContainerID == "" {
+					continue
+				}
+				cID := *sd.ContainerID
+				legitimateContainers[cID] = true
+				if len(cID) > 12 {
+					legitimateContainers[cID[:12]] = true
+				}
+				if dockCont, exists := containerMap[cID]; exists {
+					legitimateContainers[dockCont.ID] = true
+					if len(dockCont.ID) > 12 {
+						legitimateContainers[dockCont.ID[:12]] = true
+					}
+				}
+			}
+		}
+	}
+
+	// 2c. Protect in-memory active containers currently deploying
+	e.activeContainers.Range(func(key, value any) bool {
+		if cID, ok := key.(string); ok && cID != "" {
+			legitimateContainers[cID] = true
+			if len(cID) > 12 {
+				legitimateContainers[cID[:12]] = true
+			}
+		}
+		return true
+	})
+
 	// 3. Reconcile active legacy single-container deployments
 	if e.deploymentService != nil {
 		deployments, err := e.deploymentService.ListActiveDeployments(ctx)
@@ -2914,6 +2993,21 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 
 		if !hasProjectLabel && !hasDeploymentLabel && !hasServiceDeploymentLabel {
 			continue
+		}
+
+		// Check if actively tracked in memory
+		if e.isContainerTracked(c.ID) || (len(c.ID) > 12 && e.isContainerTracked(c.ID[:12])) {
+			continue
+		}
+
+		// Grace period: NEVER remove containers created within the last 15 minutes!
+		// In-flight builds, database initializations (e.g. postgres initdb), and multi-tier DAGs
+		// must never be killed by the periodic background reconciler.
+		if c.Created > 0 {
+			createdTime := time.Unix(c.Created, 0)
+			if time.Since(createdTime) < 15*time.Minute {
+				continue
+			}
 		}
 
 		if !legitimateContainers[c.ID] {
@@ -3432,6 +3526,43 @@ func isContainerNotFoundError(err error) bool {
 		strings.Contains(msg, "status 404")
 }
 
+// isInternalPortListening checks whether a specific internal TCP port is listening inside a container
+// by querying kernel socket tables (/proc/net/tcp and /proc/net/tcp6).
+// Returns (listening, supported):
+// - listening: true if the port is in TCP_LISTEN state (0A)
+// - supported: true if container exec and kernel table query succeeded (false if distroless/scratch container)
+func (e *Engine) isInternalPortListening(ctx context.Context, containerID string, internalPort int) (bool, bool) {
+	if internalPort <= 0 || e.dockerClient == nil {
+		return false, false
+	}
+	hexPort := fmt.Sprintf("%04X", internalPort)
+	execCfg := container.ExecOptions{
+		Cmd:          []string{"sh", "-c", fmt.Sprintf("grep -qiE ':[0-9A-Fa-f]*%s .* 0A' /proc/net/tcp /proc/net/tcp6 2>/dev/null", hexPort)},
+		AttachStdout: false,
+		AttachStderr: false,
+	}
+	execID, err := e.dockerClient.ContainerExecCreate(ctx, containerID, execCfg)
+	if err != nil {
+		return false, false
+	}
+	startCfg := container.ExecStartOptions{}
+	err = e.dockerClient.ContainerExecStart(ctx, execID.ID, startCfg)
+	if err != nil {
+		return false, false
+	}
+	inspect, err := e.dockerClient.ContainerExecInspect(ctx, execID.ID)
+	if err != nil {
+		return false, false
+	}
+	if inspect.ExitCode == 0 {
+		return true, true
+	}
+	if inspect.ExitCode == 1 {
+		return false, true
+	}
+	return false, false
+}
+
 // verifyServiceHealth performs health verification through the correct container/network path
 // working seamlessly whether ForgeLAB runs directly on the host or inside Docker Compose.
 func (e *Engine) verifyServiceHealth(
@@ -3538,8 +3669,12 @@ func (e *Engine) verifyServiceHealth(
 			}
 		}
 
-		// 3. Check if container actually exited
-		if cJSON.State == nil || !cJSON.State.Running {
+		// 3. Check if container actually exited or entered a restart/crash loop
+		if cJSON.State == nil || !cJSON.State.Running || cJSON.State.Restarting {
+			if cJSON.State != nil && cJSON.State.Restarting {
+				errLogFn(fmt.Sprintf("Container is in crash loop (state=restarting, restart_count=%d)", cJSON.RestartCount))
+				return false, fmt.Sprintf("container in crash loop (restart_count=%d)", cJSON.RestartCount)
+			}
 			diag := e.buildContainerExitDiagnostics(ctx, containerID, cJSON.State)
 			errLogFn(fmt.Sprintf("Container exited unexpectedly during health check: %s", diag))
 			return false, fmt.Sprintf("container exited unexpectedly: %s", diag)
@@ -3675,9 +3810,25 @@ func (e *Engine) verifyServiceHealth(
 		}
 
 		// Internal service without public port and NO native health check
-		if hostPort == nil && attempt >= 4 && cJSON.State.Running && cJSON.State.Health == nil {
-			logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
-			return true, "healthy"
+		if hostPort == nil && cJSON.State.Running && !cJSON.State.Restarting && cJSON.State.Health == nil {
+			if internalPort > 0 {
+				listening, supported := e.isInternalPortListening(ctx, containerID, internalPort)
+				if listening {
+					logFn(fmt.Sprintf("Internal service port %d verified listening inside container (attempt %d).", internalPort, attempt))
+					return true, "healthy"
+				}
+				if supported {
+					if attempt == 1 || attempt%5 == 0 {
+						logFn(fmt.Sprintf("Internal service port %d not yet listening inside container (attempt %d)... waiting", internalPort, attempt))
+					}
+				} else if attempt >= 8 && cJSON.RestartCount == 0 {
+					logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
+					return true, "healthy"
+				}
+			} else if attempt >= 6 && cJSON.RestartCount == 0 {
+				logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
+				return true, "healthy"
+			}
 		}
 
 		select {

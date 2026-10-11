@@ -405,7 +405,7 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 		port = 8080
 	}
 
-	installCmd := "if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi"
+	installCmd := "(npm pkg delete scripts.prepare 2>/dev/null || true) && if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi"
 	runBuildCmd := "npm run build"
 	runStartCmd := "npm start"
 	runnerSetup := ""
@@ -414,23 +414,23 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 
 	switch pkgManager {
 	case "pnpm":
-		installCmd = "corepack enable && pnpm install --frozen-lockfile"
+		installCmd = "corepack enable && (npm pkg delete scripts.prepare 2>/dev/null || true) && pnpm install --frozen-lockfile"
 		runBuildCmd = "pnpm run build"
 		runStartCmd = "pnpm start"
 		runnerSetup = "RUN corepack enable\n"
 	case "yarn":
-		installCmd = "corepack enable && (yarn install --immutable || yarn install --frozen-lockfile)"
+		installCmd = "corepack enable && (npm pkg delete scripts.prepare 2>/dev/null || true) && (yarn install --immutable || yarn install --frozen-lockfile)"
 		runBuildCmd = "yarn build"
 		runStartCmd = "yarn start"
 		runnerSetup = "RUN corepack enable\n"
 	case "bun":
 		builderImage = "oven/bun:1-alpine"
 		runnerImage = "oven/bun:1-alpine"
-		installCmd = "bun install --frozen-lockfile"
+		installCmd = "(bun -e \"try{const f='package.json',p=JSON.parse(require('fs').readFileSync(f));if(p.scripts&&p.scripts.prepare){delete p.scripts.prepare;require('fs').writeFileSync(f,JSON.stringify(p,null,2))}}catch(e){}\" 2>/dev/null || true) && bun install --frozen-lockfile"
 		runBuildCmd = "bun run build"
 		runStartCmd = "bun run start"
 	case "npm":
-		installCmd = "if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi"
+		installCmd = "(npm pkg delete scripts.prepare 2>/dev/null || true) && (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi)"
 		runBuildCmd = "npm run build"
 		runStartCmd = "npm start"
 	}
@@ -451,6 +451,8 @@ CMD ["nginx", "-g", "daemon off;"]
 	case "nextjs":
 		return fmt.Sprintf(`FROM %s AS builder
 WORKDIR /app
+ENV CI=true
+ENV HUSKY=0
 COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
 RUN %s
 COPY . .
@@ -469,6 +471,8 @@ CMD ["sh", "-c", "%s"]
 	case "react-vite", "vue-vite", "svelte-vite":
 		return fmt.Sprintf(`FROM %s AS builder
 WORKDIR /app
+ENV CI=true
+ENV HUSKY=0
 COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
 RUN %s
 COPY . .
@@ -487,6 +491,8 @@ CMD ["serve", "-s", "dist", "-l", "%d"]
 		cmd := runStartCmd
 		return fmt.Sprintf(`FROM %s
 WORKDIR /app
+ENV CI=true
+ENV HUSKY=0
 COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
 %sRUN %s
 COPY . .
