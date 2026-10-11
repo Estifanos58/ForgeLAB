@@ -2,6 +2,7 @@
 # Launches the ForgeLAB Local Agent on http://127.0.0.1:4142
 
 param(
+    [string]$HostAddr = "0.0.0.0",
     [int]$Port = 4142,
     [string]$Backend = "http://localhost:8080",
     [string]$AllowedRoots = "",
@@ -98,14 +99,14 @@ if (-not $binaryInfo) {
 Write-Host "====================================================" -ForegroundColor Green
 Write-Host "   ForgeLAB Local Agent for Windows" -ForegroundColor Green
 Write-Host "   Build:        $binaryInfo" -ForegroundColor Cyan
-Write-Host "   Listening on: http://127.0.0.1:$Port" -ForegroundColor Green
+Write-Host "   Listening on: http://$HostAddr`:$Port" -ForegroundColor Green
 Write-Host "   Backend URL:  $Backend" -ForegroundColor Green
 Write-Host "   Binary Path:  $agentExe" -ForegroundColor Gray
 Write-Host "   Ready for ForgeLAB browser import requests." -ForegroundColor Cyan
 Write-Host "   Press Ctrl+C to stop the agent." -ForegroundColor Yellow
 Write-Host "====================================================" -ForegroundColor Green
 
-$agentArgs = @("-port", $Port, "-backend", $Backend)
+$agentArgs = @("-host", $HostAddr, "-port", $Port, "-backend", $Backend)
 if ($AllowedRoots) {
     $agentArgs += @("-allowed-roots", $AllowedRoots)
 }

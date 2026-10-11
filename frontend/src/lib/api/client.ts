@@ -10,6 +10,7 @@ import {
   GeneratePlanRequest,
   GeneratePlanResponse,
   GitHubBranch,
+  GitHubOrg,
   GitHubRepo,
   GitHubStatus,
   ListRepositoriesResponse,
@@ -393,9 +394,21 @@ export const api = {
         });
       },
 
-      async listRepositories(page = 1, perPage = 30): Promise<ListRepositoriesResponse> {
+      async connectPAT(token: string): Promise<GitHubStatus> {
+        return apiFetch<GitHubStatus>('/api/integrations/github/token', {
+          method: 'POST',
+          body: JSON.stringify({ token }),
+        });
+      },
+
+      async listOrgs(): Promise<GitHubOrg[]> {
+        return apiFetch<GitHubOrg[]>('/api/integrations/github/orgs');
+      },
+
+      async listRepositories(page = 1, perPage = 30, org?: string): Promise<ListRepositoriesResponse> {
+        const orgQuery = org ? `&org=${encodeURIComponent(org)}` : '';
         return apiFetch<ListRepositoriesResponse>(
-          `/api/integrations/github/repositories?page=${page}&per_page=${perPage}`
+          `/api/integrations/github/repositories?page=${page}&per_page=${perPage}${orgQuery}`
         );
       },
 

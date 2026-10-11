@@ -23,14 +23,15 @@ import (
 
 // GeneratePlanRequest specifies input parameters for generating a deployment plan across any source type.
 type GeneratePlanRequest struct {
-	SourceType      string `json:"source_type"`      // "github", "local_directory", "local_upload", "local_agent"
-	SourceReference string `json:"source_reference"` // "owner/repo" or upload source UUID
-	RepositoryPath  string `json:"repository_path"`  // local filesystem path
-	Branch          string `json:"branch"`           // git branch
-	RootDir         string `json:"root_dir"`         // optional subfolder
-	AgentID         string `json:"agent_id"`         // optional local agent ID
-	AgentToken      string `json:"agent_token"`      // optional local agent session token
-	ProjectID       string `json:"project_id"`       // optional existing project ID for env conflict checks
+	SourceType      string                     `json:"source_type"`      // "github", "local_directory", "local_upload", "local_agent"
+	SourceReference string                     `json:"source_reference"` // "owner/repo" or upload source UUID
+	RepositoryPath  string                     `json:"repository_path"`  // local filesystem path
+	Branch          string                     `json:"branch"`           // git branch
+	RootDir         string                     `json:"root_dir"`         // optional subfolder
+	AgentID         string                     `json:"agent_id"`         // optional local agent ID
+	AgentToken      string                     `json:"agent_token"`      // optional local agent session token
+	ProjectID       string                     `json:"project_id"`       // optional existing project ID for env conflict checks
+	Discovery       *discovery.DiscoveryResult `json:"discovery,omitempty"` // authoritative discovery from client or agent
 }
 
 // GeneratePlanResponse returns the authoritative discovery result and snapshot deployment plan.
@@ -177,34 +178,54 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
-		var agentToken string
-		if req.AgentToken != "" {
-			agentToken = req.AgentToken
-		}
-		if agentToken == "" {
-			if sm := agent.GetGlobalSessionManager(); sm != nil {
-				if sess, err := sm.FindSessionBySourceID(sourceUUID); err == nil && sess != nil {
-					if sess.UserID == userID {
-						agentToken = sess.Token
+		// 1. If client already supplied authoritative discovery result from agent inspection, use it directly!
+		if req.Discovery != nil && len(req.Discovery.Services) > 0 {
+			discResult = req.Discovery
+		} else {
+			var agentToken string
+			if req.AgentToken != "" {
+				agentToken = req.AgentToken
+			}
+			if agentToken == "" {
+				if sm := agent.GetGlobalSessionManager(); sm != nil {
+					if sess, err := sm.FindSessionBySourceID(sourceUUID); err == nil && sess != nil {
+						if sess.UserID == userID {
+							agentToken = sess.Token
+						}
 					}
 				}
 			}
-		}
-		if agentToken == "" && h.sourceService != nil {
-			if tok, err := h.sourceService.GetDecryptedAgentToken(r.Context(), userID, sourceUUID); err == nil && tok != "" {
-				agentToken = tok
+			if agentToken == "" && h.sourceService != nil {
+				if tok, err := h.sourceService.GetDecryptedAgentToken(r.Context(), userID, sourceUUID); err == nil && tok != "" {
+					agentToken = tok
+				}
+			}
+
+			baseURL := agent.ResolveBaseURL()
+			agentDisc, err := agent.FetchSourceDiscovery(r.Context(), baseURL, sourceUUID, agentToken)
+			if err != nil {
+				// 2. Check in-memory local source session if in same process or host
+				if sess, ok := agent.LookupLocalSourceSession(sourceUUID); ok && sess != nil {
+					if sess.Discovery != nil {
+						discResult = sess.Discovery
+					} else if sess.Analysis != nil && sess.Analysis.Discovery != nil {
+						discResult = sess.Analysis.Discovery
+					}
+				}
+				// 3. Fallback to req.Discovery if present
+				if discResult == nil && req.Discovery != nil {
+					discResult = req.Discovery
+				}
+				if discResult == nil {
+					slog.Warn("failed to fetch authoritative discovery from local agent", "source_id", sourceUUID, "error", err)
+					writeError(w, http.StatusNotFound, "Local agent source session is unavailable or expired. Please reselect the folder.")
+					return
+				}
+			} else {
+				discResult = agentDisc
 			}
 		}
 
-		baseURL := agent.ResolveBaseURL()
-		agentDisc, err := agent.FetchSourceDiscovery(r.Context(), baseURL, sourceUUID, agentToken)
-		if err != nil {
-			slog.Warn("failed to fetch authoritative discovery from local agent", "source_id", sourceUUID, "error", err)
-			writeError(w, http.StatusNotFound, "Local agent source session is unavailable or expired. Please reselect the folder.")
-			return
-		}
-
-		discResult = agentDisc
 		if discResult.Fingerprint != "" {
 			sourceRevision = discResult.Fingerprint
 		} else {

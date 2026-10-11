@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api/client';
 import { Project, Deployment } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
+import { Modal } from '@/components/ui/modal';
 import { Play, RotateCcw, Square, History, Trash2, Rocket } from 'lucide-react';
 
 interface LifecycleControlsProps {
@@ -17,6 +18,8 @@ interface LifecycleControlsProps {
 export function LifecycleControls({ project, onActionComplete, onError, onDeploymentCreated }: LifecycleControlsProps) {
   const router = useRouter();
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [isRollbackModalOpen, setIsRollbackModalOpen] = useState(false);
 
   const handleAction = async (actionName: string, fn: () => Promise<any>) => {
     setLoadingAction(actionName);
@@ -52,25 +55,23 @@ export function LifecycleControls({ project, onActionComplete, onError, onDeploy
     handleAction('restart', () => api.projects.restart(project.id));
   };
 
-  const handleRollback = () => {
-    if (window.confirm('Roll back to the previous successful release? A new release will be queued.')) {
-      handleAction('rollback', async () => {
-        const newDeployment = await api.projects.rollback(project.id);
-        if (onDeploymentCreated && newDeployment?.id) {
-          onDeploymentCreated(newDeployment);
-        }
-        return newDeployment;
-      });
-    }
+  const confirmRollback = () => {
+    handleAction('rollback', async () => {
+      const newDeployment = await api.projects.rollback(project.id);
+      setIsRollbackModalOpen(false);
+      if (onDeploymentCreated && newDeployment?.id) {
+        onDeploymentCreated(newDeployment);
+      }
+      return newDeployment;
+    });
   };
 
-  const handleDelete = () => {
-    if (window.confirm(`Are you sure you want to delete "${project.name}"? This stops all containers and removes all records.`)) {
-      handleAction('delete', async () => {
-        await api.projects.delete(project.id);
-        router.push('/dashboard');
-      });
-    }
+  const confirmDelete = () => {
+    handleAction('delete', async () => {
+      await api.projects.delete(project.id);
+      setIsDeleteModalOpen(false);
+      router.push('/dashboard');
+    });
   };
 
   const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(project.status);
@@ -136,7 +137,7 @@ export function LifecycleControls({ project, onActionComplete, onError, onDeploy
         size="sm"
         disabled={isDeploying || !project.current_deployment_id || loadingAction !== null}
         loading={loadingAction === 'rollback'}
-        onClick={handleRollback}
+        onClick={() => setIsRollbackModalOpen(true)}
         icon={<History className="w-3 h-3" />}
         title="Rollback to previous known-good deployment"
       >
@@ -149,12 +150,78 @@ export function LifecycleControls({ project, onActionComplete, onError, onDeploy
         size="sm"
         disabled={loadingAction !== null}
         loading={loadingAction === 'delete'}
-        onClick={handleDelete}
+        onClick={() => setIsDeleteModalOpen(true)}
         className="text-neutral-500 hover:text-red-400 hover:bg-red-950/20"
         title="Delete project"
       >
         <Trash2 className="w-3.5 h-3.5" />
       </Button>
+
+      {/* Delete Project Confirmation Modal */}
+      <Modal
+        isOpen={isDeleteModalOpen}
+        onClose={() => setIsDeleteModalOpen(false)}
+        title="Delete Project"
+        description="Permanently remove project and all running containers."
+      >
+        <div className="space-y-4">
+          <p className="text-xs sm:text-sm text-neutral-300">
+            Are you sure you want to delete <span className="font-semibold text-white">{project.name}</span>? This stops all active containers and removes all service definitions, environments, and deployment logs. This action cannot be undone.
+          </p>
+          <div className="flex justify-end gap-2 pt-2 border-t border-surface-border">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={loadingAction === 'delete'}
+              onClick={() => setIsDeleteModalOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              loading={loadingAction === 'delete'}
+              onClick={confirmDelete}
+              icon={<Trash2 className="w-3.5 h-3.5" />}
+            >
+              Delete Project
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Rollback Confirmation Modal */}
+      <Modal
+        isOpen={isRollbackModalOpen}
+        onClose={() => setIsRollbackModalOpen(false)}
+        title="Rollback Deployment"
+        description="Roll back to the previous successful release."
+      >
+        <div className="space-y-4">
+          <p className="text-xs sm:text-sm text-neutral-300">
+            A new release will be automatically queued restoring the previous successful deployment configuration for <span className="font-semibold text-white">{project.name}</span>.
+          </p>
+          <div className="flex justify-end gap-2 pt-2 border-t border-surface-border">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={loadingAction === 'rollback'}
+              onClick={() => setIsRollbackModalOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              loading={loadingAction === 'rollback'}
+              onClick={confirmRollback}
+              icon={<History className="w-3.5 h-3.5" />}
+            >
+              Rollback Release
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

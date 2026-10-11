@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -75,6 +76,50 @@ func (h *IntegrationHandler) ConnectGitHub(w http.ResponseWriter, r *http.Reques
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"url": authURL,
+	})
+}
+
+// ConnectGitHubPAT handles POST /api/integrations/github/token
+func (h *IntegrationHandler) ConnectGitHubPAT(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Token) == "" {
+		writeError(w, http.StatusBadRequest, "personal access token is required")
+		return
+	}
+
+	status, err := h.githubService.ConnectWithPAT(r.Context(), userID, req.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, status)
+}
+
+// ListOrganizations handles GET /api/integrations/github/orgs
+func (h *IntegrationHandler) ListOrganizations(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	orgs, err := h.githubService.ListOrganizations(r.Context(), userID)
+	if err != nil {
+		h.handleGitHubError(w, err, "failed to list organizations")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"organizations": orgs,
 	})
 }
 
@@ -233,7 +278,8 @@ func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Req
 		perPage = pp
 	}
 
-	repos, hasMore, err := h.githubService.ListRepositories(r.Context(), userID, page, perPage)
+	org := r.URL.Query().Get("org")
+	repos, hasMore, err := h.githubService.ListRepositories(r.Context(), userID, page, perPage, org)
 	if err != nil {
 		h.handleGitHubError(w, err, "failed to list github repositories")
 		return

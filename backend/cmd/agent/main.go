@@ -23,6 +23,7 @@ var (
 
 func main() {
 	versionFlag := flag.Bool("version", false, "Print version and exit")
+	hostFlag := flag.String("host", "0.0.0.0", "Local agent listening host address (0.0.0.0 to allow container and local access)")
 	port := flag.Int("port", 4142, "Local agent listening port")
 	backendURL := flag.String("backend", "http://localhost:8080", "ForgeLAB backend URL")
 	agentIDFlag := flag.String("agent-id", "", "Unique agent identifier")
@@ -32,6 +33,14 @@ func main() {
 	if *versionFlag {
 		fmt.Printf("forgelab-agent v%s (commit: %s, built: %s)\n", Version, CommitSHA, BuildTime)
 		return
+	}
+
+	listenHost := strings.TrimSpace(*hostFlag)
+	if envHost := os.Getenv("FORGELAB_AGENT_HOST_BIND"); envHost != "" {
+		listenHost = strings.TrimSpace(envHost)
+	}
+	if listenHost == "" {
+		listenHost = "0.0.0.0"
 	}
 
 	var allowedRoots []string
@@ -63,7 +72,7 @@ func main() {
 		BackendURL:   *backendURL,
 	})
 
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	addr := fmt.Sprintf("%s:%d", listenHost, *port)
 	httpServer := &http.Server{
 		Addr:         addr,
 		Handler:      server.Router(),

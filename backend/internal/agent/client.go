@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -37,86 +36,140 @@ func ResolveBaseURL() string {
 		return trimmed
 	}
 
-	// Check if running inside container (/.dockerenv exists)
+	// 1. Check if running inside container (/.dockerenv exists)
 	if _, err := os.Stat("/.dockerenv"); err == nil {
-		conn, err := net.DialTimeout("tcp", "host.docker.internal:4142", 200*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", "host.docker.internal:4142", 1000*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			return "http://host.docker.internal:4142"
 		}
 	}
 
-	// Try 127.0.0.1:4142 first (for local non-docker backend)
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:4142", 200*time.Millisecond)
+	// 2. Try 127.0.0.1:4142 (local non-docker backend)
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:4142", 1000*time.Millisecond)
 	if err == nil {
 		conn.Close()
 		return "http://127.0.0.1:4142"
 	}
-	// Fallback to host.docker.internal:4142 (for containerized backend accessing host agent)
-	return "http://host.docker.internal:4142"
+
+	// 3. Try localhost:4142
+	conn, err = net.DialTimeout("tcp", "localhost:4142", 1000*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return "http://localhost:4142"
+	}
+
+	// 4. Try host.docker.internal:4142
+	conn, err = net.DialTimeout("tcp", "host.docker.internal:4142", 1000*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return "http://host.docker.internal:4142"
+	}
+
+	// Final container check
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return "http://host.docker.internal:4142"
+	}
+	return "http://127.0.0.1:4142"
 }
 
 // FetchSourceDiscovery contacts the running local agent and retrieves the authoritative DiscoveryResult for a source.
 func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUID, token string) (*discovery.DiscoveryResult, error) {
-	if baseURL == "" {
-		baseURL = ResolveBaseURL()
-	}
-	cleanBase := strings.TrimRight(baseURL, "/")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	// 1. Try GET /api/agent/sources/{source_id}
-	agentURL := fmt.Sprintf("%s/api/agent/sources/%s", cleanBase, sourceID.String())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create agent discovery request: %w", err)
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("X-Agent-Session-Token", token)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		slog.Warn("failed to connect to local agent", "url", agentURL, "error", err)
-		return nil, fmt.Errorf("%w (%v)", ErrAgentSessionUnavailable, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, ErrAgentSessionUnavailable
-	}
-
-	if resp.StatusCode == http.StatusOK {
-		var sessionResp struct {
-			Status    string                     `json:"status"`
-			Error     string                     `json:"error,omitempty"`
-			Discovery *discovery.DiscoveryResult `json:"discovery,omitempty"`
+	// 0. Check in-memory local source session first if available in the same runtime
+	if sess, ok := LookupLocalSourceSession(sourceID); ok && sess != nil {
+		if sess.Discovery != nil {
+			return sess.Discovery, nil
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&sessionResp); err == nil && sessionResp.Discovery != nil && len(sessionResp.Discovery.Services) > 0 {
-			return sessionResp.Discovery, nil
+		if sess.Analysis != nil && sess.Analysis.Discovery != nil {
+			return sess.Analysis.Discovery, nil
 		}
 	}
 
-	// 2. Fallback: try dedicated endpoint GET /api/agent/sources/{source_id}/discovery
-	discURL := fmt.Sprintf("%s/api/agent/sources/%s/discovery", cleanBase, sourceID.String())
-	reqDisc, err := http.NewRequestWithContext(ctx, http.MethodGet, discURL, nil)
-	if err == nil {
-		if token != "" {
-			reqDisc.Header.Set("Authorization", "Bearer "+token)
-			reqDisc.Header.Set("X-Agent-Session-Token", token)
-		}
-		respDisc, err := client.Do(reqDisc)
-		if err == nil {
-			defer respDisc.Body.Close()
-			if respDisc.StatusCode == http.StatusOK {
-				var directDisc discovery.DiscoveryResult
-				if err := json.NewDecoder(respDisc.Body).Decode(&directDisc); err == nil && len(directDisc.Services) > 0 {
-					return &directDisc, nil
-				}
-			} else if respDisc.StatusCode == http.StatusNotFound || respDisc.StatusCode == http.StatusUnauthorized || respDisc.StatusCode == http.StatusForbidden {
-				return nil, ErrAgentSessionUnavailable
+	candidateBases := make([]string, 0, 4)
+	if baseURL != "" {
+		candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
+	}
+	resolved := strings.TrimRight(ResolveBaseURL(), "/")
+	if resolved != "" && (len(candidateBases) == 0 || candidateBases[0] != resolved) {
+		candidateBases = append(candidateBases, resolved)
+	}
+	for _, fallback := range []string{"http://127.0.0.1:4142", "http://localhost:4142", "http://host.docker.internal:4142"} {
+		found := false
+		for _, cb := range candidateBases {
+			if cb == fallback {
+				found = true
+				break
 			}
+		}
+		if !found {
+			candidateBases = append(candidateBases, fallback)
+		}
+	}
+
+	client := &http.Client{Timeout: 8 * time.Second}
+
+	for _, cleanBase := range candidateBases {
+		// 1. Try GET /api/agent/sources/{source_id}
+		agentURL := fmt.Sprintf("%s/api/agent/sources/%s", cleanBase, sourceID.String())
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+		if err != nil {
+			continue
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("X-Agent-Session-Token", token)
+		}
+
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				var sessionResp struct {
+					Status    string                        `json:"status"`
+					Error     string                        `json:"error,omitempty"`
+					Discovery *discovery.DiscoveryResult    `json:"discovery,omitempty"`
+					Services  []discovery.DiscoveredService `json:"services,omitempty"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&sessionResp); err == nil {
+					if sessionResp.Discovery != nil {
+						return sessionResp.Discovery, nil
+					}
+					if len(sessionResp.Services) > 0 {
+						return &discovery.DiscoveryResult{
+							Services:   sessionResp.Services,
+							TotalFiles: 1,
+						}, nil
+					}
+				}
+			}
+		}
+
+		// 2. Try dedicated endpoint GET /api/agent/sources/{source_id}/discovery
+		discURL := fmt.Sprintf("%s/api/agent/sources/%s/discovery", cleanBase, sourceID.String())
+		reqDisc, err := http.NewRequestWithContext(ctx, http.MethodGet, discURL, nil)
+		if err == nil {
+			if token != "" {
+				reqDisc.Header.Set("Authorization", "Bearer "+token)
+				reqDisc.Header.Set("X-Agent-Session-Token", token)
+			}
+			respDisc, err := client.Do(reqDisc)
+			if err == nil {
+				defer respDisc.Body.Close()
+				if respDisc.StatusCode == http.StatusOK {
+					var directDisc discovery.DiscoveryResult
+					if err := json.NewDecoder(respDisc.Body).Decode(&directDisc); err == nil {
+						return &directDisc, nil
+					}
+				}
+			}
+		}
+	}
+
+	// Final fallback: check in-memory global registry once more
+	if sess, ok := LookupLocalSourceSession(sourceID); ok && sess != nil {
+		if sess.Discovery != nil {
+			return sess.Discovery, nil
 		}
 	}
 

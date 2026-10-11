@@ -27,7 +27,10 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # Final runtime stage
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates curl docker-cli
+RUN for i in 1 2 3 4 5; do \
+        apk add --no-cache ca-certificates curl docker-cli && break || \
+        (echo "Retrying apk add in 3s..." && sleep 3); \
+    done
 
 WORKDIR /app
 

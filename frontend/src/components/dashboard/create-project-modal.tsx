@@ -11,6 +11,7 @@ import {
   Project,
   GitHubRepo,
   GitHubBranch,
+  GitHubOrg,
   GitHubStatus,
   DetectionResult,
   AgentStatus,
@@ -57,6 +58,9 @@ import {
   Network,
   Workflow,
   FileText,
+  Key,
+  ExternalLink,
+  Building2,
 } from 'lucide-react';
 
 interface CreateProjectModalProps {
@@ -180,6 +184,20 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     not_connected?: boolean;
     not_found?: boolean;
   } | null>(null);
+
+  // GitHub Vercel/Render-style import state
+  const [repoVisibilityFilter, setRepoVisibilityFilter] = useState<'all' | 'public' | 'private'>('all');
+  const [orgs, setOrgs] = useState<GitHubOrg[]>([]);
+  const [selectedOrg, setSelectedOrg] = useState<string>('');
+  const [quickUrlInput, setQuickUrlInput] = useState<string>('');
+  const [isQuickUrlImporting, setIsQuickUrlImporting] = useState<boolean>(false);
+  const [isPATModalOpen, setIsPATModalOpen] = useState<boolean>(false);
+  const [patTokenInput, setPatTokenInput] = useState<string>('');
+  const [isConnectingPAT, setIsConnectingPAT] = useState<boolean>(false);
+
+  // Service deletion modal state (replaces alerts)
+  const [serviceToRemoveIndex, setServiceToRemoveIndex] = useState<number | null>(null);
+  const [showCannotRemoveServiceModal, setShowCannotRemoveServiceModal] = useState<boolean>(false);
 
   // Local Agent State
   const [localMode, setLocalMode] = useState<LocalMode>('agent');
@@ -552,6 +570,9 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
   const handleApplyAgentSession = (session: AgentSourceSession) => {
     setAgentSession(session);
+    if ((session as any).discovery) {
+      setDiscoveryResult((session as any).discovery);
+    }
     setProjectName(session.folder_name);
     setLocalFolderName(session.folder_name);
     setLocalFilesCount(session.total_files);
@@ -629,12 +650,19 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     });
   };
 
-  const handleRemoveService = (svcIndex: number) => {
+  const promptRemoveService = (svcIndex: number) => {
     if (configuredServices.length <= 1) {
-      setError('A project must have at least one service');
+      setShowCannotRemoveServiceModal(true);
       return;
     }
-    setConfiguredServices((prev) => prev.filter((_, idx) => idx !== svcIndex));
+    setServiceToRemoveIndex(svcIndex);
+  };
+
+  const confirmRemoveService = () => {
+    if (serviceToRemoveIndex !== null) {
+      setConfiguredServices((prev) => prev.filter((_, idx) => idx !== serviceToRemoveIndex));
+      setServiceToRemoveIndex(null);
+    }
   };
 
   const handleAddCustomService = () => {
@@ -695,7 +723,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       const status = await api.integrations.github.getStatus();
       setGhStatus(status);
       if (status.connected) {
-        loadRepositories();
+        loadRepositories(1, false);
+        loadOrgs();
       }
     } catch (err: any) {
       handleGitHubErrorResponse(err, 'Failed to check GitHub integration status');
@@ -704,7 +733,16 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     }
   };
 
-  const loadRepositories = async (page = 1, append = false) => {
+  const loadOrgs = async () => {
+    try {
+      const list = await api.integrations.github.listOrgs();
+      setOrgs(list || []);
+    } catch {
+      // Ignore if org listing is not permitted
+    }
+  };
+
+  const loadRepositories = async (page = 1, append = false, orgFilter = selectedOrg) => {
     if (append) {
       setLoadingMoreRepos(true);
     } else {
@@ -714,7 +752,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     setGhErrorState(null);
     setError(null);
     try {
-      const res = await api.integrations.github.listRepositories(page, 30);
+      const res = await api.integrations.github.listRepositories(page, 30, orgFilter || undefined);
       if (append) {
         setRepos((prev) => [...prev, ...(res.repositories || [])]);
       } else {
@@ -730,9 +768,83 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     }
   };
 
+  const handleSelectOrg = (orgLogin: string) => {
+    setSelectedOrg(orgLogin);
+    loadRepositories(1, false, orgLogin);
+  };
+
   const handleLoadMoreRepos = () => {
     if (!loadingMoreRepos && hasMoreRepos) {
       loadRepositories(repoPage + 1, true);
+    }
+  };
+
+  const handleConnectPAT = async () => {
+    if (!patTokenInput.trim()) {
+      setError('Please provide a GitHub personal access token');
+      return;
+    }
+    setIsConnectingPAT(true);
+    setError(null);
+    try {
+      const status = await api.integrations.github.connectPAT(patTokenInput.trim());
+      setGhStatus(status);
+      setIsPATModalOpen(false);
+      setPatTokenInput('');
+      setGhErrorState(null);
+      await loadRepositories(1, false);
+      await loadOrgs();
+    } catch (err: any) {
+      setError(err.message || 'Failed to connect via Personal Access Token');
+    } finally {
+      setIsConnectingPAT(false);
+    }
+  };
+
+  const handleQuickUrlImport = async () => {
+    const raw = quickUrlInput.trim();
+    if (!raw) return;
+
+    let clean = raw.replace(/\.git$/, '');
+    clean = clean.replace(/^git@github\.com:/, '');
+    clean = clean.replace(/^https?:\/\/github\.com\//, '');
+    const parts = clean.split('/').filter(Boolean);
+    if (parts.length < 2) {
+      setError('Please enter a valid GitHub repository URL or "owner/repo"');
+      return;
+    }
+
+    const owner = parts[0];
+    const repoName = parts[1];
+    const fullName = `${owner}/${repoName}`;
+
+    setIsQuickUrlImporting(true);
+    setError(null);
+    setGhErrorState(null);
+
+    try {
+      let repoMeta: GitHubRepo;
+      try {
+        repoMeta = await api.integrations.github.getRepo(owner, repoName);
+      } catch {
+        repoMeta = {
+          id: Date.now(),
+          name: repoName,
+          full_name: fullName,
+          owner: owner,
+          private: false,
+          default_branch: 'main',
+          description: '',
+          html_url: `https://github.com/${fullName}`,
+          updated_at: new Date().toISOString(),
+        };
+      }
+
+      await handleSelectRepo(repoMeta);
+    } catch (err: any) {
+      handleGitHubErrorResponse(err, 'Failed to import repository from URL');
+    } finally {
+      setIsQuickUrlImporting(false);
     }
   };
 
@@ -1033,6 +1145,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           agent_token: agentAuthSession?.token,
           branch: 'main',
           root_dir: '.',
+          discovery: (agentSession as any)?.discovery || discoveryResult || undefined,
         };
       } else {
         if (!localSourceId) {
@@ -1194,16 +1307,22 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     }
   };
 
-  const filteredRepos = repos.filter(
-    (r) =>
-      r.full_name.toLowerCase().includes(repoSearch.toLowerCase()) ||
-      (r.description && r.description.toLowerCase().includes(repoSearch.toLowerCase()))
-  );
+  const filteredRepos = repos.filter((r) => {
+    if (repoVisibilityFilter === 'private' && !r.private) return false;
+    if (repoVisibilityFilter === 'public' && r.private) return false;
+    if (!repoSearch.trim()) return true;
+    const term = repoSearch.toLowerCase();
+    return (
+      r.full_name.toLowerCase().includes(term) ||
+      (r.description && r.description.toLowerCase().includes(term))
+    );
+  });
 
   const isLocalAgentOnline = agentStatus?.status === 'online';
 
   return (
-    <Modal
+    <>
+      <Modal
       isOpen={isOpen}
       onClose={onClose}
       title={
@@ -1897,27 +2016,65 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             </div>
           )}
 
-          {/* TAB 2: GITHUB REPOSITORIES (PRESERVED) */}
+          {/* TAB 2: GITHUB REPOSITORIES (REBUILT: Vercel / Render / Google AI Studio Style) */}
           {sourceTab === 'github' && (
-            <div className="space-y-3.5">
+            <div className="space-y-4">
+              {/* Quick Git Repository URL Import (Vercel Style) */}
+              <div className="p-3.5 rounded-lg border border-surface-border bg-surface-elevated/40 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-white flex items-center gap-1.5">
+                    <Github className="w-3.5 h-3.5 text-neutral-300" />
+                    Import Git Repository
+                  </span>
+                  <span className="text-[11px] text-neutral-400">
+                    Public or private repository URL
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      placeholder="https://github.com/owner/repository or owner/repo"
+                      value={quickUrlInput}
+                      onChange={(e) => setQuickUrlInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleQuickUrlImport();
+                        }
+                      }}
+                      className="w-full h-8 px-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-neutral-500 transition-colors font-mono"
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="sm"
+                    disabled={!quickUrlInput.trim() || isQuickUrlImporting}
+                    loading={isQuickUrlImporting}
+                    onClick={handleQuickUrlImport}
+                    icon={<ArrowRight className="w-3.5 h-3.5" />}
+                  >
+                    Import
+                  </Button>
+                </div>
+              </div>
+
               {loadingGhStatus ? (
-                <div className="flex items-center justify-center py-10 text-xs text-neutral-400">
+                <div className="flex items-center justify-center py-8 text-xs text-neutral-400">
                   <RefreshCw className="w-4 h-4 animate-spin mr-2" />
                   Checking GitHub permissions...
                 </div>
               ) : !ghStatus?.connected ? (
-                <div className="rounded-lg border border-surface-border bg-surface-elevated/40 p-6 text-center space-y-3">
-                  <div className="w-10 h-10 mx-auto rounded-full bg-surface-elevated border border-surface-border flex items-center justify-center text-white">
-                    <Github className="w-5 h-5" />
-                  </div>
+                /* Unauthenticated State: Clear Connect / Token Options */
+                <div className="rounded-lg border border-surface-border bg-surface-elevated/30 p-5 text-center space-y-3">
                   <div>
-                    <h4 className="text-sm font-semibold text-white">GitHub Repository Access Required</h4>
+                    <h4 className="text-sm font-semibold text-white">Connect GitHub Account</h4>
                     <p className="text-xs text-neutral-400 max-w-sm mx-auto mt-1 leading-relaxed">
-                      Authorize ForgeLAB with read-only repository permissions to discover and import your
-                      public and private repositories.
+                      Connect your GitHub account or Personal Access Token to list your private repositories and organization projects.
                     </p>
                   </div>
-                  <div className="pt-2">
+                  <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
                     <Button
                       type="button"
                       variant="primary"
@@ -1925,112 +2082,183 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                       onClick={handleConnectGitHub}
                       icon={<Github className="w-4 h-4" />}
                     >
-                      Authorize GitHub Repositories
+                      Authorize with GitHub
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => setIsPATModalOpen(true)}
+                      icon={<Key className="w-3.5 h-3.5" />}
+                    >
+                      Personal Access Token
                     </Button>
                   </div>
                 </div>
               ) : (
+                /* Authenticated State */
                 <div className="space-y-3">
-                  {(ghStatus.needs_reauth || ghErrorState?.needs_reauth) && (
-                    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-200 flex items-start gap-2.5">
-                      <AlertCircle className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
-                      <div className="flex-1 space-y-2">
-                        <div>
-                          <strong className="text-white block font-medium">Re-authorization Required for Repository Access</strong>
-                          <span className="text-amber-300/80 text-[11px] leading-tight block mt-0.5">
-                            Your connected GitHub authorization has expired or is missing repository permissions. Re-authorize ForgeLAB to access your public and private repositories.
-                          </span>
-                        </div>
-                        <Button
-                          type="button"
-                          variant="secondary"
-                          size="sm"
-                          onClick={handleConnectGitHub}
-                          icon={<Github className="w-3.5 h-3.5" />}
-                          className="text-xs h-7 px-2.5 border-amber-500/40 hover:bg-amber-500/20"
-                        >
-                          Re-authorize GitHub
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-
-                  {ghErrorState?.sso_required && (
-                    <div className="rounded-lg border border-purple-500/40 bg-purple-500/10 p-3.5 text-xs text-purple-200 flex items-start gap-2.5">
-                      <AlertCircle className="w-4 h-4 text-purple-400 mt-0.5 flex-shrink-0" />
-                      <div className="flex-1 space-y-2">
-                        <div>
-                          <strong className="text-white block font-medium">Organization SAML / SSO Authorization Required</strong>
-                          <span className="text-purple-300/80 text-[11px] leading-tight block mt-0.5">
-                            This repository belongs to an organization protected by SAML Single Sign-On (SSO). Please grant ForgeLAB access in your GitHub organization settings or re-authorize with SSO.
-                          </span>
-                        </div>
-                        <Button
-                          type="button"
-                          variant="secondary"
-                          size="sm"
-                          onClick={handleConnectGitHub}
-                          icon={<Github className="w-3.5 h-3.5" />}
-                          className="text-xs h-7 px-2.5 border-purple-500/40 hover:bg-purple-500/20"
-                        >
-                          Authorize Organization via GitHub
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-
-                  {ghErrorState?.rate_limited && (
-                    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-200 flex items-start gap-2.5">
-                      <AlertCircle className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
-                      <div className="flex-1 space-y-1">
-                        <strong className="text-white block font-medium">GitHub API Rate Limit Exceeded</strong>
-                        <span className="text-amber-300/80 text-[11px] leading-tight block mt-0.5">
-                          GitHub API rate limit exceeded. Please wait a moment before refreshing or trying again.
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  {ghErrorState?.not_found && (
-                    <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-3.5 text-xs text-red-200 flex items-start gap-2.5">
-                      <AlertCircle className="w-4 h-4 text-red-400 mt-0.5 flex-shrink-0" />
-                      <div className="flex-1 space-y-1">
-                        <strong className="text-white block font-medium">Repository Not Found or Access Denied</strong>
-                        <span className="text-red-300/80 text-[11px] leading-tight block mt-0.5">
-                          The repository could not be found or your account does not have read access to it.
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-neutral-400 flex items-center gap-1.5 font-mono">
+                  {/* Status Banner / Header */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-lg bg-surface-elevated/30 border border-surface-border text-xs">
+                    <div className="flex items-center gap-2">
                       <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />
-                      Connected as <strong className="text-white">@{ghStatus.username}</strong>
-                    </span>
+                      <span className="text-neutral-300">
+                        Connected as <strong className="text-white">@{ghStatus.username}</strong>
+                      </span>
+                      {ghStatus.auth_type === 'pat' && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-sky-500/10 text-sky-400 border border-sky-500/20 font-mono">
+                          Token (PAT)
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {/* Organization Dropdown */}
+                      {orgs.length > 0 && (
+                        <div className="flex items-center gap-1">
+                          <Building2 className="w-3 h-3 text-neutral-400" />
+                          <select
+                            value={selectedOrg}
+                            onChange={(e) => handleSelectOrg(e.target.value)}
+                            className="h-7 px-2 text-xs rounded bg-surface border border-surface-border text-white focus:outline-none focus:border-neutral-500"
+                          >
+                            <option value="">Personal ({ghStatus.username})</option>
+                            {orgs.map((org) => (
+                              <option key={org.id} value={org.login}>
+                                {org.login}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => setIsPATModalOpen(true)}
+                        className="text-[11px] text-neutral-400 hover:text-white flex items-center gap-1 transition-colors px-1.5 py-1 rounded hover:bg-surface-elevated"
+                      >
+                        <Key className="w-3 h-3" />
+                        {ghStatus.auth_type === 'pat' ? 'Update PAT' : 'Use PAT'}
+                      </button>
+
+                      {ghStatus.needs_reauth && (
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          onClick={handleConnectGitHub}
+                          icon={<Github className="w-3.5 h-3.5" />}
+                          className="text-[11px] h-6 px-2 border-amber-500/40 text-amber-300 hover:bg-amber-500/20"
+                        >
+                          Re-authorize
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Warning Notifications (non-blocking) */}
+                  {(ghStatus.needs_reauth || ghErrorState?.needs_reauth) && (
+                    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200 flex items-start justify-between gap-2.5">
+                      <div className="flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
+                        <div>
+                          <strong className="text-white block font-medium">Re-authorization Recommended</strong>
+                          <span className="text-amber-300/80 text-[11px] block mt-0.5">
+                            Additional repository permissions or fine-grained scopes may be required for private repos.
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-shrink-0">
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => setIsPATModalOpen(true)}
+                          icon={<Key className="w-3.5 h-3.5" />}
+                          className="text-[11px] h-6 px-2"
+                        >
+                          Use PAT
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="primary"
+                          size="sm"
+                          onClick={handleConnectGitHub}
+                          className="text-[11px] h-6 px-2"
+                        >
+                          Authorize
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Repositories Filter Bar */}
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
+                    <div className="relative flex-1">
+                      <Search className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        placeholder="Search repositories..."
+                        value={repoSearch}
+                        onChange={(e) => setRepoSearch(e.target.value)}
+                        className="w-full h-8 pl-8 pr-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-neutral-500 transition-colors"
+                      />
+                    </div>
+
+                    <div className="flex items-center gap-1 p-0.5 rounded bg-surface-elevated border border-surface-border text-[11px] self-start sm:self-auto">
+                      <button
+                        type="button"
+                        onClick={() => setRepoVisibilityFilter('all')}
+                        className={cn(
+                          'px-2.5 py-1 rounded transition-colors',
+                          repoVisibilityFilter === 'all'
+                            ? 'bg-surface text-white font-medium shadow-sm'
+                            : 'text-neutral-400 hover:text-white'
+                        )}
+                      >
+                        All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRepoVisibilityFilter('public')}
+                        className={cn(
+                          'px-2.5 py-1 rounded transition-colors flex items-center gap-1',
+                          repoVisibilityFilter === 'public'
+                            ? 'bg-surface text-white font-medium shadow-sm'
+                            : 'text-neutral-400 hover:text-white'
+                        )}
+                      >
+                        <Globe className="w-2.5 h-2.5" />
+                        Public
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRepoVisibilityFilter('private')}
+                        className={cn(
+                          'px-2.5 py-1 rounded transition-colors flex items-center gap-1',
+                          repoVisibilityFilter === 'private'
+                            ? 'bg-surface text-white font-medium shadow-sm'
+                            : 'text-neutral-400 hover:text-white'
+                        )}
+                      >
+                        <Lock className="w-2.5 h-2.5" />
+                        Private
+                      </button>
+                    </div>
+
                     <button
                       type="button"
                       onClick={() => loadRepositories(1, false)}
                       disabled={loadingRepos}
-                      className="text-neutral-400 hover:text-white flex items-center gap-1 transition-colors text-[11px]"
+                      className="p-1.5 rounded text-neutral-400 hover:text-white hover:bg-surface-elevated transition-colors text-[11px] self-end sm:self-auto"
+                      title="Refresh repositories"
                     >
-                      <RefreshCw className={`w-3 h-3 ${loadingRepos ? 'animate-spin' : ''}`} />
-                      Refresh
+                      <RefreshCw className={cn('w-3.5 h-3.5', loadingRepos && 'animate-spin')} />
                     </button>
                   </div>
 
-                  <div className="relative">
-                    <Search className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      placeholder="Search repositories..."
-                      value={repoSearch}
-                      onChange={(e) => setRepoSearch(e.target.value)}
-                      className="w-full h-8 pl-8 pr-3 rounded bg-surface border border-surface-border text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-neutral-500 transition-colors"
-                    />
-                  </div>
-
-                  <div className="rounded border border-surface-border bg-surface divide-y divide-surface-border max-h-56 overflow-y-auto font-sans">
+                  {/* Repository Cards List */}
+                  <div className="rounded-lg border border-surface-border bg-surface divide-y divide-surface-border max-h-60 overflow-y-auto font-sans">
                     {loadingRepos ? (
                       <div className="p-8 text-center text-xs text-neutral-400 flex items-center justify-center">
                         <RefreshCw className="w-4 h-4 animate-spin mr-2" />
@@ -2038,7 +2266,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                       </div>
                     ) : filteredRepos.length === 0 ? (
                       <div className="p-8 text-center text-xs text-neutral-500">
-                        No repositories found matching your search.
+                        {repoSearch ? 'No repositories found matching your search.' : 'No repositories found.'}
                       </div>
                     ) : (
                       filteredRepos.map((repo) => {
@@ -2046,41 +2274,48 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                         return (
                           <div
                             key={repo.id}
-                            onClick={() => handleSelectRepo(repo)}
-                            className={`p-2.5 flex items-center justify-between gap-3 text-xs cursor-pointer transition-colors ${
-                              isSelected
-                                ? 'bg-surface-elevated border-l-2 border-primary text-white'
-                                : 'hover:bg-surface-elevated/50 text-neutral-300'
-                            }`}
+                            className={cn(
+                              'p-3 flex items-center justify-between gap-3 text-xs transition-colors',
+                              isSelected ? 'bg-surface-elevated/70 border-l-2 border-primary' : 'hover:bg-surface-elevated/30'
+                            )}
                           >
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-2">
-                                <span className="font-medium text-white truncate">{repo.full_name}</span>
+                                <span className="font-semibold text-white truncate">{repo.full_name}</span>
                                 {repo.private ? (
-                                  <span className="flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-neutral-800 text-neutral-400 border border-neutral-700">
+                                  <span className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20 font-medium">
                                     <Lock className="w-2.5 h-2.5" /> Private
                                   </span>
                                 ) : (
-                                  <span className="flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-neutral-900 text-neutral-400 border border-neutral-800">
+                                  <span className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-neutral-800 text-neutral-300 border border-neutral-700">
                                     <Globe className="w-2.5 h-2.5" /> Public
                                   </span>
                                 )}
                               </div>
                               {repo.description && (
-                                <p className="text-[11px] text-neutral-400 truncate mt-0.5">
-                                  {repo.description}
-                                </p>
+                                <p className="text-[11px] text-neutral-400 truncate mt-0.5">{repo.description}</p>
                               )}
+                              <div className="flex items-center gap-2 mt-1 text-[10px] text-neutral-500 font-mono">
+                                <span>Branch: {repo.default_branch}</span>
+                                {repo.updated_at && (
+                                  <span>· Updated {new Date(repo.updated_at).toLocaleDateString()}</span>
+                                )}
+                              </div>
                             </div>
+
                             <div className="flex items-center gap-2 flex-shrink-0">
-                              <span className="font-mono text-[10px] text-neutral-500">
-                                {repo.default_branch}
-                              </span>
                               {isSelected ? (
-                                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                                <span className="flex items-center gap-1 text-xs text-emerald-400 font-medium px-2 py-1 bg-emerald-500/10 rounded border border-emerald-500/20">
+                                  <CheckCircle2 className="w-3.5 h-3.5" /> Selected
+                                </span>
                               ) : (
-                                <Button size="sm" variant="ghost" className="h-6 text-[11px] px-2">
-                                  Select
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  className="h-7 text-xs px-3"
+                                  onClick={() => handleSelectRepo(repo)}
+                                >
+                                  Import
                                 </Button>
                               )}
                             </div>
@@ -2109,8 +2344,19 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                     )}
                   </div>
 
+                  {/* Selected Repository Configuration Panel */}
                   {selectedRepo && (
-                    <div className="p-3 rounded-md bg-surface-elevated/40 border border-surface-border space-y-3 animate-in fade-in duration-100">
+                    <div className="p-3.5 rounded-lg bg-surface-elevated/40 border border-surface-border space-y-3 animate-in fade-in duration-100">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Github className="w-4 h-4 text-white" />
+                          <span className="text-xs font-semibold text-white">{selectedRepo.full_name}</span>
+                        </div>
+                        <span className="text-[11px] font-mono text-neutral-400">
+                          Configure Deployment
+                        </span>
+                      </div>
+
                       <div className="grid grid-cols-2 gap-3">
                         <div>
                           <label className="block text-[11px] font-mono text-neutral-400 mb-1">
@@ -2318,19 +2564,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                       <span className="text-[11px] font-mono text-neutral-400 bg-surface-elevated px-2 py-0.5 rounded border border-surface-border">
                         Port {svc.internal_port}
                       </span>
-                      {configuredServices.length > 1 && (
-                        <button
-                          type="button"
-                          className="p-1 rounded text-neutral-400 hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleRemoveService(svcIdx);
-                          }}
-                          title="Remove service"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        className="p-1 rounded text-neutral-400 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          promptRemoveService(svcIdx);
+                        }}
+                        title="Remove service"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
                       <button type="button" className="p-1 text-neutral-400 hover:text-white">
                         {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                       </button>
@@ -2855,6 +3099,133 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           </div>
         </div>
       )}
-    </Modal>
+      </Modal>
+
+      {/* Connect with GitHub Personal Access Token Modal */}
+      <Modal
+        isOpen={isPATModalOpen}
+        onClose={() => setIsPATModalOpen(false)}
+        title="Connect with Personal Access Token"
+        description="Use a GitHub Personal Access Token (Classic or Fine-Grained) to import private repositories and organizations."
+      >
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-white mb-1.5">
+              Personal Access Token
+            </label>
+            <input
+              type="password"
+              placeholder="ghp_... or github_pat_..."
+              value={patTokenInput}
+              onChange={(e) => setPatTokenInput(e.target.value)}
+              className="w-full h-9 px-3 rounded bg-surface border border-surface-border text-xs text-white font-mono placeholder-neutral-500 focus:outline-none focus:border-neutral-500"
+            />
+            <p className="text-[11px] text-neutral-400 mt-1.5">
+              Your token requires <code className="text-white bg-neutral-800 px-1 py-0.5 rounded">repo</code> permissions to clone and deploy private codebases.
+            </p>
+          </div>
+
+          <div className="p-3 rounded-lg bg-surface-elevated border border-surface-border text-xs text-neutral-300 space-y-2">
+            <span className="font-semibold text-white block">How to create a GitHub token:</span>
+            <ol className="list-decimal list-inside space-y-1 text-neutral-400 text-[11px]">
+              <li>Go to GitHub Settings &gt; Developer settings &gt; Personal access tokens.</li>
+              <li>Generate a token with repository read permissions (<code className="text-neutral-300">repo</code>).</li>
+              <li>Paste the generated token above and click Connect.</li>
+            </ol>
+            <a
+              href="https://github.com/settings/tokens/new?scopes=repo,read:user,user:email&description=ForgeLAB"
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 text-primary hover:underline text-[11px] font-medium pt-1"
+            >
+              Create Token on GitHub <ExternalLink className="w-3 h-3" />
+            </a>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2 border-t border-surface-border">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setIsPATModalOpen(false)}
+              disabled={isConnectingPAT}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              loading={isConnectingPAT}
+              onClick={handleConnectPAT}
+              icon={<Key className="w-3.5 h-3.5" />}
+            >
+              Connect Token
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Remove Service Confirmation Modal */}
+      <Modal
+        isOpen={serviceToRemoveIndex !== null}
+        onClose={() => setServiceToRemoveIndex(null)}
+        title="Remove Service"
+        description="Confirm service deletion from project architecture."
+      >
+        <div className="space-y-4">
+          <p className="text-xs sm:text-sm text-neutral-300">
+            Are you sure you want to remove service{' '}
+            <span className="font-semibold text-white">
+              {serviceToRemoveIndex !== null ? configuredServices[serviceToRemoveIndex]?.name : ''}
+            </span>{' '}
+            from this deployment configuration?
+          </p>
+          <div className="flex justify-end gap-2 pt-2 border-t border-surface-border">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setServiceToRemoveIndex(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="danger"
+              size="sm"
+              onClick={confirmRemoveService}
+              icon={<Trash2 className="w-3.5 h-3.5" />}
+            >
+              Remove Service
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Cannot Remove Only Service Modal */}
+      <Modal
+        isOpen={showCannotRemoveServiceModal}
+        onClose={() => setShowCannotRemoveServiceModal(false)}
+        title="Cannot Remove Service"
+        description="A project must have at least one service."
+      >
+        <div className="space-y-4">
+          <p className="text-xs sm:text-sm text-neutral-300">
+            Every deployment requires at least one runnable service definition. You cannot remove the only remaining service from this project.
+          </p>
+          <div className="flex justify-end pt-2 border-t border-surface-border">
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              onClick={() => setShowCannotRemoveServiceModal(false)}
+            >
+              Understand
+            </Button>
+          </div>
+        </div>
+      </Modal>
+    </>
   );
 }

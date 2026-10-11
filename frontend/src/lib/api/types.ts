@@ -332,6 +332,14 @@ export interface GitHubStatus {
   scopes?: string[];
   needs_reauth?: boolean;
   updated_at?: string;
+  auth_type?: 'oauth' | 'pat';
+}
+
+export interface GitHubOrg {
+  login: string;
+  id: number;
+  avatar_url?: string;
+  description?: string;
 }
 
 export interface ListRepositoriesResponse {
@@ -580,6 +588,7 @@ export interface GeneratePlanRequest {
   agent_id?: string;
   agent_token?: string;
   project_id?: string;
+  discovery?: DiscoveryResult;
 }
 
 export interface GeneratePlanResponse {

@@ -77,7 +77,13 @@ type GitHubStatus struct {
 	Username    string     `json:"username,omitempty"`
 	Scopes      []string   `json:"scopes,omitempty"`
 	NeedsReauth bool       `json:"needs_reauth"`
+	AuthType    string     `json:"auth_type,omitempty"` // "oauth" or "pat"
 	UpdatedAt   *time.Time `json:"updated_at,omitempty"`
+}
+
+type GitHubOrg struct {
+	Login     string `json:"login"`
+	AvatarURL string `json:"avatar_url"`
 }
 
 type GitHubService struct {
@@ -151,11 +157,18 @@ func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHu
 
 	scopes := parseOAuthScopes(scope)
 	hasRepoScope := false
+	authType := "oauth"
 	for _, sc := range scopes {
-		if sc == "repo" {
+		if sc == "repo" || sc == "pat" {
 			hasRepoScope = true
-			break
 		}
+		if sc == "pat" {
+			authType = "pat"
+		}
+	}
+	// Fine-grained personal access tokens do not return standard OAuth scope strings
+	if len(scopes) == 0 {
+		hasRepoScope = true
 	}
 
 	return &GitHubStatus{
@@ -163,6 +176,7 @@ func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHu
 		Username:    username,
 		Scopes:      scopes,
 		NeedsReauth: !hasRepoScope,
+		AuthType:    authType,
 		UpdatedAt:   &updatedAt,
 	}, nil
 }
@@ -226,7 +240,8 @@ func (s *GitHubService) GetConnectURL(ctx context.Context, userID uuid.UUID) (au
 		redirectURL = "http://localhost:3000/api/integrations/github/callback"
 	}
 	params.Set("redirect_uri", redirectURL)
-	params.Set("scope", "repo,read:user")
+	params.Set("scope", "repo,read:user,user:email")
+	params.Set("prompt", "consent")
 	params.Set("state", state)
 
 	return "https://github.com/login/oauth/authorize?" + params.Encode(), nonce, nil
@@ -397,6 +412,125 @@ func (s *GitHubService) Disconnect(ctx context.Context, userID uuid.UUID) error 
 	return nil
 }
 
+// ConnectWithPAT verifies and encrypts a GitHub Personal Access Token (classic or fine-grained) for the user.
+func (s *GitHubService) ConnectWithPAT(ctx context.Context, userID uuid.UUID, patToken string) (*GitHubStatus, error) {
+	cleanToken := strings.TrimSpace(patToken)
+	if cleanToken == "" {
+		return nil, errors.New("personal access token cannot be empty")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cleanToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "ForgeLAB-App")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify GitHub token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, errors.New("invalid or expired GitHub token. Please verify token permissions.")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+	}
+
+	var ghUser struct {
+		ID    int64  `json:"id"`
+		Login string `json:"login"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ghUser); err != nil || ghUser.Login == "" {
+		return nil, errors.New("failed to retrieve GitHub user profile with token")
+	}
+
+	scopeHeader := resp.Header.Get("X-OAuth-Scopes")
+	savedScope := "repo,pat"
+	if scopeHeader != "" {
+		savedScope = scopeHeader + ",pat"
+	}
+
+	encryptedToken, err := s.encryptor.Encrypt([]byte(cleanToken))
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt GitHub token: %w", err)
+	}
+
+	now := time.Now()
+	ghUserIDStr := fmt.Sprintf("%d", ghUser.ID)
+
+	_, err = s.db.Exec(ctx,
+		`INSERT INTO github_integrations (user_id, encrypted_access_token, github_user_id, github_username, scope, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 ON CONFLICT (user_id) DO UPDATE SET
+		   encrypted_access_token = EXCLUDED.encrypted_access_token,
+		   github_user_id = EXCLUDED.github_user_id,
+		   github_username = EXCLUDED.github_username,
+		   scope = EXCLUDED.scope,
+		   updated_at = EXCLUDED.updated_at`,
+		userID, encryptedToken, ghUserIDStr, ghUser.Login, savedScope, now, now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to save GitHub integration: %w", err)
+	}
+
+	slog.Info("github personal access token connected successfully", "user_id", userID, "username", ghUser.Login)
+	return &GitHubStatus{
+		Connected:   true,
+		Username:    ghUser.Login,
+		Scopes:      parseOAuthScopes(savedScope),
+		NeedsReauth: false,
+		AuthType:    "pat",
+		UpdatedAt:   &now,
+	}, nil
+}
+
+// ListOrganizations retrieves the GitHub organizations the authenticated user belongs to.
+func (s *GitHubService) ListOrganizations(ctx context.Context, userID uuid.UUID) ([]GitHubOrg, error) {
+	token, _ := s.getDecryptedToken(ctx, userID)
+	if token == "" {
+		return []GitHubOrg{}, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/orgs", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "ForgeLAB-App")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return []GitHubOrg{}, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return []GitHubOrg{}, nil
+	}
+
+	var rawOrgs []struct {
+		Login     string `json:"login"`
+		AvatarURL string `json:"avatar_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rawOrgs); err != nil {
+		return []GitHubOrg{}, nil
+	}
+
+	orgs := make([]GitHubOrg, len(rawOrgs))
+	for i, o := range rawOrgs {
+		orgs[i] = GitHubOrg{
+			Login:     o.Login,
+			AvatarURL: o.AvatarURL,
+		}
+	}
+	return orgs, nil
+}
+
 // getDecryptedTokenAndScope retrieves and decrypts the GitHub access token along with authorized OAuth scopes.
 func (s *GitHubService) getDecryptedTokenAndScope(ctx context.Context, userID uuid.UUID) (string, string, error) {
 	if s.tokenGetter != nil {
@@ -432,17 +566,16 @@ func (s *GitHubService) getDecryptedToken(ctx context.Context, userID uuid.UUID)
 
 // GetRepo verifies access and fetches metadata for a specific repository.
 func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, repo string) (*GitHubRepo, error) {
-	token, err := s.getDecryptedToken(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
+	token, tokenErr := s.getDecryptedToken(ctx, userID)
 
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s", url.PathEscape(owner), url.PathEscape(repo))
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "ForgeLAB-App")
 
@@ -466,6 +599,9 @@ func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, re
 		return nil, ErrGitHubNeedsReauth
 	}
 	if resp.StatusCode == http.StatusNotFound {
+		if token == "" && errors.Is(tokenErr, ErrGitHubNotConnected) {
+			return nil, ErrGitHubNotConnected
+		}
 		return nil, ErrGitHubRepoNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -504,21 +640,21 @@ func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, re
 }
 
 // ListRepositories retrieves repositories accessible to the user via their GitHub authorization.
-func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, page, perPage int) ([]GitHubRepo, bool, error) {
+func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, page, perPage int, orgFilter ...string) ([]GitHubRepo, bool, error) {
 	token, scope, err := s.getDecryptedTokenAndScope(ctx, userID)
 	if err != nil {
 		return nil, false, err
 	}
 
 	scopes := parseOAuthScopes(scope)
-	hasRepoScope := false
+	hasRepo := false
 	for _, sc := range scopes {
-		if sc == "repo" {
-			hasRepoScope = true
+		if sc == "repo" || sc == "pat" {
+			hasRepo = true
 			break
 		}
 	}
-	if !hasRepoScope && len(scopes) > 0 {
+	if len(scopes) > 0 && !hasRepo {
 		return nil, false, ErrGitHubNeedsReauth
 	}
 
@@ -529,7 +665,13 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 		perPage = 30
 	}
 
-	apiURL := fmt.Sprintf("https://api.github.com/user/repos?visibility=all&affiliation=owner,collaborator,organization_member&sort=updated&direction=desc&page=%d&per_page=%d", page, perPage)
+	var apiURL string
+	if len(orgFilter) > 0 && strings.TrimSpace(orgFilter[0]) != "" {
+		cleanOrg := strings.TrimSpace(orgFilter[0])
+		apiURL = fmt.Sprintf("https://api.github.com/orgs/%s/repos?sort=updated&direction=desc&page=%d&per_page=%d", url.PathEscape(cleanOrg), page, perPage)
+	} else {
+		apiURL = fmt.Sprintf("https://api.github.com/user/repos?visibility=all&affiliation=owner,collaborator,organization_member&sort=updated&direction=desc&page=%d&per_page=%d", page, perPage)
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, false, err
@@ -605,17 +747,16 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 
 // ListBranches retrieves branches for a specific repository.
 func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owner, repo string) ([]GitHubBranch, error) {
-	token, err := s.getDecryptedToken(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
+	token, tokenErr := s.getDecryptedToken(ctx, userID)
 
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/branches?per_page=100", url.PathEscape(owner), url.PathEscape(repo))
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "ForgeLAB-App")
 
@@ -639,6 +780,9 @@ func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owne
 		return nil, ErrGitHubNeedsReauth
 	}
 	if resp.StatusCode == http.StatusNotFound {
+		if token == "" && errors.Is(tokenErr, ErrGitHubNotConnected) {
+			return nil, ErrGitHubNotConnected
+		}
 		return nil, ErrGitHubRepoNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -668,10 +812,7 @@ func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owne
 
 // DetectRepo queries file indicators on GitHub and performs runtime detection.
 func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner, repo, branch, rootDir string) (*detector.DetectionResult, error) {
-	token, err := s.getDecryptedToken(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
+	token, tokenErr := s.getDecryptedToken(ctx, userID)
 
 	if branch == "" {
 		branch = "main"
@@ -686,7 +827,9 @@ func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner,
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "ForgeLAB-App")
 
@@ -709,6 +852,9 @@ func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner,
 		return nil, ErrGitHubNeedsReauth
 	}
 	if resp.StatusCode == http.StatusNotFound {
+		if token == "" && errors.Is(tokenErr, ErrGitHubNotConnected) {
+			return nil, ErrGitHubNotConnected
+		}
 		return nil, ErrGitHubRepoNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -754,10 +900,7 @@ func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner,
 
 // ResolveCommitSHA resolves a branch/ref to the exact 40-character commit SHA.
 func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, owner, repo, ref string) (string, error) {
-	token, err := s.getDecryptedToken(ctx, userID)
-	if err != nil {
-		return "", err
-	}
+	token, tokenErr := s.getDecryptedToken(ctx, userID)
 	if ref == "" {
 		ref = "main"
 	}
@@ -769,7 +912,9 @@ func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, 
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "ForgeLAB-App")
 
@@ -793,6 +938,9 @@ func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, 
 		return "", ErrGitHubNeedsReauth
 	}
 	if resp.StatusCode == http.StatusNotFound {
+		if token == "" && errors.Is(tokenErr, ErrGitHubNotConnected) {
+			return "", ErrGitHubNotConnected
+		}
 		return "", ErrGitHubRepoNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -919,10 +1067,7 @@ func copyDirectoryContents(src, dst string) error {
 // It verifies repository authorization before serving cached or newly downloaded snapshots.
 // Private repository snapshots are strictly isolated per ForgeLAB user.
 func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID, owner, repo, branch, targetDir string) error {
-	token, err := s.getDecryptedToken(ctx, userID)
-	if err != nil {
-		return err
-	}
+	token, _ := s.getDecryptedToken(ctx, userID)
 
 	if branch == "" {
 		branch = "main"
@@ -973,7 +1118,9 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "ForgeLAB-App")
 

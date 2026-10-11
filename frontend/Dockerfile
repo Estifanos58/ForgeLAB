@@ -3,7 +3,10 @@ FROM node:22-alpine AS base
 
 # Stage 1: Install dependencies
 FROM base AS deps
-RUN apk add --no-cache libc6-compat
+RUN for i in 1 2 3 4 5; do \
+        apk add --no-cache libc6-compat && break || \
+        (echo "Retrying apk add in 3s..." && sleep 3); \
+    done
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
@@ -23,7 +26,10 @@ RUN npm run build
 
 # Stage 3: Minimal production runtime
 FROM base AS runner
-RUN apk add --no-cache curl
+RUN for i in 1 2 3 4 5; do \
+        apk add --no-cache curl && break || \
+        (echo "Retrying apk add in 3s..." && sleep 3); \
+    done
 WORKDIR /app
 
 ENV NODE_ENV=production

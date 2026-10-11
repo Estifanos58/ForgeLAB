@@ -378,6 +378,8 @@ func main() {
 					r.Get("/", integrationHandler.GetGitHubStatus)
 					r.Get("/connect", integrationHandler.ConnectGitHub)
 					r.Post("/connect", integrationHandler.ConnectGitHub)
+					r.Post("/token", integrationHandler.ConnectGitHubPAT)
+					r.Get("/orgs", integrationHandler.ListOrganizations)
 					r.Post("/disconnect", integrationHandler.DisconnectGitHub)
 					r.Get("/repositories", integrationHandler.ListRepositories)
 					r.Get("/repositories/{owner}/{repo}", integrationHandler.GetRepository)

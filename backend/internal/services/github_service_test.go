@@ -40,7 +40,8 @@ func TestGitHubService_GetConnectURL_UsesRepositoryCallback(t *testing.T) {
 	q := parsedURL.Query()
 	assert.Equal(t, "test-github-client-id", q.Get("client_id"))
 	assert.Equal(t, "http://localhost:3000/api/integrations/github/callback", q.Get("redirect_uri"))
-	assert.Equal(t, "repo,read:user", q.Get("scope"))
+	assert.Equal(t, "repo,read:user,user:email", q.Get("scope"))
+	assert.Equal(t, "consent", q.Get("prompt"))
 	assert.NotEmpty(t, q.Get("state"))
 }
 
