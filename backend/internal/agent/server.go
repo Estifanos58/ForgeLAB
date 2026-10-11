@@ -3,6 +3,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +72,13 @@ func LookupLocalSourceSession(sourceID uuid.UUID) (*LocalSourceSession, bool) {
 	defer globalSourceSessionsMu.RUnlock()
 	sess, ok := globalSourceSessions[sourceID]
 	return sess, ok
+}
+
+// DeleteLocalSourceSession removes a registered local source session from the global registry.
+func DeleteLocalSourceSession(sourceID uuid.UUID) {
+	globalSourceSessionsMu.Lock()
+	defer globalSourceSessionsMu.Unlock()
+	delete(globalSourceSessions, sourceID)
 }
 
 type AgentServerConfig struct {
@@ -205,6 +214,7 @@ func (s *AgentServer) CleanupExpiredSessions() int {
 	for id, sess := range s.sessions {
 		if now.After(sess.ExpiresAt) {
 			delete(s.sessions, id)
+			DeleteLocalSourceSession(id)
 			removed++
 		}
 	}
@@ -1060,6 +1070,7 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			s.mu.Lock()
 			delete(s.sessions, sourceUUID)
 			s.mu.Unlock()
+			DeleteLocalSourceSession(sourceUUID)
 			writeJSON(w, http.StatusOK, map[string]string{"message": "session removed"})
 			return
 		}
@@ -1261,7 +1272,15 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			}
 		}
 
-		matcher, _ := dockerignore.LoadDockerignore(evalServiceDir)
+		matcher, dErr := dockerignore.LoadDockerignore(evalServiceDir)
+		if dErr != nil {
+			slog.Error("error loading .dockerignore", "source_id", session.SourceID, "error", dErr)
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":  "failed to read or parse .dockerignore",
+				"reason": dErr.Error(),
+			})
+			return
+		}
 
 		bOpts := tararchive.BuildContextOptions{
 			BuildContextDir: evalServiceDir,
@@ -1293,8 +1312,17 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			return
 		}
 
+		// Compute SHA256 of completed archive for integrity verification
+		h := sha256.New()
+		if _, hashErr := io.Copy(h, tmpFile); hashErr == nil {
+			archiveSha := hex.EncodeToString(h.Sum(nil))
+			w.Header().Set("X-Archive-SHA256", archiveSha)
+		}
+		_, _ = tmpFile.Seek(0, io.SeekStart)
+
 		w.Header().Set("Content-Type", "application/x-tar")
 		w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+		w.Header().Set("X-Archive-Total-Bytes", strconv.FormatInt(stat.Size(), 10))
 		w.WriteHeader(http.StatusOK)
 
 		if _, copyErr := io.Copy(w, tmpFile); copyErr != nil {

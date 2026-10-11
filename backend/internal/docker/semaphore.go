@@ -3,16 +3,46 @@ package docker
 import (
 	"context"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 )
 
+// SlotOwnerInfo captures rich, non-sensitive diagnostic metadata for an
+// active or queued build-slot participant.
+type SlotOwnerInfo struct {
+	ID                  string    `json:"id"`
+	DeploymentID        string    `json:"deployment_id,omitempty"`
+	ServiceDeploymentID string    `json:"service_deployment_id,omitempty"`
+	ServiceName         string    `json:"service_name,omitempty"`
+	Phase               string    `json:"phase"` // "queued", "waiting_for_build_slot", "context_generation", "context_transfer", "context_validation", "docker_build", "slot_granted"
+	EnteredQueueAt      time.Time `json:"entered_queue_at"`
+	AcquiredAt          time.Time `json:"acquired_at,omitempty"`
+}
+
+// SemaphoreDiagnostics provides a structured snapshot of current build slot capacity and waiters.
+type SemaphoreDiagnostics struct {
+	Limit        int             `json:"limit"`
+	ActiveCount  int             `json:"active_count"`
+	WaitersCount int             `json:"waiters_count"`
+	ActiveSlots  []SlotOwnerInfo `json:"active_slots"`
+	Waiters      []SlotOwnerInfo `json:"waiters"`
+}
+
+type waiterItem struct {
+	ch   chan struct{}
+	info SlotOwnerInfo
+}
+
 // BuildSemaphore provides a dynamic, thread-safe concurrency limiter
-// specifically for Docker image builds. It supports dynamic limit adjustments
-// without leaking semaphore slots, desynchronizing channels, or deadlocking.
+// specifically for Docker image builds with first-class ownership diagnostics,
+// queue progress observability, and cancellation resilience.
 type BuildSemaphore struct {
-	mu      sync.Mutex
-	limit   int
-	active  int
-	waiters []chan struct{}
+	mu          sync.Mutex
+	limit       int
+	active      int
+	activeSlots map[string]*SlotOwnerInfo
+	waiters     []*waiterItem
 }
 
 // NewBuildSemaphore initializes a build semaphore with the given limit.
@@ -21,7 +51,8 @@ func NewBuildSemaphore(limit int) *BuildSemaphore {
 		limit = 1
 	}
 	return &BuildSemaphore{
-		limit: limit,
+		limit:       limit,
+		activeSlots: make(map[string]*SlotOwnerInfo),
 	}
 }
 
@@ -42,7 +73,10 @@ func (s *BuildSemaphore) SetLimit(newLimit int) {
 		w := s.waiters[0]
 		s.waiters = s.waiters[1:]
 		s.active++
-		close(w)
+		w.info.AcquiredAt = time.Now()
+		w.info.Phase = "slot_granted"
+		s.activeSlots[w.info.ID] = &w.info
+		close(w.ch)
 	}
 }
 
@@ -67,65 +101,174 @@ func (s *BuildSemaphore) GetWaitersCount() int {
 	return len(s.waiters)
 }
 
+// GetDiagnostics returns a full diagnostic snapshot of active slots and queued waiters.
+func (s *BuildSemaphore) GetDiagnostics() SemaphoreDiagnostics {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	active := make([]SlotOwnerInfo, 0, len(s.activeSlots))
+	for _, v := range s.activeSlots {
+		if v != nil {
+			active = append(active, *v)
+		}
+	}
+
+	waiters := make([]SlotOwnerInfo, 0, len(s.waiters))
+	for _, w := range s.waiters {
+		if w != nil {
+			waiters = append(waiters, w.info)
+		}
+	}
+
+	return SemaphoreDiagnostics{
+		Limit:        s.limit,
+		ActiveCount:  s.active,
+		WaitersCount: len(s.waiters),
+		ActiveSlots:  active,
+		Waiters:      waiters,
+	}
+}
+
+// UpdatePhase updates the current execution phase of an active slot holder.
+func (s *BuildSemaphore) UpdatePhase(slotID, newPhase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slot, exists := s.activeSlots[slotID]; exists && slot != nil {
+		slot.Phase = newPhase
+	}
+}
+
 // Acquire requests a build slot, waiting if necessary until one becomes available or ctx is cancelled.
 // It returns a release function that must be called when the build finishes.
 func (s *BuildSemaphore) Acquire(ctx context.Context) (func(), error) {
+	return s.AcquireWithInfo(ctx, SlotOwnerInfo{
+		ID:    uuid.NewString(),
+		Phase: "building",
+	}, nil)
+}
+
+// AcquireWithInfo requests a build slot with detailed owner metadata and queue wait progress callbacks.
+func (s *BuildSemaphore) AcquireWithInfo(
+	ctx context.Context,
+	info SlotOwnerInfo,
+	onWait func(position int, waitDuration time.Duration, activeSlots []SlotOwnerInfo),
+) (func(), error) {
+	if info.ID == "" {
+		info.ID = uuid.NewString()
+	}
+	now := time.Now()
+	info.EnteredQueueAt = now
+
 	s.mu.Lock()
 	if s.active < s.limit {
 		s.active++
+		info.AcquiredAt = now
+		info.Phase = "slot_granted"
+		s.activeSlots[info.ID] = &info
 		s.mu.Unlock()
 
 		var once sync.Once
 		return func() {
 			once.Do(func() {
-				s.release()
+				s.release(info.ID)
 			})
 		}, nil
 	}
 
-	ch := make(chan struct{})
-	s.waiters = append(s.waiters, ch)
+	// Queue the waiter
+	info.Phase = "waiting_for_build_slot"
+	item := &waiterItem{
+		ch:   make(chan struct{}),
+		info: info,
+	}
+	s.waiters = append(s.waiters, item)
+	queuePosition := len(s.waiters)
+
+	// Collect active owners for initial progress reporting
+	activeCopy := make([]SlotOwnerInfo, 0, len(s.activeSlots))
+	for _, v := range s.activeSlots {
+		if v != nil {
+			activeCopy = append(activeCopy, *v)
+		}
+	}
 	s.mu.Unlock()
 
-	select {
-	case <-ch:
-		var once sync.Once
-		return func() {
-			once.Do(func() {
-				s.release()
-			})
-		}, nil
-	case <-ctx.Done():
-		s.mu.Lock()
+	if onWait != nil {
+		onWait(queuePosition, 0, activeCopy)
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
 		select {
-		case <-ch:
-			// Slot was already granted right as cancellation occurred; must release it
-			s.mu.Unlock()
-			s.release()
-			return nil, ctx.Err()
-		default:
-			// Remove ch from waiters list
-			for i, w := range s.waiters {
-				if w == ch {
-					s.waiters = append(s.waiters[:i], s.waiters[i+1:]...)
-					break
+		case <-item.ch:
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					s.release(info.ID)
+				})
+			}, nil
+
+		case tickTime := <-ticker.C:
+			if onWait != nil {
+				s.mu.Lock()
+				pos := -1
+				for idx, w := range s.waiters {
+					if w == item {
+						pos = idx + 1
+						break
+					}
+				}
+				actCopy := make([]SlotOwnerInfo, 0, len(s.activeSlots))
+				for _, v := range s.activeSlots {
+					if v != nil {
+						actCopy = append(actCopy, *v)
+					}
+				}
+				s.mu.Unlock()
+				if pos > 0 {
+					onWait(pos, tickTime.Sub(now), actCopy)
 				}
 			}
-			s.mu.Unlock()
-			return nil, ctx.Err()
+
+		case <-ctx.Done():
+			s.mu.Lock()
+			select {
+			case <-item.ch:
+				// Slot was granted right as cancellation arrived; release it cleanly
+				s.mu.Unlock()
+				s.release(info.ID)
+				return nil, ctx.Err()
+			default:
+				// Remove item from waiters
+				for i, w := range s.waiters {
+					if w == item {
+						s.waiters = append(s.waiters[:i], s.waiters[i+1:]...)
+						break
+					}
+				}
+				s.mu.Unlock()
+				return nil, ctx.Err()
+			}
 		}
 	}
 }
 
-func (s *BuildSemaphore) release() {
+func (s *BuildSemaphore) release(slotID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	delete(s.activeSlots, slotID)
 	s.active--
+
 	if s.active < s.limit && len(s.waiters) > 0 {
 		w := s.waiters[0]
 		s.waiters = s.waiters[1:]
 		s.active++
-		close(w)
+		w.info.AcquiredAt = time.Now()
+		w.info.Phase = "slot_granted"
+		s.activeSlots[w.info.ID] = &w.info
+		close(w.ch)
 	}
 }

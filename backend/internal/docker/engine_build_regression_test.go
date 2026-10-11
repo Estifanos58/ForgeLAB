@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -191,10 +192,16 @@ func TestEngine_BuildImage_ContextRemainsActiveDuringStreamParsing(t *testing.T)
 	streamMu.Lock()
 	defer streamMu.Unlock()
 
-	require.Len(t, streamLinesReceived, 5, "all stream log lines should have been parsed without cancellation interruption")
-	assert.Contains(t, streamLinesReceived[0], "Step 1/3")
-	assert.Contains(t, streamLinesReceived[1], "building ccms-backend")
-	assert.Contains(t, streamLinesReceived[3], "Successfully built 9a8b7c6d5e4f")
+	var dockerStreamLines []string
+	for _, l := range streamLinesReceived {
+		if strings.HasPrefix(l, "Step ") || strings.HasPrefix(l, "Successfully ") {
+			dockerStreamLines = append(dockerStreamLines, l)
+		}
+	}
+	require.Len(t, dockerStreamLines, 5, "all stream log lines should have been parsed without cancellation interruption")
+	assert.Contains(t, dockerStreamLines[0], "Step 1/3")
+	assert.Contains(t, dockerStreamLines[1], "building ccms-backend")
+	assert.Contains(t, dockerStreamLines[3], "Successfully built 9a8b7c6d5e4f")
 
 	// Verify tarArchive was closed exactly once and only after build finished
 	assert.True(t, tarRC.IsClosed(), "source tarArchive must be closed after build completes")
@@ -361,7 +368,7 @@ func TestEngine_BuildImage_StructuredCleanup_OnError(t *testing.T) {
 		defer dockerCli.Close()
 
 		engine := &Engine{dockerClient: dockerCli}
-		tarRC := newTrackingReadCloser(bytes.NewReader([]byte("test")))
+		tarRC := newTrackingReadCloser(bytes.NewReader(createSampleTarArchive(t)))
 
 		err = engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
 

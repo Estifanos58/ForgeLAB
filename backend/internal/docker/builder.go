@@ -139,7 +139,6 @@ func extractDockerfileFromTar(r io.Reader, targetDockerfile string) ([]byte, err
 	}
 	cleanedTarget = strings.ReplaceAll(cleanedTarget, "\\", "/")
 	cleanedTarget = strings.TrimPrefix(cleanedTarget, "./")
-	baseTarget := filepath.Base(cleanedTarget)
 
 	tr := tar.NewReader(r)
 	for {
@@ -148,10 +147,7 @@ func extractDockerfileFromTar(r io.Reader, targetDockerfile string) ([]byte, err
 			break
 		}
 		hdrName := strings.TrimPrefix(strings.ReplaceAll(hdr.Name, "\\", "/"), "./")
-		isMatch := hdrName == cleanedTarget ||
-			filepath.Base(hdrName) == baseTarget ||
-			hdrName == "Dockerfile" ||
-			hdrName == "Dockerfile.forgelab"
+		isMatch := hdrName == cleanedTarget || (cleanedTarget == "Dockerfile" && hdrName == "Dockerfile.forgelab")
 
 		if isMatch && (hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA) {
 			limit := hdr.Size

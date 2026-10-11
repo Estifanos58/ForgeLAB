@@ -224,9 +224,40 @@ func (e *Engine) CancelActiveDeployment(deploymentID uuid.UUID) bool {
 	return false
 }
 
+type buildSlotContextKeyType struct{}
+
+var buildSlotContextKey = buildSlotContextKeyType{}
+
+func getDockerBuildTimeout() time.Duration {
+	if raw := os.Getenv("FORGELAB_DOCKER_BUILD_TIMEOUT"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+		if mins, err := strconv.Atoi(raw); err == nil && mins > 0 {
+			return time.Duration(mins) * time.Minute
+		}
+	}
+	return 45 * time.Minute
+}
+
 // acquireBuildSlot acquires a slot under the global Docker build concurrency limit.
 func (e *Engine) acquireBuildSlot(ctx context.Context) (func(), error) {
+	if ctx.Value(buildSlotContextKey) != nil {
+		return func() {}, nil
+	}
 	return e.getBuildSemaphore().Acquire(ctx)
+}
+
+// acquireBuildSlotWithInfo acquires a slot with rich owner diagnostics and queue wait progress callbacks.
+func (e *Engine) acquireBuildSlotWithInfo(
+	ctx context.Context,
+	info SlotOwnerInfo,
+	onWait func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo),
+) (func(), error) {
+	if ctx.Value(buildSlotContextKey) != nil {
+		return func() {}, nil
+	}
+	return e.getBuildSemaphore().AcquireWithInfo(ctx, info, onWait)
 }
 
 // SetServiceService configures the service management service.
@@ -833,10 +864,45 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				if service.StartCommand != "" {
 					agentQuery.Set("start_cmd", service.StartCommand)
 				}
-				if service.PackageManager != "" {
-					agentQuery.Set("package_manager", service.PackageManager)
+				pkgManager := service.PackageManager
+				if pkgManager == "" && service.RuntimeType == "nodejs" {
+					pkgManager = "npm"
+				}
+				if pkgManager != "" {
+					agentQuery.Set("package_manager", pkgManager)
 				}
 			}
+
+			slotID := uuid.NewString()
+			deployIDStr := ""
+			if serviceDeploy.DeploymentID != nil {
+				deployIDStr = serviceDeploy.DeploymentID.String()
+			}
+			slotInfo := SlotOwnerInfo{
+				ID:                  slotID,
+				DeploymentID:        deployIDStr,
+				ServiceDeploymentID: serviceDeploy.ID.String(),
+				ServiceName:         service.Name,
+				Phase:               "waiting_for_build_slot",
+			}
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Service '%s' waiting for Docker build slot...", service.Name))
+			releaseSlot, slotErr := e.acquireBuildSlotWithInfo(execCtx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+				var ownerDesc string
+				if len(actSlots) > 0 {
+					ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
+			})
+			if slotErr != nil {
+				reason := fmt.Sprintf("Docker build queue wait cancelled: %v", slotErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
+			}
+			defer releaseSlot()
+			e.buildSem.UpdatePhase(slotID, "context_transfer")
+			execCtx = context.WithValue(execCtx, buildSlotContextKey, slotID)
+
 			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?%s",
 				baseURL,
 				project.SourceReference,
@@ -992,6 +1058,38 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			matcher, _ := LoadDockerignore(svcContextDir)
 			if matcher == nil {
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
+			}
+
+			if execCtx.Value(buildSlotContextKey) == nil {
+				slotID := uuid.NewString()
+				deployIDStr := ""
+				if serviceDeploy.DeploymentID != nil {
+					deployIDStr = serviceDeploy.DeploymentID.String()
+				}
+				slotInfo := SlotOwnerInfo{
+					ID:                  slotID,
+					DeploymentID:        deployIDStr,
+					ServiceDeploymentID: serviceDeploy.ID.String(),
+					ServiceName:         service.Name,
+					Phase:               "waiting_for_build_slot",
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Service '%s' waiting for Docker build slot...", service.Name))
+				releaseSlot, slotErr := e.acquireBuildSlotWithInfo(execCtx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+					var ownerDesc string
+					if len(actSlots) > 0 {
+						ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
+					}
+					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
+				})
+				if slotErr != nil {
+					reason := fmt.Sprintf("Docker build queue wait cancelled: %v", slotErr)
+					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+					emitStatus(models.DeployStatusFailed, nil, &reason)
+					return errors.New(reason)
+				}
+				defer releaseSlot()
+				e.buildSem.UpdatePhase(slotID, "archive_generation")
+				execCtx = context.WithValue(execCtx, buildSlotContextKey, slotID)
 			}
 
 			archFile, archErr := tararchive.CreateCompletedArchiveFile(execCtx, e.workDir, tararchive.BuildContextOptions{
@@ -1800,7 +1898,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 				errList = append(errList, fmt.Sprintf("%s: skipped because dependency '%s' failed condition '%s'", sd.ServiceName, failedDepName, failedCondition))
 				mu.Unlock()
 				reason := fmt.Sprintf("Skipped because dependency '%s' failed condition '%s'", failedDepName, failedCondition)
-				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusFailed, &reason)
+				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusSkipped, &reason)
 				continue
 			}
 
@@ -2027,10 +2125,43 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				updateStatus(models.DeployStatusFailed, &reason)
 				return errors.New(reason)
 			}
-			pkgManager := ""
+			var targetSvc *models.Service
 			if len(project.Services) > 0 && project.Services[0] != nil {
-				pkgManager = project.Services[0].PackageManager
+				targetSvc = project.Services[0]
 			}
+			pkgManager := ""
+			if targetSvc != nil {
+				pkgManager = targetSvc.PackageManager
+			}
+			if pkgManager == "" && deployment.RuntimeType == "nodejs" {
+				pkgManager = "npm"
+			}
+
+			slotID := uuid.NewString()
+			slotInfo := SlotOwnerInfo{
+				ID:           slotID,
+				DeploymentID: deployment.ID.String(),
+				ServiceName:  project.Name,
+				Phase:        "waiting_for_build_slot",
+			}
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Waiting for Docker build slot...")
+			releaseSlot, slotErr := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+				var ownerDesc string
+				if len(actSlots) > 0 {
+					ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
+			})
+			if slotErr != nil {
+				reason := fmt.Sprintf("Docker build slot wait cancelled: %v", slotErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
+			defer releaseSlot()
+			e.buildSem.UpdatePhase(slotID, "context_transfer")
+			ctx = context.WithValue(ctx, buildSlotContextKey, slotID)
+
 			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s&package_manager=%s",
 				baseURL,
 				project.SourceReference,
@@ -2142,6 +2273,33 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			matcher, _ := LoadDockerignore(buildContextDir)
 			if matcher == nil {
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
+			}
+
+			if ctx.Value(buildSlotContextKey) == nil {
+				slotID := uuid.NewString()
+				slotInfo := SlotOwnerInfo{
+					ID:           slotID,
+					DeploymentID: deployment.ID.String(),
+					ServiceName:  project.Name,
+					Phase:        "waiting_for_build_slot",
+				}
+				emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Waiting for Docker build slot...")
+				releaseSlot, slotErr := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+					var ownerDesc string
+					if len(actSlots) > 0 {
+						ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
+					}
+					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
+				})
+				if slotErr != nil {
+					reason := fmt.Sprintf("Docker build queue wait cancelled: %v", slotErr)
+					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+					updateStatus(models.DeployStatusFailed, &reason)
+					return errors.New(reason)
+				}
+				defer releaseSlot()
+				e.buildSem.UpdatePhase(slotID, "archive_generation")
+				ctx = context.WithValue(ctx, buildSlotContextKey, slotID)
 			}
 
 			archFile, archErr := tararchive.CreateCompletedArchiveFile(ctx, e.workDir, tararchive.BuildContextOptions{
@@ -2906,17 +3064,19 @@ func (e *Engine) buildImage(
 	}
 	defer e.buildMaintenanceMu.RUnlock()
 
-	// 2. Acquire Docker build slot under configurable concurrency limit (BuildSemaphore)
-	if onLogLine != nil {
-		onLogLine("Waiting for Docker build slot...")
-	}
-	releaseSlot, err := e.acquireBuildSlot(ctx)
-	if err != nil {
-		return fmt.Errorf("Docker build concurrency limit wait cancelled: %w", err)
-	}
-	defer releaseSlot()
-	if onLogLine != nil {
-		onLogLine("Docker build slot acquired.")
+	// 2. Acquire Docker build slot under configurable concurrency limit (BuildSemaphore) if not already held
+	if ctx.Value(buildSlotContextKey) == nil {
+		if onLogLine != nil {
+			onLogLine("Waiting for Docker build slot...")
+		}
+		rel, err := e.acquireBuildSlot(ctx)
+		if err != nil {
+			return fmt.Errorf("Docker build concurrency limit wait cancelled: %w", err)
+		}
+		defer rel()
+		if onLogLine != nil {
+			onLogLine("Docker build slot acquired.")
+		}
 	}
 
 	// 3. Stage and validate build context archive onto disk
@@ -2973,24 +3133,65 @@ func (e *Engine) buildImage(
 		options = resolvedOptions
 	}
 
-	slog.Info("docker image build started", "tags", options.Tags, "builder_version", options.Version)
-
-	buildCtx, buildCancel := context.WithTimeout(ctx, 15*time.Minute)
+	buildTimeout := getDockerBuildTimeout()
+	buildCtx, buildCancel := context.WithTimeout(ctx, buildTimeout)
 	defer buildCancel()
 
+	slog.Info("docker image build started", "tags", options.Tags, "builder_version", options.Version, "timeout", buildTimeout.String())
+
 	if onLogLine != nil {
-		onLogLine("Docker build started.")
+		onLogLine(fmt.Sprintf("Docker build started (timeout: %s).", buildTimeout.Round(time.Second)))
 	}
 
-	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, validatedArchiveFile, options)
+	if _, err := validatedArchiveFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to rewind build context file before Docker ImageBuild: %w", err)
+	}
+
+	stat, statErr := validatedArchiveFile.Stat()
+	if statErr != nil {
+		return fmt.Errorf("failed to stat build context file: %w", statErr)
+	}
+
+	var buildContextReader io.Reader
+	if stat.Size() <= 512*1024*1024 {
+		archiveBytes, readErr := io.ReadAll(validatedArchiveFile)
+		if readErr != nil {
+			return fmt.Errorf("failed buffering build context for Docker ImageBuild: %w", readErr)
+		}
+		buildContextReader = bytes.NewReader(archiveBytes)
+	} else {
+		buildContextReader = validatedArchiveFile
+	}
+
+	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, buildContextReader, options)
 	if err != nil {
+		if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("Docker build timed out after %s: %w", buildTimeout.Round(time.Second), err)
+		}
 		return fmt.Errorf("Docker build failed: %w", err)
 	}
 	defer buildResponse.Body.Close()
 
 	if parseErr := e.parseDockerStream(buildResponse.Body, onLogLine); parseErr != nil {
-		// If BuildKit was used and rejected the tar header, attempt fallback to standard builder
-		if options.Version == types.BuilderBuildKit && strings.Contains(parseErr.Error(), "archive/tar: invalid tar header") {
+		if os.Getenv("FORGELAB_PRESERVE_FAILED_CONTEXTS") == "true" || os.Getenv("FORGELAB_PRESERVE_FAILED_CONTEXTS") == "1" {
+			diagDir := filepath.Join(e.workDir, "diagnostics", "failed-build-contexts")
+			_ = os.MkdirAll(diagDir, 0755)
+			diagPath := filepath.Join(diagDir, fmt.Sprintf("failed-build-%d.tar", time.Now().UnixNano()))
+			if _, rErr := validatedArchiveFile.Seek(0, io.SeekStart); rErr == nil {
+				if df, cErr := os.Create(diagPath); cErr == nil {
+					_, _ = io.Copy(df, validatedArchiveFile)
+					_ = df.Close()
+					slog.Info("preserved failed build context for diagnostics", "path", diagPath, "size", stat.Size())
+				}
+			}
+		}
+
+		if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("Docker build timed out after %s: %w", buildTimeout.Round(time.Second), parseErr)
+		}
+
+		// If BuildKit was used and rejected the tar header, attempt fallback only if Dockerfile does NOT require BuildKit
+		if options.Version == types.BuilderBuildKit && strings.Contains(parseErr.Error(), "archive/tar: invalid tar header") && !requiresBuildKit {
 			slog.Warn("buildkit rejected tar build context; retrying with standard builder", "error", parseErr)
 			if onLogLine != nil {
 				onLogLine("BuildKit rejected tar build context header. Retrying with standard Docker builder...")
@@ -2998,9 +3199,15 @@ func (e *Engine) buildImage(
 			if _, seekErr := validatedArchiveFile.Seek(0, io.SeekStart); seekErr == nil {
 				fallbackOpts := options
 				fallbackOpts.Version = ""
-				retryCtx, retryCancel := context.WithTimeout(ctx, 15*time.Minute)
+				retryCtx, retryCancel := context.WithTimeout(ctx, buildTimeout)
 				defer retryCancel()
-				retryResp, retryErr := e.dockerClient.ImageBuild(retryCtx, validatedArchiveFile, fallbackOpts)
+				var retryReader io.Reader = validatedArchiveFile
+				if stat.Size() <= 512*1024*1024 {
+					if rBytes, err := io.ReadAll(validatedArchiveFile); err == nil {
+						retryReader = bytes.NewReader(rBytes)
+					}
+				}
+				retryResp, retryErr := e.dockerClient.ImageBuild(retryCtx, retryReader, fallbackOpts)
 				if retryErr == nil {
 					defer retryResp.Body.Close()
 					if retryParseErr := e.parseDockerStream(retryResp.Body, onLogLine); retryParseErr == nil {
@@ -3047,10 +3254,10 @@ func (e *Engine) parseDockerStream(r io.Reader, onLogLine func(string)) error {
 					if jsonMsg.Error != "" {
 						return errors.New(jsonMsg.Error)
 					}
-					if jsonMsg.Stream != "" {
+					if jsonMsg.Stream != "" && onLogLine != nil {
 						onLogLine(strings.TrimSuffix(jsonMsg.Stream, "\n"))
 					}
-				} else {
+				} else if onLogLine != nil {
 					onLogLine(line)
 				}
 			}
@@ -3060,6 +3267,28 @@ func (e *Engine) parseDockerStream(r io.Reader, onLogLine func(string)) error {
 		}
 		if err != nil {
 			return err
+		}
+	}
+
+	// Flush trailing incomplete line at EOF
+	if rawBuffer.Len() > 0 {
+		line := strings.TrimSpace(rawBuffer.String())
+		rawBuffer.Reset()
+		if line != "" {
+			var jsonMsg struct {
+				Stream string `json:"stream"`
+				Error  string `json:"error"`
+			}
+			if jsonErr := json.Unmarshal([]byte(line), &jsonMsg); jsonErr == nil {
+				if jsonMsg.Error != "" {
+					return errors.New(jsonMsg.Error)
+				}
+				if jsonMsg.Stream != "" && onLogLine != nil {
+					onLogLine(strings.TrimSuffix(jsonMsg.Stream, "\n"))
+				}
+			} else if onLogLine != nil {
+				onLogLine(line)
+			}
 		}
 	}
 	return nil

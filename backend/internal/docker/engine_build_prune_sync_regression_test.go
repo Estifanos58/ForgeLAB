@@ -70,7 +70,7 @@ func TestRegression_BuildPruneSync_TestA_PruneWaitsForActiveBuild(t *testing.T) 
 	// 1. Start buildImage in background
 	buildDone := make(chan error, 1)
 	go func() {
-		tarRC := newTrackingRC(bytes.NewReader([]byte("dummy-tar")))
+		tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
 		err := engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
 		buildDone <- err
 	}()
@@ -166,7 +166,7 @@ func TestRegression_BuildPruneSync_TestB_BuildWaitsForActivePrune(t *testing.T) 
 	buildStarted := make(chan struct{})
 	go func() {
 		close(buildStarted)
-		tarRC := newTrackingRC(bytes.NewReader([]byte("dummy-tar")))
+		tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
 		err := engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
 		buildDone <- err
 	}()
@@ -257,7 +257,7 @@ func TestRegression_BuildPruneSync_TestC_MultipleBuildsCompatibility(t *testing.
 
 		b1Done := make(chan error, 1)
 		go func() {
-			tarRC := newTrackingRC(bytes.NewReader([]byte("tar1")))
+			tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
 			b1Done <- engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
 		}()
 		<-b1Started
@@ -265,7 +265,7 @@ func TestRegression_BuildPruneSync_TestC_MultipleBuildsCompatibility(t *testing.
 		// Build 2 starts while Build 1 is in-flight: acquires RLock, then waits on semaphore
 		b2Done := make(chan error, 1)
 		go func() {
-			tarRC := newTrackingRC(bytes.NewReader([]byte("tar2")))
+			tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
 			b2Done <- engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
 		}()
 
@@ -348,7 +348,7 @@ func TestRegression_BuildPruneSync_TestC_MultipleBuildsCompatibility(t *testing.
 		for i := 0; i < 2; i++ {
 			go func() {
 				defer wg.Done()
-				tarRC := newTrackingRC(bytes.NewReader([]byte("tar")))
+				tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
 				err := engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
 				assert.NoError(t, err)
 			}()
@@ -415,7 +415,7 @@ func TestRegression_BuildPruneSync_TestD_LongRunningBuildSchedulerSafety(t *test
 	// 1. Long-running build starts (simulating e.g. 4-minute npm ci self-deployment)
 	buildDone := make(chan error, 1)
 	go func() {
-		tarRC := newTrackingRC(bytes.NewReader([]byte("dummy-context")))
+		tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
 		buildDone <- engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
 	}()
 

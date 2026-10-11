@@ -484,8 +484,22 @@ Container configuration is validated through authoritative unified boundaries in
   - **Periodic Garbage Collection:** Pruning expired build directories in `workDir` and dangling Docker images runs on a separate, less frequent background schedule (configurable via `FORGELAB_IMAGE_PRUNE_INTERVAL`, defaulting to 1 hour). Image pruning is never run directly inside the rapid 2-minute container reconciliation loop.
   - **Observable Diagnostics:** Failures during workspace removal or Docker image pruning (`dockerClient.ImagesPrune`) are explicitly logged with context and returned rather than silently swallowed.
 
-### 7. Docker Build Concurrency & Maintenance Synchronization
+### 7. Docker Build Concurrency, Slot Lifecycle & BuildKit Reliability
 - **Decoupled Concurrency:** ForgeLAB separates service deployment concurrency from Docker image build concurrency. Service deployments (source resolution, staging, container launch, and health checking) run concurrently, while `ImageBuild` calls are gated through a thread-safe `BuildSemaphore`.
+- **Upfront Build Slot Acquisition Ordering:** Build capacity MUST be acquired BEFORE opening expensive or unbuffered context generation/streaming connections (such as the Local Agent `/stream-context` HTTP response stream). Opening an HTTP response stream prior to acquiring the build slot results in idle network timeouts, TCP socket drops, and `unexpected EOF` errors when build slots are contested.
+- **Structured Queue Diagnostics & Ownership:** The `BuildSemaphore` tracks structured owner metadata (`deployment_id`, `service_deployment_id`, `service_name`, `phase`, `entered_queue_at`, `acquired_at`) and provides real-time progress reporting (`position`, `wait_duration`, current slot owner). Services waiting for build slots surface their position and current owner rather than hanging silently.
+- **Windows Named Pipe & BuildKit Context Submission Invariant:**
+  - On Windows hosts with Docker Desktop, the Docker client communicates via the named pipe `//./pipe/docker_engine`.
+  - Go's `net/http` client only populates `Request.ContentLength` when the request body is a `*bytes.Reader`, `*bytes.Buffer`, or `*strings.Reader`. When an `*os.File` or unseekable streaming wrapper is passed to `cli.ImageBuild`, `net/http` transmits the request body using `Transfer-Encoding: chunked`.
+  - Docker Desktop's named pipe proxy / BuildKit daemon on Windows frequently fails to unpack chunked tar request streams, reporting `failed to read dockerfile: archive/tar: invalid tar header`.
+  - Staging the completed, validated archive to disk and submitting it to `ImageBuild` as a memory-buffered `*bytes.Reader` (for contexts <= 512 MB) ensures `Content-Length` is explicitly set and chunked transfer encoding is disabled, guaranteeing 100% reliable BuildKit context parsing.
+- **Configurable Phase Timeouts:**
+  - Docker image compilation is governed by `FORGELAB_DOCKER_BUILD_TIMEOUT` (default: 45 minutes), replacing previous hardcoded 15-minute limits.
+  - Context staging, transfer deadlines, and queue waiting operate under independent timeouts, allowing actionable differentiation between source network aborts, Docker daemon timeouts, and application compilation failures.
+- **Exact Dockerfile Resolution:**
+  - `tararchive.ValidateTarArchive` and `extractDockerfileFromTar` enforce exact normalized relative path matching (e.g. `backend/Dockerfile` vs `frontend/Dockerfile` vs root `Dockerfile`), preventing collisions caused by basename matching.
+- **DAG Status Discrimination:**
+  - Downstream services whose prerequisites fail or do not meet required dependency conditions are marked as `models.DeployStatusSkipped` with the exact failing dependency and condition, never reported as failed builds.
 - **Configurable Concurrency Limit:** Build concurrency is configured via `FORGELAB_MAX_CONCURRENT_BUILDS` or `FORGELAB_MAX_DOCKER_BUILDS`. For local development and Docker Desktop environments, it defaults conservatively to `1` to avoid containerd snapshotter layer export collisions (`io.containerd.content.v1.content/ingest/` rename races).
 - **Safe Semaphore Lifecycles:** The `BuildSemaphore` guarantees slots are released on build success, daemon failure, timeout, or context cancellation without deadlocks or slot leaks.
 - **Mutual Build / Prune Synchronization Invariant:**
@@ -495,7 +509,6 @@ Container configuration is validated through authoritative unified boundaries in
   - **Core Invariant:** NO `ImagesPrune` may execute while ANY `ImageBuild` is in-flight. NO new `ImageBuild` may begin while `ImagesPrune` is actively executing.
   - **Prevention of Containerd Layer Ingest Collisions:** This synchronization directly eliminates the containerd error: `failed to export layer: CreateDiff: mount callback failed ... failed to commit: rename .../io.containerd.content.v1.content/ingest/<id>/data .../io.containerd.content.v1.content/blobs/sha256/<digest>: no such file or directory`, which occurred when the 2-minute maintenance loop triggered `ImagesPrune` concurrently with an active multi-minute Docker build.
 - **Error Classification & Diagnostics:** Errors returned during layer export (e.g. `CreateDiff`, `mount callback failed`, `io.containerd.content.v1.content`, `no such file or directory`) are classified as storage/daemon failures (`CategoryStorageDaemon`). The engine logs clear actionable diagnostics (inspecting Docker Desktop health, storage, and disk space) and queries non-sensitive Docker daemon info (Ping, ServerVersion, OS/Arch, StorageDriver) without leaking credentials or environment variables.
-- **Stream Lifecycle Integrity:** Build contexts are streamed through `io.Reader` (e.g. from the Local Agent). Because streams are consumed once sent to Docker and buffering repositories in memory is unsafe, failed builds fail cleanly once with diagnostic telemetry rather than attempting blind retries with an exhausted stream.
 
 ### 8. Local Agent Automatic `.env` Import & Precedence Rules
 - **Automatic Import:** During project creation from a local repository (via Local Agent), ForgeLAB inspects `.env` files and imports missing environment variables into the project's Environment Settings.

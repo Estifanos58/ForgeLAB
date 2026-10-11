@@ -386,6 +386,9 @@ func (s *GitHubService) HandleCallback(ctx context.Context, code, state, nonce s
 
 // Disconnect revokes repository integration by removing the encrypted credential.
 func (s *GitHubService) Disconnect(ctx context.Context, userID uuid.UUID) error {
+	if s.db == nil {
+		return nil
+	}
 	_, err := s.db.Exec(ctx, "DELETE FROM github_integrations WHERE user_id = $1", userID)
 	if err != nil {
 		return fmt.Errorf("failed to delete github integration: %w", err)
@@ -502,9 +505,21 @@ func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, re
 
 // ListRepositories retrieves repositories accessible to the user via their GitHub authorization.
 func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, page, perPage int) ([]GitHubRepo, bool, error) {
-	token, _, err := s.getDecryptedTokenAndScope(ctx, userID)
+	token, scope, err := s.getDecryptedTokenAndScope(ctx, userID)
 	if err != nil {
 		return nil, false, err
+	}
+
+	scopes := parseOAuthScopes(scope)
+	hasRepoScope := false
+	for _, sc := range scopes {
+		if sc == "repo" {
+			hasRepoScope = true
+			break
+		}
+	}
+	if !hasRepoScope && len(scopes) > 0 {
+		return nil, false, ErrGitHubNeedsReauth
 	}
 
 	if page < 1 {

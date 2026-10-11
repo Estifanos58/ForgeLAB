@@ -134,6 +134,12 @@ func TestRegression_NoDuplicateBuildExecutionWithConsumedTarStream(t *testing.T)
 	buildCalls := atomic.Int32{}
 
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/_ping" || r.URL.Path == "/v1.41/_ping" {
+			w.Header().Set("API-Version", "1.41")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+			return
+		}
 		buildCalls.Add(1)
 		// Read body to consume it
 		_, _ = io.ReadAll(r.Body)
@@ -151,7 +157,7 @@ func TestRegression_NoDuplicateBuildExecutionWithConsumedTarStream(t *testing.T)
 	defer cli.Close()
 
 	engine := &Engine{dockerClient: cli}
-	tarRC := newTrackingRC(bytes.NewReader([]byte("dummy-tar-content")))
+	tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
 
 	// Initial build attempt
 	err = engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})

@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	ErrBuildContextTooLarge     = errors.New("build context exceeds maximum allowed total size limit")
+	ErrBuildContextTooLarge     = errors.New("build context exceeds maximum allowed total context size limit")
 	ErrBuildContextTooManyFiles = errors.New("build context exceeds maximum allowed file count limit")
 	ErrBuildContextFileTooLarge = errors.New("build context contains a file exceeding maximum allowed single file size limit")
 	ErrBuildContextAccessDenied = errors.New("build context file access denied or security violation during traversal")
@@ -324,9 +324,11 @@ func ValidateTarArchive(r io.Reader, requiredFile string) error {
 		}
 
 		cleanEntry := path.Clean(filepath.ToSlash(strings.TrimPrefix(hdr.Name, "./")))
-		if cleanEntry == cleanRequired || strings.HasSuffix(cleanEntry, "/"+cleanRequired) {
-			foundRequired = true
-		} else if filepath.Base(cleanEntry) == filepath.Base(cleanRequired) {
+		if strings.HasPrefix(cleanEntry, "/") || strings.HasPrefix(cleanEntry, "../") || cleanEntry == ".." {
+			return fmt.Errorf("%w: entry %q contains path traversal", ErrTarCorrupted, hdr.Name)
+		}
+
+		if cleanEntry == cleanRequired {
 			foundRequired = true
 		}
 
@@ -402,10 +404,44 @@ func StageAndValidateArchiveStream(ctx context.Context, tempDir string, src io.R
 		return nil, fmt.Errorf("failed to allocate temporary staged archive file: %w", err)
 	}
 
-	if _, err := io.Copy(tmpFile, src); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
-		return nil, fmt.Errorf("failed receiving build context stream: %w", err)
+	maxBytes := getEnvInt64("BUILD_CONTEXT_MAX_BYTES", 500*1024*1024)
+	buf := make([]byte, 64*1024)
+	var totalRead int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+			return nil, fmt.Errorf("build context transfer cancelled: %w", ctx.Err())
+		default:
+		}
+
+		n, rErr := src.Read(buf)
+		if n > 0 {
+			totalRead += int64(n)
+			if totalRead > maxBytes {
+				_ = tmpFile.Close()
+				_ = os.Remove(tmpFile.Name())
+				return nil, fmt.Errorf("%w (limit: %d bytes exceeded while staging stream)", ErrBuildContextTooLarge, maxBytes)
+			}
+			if _, wErr := tmpFile.Write(buf[:n]); wErr != nil {
+				_ = tmpFile.Close()
+				_ = os.Remove(tmpFile.Name())
+				return nil, fmt.Errorf("failed writing staged build context archive: %w", wErr)
+			}
+		}
+		if rErr != nil {
+			if errors.Is(rErr, io.EOF) {
+				break
+			}
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+			if errors.Is(rErr, context.Canceled) || errors.Is(rErr, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("build context transfer timed out or cancelled: %w", rErr)
+			}
+			return nil, fmt.Errorf("failed receiving build context stream: %w", rErr)
+		}
 	}
 
 	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {

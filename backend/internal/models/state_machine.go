@@ -14,6 +14,7 @@ var AllowedTransitions = map[string]map[string]bool{
 	DeployStatusQueued: {
 		DeployStatusCloning: true,
 		DeployStatusFailed:  true,
+		DeployStatusSkipped: true,
 	},
 	DeployStatusCloning: {
 		DeployStatusBuilding: true,
@@ -44,7 +45,8 @@ var AllowedTransitions = map[string]map[string]bool{
 		DeployStatusRunning: true,
 		DeployStatusFailed:  true,
 	},
-	DeployStatusFailed: {}, // Terminal
+	DeployStatusFailed:  {}, // Terminal
+	DeployStatusSkipped: {}, // Terminal
 }
 
 // ValidateStateTransition checks whether transitioning from currentStatus to nextStatus is valid.

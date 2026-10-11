@@ -940,4 +940,85 @@ Verify the secure local agent credential flow: agent session creation, encrypted
 - **Environment:** —
 - **Notes:** —
 
+---
+
+### Procedure 16: Multi-Service Concurrency, Build-Slot Queueing, and BuildKit Deployment Reliability
+
+#### Purpose
+Verify the end-to-end reliability of multi-service deployments on Windows with Docker Desktop:
+1. Docker build slot serialization under concurrency limit 1 without deadlock.
+2. Queue progress visibility (queue position, elapsed wait time, and current active slot owner).
+3. Elimination of premature HTTP connection opening to the local agent before slot acquisition.
+4. Reliable BuildKit context unpacking over Windows named pipes (`//./pipe/docker_engine`) without `invalid tar header` corruption.
+5. Shared build artifact coordination and migration job completion gating (`service_completed_successfully`).
+6. Accurate DAG dependency skip transitions (`models.DeployStatusSkipped`) instead of reporting skipped services as build failures.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- Windows 10/11 host running Docker Desktop 4.29+ with Linux containers (WSL2 / Hyper-V backend).
+- Docker named pipe active at `//./pipe/docker_engine`.
+- ForgeLAB agent running: `cd backend && go run cmd/agent/main.go` on `http://127.0.0.1:4142`.
+- Central ForgeLAB control plane running: `cd backend && go run cmd/server/main.go` on `http://localhost:8080`.
+- PostgreSQL and Redis containers active.
+
+#### Test Procedure 16.1 — Two Services Waiting for Docker Build Slots (Scenario A/B Concurrency)
+1. Configure build concurrency limit to 1:
+   ```powershell
+   $env:FORGELAB_MAX_CONCURRENT_BUILDS = "1"
+   ```
+2. Import a project with two independent buildable services (e.g. `ccms-backend` and `ccms-frontend`).
+3. Trigger a full release deployment.
+4. Observe the live deployment logs in the dashboard or WebSocket stream:
+   - Service 1 enters the build queue and immediately acquires the Docker build slot:
+     ```text
+     [BUILD] Service 'ccms-backend' waiting for Docker build slot...
+     [BUILD] Docker build slot acquired.
+     [BUILD] Docker build started (timeout: 45m0s).
+     ```
+   - Service 2 enters the queue and reports its position and current owner rather than hanging or opening a stream prematurely:
+     ```text
+     [BUILD] Service 'ccms-frontend' waiting for Docker build slot...
+     [BUILD] Queued for Docker build slot: position 1, elapsed 5s (currently held by service 'ccms-backend' in phase 'docker_build')
+     ```
+   - No HTTP connection to `/api/agent/sources/<id>/stream-context` is opened for Service 2 while it is queued.
+5. Once Service 1 completes, verify Service 2 immediately acquires the slot, requests its context stream, builds, and starts.
+6. Verify both containers become healthy and active build slots return to 0.
+
+#### Test Procedure 16.2 — ForgeLAB Self-Deployment (Scenario A Shared Image & BuildKit)
+1. In the ForgeLAB dashboard, select the ForgeLAB root repository containing `docker-compose.yml`.
+2. Inspect detected services: `postgres`, `redis`, `migrate`, `backend`, `frontend`.
+3. Verify `migrate` and `backend` both share the image `forgelab-backend:latest` with build context `./backend`.
+4. Trigger the release deployment.
+5. Expected chronological execution log:
+   - Tier 1: `postgres` and `redis` start and pass health checks.
+   - Tier 2: `migrate` acquires the build slot and compiles `./backend/Dockerfile` using BuildKit (`builder_version=2`).
+     - Staged archive is submitted with exact `Content-Length` via memory buffering.
+     - BuildKit unpacks context cleanly without `archive/tar: invalid tar header`.
+     - Container `forgelab-migrate` runs `./forgelab-migrate up` and exits with code 0 (`service_completed_successfully`).
+   - Tier 3: `backend` starts using the pre-built `forgelab-backend:latest` image without triggering an unnecessary redundant build, passes health check on `:8080/health`.
+   - Tier 4: `frontend` builds from `./frontend/Dockerfile`, starts, and passes health check on `:3000`.
+6. Confirm the overall release status transitions to `running`.
+
+#### Test Procedure 16.3 — Stream Interruption and Cancellation Recovery
+1. Start a deployment of a service with a large context.
+2. During context transfer, abruptly terminate the agent process (`Ctrl+C` in agent console).
+3. Observe backend log:
+   - Backend reports: `failed receiving build context stream: unexpected EOF`.
+   - Staged temporary archive file in `os.TempDir()` is deleted immediately.
+   - Build slot is released immediately (`active_count: 0`).
+4. Restart agent and re-trigger deployment; verify it proceeds immediately without permanent queue blockage or permit leaks.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+
 

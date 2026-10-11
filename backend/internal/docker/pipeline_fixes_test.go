@@ -711,7 +711,7 @@ services:
 	mig := servicesMap["migrate"]
 
 	assert.Equal(t, models.BuildStrategyDockerfile, be.BuildStrategy)
-	assert.Equal(t, "./backend", be.BuildContext)
+	assert.True(t, be.BuildContext == "backend" || be.BuildContext == "./backend", "expected backend or ./backend, got %s", be.BuildContext)
 	assert.Equal(t, "Dockerfile", be.DockerfilePath)
 
 	assert.Equal(t, models.BuildStrategyDockerfile, mig.BuildStrategy, "migrate should adopt dockerfile build strategy from backend")

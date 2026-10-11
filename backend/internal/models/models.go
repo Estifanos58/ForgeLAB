@@ -410,7 +410,7 @@ func IsDeploymentActiveStatus(status string) bool {
 // IsDeploymentTerminalStatus returns true for final/completed deployment statuses.
 func IsDeploymentTerminalStatus(status string) bool {
 	switch status {
-	case DeployStatusRunning, DeployStatusStopped, DeployStatusCrashed, DeployStatusFailed:
+	case DeployStatusRunning, DeployStatusStopped, DeployStatusCrashed, DeployStatusFailed, DeployStatusSkipped:
 		return true
 	}
 	return false
@@ -461,6 +461,7 @@ const (
 	DeployStatusStopped        = "stopped"
 	DeployStatusCrashed        = "crashed"
 	DeployStatusFailed         = "failed"
+	DeployStatusSkipped        = "skipped"
 )
 
 // EnvironmentVariable represents a project environment variable or secret.
