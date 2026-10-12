@@ -953,22 +953,54 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			e.buildSem.UpdatePhase(slotID, "context_transfer")
 			execCtx = context.WithValue(execCtx, buildSlotContextKey, slotID)
 
-			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?%s",
-				baseURL,
-				project.SourceReference,
-				agentQuery.Encode(),
-			)
-			req, reqErr := http.NewRequestWithContext(execCtx, http.MethodGet, agentURL, nil)
-			if reqErr != nil {
-				reason := fmt.Sprintf("Failed to request agent stream context: %v", reqErr)
-				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-				emitStatus(models.DeployStatusFailed, nil, &reason)
-				return errors.New(reason)
+			candidateBases := make([]string, 0, 8)
+			if baseURL != "" {
+				candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
 			}
-			req.Header.Set("Authorization", "Bearer "+agentToken)
-			req.Header.Set("X-Agent-Session-Token", agentToken)
-			resp, httpErr := http.DefaultClient.Do(req)
-			if httpErr != nil || resp.StatusCode != http.StatusOK {
+			for _, cb := range agent.ResolveCandidateBaseURLs() {
+				found := false
+				for _, c := range candidateBases {
+					if c == cb {
+						found = true
+						break
+					}
+				}
+				if !found {
+					candidateBases = append(candidateBases, cb)
+				}
+			}
+
+			var resp *http.Response
+			var httpErr error
+			for _, candBase := range candidateBases {
+				agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?%s",
+					candBase,
+					project.SourceReference,
+					agentQuery.Encode(),
+				)
+				req, reqErr := http.NewRequestWithContext(execCtx, http.MethodGet, agentURL, nil)
+				if reqErr != nil {
+					continue
+				}
+				req.Header.Set("Authorization", "Bearer "+agentToken)
+				req.Header.Set("X-Agent-Session-Token", agentToken)
+				r, err := http.DefaultClient.Do(req)
+				if err == nil {
+					resp = r
+					httpErr = nil
+					if r.StatusCode == http.StatusOK {
+						break
+					}
+					if r.StatusCode == http.StatusUnauthorized || r.StatusCode == http.StatusForbidden || r.StatusCode == http.StatusNotFound {
+						break
+					}
+					_ = r.Body.Close()
+				} else {
+					httpErr = err
+				}
+			}
+
+			if httpErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
 				reason := "Failed to stream source from local agent"
 				if httpErr != nil {
 					reason = httpErr.Error()
@@ -1278,6 +1310,53 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 	}
 
+	// Auto-heal missing environment variables for local agent projects:
+	if len(runtimeEnvMap) == 0 && e.projectService != nil && project.SourceType == models.SourceTypeLocalAgent {
+		if importedCount, err := e.projectService.ImportProjectEnvironment(execCtx, project, project.OwnerID); err == nil && importedCount > 0 {
+			if e.secretService != nil {
+				if reloaded, _, err := e.secretService.GetDecryptedEnvMap(execCtx, project.ID, &service.ID, models.EnvScopeRuntime); err == nil && len(reloaded) > 0 {
+					runtimeEnvMap = reloaded
+				}
+			}
+		}
+	}
+
+	// Supply necessary container initialization variables for infrastructure services if missing
+	svcNameLower := strings.ToLower(service.Name)
+	svcImageLower := strings.ToLower(service.Image)
+	isCurrentPostgres := strings.Contains(svcNameLower, "postgres") || strings.Contains(svcImageLower, "postgres")
+	if isCurrentPostgres {
+		if runtimeEnvMap == nil {
+			runtimeEnvMap = make(map[string]string)
+		}
+		if _, hasPass := runtimeEnvMap["POSTGRES_PASSWORD"]; !hasPass {
+			if _, hasAuth := runtimeEnvMap["POSTGRES_HOST_AUTH_METHOD"]; !hasAuth {
+				runtimeEnvMap["POSTGRES_PASSWORD"] = "forgelab_dev_password"
+			}
+		}
+		if _, hasUser := runtimeEnvMap["POSTGRES_USER"]; !hasUser {
+			runtimeEnvMap["POSTGRES_USER"] = "forgelab"
+		}
+		if _, hasDB := runtimeEnvMap["POSTGRES_DB"]; !hasDB {
+			runtimeEnvMap["POSTGRES_DB"] = "forgelab"
+		}
+	}
+
+	isCurrentMySQL := strings.Contains(svcNameLower, "mysql") || strings.Contains(svcNameLower, "mariadb") || strings.Contains(svcImageLower, "mysql") || strings.Contains(svcImageLower, "mariadb")
+	if isCurrentMySQL {
+		if runtimeEnvMap == nil {
+			runtimeEnvMap = make(map[string]string)
+		}
+		if _, hasPass := runtimeEnvMap["MYSQL_ROOT_PASSWORD"]; !hasPass {
+			if _, hasEmpty := runtimeEnvMap["MYSQL_ALLOW_EMPTY_PASSWORD"]; !hasEmpty {
+				runtimeEnvMap["MYSQL_ROOT_PASSWORD"] = "root"
+			}
+		}
+		if _, hasDB := runtimeEnvMap["MYSQL_DATABASE"]; !hasDB {
+			runtimeEnvMap["MYSQL_DATABASE"] = "forgelab"
+		}
+	}
+
 	svcEnv := make([]string, 0, len(runtimeEnvMap)+len(allProjectServices)*4+4)
 	for k, v := range runtimeEnvMap {
 		trimmedV := strings.TrimSpace(v)
@@ -1370,17 +1449,14 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	if len(serviceNetworks) > 0 {
 		for i, net := range serviceNetworks {
 			projNet := fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
-			if e.dockerClient != nil {
-				_, netErr := e.dockerClient.NetworkInspect(execCtx, projNet, dockernetwork.InspectOptions{})
-				if netErr != nil {
-					_, _ = e.dockerClient.NetworkCreate(execCtx, projNet, dockernetwork.CreateOptions{
-						Driver: "bridge",
-						Labels: map[string]string{
-							"forgelab.project_id": project.ID.String(),
-							"forgelab.network":    net,
-						},
-					})
-				}
+			if err := e.EnsureNetwork(execCtx, projNet, map[string]string{
+				"forgelab.project_id": project.ID.String(),
+				"forgelab.network":    net,
+			}); err != nil {
+				reason := fmt.Sprintf("Failed to initialize service network '%s': %v", projNet, err)
+				emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
 			}
 			if i == 0 {
 				primaryNetworkName = projNet
@@ -1392,16 +1468,13 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	// Always ensure common project network is present so all services in the project can resolve each other via DNS aliases
 	commonProjectNet := fmt.Sprintf("forgelab-net-%s", project.ID.String())
-	if e.dockerClient != nil {
-		_, netErr := e.dockerClient.NetworkInspect(execCtx, commonProjectNet, dockernetwork.InspectOptions{})
-		if netErr != nil {
-			_, _ = e.dockerClient.NetworkCreate(execCtx, commonProjectNet, dockernetwork.CreateOptions{
-				Driver: "bridge",
-				Labels: map[string]string{
-					"forgelab.project_id": project.ID.String(),
-				},
-			})
-		}
+	if err := e.EnsureNetwork(execCtx, commonProjectNet, map[string]string{
+		"forgelab.project_id": project.ID.String(),
+	}); err != nil {
+		reason := fmt.Sprintf("Failed to initialize common project network '%s': %v", commonProjectNet, err)
+		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
 	}
 	if primaryNetworkName == "" {
 		primaryNetworkName = commonProjectNet
@@ -1606,6 +1679,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		return errors.New(reason)
 	}
 
+	if primaryNetworkName != "" {
+		hostConfig.NetworkMode = container.NetworkMode(primaryNetworkName)
+	}
+
 	netConfig := &dockernetwork.NetworkingConfig{
 		EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
 			primaryNetworkName: {
@@ -1632,9 +1709,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	// Connect to any secondary isolated project networks
 	for _, secNet := range secondaryNetworkNames {
 		if e.dockerClient != nil {
-			_ = e.dockerClient.NetworkConnect(execCtx, secNet, resp.ID, &dockernetwork.EndpointSettings{
+			if netConnErr := e.dockerClient.NetworkConnect(execCtx, secNet, resp.ID, &dockernetwork.EndpointSettings{
 				Aliases: []string{service.Name},
-			})
+			}); netConnErr != nil {
+				slog.Warn("failed to connect secondary network", "network", secNet, "service", service.Name, "error", netConnErr)
+			}
 		}
 	}
 
@@ -1924,6 +2003,38 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		updateReleaseStatus(models.DeployStatusFailed, &reason)
 		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 		return errors.New(reason)
+	}
+
+	// Proactively initialize common project mesh network and any declared service networks before executing DAG tiers
+	commonProjectNet := fmt.Sprintf("forgelab-net-%s", project.ID.String())
+	if err := e.EnsureNetwork(execCtx, commonProjectNet, map[string]string{
+		"forgelab.project_id": project.ID.String(),
+	}); err != nil {
+		reason := fmt.Sprintf("Failed to initialize project network mesh '%s': %v", commonProjectNet, err)
+		updateReleaseStatus(models.DeployStatusFailed, &reason)
+		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+		return errors.New(reason)
+	}
+
+	for _, sd := range svcDeploys {
+		var sNets []string
+		if len(sd.Networks) > 0 {
+			sNets = sd.Networks
+		} else if svc, ok := servicesMap[sd.ServiceName]; ok && len(svc.Networks) > 0 {
+			sNets = svc.Networks
+		}
+		for _, net := range sNets {
+			projNet := fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
+			if err := e.EnsureNetwork(execCtx, projNet, map[string]string{
+				"forgelab.project_id": project.ID.String(),
+				"forgelab.network":    net,
+			}); err != nil {
+				reason := fmt.Sprintf("Failed to initialize service network '%s': %v", projNet, err)
+				updateReleaseStatus(models.DeployStatusFailed, &reason)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				return errors.New(reason)
+			}
+		}
 	}
 
 	var (
@@ -2286,29 +2397,63 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			e.buildSem.UpdatePhase(slotID, "context_transfer")
 			ctx = context.WithValue(ctx, buildSlotContextKey, slotID)
 
-			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s&package_manager=%s",
-				baseURL,
-				project.SourceReference,
-				url.QueryEscape(cleanRelPath),
-				url.QueryEscape(deployment.RuntimeType),
-				deployment.InternalPort,
-				url.QueryEscape(deployment.StartCommand),
-				url.QueryEscape(pkgManager),
-			)
-			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-			if reqErr != nil {
-				reason := fmt.Sprintf("Failed to request agent stream context: %v", reqErr)
-				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-				updateStatus(models.DeployStatusFailed, &reason)
-				return errors.New(reason)
+			candidateBases := make([]string, 0, 8)
+			if baseURL != "" {
+				candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
 			}
-			req.Header.Set("Authorization", "Bearer "+agentToken)
-			req.Header.Set("X-Agent-Session-Token", agentToken)
-			resp, httpErr := http.DefaultClient.Do(req)
-			if httpErr != nil || resp.StatusCode != http.StatusOK {
+			for _, cb := range agent.ResolveCandidateBaseURLs() {
+				found := false
+				for _, c := range candidateBases {
+					if c == cb {
+						found = true
+						break
+					}
+				}
+				if !found {
+					candidateBases = append(candidateBases, cb)
+				}
+			}
+
+			var resp *http.Response
+			var httpErr error
+			for _, candBase := range candidateBases {
+				agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s&package_manager=%s",
+					candBase,
+					project.SourceReference,
+					url.QueryEscape(cleanRelPath),
+					url.QueryEscape(deployment.RuntimeType),
+					deployment.InternalPort,
+					url.QueryEscape(deployment.StartCommand),
+					url.QueryEscape(pkgManager),
+				)
+				req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+				if reqErr != nil {
+					continue
+				}
+				req.Header.Set("Authorization", "Bearer "+agentToken)
+				req.Header.Set("X-Agent-Session-Token", agentToken)
+				r, err := http.DefaultClient.Do(req)
+				if err == nil {
+					resp = r
+					httpErr = nil
+					if r.StatusCode == http.StatusOK {
+						break
+					}
+					if r.StatusCode == http.StatusUnauthorized || r.StatusCode == http.StatusForbidden || r.StatusCode == http.StatusNotFound {
+						break
+					}
+					_ = r.Body.Close()
+				} else {
+					httpErr = err
+				}
+			}
+
+			if httpErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
 				reason := "Failed to stream source from local agent"
 				if httpErr != nil {
 					reason = httpErr.Error()
+				} else if resp != nil {
+					reason = fmt.Sprintf("Agent returned HTTP %d", resp.StatusCode)
 				}
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 				updateStatus(models.DeployStatusFailed, &reason)
@@ -2523,6 +2668,48 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	if e.secretService != nil {
 		envMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeRuntime)
 	}
+
+	if len(envMap) == 0 && e.projectService != nil && project.SourceType == models.SourceTypeLocalAgent {
+		if importedCount, err := e.projectService.ImportProjectEnvironment(ctx, project, project.OwnerID); err == nil && importedCount > 0 {
+			if e.secretService != nil {
+				if reloaded, _, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeRuntime); err == nil && len(reloaded) > 0 {
+					envMap = reloaded
+				}
+			}
+		}
+	}
+
+	projNameLower := strings.ToLower(project.Name)
+	if strings.Contains(projNameLower, "postgres") {
+		if envMap == nil {
+			envMap = make(map[string]string)
+		}
+		if _, hasPass := envMap["POSTGRES_PASSWORD"]; !hasPass {
+			if _, hasAuth := envMap["POSTGRES_HOST_AUTH_METHOD"]; !hasAuth {
+				envMap["POSTGRES_PASSWORD"] = "forgelab_dev_password"
+			}
+		}
+		if _, hasUser := envMap["POSTGRES_USER"]; !hasUser {
+			envMap["POSTGRES_USER"] = "forgelab"
+		}
+		if _, hasDB := envMap["POSTGRES_DB"]; !hasDB {
+			envMap["POSTGRES_DB"] = "forgelab"
+		}
+	}
+	if strings.Contains(projNameLower, "mysql") || strings.Contains(projNameLower, "mariadb") {
+		if envMap == nil {
+			envMap = make(map[string]string)
+		}
+		if _, hasPass := envMap["MYSQL_ROOT_PASSWORD"]; !hasPass {
+			if _, hasEmpty := envMap["MYSQL_ALLOW_EMPTY_PASSWORD"]; !hasEmpty {
+				envMap["MYSQL_ROOT_PASSWORD"] = "root"
+			}
+		}
+		if _, hasDB := envMap["MYSQL_DATABASE"]; !hasDB {
+			envMap["MYSQL_DATABASE"] = "forgelab"
+		}
+	}
+
 	envSlice := make([]string, 0, len(envMap)+1)
 	for k, v := range envMap {
 		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
@@ -2883,12 +3070,14 @@ func (e *Engine) CleanUpProjectContainers(ctx context.Context, projectID uuid.UU
 	}
 
 	// 1. Clean up legacy single-container deployment containers
-	deployments, err := e.deploymentService.ListDeployments(ctx, projectID)
-	if err == nil {
-		for _, d := range deployments {
-			if d.ContainerID != nil && *d.ContainerID != "" {
-				_ = e.dockerClient.ContainerStop(ctx, *d.ContainerID, container.StopOptions{})
-				_ = e.dockerClient.ContainerRemove(ctx, *d.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+	if e.deploymentService != nil {
+		deployments, err := e.deploymentService.ListDeployments(ctx, projectID)
+		if err == nil {
+			for _, d := range deployments {
+				if d.ContainerID != nil && *d.ContainerID != "" {
+					_ = e.dockerClient.ContainerStop(ctx, *d.ContainerID, container.StopOptions{})
+					_ = e.dockerClient.ContainerRemove(ctx, *d.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+				}
 			}
 		}
 	}
@@ -2900,6 +3089,20 @@ func (e *Engine) CleanUpProjectContainers(ctx context.Context, projectID uuid.UU
 			if svc.ContainerID != nil && *svc.ContainerID != "" {
 				_ = e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{})
 				_ = e.dockerClient.ContainerRemove(ctx, *svc.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+			}
+		}
+	}
+
+	// 3. Clean up project networks
+	nets, netListErr := e.dockerClient.NetworkList(ctx, dockernetwork.ListOptions{})
+	if netListErr == nil {
+		projPrefix := fmt.Sprintf("forgelab-net-%s", projectID.String())
+		projShortPrefix := fmt.Sprintf("forgelab-net-%s", projectID.String()[:8])
+		for _, n := range nets {
+			if (n.Labels != nil && n.Labels["forgelab.project_id"] == projectID.String()) ||
+				strings.HasPrefix(n.Name, projPrefix) ||
+				strings.HasPrefix(n.Name, projShortPrefix) {
+				_ = e.dockerClient.NetworkRemove(ctx, n.ID)
 			}
 		}
 	}
@@ -3110,6 +3313,9 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 		slog.Info("reconciliation completed: cleaned up orphaned containers", "count", orphansCleaned)
 	}
 
+	// 5. Prune orphaned ForgeLAB networks with zero connected containers
+	_ = e.PruneDanglingNetworks(ctx)
+
 	return nil
 }
 
@@ -3157,6 +3363,13 @@ func (e *Engine) PruneDanglingResources(ctx context.Context, maxBuildAge time.Du
 		}
 	}
 
+	// 3. Prune dangling/orphaned ForgeLAB networks with zero active containers
+	if e.dockerClient != nil {
+		if err := e.PruneDanglingNetworks(ctx); err != nil {
+			pruneErrs = append(pruneErrs, err)
+		}
+	}
+
 	if len(pruneErrs) > 0 {
 		return errors.Join(pruneErrs...)
 	}
@@ -3190,6 +3403,96 @@ func (e *Engine) pruneDanglingImages(ctx context.Context) error {
 	}
 
 	slog.Info("docker image prune completed", "deleted_count", len(report.ImagesDeleted), "space_reclaimed_bytes", report.SpaceReclaimed)
+	return nil
+}
+
+// EnsureNetwork guarantees a Docker network exists with the given name and labels.
+// It handles race conditions (already exists / conflict) and performs automatic self-healing
+// pruning if the Docker daemon's IPAM default address pool is exhausted.
+func (e *Engine) EnsureNetwork(ctx context.Context, networkName string, labels map[string]string) error {
+	if e.dockerClient == nil {
+		return nil
+	}
+
+	// 1. Fast check: already exists?
+	_, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{})
+	if inspectErr == nil {
+		return nil
+	}
+
+	// 2. Attempt creation
+	createOpts := dockernetwork.CreateOptions{
+		Driver: "bridge",
+		Labels: labels,
+	}
+
+	_, err := e.dockerClient.NetworkCreate(ctx, networkName, createOpts)
+	if err == nil {
+		return nil
+	}
+
+	// 3. Handle conflict / already exists (concurrent worker created it)
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
+		if _, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{}); inspectErr == nil {
+			return nil
+		}
+	}
+
+	// 4. Handle pool exhaustion / overlap: self-heal by pruning orphaned unattached forgelab networks
+	if strings.Contains(errStr, "pool") || strings.Contains(errStr, "address") || strings.Contains(errStr, "overlap") {
+		slog.Warn("docker network pool exhaustion detected; pruning orphaned networks", "network", networkName, "error", err)
+		_ = e.PruneDanglingNetworks(ctx)
+		// Retry creation once after pruning
+		_, retryErr := e.dockerClient.NetworkCreate(ctx, networkName, createOpts)
+		if retryErr == nil {
+			slog.Info("successfully created network after pruning orphaned networks", "network", networkName)
+			return nil
+		}
+		if strings.Contains(strings.ToLower(retryErr.Error()), "already exists") || strings.Contains(strings.ToLower(retryErr.Error()), "conflict") {
+			if _, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{}); inspectErr == nil {
+				return nil
+			}
+		}
+		err = retryErr
+	}
+
+	return fmt.Errorf("failed to create network '%s': %w", networkName, err)
+}
+
+// PruneDanglingNetworks cleans up orphaned ForgeLAB bridge networks that have zero connected containers.
+func (e *Engine) PruneDanglingNetworks(ctx context.Context) error {
+	if e.dockerClient == nil {
+		return nil
+	}
+
+	nets, err := e.dockerClient.NetworkList(ctx, dockernetwork.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list networks for pruning: %w", err)
+	}
+
+	for _, n := range nets {
+		// Only touch networks created by ForgeLAB
+		isForgeLabNet := strings.HasPrefix(n.Name, "forgelab-net-") || (n.Labels != nil && n.Labels["forgelab.project_id"] != "")
+		if !isForgeLabNet {
+			continue
+		}
+
+		// Inspect network to verify no active containers are attached
+		insp, inspectErr := e.dockerClient.NetworkInspect(ctx, n.ID, dockernetwork.InspectOptions{})
+		if inspectErr != nil {
+			continue
+		}
+		if len(insp.Containers) == 0 {
+			if removeErr := e.dockerClient.NetworkRemove(ctx, n.ID); removeErr == nil {
+				shortID := n.ID
+				if len(shortID) > 12 {
+					shortID = shortID[:12]
+				}
+				slog.Info("pruned orphaned forgelab network", "network_id", shortID, "network_name", n.Name)
+			}
+		}
+	}
 	return nil
 }
 

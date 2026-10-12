@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,76 @@ import (
 
 // ErrAgentSessionUnavailable indicates the local agent session was not found or has expired.
 var ErrAgentSessionUnavailable = errors.New("Local agent source session is unavailable or expired. Please reselect the folder.")
+
+// getDefaultGateway extracts the IPv4 default gateway from /proc/net/route in containerized Linux environments.
+func getDefaultGateway() string {
+	file, err := os.Open("/proc/net/route")
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 3 && fields[1] == "00000000" {
+			d, err := hex.DecodeString(fields[2])
+			if err == nil && len(d) == 4 {
+				// IPv4 little-endian order: 010012AC -> 172.18.0.1
+				return fmt.Sprintf("%d.%d.%d.%d", d[3], d[2], d[1], d[0])
+			}
+		}
+	}
+	return ""
+}
+
+// ResolveCandidateBaseURLs returns prioritized candidate base URLs for reaching the local agent.
+func ResolveCandidateBaseURLs() []string {
+	var candidates []string
+	add := func(u string) {
+		trimmed := strings.TrimRight(strings.TrimSpace(u), "/")
+		if trimmed == "" {
+			return
+		}
+		if !strings.HasPrefix(trimmed, "http://") && !strings.HasPrefix(trimmed, "https://") {
+			trimmed = "http://" + trimmed
+		}
+		for _, c := range candidates {
+			if c == trimmed {
+				return
+			}
+		}
+		candidates = append(candidates, trimmed)
+	}
+
+	if u := os.Getenv("FORGELAB_AGENT_URL"); u != "" {
+		add(u)
+	}
+	if h := os.Getenv("FORGELAB_AGENT_HOST"); h != "" {
+		add(h)
+	}
+
+	// 1. Docker Desktop for Windows / macOS host gateway IP (accessible from Linux containers)
+	add("http://192.168.65.254:4142")
+	add("http://192.168.65.2:4142")
+
+	// 2. Container network default gateway from /proc/net/route
+	if gw := getDefaultGateway(); gw != "" {
+		add(fmt.Sprintf("http://%s:4142", gw))
+	}
+
+	// 3. host.docker.internal (works if extra_hosts: host.docker.internal:host-gateway is set)
+	add("http://host.docker.internal:4142")
+
+	// 4. Default bridge gateway
+	add("http://172.17.0.1:4142")
+
+	// 5. Direct localhost (for non-docker backend setups)
+	add("http://127.0.0.1:4142")
+	add("http://localhost:4142")
+
+	return candidates
+}
 
 // ResolveBaseURL dynamically resolves the local agent URL, handling containerized backend setups.
 func ResolveBaseURL() string {
@@ -36,40 +108,34 @@ func ResolveBaseURL() string {
 		return trimmed
 	}
 
-	// 1. Check if running inside container (/.dockerenv exists)
-	if _, err := os.Stat("/.dockerenv"); err == nil {
-		conn, err := net.DialTimeout("tcp", "host.docker.internal:4142", 1000*time.Millisecond)
+	candidates := ResolveCandidateBaseURLs()
+	for _, cand := range candidates {
+		raw := strings.TrimPrefix(strings.TrimPrefix(cand, "http://"), "https://")
+		conn, err := net.DialTimeout("tcp", raw, 200*time.Millisecond)
 		if err == nil {
 			conn.Close()
-			return "http://host.docker.internal:4142"
+			return cand
 		}
 	}
 
-	// 2. Try 127.0.0.1:4142 (local non-docker backend)
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:4142", 1000*time.Millisecond)
-	if err == nil {
-		conn.Close()
-		return "http://127.0.0.1:4142"
-	}
-
-	// 3. Try localhost:4142
-	conn, err = net.DialTimeout("tcp", "localhost:4142", 1000*time.Millisecond)
-	if err == nil {
-		conn.Close()
-		return "http://localhost:4142"
-	}
-
-	// 4. Try host.docker.internal:4142
-	conn, err = net.DialTimeout("tcp", "host.docker.internal:4142", 1000*time.Millisecond)
-	if err == nil {
-		conn.Close()
-		return "http://host.docker.internal:4142"
-	}
-
-	// Final container check
+	// Fallback when no active probe succeeded:
+	isContainer := false
 	if _, err := os.Stat("/.dockerenv"); err == nil {
-		return "http://host.docker.internal:4142"
+		isContainer = true
 	}
+	if !isContainer {
+		if gw := getDefaultGateway(); gw != "" {
+			isContainer = true
+		}
+	}
+
+	if isContainer {
+		if ips, err := net.LookupHost("host.docker.internal"); err == nil && len(ips) > 0 {
+			return "http://host.docker.internal:4142"
+		}
+		return "http://192.168.65.254:4142"
+	}
+
 	return "http://127.0.0.1:4142"
 }
 
@@ -85,24 +151,33 @@ func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUI
 		}
 	}
 
-	candidateBases := make([]string, 0, 4)
+	candidateBases := make([]string, 0, 8)
 	if baseURL != "" {
 		candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
 	}
 	resolved := strings.TrimRight(ResolveBaseURL(), "/")
-	if resolved != "" && (len(candidateBases) == 0 || candidateBases[0] != resolved) {
-		candidateBases = append(candidateBases, resolved)
-	}
-	for _, fallback := range []string{"http://127.0.0.1:4142", "http://localhost:4142", "http://host.docker.internal:4142"} {
+	if resolved != "" {
 		found := false
 		for _, cb := range candidateBases {
-			if cb == fallback {
+			if cb == resolved {
 				found = true
 				break
 			}
 		}
 		if !found {
-			candidateBases = append(candidateBases, fallback)
+			candidateBases = append(candidateBases, resolved)
+		}
+	}
+	for _, c := range ResolveCandidateBaseURLs() {
+		found := false
+		for _, cb := range candidateBases {
+			if cb == c {
+				found = true
+				break
+			}
+		}
+		if !found {
+			candidateBases = append(candidateBases, c)
 		}
 	}
 
@@ -178,69 +253,95 @@ func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUI
 
 // FetchSourcePath contacts the running local agent and retrieves the authoritative local source path for a source.
 func FetchSourcePath(ctx context.Context, baseURL string, sourceID uuid.UUID, token string) (string, error) {
-	if baseURL == "" {
-		baseURL = ResolveBaseURL()
+	candidateBases := make([]string, 0, 8)
+	if baseURL != "" {
+		candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
 	}
-	cleanBase := strings.TrimRight(baseURL, "/")
+	resolved := strings.TrimRight(ResolveBaseURL(), "/")
+	if resolved != "" {
+		found := false
+		for _, cb := range candidateBases {
+			if cb == resolved {
+				found = true
+				break
+			}
+		}
+		if !found {
+			candidateBases = append(candidateBases, resolved)
+		}
+	}
+	for _, c := range ResolveCandidateBaseURLs() {
+		found := false
+		for _, cb := range candidateBases {
+			if cb == c {
+				found = true
+				break
+			}
+		}
+		if !found {
+			candidateBases = append(candidateBases, c)
+		}
+	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// 1. Try GET /api/agent/sources/{source_id}
-	agentURL := fmt.Sprintf("%s/api/agent/sources/%s", cleanBase, sourceID.String())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create agent path request: %w", err)
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("X-Agent-Session-Token", token)
-	}
-
-	resp, err := client.Do(req)
-	if err == nil {
-		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			var sessionResp struct {
-				SourcePath    string                 `json:"source_path"`
-				CanonicalPath string                 `json:"canonical_path"`
-				Source        map[string]interface{} `json:"source"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&sessionResp); err == nil {
-				if sessionResp.SourcePath != "" {
-					return sessionResp.SourcePath, nil
-				}
-				if sessionResp.CanonicalPath != "" {
-					return sessionResp.CanonicalPath, nil
-				}
-				if sessionResp.Source != nil {
-					if sp, ok := sessionResp.Source["source_path"].(string); ok && sp != "" {
-						return sp, nil
-					}
-					if cp, ok := sessionResp.Source["canonical_path"].(string); ok && cp != "" {
-						return cp, nil
-					}
-				}
-			}
-		}
-	}
-
-	// 2. Try GET /api/agent/sources/{source_id}/path
-	pathURL := fmt.Sprintf("%s/api/agent/sources/%s/path", cleanBase, sourceID.String())
-	reqPath, err := http.NewRequestWithContext(ctx, http.MethodGet, pathURL, nil)
-	if err == nil {
-		if token != "" {
-			reqPath.Header.Set("Authorization", "Bearer "+token)
-			reqPath.Header.Set("X-Agent-Session-Token", token)
-		}
-		respPath, err := client.Do(reqPath)
+	for _, cleanBase := range candidateBases {
+		// 1. Try GET /api/agent/sources/{source_id}
+		agentURL := fmt.Sprintf("%s/api/agent/sources/%s", cleanBase, sourceID.String())
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
 		if err == nil {
-			defer respPath.Body.Close()
-			if respPath.StatusCode == http.StatusOK {
-				var pathResp struct {
-					SourcePath string `json:"source_path"`
+			if token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+				req.Header.Set("X-Agent-Session-Token", token)
+			}
+
+			resp, err := client.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var sessionResp struct {
+						SourcePath    string                 `json:"source_path"`
+						CanonicalPath string                 `json:"canonical_path"`
+						Source        map[string]interface{} `json:"source"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&sessionResp); err == nil {
+						if sessionResp.SourcePath != "" {
+							return sessionResp.SourcePath, nil
+						}
+						if sessionResp.CanonicalPath != "" {
+							return sessionResp.CanonicalPath, nil
+						}
+						if sessionResp.Source != nil {
+							if sp, ok := sessionResp.Source["source_path"].(string); ok && sp != "" {
+								return sp, nil
+							}
+							if cp, ok := sessionResp.Source["canonical_path"].(string); ok && cp != "" {
+								return cp, nil
+							}
+						}
+					}
 				}
-				if err := json.NewDecoder(respPath.Body).Decode(&pathResp); err == nil && pathResp.SourcePath != "" {
-					return pathResp.SourcePath, nil
+			}
+		}
+
+		// 2. Try GET /api/agent/sources/{source_id}/path
+		pathURL := fmt.Sprintf("%s/api/agent/sources/%s/path", cleanBase, sourceID.String())
+		reqPath, err := http.NewRequestWithContext(ctx, http.MethodGet, pathURL, nil)
+		if err == nil {
+			if token != "" {
+				reqPath.Header.Set("Authorization", "Bearer "+token)
+				reqPath.Header.Set("X-Agent-Session-Token", token)
+			}
+			respPath, err := client.Do(reqPath)
+			if err == nil {
+				defer respPath.Body.Close()
+				if respPath.StatusCode == http.StatusOK {
+					var pathResp struct {
+						SourcePath string `json:"source_path"`
+					}
+					if err := json.NewDecoder(respPath.Body).Decode(&pathResp); err == nil && pathResp.SourcePath != "" {
+						return pathResp.SourcePath, nil
+					}
 				}
 			}
 		}

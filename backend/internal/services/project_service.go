@@ -1140,7 +1140,7 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 			agentToken, _ = s.sourceService.GetDecryptedAgentToken(ctx, ownerID, sourceUUID)
 		}
 
-		baseURL := resolveAgentBaseURL()
+		candidateBases := agent.ResolveCandidateBaseURLs()
 		var serviceQueryParts []string
 		for _, svc := range project.Services {
 			if svc.SourcePath != "" && svc.SourcePath != "." {
@@ -1148,19 +1148,22 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 			}
 		}
 
-		agentURL := fmt.Sprintf("%s/api/agent/sources/%s/environment", baseURL, project.SourceReference)
-		if len(serviceQueryParts) > 0 {
-			agentURL += "?" + strings.Join(serviceQueryParts, "&")
-		}
+		client := &http.Client{Timeout: 5 * time.Second}
+		for _, baseURL := range candidateBases {
+			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/environment", baseURL, project.SourceReference)
+			if len(serviceQueryParts) > 0 {
+				agentURL += "?" + strings.Join(serviceQueryParts, "&")
+			}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-		if err == nil {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+			if err != nil {
+				continue
+			}
 			if agentToken != "" {
 				req.Header.Set("Authorization", "Bearer "+agentToken)
 				req.Header.Set("X-Agent-Session-Token", agentToken)
 			}
 
-			client := &http.Client{Timeout: 5 * time.Second}
 			resp, err := client.Do(req)
 			if err == nil {
 				defer resp.Body.Close()
@@ -1190,6 +1193,7 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 						for k, v := range envResp.Root {
 							addEntry(nil, k, v)
 						}
+						break
 					}
 				}
 			}
