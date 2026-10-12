@@ -106,11 +106,14 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 						if services[i].HealthStrategy == models.HealthStrategyAuto && hs != models.HealthStrategyAuto {
 							services[i].HealthStrategy = hs
 						}
-						if services[i].BuildCommand == "" && bc != "" {
-							services[i].BuildCommand = bc
-						}
-						if services[i].StartCommand == "" && sc != "" {
-							services[i].StartCommand = sc
+						// Only enrich build/start commands if NOT using Dockerfile build strategy
+						if services[i].BuildStrategy != models.BuildStrategyDockerfile && services[i].DockerfilePath == "" {
+							if services[i].BuildCommand == "" && bc != "" {
+								services[i].BuildCommand = bc
+							}
+							if services[i].StartCommand == "" && sc != "" {
+								services[i].StartCommand = sc
+							}
 						}
 					}
 				}

@@ -717,5 +717,16 @@ services:
 	assert.Equal(t, models.BuildStrategyDockerfile, mig.BuildStrategy, "migrate should adopt dockerfile build strategy from backend")
 	assert.Equal(t, be.BuildContext, mig.BuildContext, "migrate should share build context with backend")
 	assert.Equal(t, be.DockerfilePath, mig.DockerfilePath, "migrate should share dockerfile with backend")
+	assert.Empty(t, be.StartCommand, "backend should not receive synthetic start command overriding Dockerfile CMD")
+	assert.Contains(t, mig.StartCommand, "forgelab-migrate", "migrate should keep explicit compose command")
+}
+
+func TestSyntheticAutoStartCommandIgnoredForDockerfile(t *testing.T) {
+	assert.True(t, isSyntheticAutoStartCommand("/app/server"))
+	assert.True(t, isSyntheticAutoStartCommand("java -jar /app/app.jar"))
+	assert.True(t, isSyntheticAutoStartCommand("./target/release/server"))
+	assert.False(t, isSyntheticAutoStartCommand("./forgelab-server"))
+	assert.False(t, isSyntheticAutoStartCommand("./forgelab-migrate up"))
+	assert.False(t, isSyntheticAutoStartCommand("npm start"))
 }
 

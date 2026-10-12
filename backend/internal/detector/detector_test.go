@@ -228,3 +228,21 @@ func TestGenerateDockerfile_Rust_Valid(t *testing.T) {
 		t.Fatalf("expected CMD [/app/server] in Rust Dockerfile: %s", df)
 	}
 }
+
+func TestGenerateDockerfile_Node_ResilientInstall(t *testing.T) {
+	df := GenerateDockerfile("react-vite", 3000, "", "npm")
+	if !strings.Contains(df, "node:22-alpine") {
+		t.Fatalf("expected node:22-alpine in react-vite Dockerfile, got: %s", df)
+	}
+	if !strings.Contains(df, "npm ci || npm install") {
+		t.Fatalf("expected resilient 'npm ci || npm install' fallback in Dockerfile, got: %s", df)
+	}
+
+	dfExpress := GenerateDockerfile("express", 3000, "", "npm")
+	if !strings.Contains(dfExpress, "node:22-alpine") {
+		t.Fatalf("expected node:22-alpine in express Dockerfile, got: %s", dfExpress)
+	}
+	if !strings.Contains(dfExpress, "npm ci || npm install") {
+		t.Fatalf("expected resilient 'npm ci || npm install' fallback in express Dockerfile, got: %s", dfExpress)
+	}
+}

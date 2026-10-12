@@ -65,6 +65,8 @@ type ContainerSecurityOptions struct {
 	AllowedMountPrefixes []string
 	AllowDockerSocket    bool
 	CapAdd               []string
+	IsJob                bool
+	RestartPolicy        string
 }
 
 func splitDockerBind(bind string) (hostPath, containerPath, mode string) {
@@ -250,6 +252,13 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 		}
 	}
 
+	restartPolicyName := "unless-stopped"
+	if opts.RestartPolicy != "" {
+		restartPolicyName = opts.RestartPolicy
+	} else if opts.IsJob {
+		restartPolicyName = "no"
+	}
+
 	hostConfig := &container.HostConfig{
 		PortBindings: opts.PortBindings,
 		Binds:        validatedBinds,
@@ -258,7 +267,7 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 		CapDrop:      []string{"ALL"},
 		CapAdd:       safeCaps,
 		RestartPolicy: container.RestartPolicy{
-			Name: "unless-stopped",
+			Name: container.RestartPolicyMode(restartPolicyName),
 		},
 		Resources: container.Resources{
 			Memory:    memBytes,

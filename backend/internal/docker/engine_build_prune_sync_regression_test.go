@@ -19,7 +19,16 @@ import (
 
 // Helper to create a test Docker client wired to an httptest.Server
 func newTestDockerClient(t *testing.T, handler http.Handler) (*client.Client, func()) {
-	server := httptest.NewServer(handler)
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/networks") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+	server := httptest.NewServer(wrapped)
 	cli, err := client.NewClientWithOpts(
 		client.WithHost(server.URL),
 		client.WithHTTPClient(server.Client()),

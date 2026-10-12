@@ -183,6 +183,15 @@ func (e *Engine) getOrInitSharedBuild(key string) (*sharedBuildPromise, bool) {
 	return actual.(*sharedBuildPromise), loaded
 }
 
+func isSyntheticAutoStartCommand(cmd string) bool {
+	trimmed := strings.TrimSpace(cmd)
+	switch trimmed {
+	case "/app/server", "java -jar /app/app.jar", "./target/release/server":
+		return true
+	}
+	return false
+}
+
 func parseCommandToArgs(cmdStr string) []string {
 	cmdStr = strings.TrimSpace(cmdStr)
 	if cmdStr == "" {
@@ -1514,6 +1523,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	if startCmd == "" {
 		startCmd = strings.TrimSpace(service.StartCommand)
 	}
+
+	// For Dockerfile builds, ignore synthetic auto-detected commands (like "/app/server") so the Dockerfile's native CMD / ENTRYPOINT executes
+	isDockerfileBuild := (service.BuildStrategy == models.BuildStrategyDockerfile ||
+		serviceDeploy.BuildStrategy == models.BuildStrategyDockerfile ||
+		service.DockerfilePath != "" ||
+		serviceDeploy.DockerfilePath != "")
+	if isDockerfileBuild && isSyntheticAutoStartCommand(startCmd) {
+		startCmd = ""
+	}
+
 	if startCmd != "" {
 		cmdParts = parseCommandToArgs(startCmd)
 	}
@@ -1659,6 +1678,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		targetPidsLimit = service.PidsLimit
 	}
 
+	isJob := (service.Classification == models.ClassificationJob || serviceDeploy.Classification == models.ClassificationJob)
 	hostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
 		PortBindings:         portBindings,
 		TargetCpuMillicores:  targetCpuMillicores,
@@ -1668,6 +1688,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		NetworkMode:          "",
 		AllowedMountPrefixes: allowedMountPrefixes,
 		AllowDockerSocket:    hasDockerSocketBind,
+		IsJob:                isJob,
 	})
 	if err != nil {
 		if hostPort != nil {
@@ -1740,7 +1761,6 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	// Start runtime log collector — continuously reads container stdout/stderr
 	e.startRuntimeLogCollector(execCtx, containerID, serviceDeploy.ID, service.ID, project.ID, redactor, emitLog)
 
-	isJob := service.Classification == models.ClassificationJob || serviceDeploy.Classification == models.ClassificationJob
 	if isJob {
 		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Service '%s' is a one-shot job (classification: %s). Waiting for container execution to complete...", service.Name, service.Classification))
 		if e.dockerClient != nil {
