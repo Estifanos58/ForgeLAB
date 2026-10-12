@@ -1424,3 +1424,208 @@ func TestDeploymentQueue_AtomicRecoveryIgnoresActiveLeaseRace(t *testing.T) {
 		t.Fatalf("expected job to remain in processing queue, got %d", procLen)
 	}
 }
+
+func TestDeploymentQueue_ReconcileLeaseError_WorkerOwnsLease_Proceeds(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+	token := "worker-1:token-abc"
+
+	// Simulate that on Redis the lease was acquired by this worker and job is in processing queue
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+	client.Set(ctx, JobLeasePrefix+jobID.String(), token, 30*time.Second)
+	client.Set(ctx, JobStatePrefix+jobID.String(), JobStateProcessing, 24*time.Hour)
+
+	// Worker reconciles ambiguous error with canProceed = "1"
+	code, err := q.ReconcileLeaseError(ctx, jobID, token, itemStr, "1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 1 {
+		t.Fatalf("expected code 1 (proceed as owner), got %d", code)
+	}
+
+	// Verify state and lease are intact
+	isOwner, err := q.IsLeaseOwner(ctx, jobID, token)
+	if err != nil || !isOwner {
+		t.Fatalf("expected worker to remain lease owner")
+	}
+	state, _ := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if state != JobStateProcessing {
+		t.Fatalf("expected state to remain processing, got %s", state)
+	}
+	// Verify nothing was re-pushed to deployment queue (preventing duplicate execution)
+	depLen, _ := client.LLen(ctx, DeploymentQueueKey).Result()
+	if depLen != 0 {
+		t.Fatalf("expected deployment queue to be 0, got %d", depLen)
+	}
+}
+
+func TestDeploymentQueue_ReconcileLeaseError_OtherWorkerHoldsLease_DoesNotResetOrRequeue(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+
+	otherWorkerToken := "other-worker:token-xyz"
+	myToken := "my-worker:token-failed"
+
+	// Another worker is running the job
+	client.LPush(ctx, ProcessingQueueKey, itemStr) // duplicate entry popped by my-worker
+	client.LPush(ctx, ProcessingQueueKey, itemStr) // entry being processed by other-worker
+	client.Set(ctx, JobLeasePrefix+jobID.String(), otherWorkerToken, 30*time.Second)
+	client.Set(ctx, JobStatePrefix+jobID.String(), JobStateProcessing, 24*time.Hour)
+
+	// my-worker reconciles ambiguous lease acquisition
+	code, err := q.ReconcileLeaseError(ctx, jobID, myToken, itemStr, "1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 3 {
+		t.Fatalf("expected code 3 (duplicate removed without touching active job), got %d", code)
+	}
+
+	// 1 duplicate removed from processing queue, leaving active worker's copy
+	procLen, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 1 {
+		t.Fatalf("expected processing queue to have 1 item remaining, got %d", procLen)
+	}
+
+	// Deployment queue must NOT have received a duplicate job
+	depLen, _ := client.LLen(ctx, DeploymentQueueKey).Result()
+	if depLen != 0 {
+		t.Fatalf("expected deployment queue to remain 0, got %d", depLen)
+	}
+
+	// State must NOT have been reset to pending! It must remain processing for the other worker
+	state, _ := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if state != JobStateProcessing {
+		t.Fatalf("expected state to remain processing, got %s", state)
+	}
+	// Lease must still be owned by the other worker
+	isOwner, _ := q.IsLeaseOwner(ctx, jobID, otherWorkerToken)
+	if !isOwner {
+		t.Fatalf("expected other worker to still own the lease")
+	}
+}
+
+func TestDeploymentQueue_ReconcileLeaseError_NoLease_RestoresSafely(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+	token := "worker-1:token-abc"
+
+	// Job is in processing queue but no lease exists anywhere
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+
+	code, err := q.ReconcileLeaseError(ctx, jobID, token, itemStr, "1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 4 {
+		t.Fatalf("expected code 4 (stranded job restored), got %d", code)
+	}
+
+	// Processing queue should now be empty
+	procLen, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 0 {
+		t.Fatalf("expected processing queue to be empty, got %d", procLen)
+	}
+
+	// Deployment queue should have the job restored
+	depLen, _ := client.LLen(ctx, DeploymentQueueKey).Result()
+	if depLen != 1 {
+		t.Fatalf("expected deployment queue to have 1 item, got %d", depLen)
+	}
+
+	// State must be pending
+	state, _ := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if state != JobStatePending {
+		t.Fatalf("expected state to be pending, got %s", state)
+	}
+}
+
+func TestDeploymentQueue_RemoveDuplicateIfLeaseHeld(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+	jobID := uuid.New()
+	job := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  jobID,
+		ServiceDeploymentID: jobID,
+	}
+	itemStr := job.Encode()
+	otherToken := "active-worker:token-123"
+
+	// Case 1: Lease is active -> duplicate removed, deployment queue untouched
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+	client.Set(ctx, JobLeasePrefix+jobID.String(), otherToken, 30*time.Second)
+
+	code, err := q.RemoveDuplicateIfLeaseHeld(ctx, jobID, itemStr)
+	if err != nil || code != 1 {
+		t.Fatalf("expected code 1, got %d (err: %v)", code, err)
+	}
+	procLen, _ := client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 0 {
+		t.Fatalf("expected processing queue to be 0, got %d", procLen)
+	}
+	depLen, _ := client.LLen(ctx, DeploymentQueueKey).Result()
+	if depLen != 0 {
+		t.Fatalf("expected deployment queue to remain 0, got %d", depLen)
+	}
+
+	// Case 2: Lease expired before duplicate removal -> restored so job doesn't disappear
+	client.LPush(ctx, ProcessingQueueKey, itemStr)
+	client.Del(ctx, JobLeasePrefix+jobID.String())
+
+	code, err = q.RemoveDuplicateIfLeaseHeld(ctx, jobID, itemStr)
+	if err != nil || code != 2 {
+		t.Fatalf("expected code 2 (restored), got %d (err: %v)", code, err)
+	}
+	procLen, _ = client.LLen(ctx, ProcessingQueueKey).Result()
+	if procLen != 0 {
+		t.Fatalf("expected processing queue to be 0, got %d", procLen)
+	}
+	depLen, _ = client.LLen(ctx, DeploymentQueueKey).Result()
+	if depLen != 1 {
+		t.Fatalf("expected deployment queue to have 1 restored item, got %d", depLen)
+	}
+	state, _ := client.Get(ctx, JobStatePrefix+jobID.String()).Result()
+	if state != JobStatePending {
+		t.Fatalf("expected state to be pending, got %s", state)
+	}
+}
+

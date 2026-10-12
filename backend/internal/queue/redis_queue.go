@@ -212,6 +212,59 @@ var (
 		end
 		return rem
 	`)
+
+	// reconcileLeaseErrorScript atomically reconciles the state of a job in Redis when an acquireLease
+	// call encounters a network or client error.
+	// KEYS[1]: leaseKey, KEYS[2]: processingQueueKey, KEYS[3]: deploymentQueueKey, KEYS[4]: stateKey
+	// ARGV[1]: leaseToken, ARGV[2]: itemStr, ARGV[3]: canProceed ("1" or "0")
+	// Returns:
+	//   1: caller holds the lease and can proceed
+	//   2: caller held the lease, aborted, released lease and requeued to deployment queue
+	//   3: another worker holds active lease; duplicate removed from processing queue only
+	//   4: no active lease found; stranded job safely requeued to deployment queue
+	reconcileLeaseErrorScript = redis.NewScript(`
+		local curLease = redis.call("GET", KEYS[1])
+		if curLease == ARGV[1] then
+			if ARGV[3] == "1" then
+				return 1
+			else
+				redis.call("DEL", KEYS[1])
+				redis.call("LREM", KEYS[2], 1, ARGV[2])
+				redis.call("LPUSH", KEYS[3], ARGV[2])
+				redis.call("SET", KEYS[4], "pending", "EX", 86400)
+				return 2
+			end
+		elseif curLease and curLease ~= false and curLease ~= "" then
+			redis.call("LREM", KEYS[2], 1, ARGV[2])
+			return 3
+		else
+			redis.call("LREM", KEYS[2], 1, ARGV[2])
+			redis.call("LPUSH", KEYS[3], ARGV[2])
+			redis.call("SET", KEYS[4], "pending", "EX", 86400)
+			return 4
+		end
+	`)
+
+	// removeDuplicateIfLeaseHeldScript handles redundant queue items when acquireLease returns false.
+	// If an active lease exists, removes the duplicate item from processing queue.
+	// If the lease expired in the interim, restores the job to deployment queue so it does not disappear.
+	// KEYS[1]: leaseKey, KEYS[2]: processingQueueKey, KEYS[3]: deploymentQueueKey, KEYS[4]: stateKey
+	// ARGV[1]: itemStr
+	// Returns:
+	//   1: duplicate removed while lease active
+	//   2: lease expired; restored to deployment queue
+	removeDuplicateIfLeaseHeldScript = redis.NewScript(`
+		local curLease = redis.call("GET", KEYS[1])
+		if curLease and curLease ~= false and curLease ~= "" then
+			redis.call("LREM", KEYS[2], 1, ARGV[1])
+			return 1
+		else
+			redis.call("LREM", KEYS[2], 1, ARGV[1])
+			redis.call("LPUSH", KEYS[3], ARGV[1])
+			redis.call("SET", KEYS[4], "pending", "EX", 86400)
+			return 2
+		end
+	`)
 )
 
 type JobType string
@@ -387,7 +440,7 @@ func (q *DeploymentQueue) acquireLease(ctx context.Context, jobID uuid.UUID, wor
 		token, q.leaseTTL.Milliseconds(), JobStateProcessing, int64(24*time.Hour/time.Second),
 	).Result()
 	if err != nil {
-		return "", false, fmt.Errorf("failed to execute acquire lease script: %w", err)
+		return token, false, fmt.Errorf("failed to execute acquire lease script: %w", err)
 	}
 	acquired, ok := res.(int64)
 	if !ok || acquired == 0 {
@@ -546,6 +599,55 @@ func (q *DeploymentQueue) RecoverJobAtomic(ctx context.Context, itemStr string, 
 	code, ok := res.(int64)
 	if !ok {
 		return 0, fmt.Errorf("unexpected return from atomic recovery script: %v", res)
+	}
+	return int(code), nil
+}
+
+// ReconcileLeaseError atomically reconciles the state of a job when acquireLease encounters an ambiguous error.
+// Returns:
+//   1: caller holds the lease and can proceed
+//   2: caller held the lease, aborted, released lease and requeued
+//   3: another worker holds active lease; duplicate removed from processing queue only (state and deployment queue untouched)
+//   4: no active lease found; stranded job safely requeued to deployment queue with pending state
+func (q *DeploymentQueue) ReconcileLeaseError(ctx context.Context, jobID uuid.UUID, leaseToken, itemStr, canProceed string) (int, error) {
+	keyID := jobID.String()
+	leaseKey := JobLeasePrefix + keyID
+	stateKey := JobStatePrefix + keyID
+
+	res, err := reconcileLeaseErrorScript.Run(ctx, q.client,
+		[]string{leaseKey, ProcessingQueueKey, DeploymentQueueKey, stateKey},
+		leaseToken, itemStr, canProceed,
+	).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to execute reconcile lease error script: %w", err)
+	}
+	code, ok := res.(int64)
+	if !ok {
+		return 0, fmt.Errorf("unexpected return from reconcile lease error script: %v", res)
+	}
+	return int(code), nil
+}
+
+// RemoveDuplicateIfLeaseHeld removes a redundant job entry from processing queue only if an active lease is held.
+// If the lease expired in the interim, it safely restores the job to the deployment queue so it cannot be lost.
+// Returns:
+//   1: duplicate removed while active lease held
+//   2: lease expired; restored to deployment queue
+func (q *DeploymentQueue) RemoveDuplicateIfLeaseHeld(ctx context.Context, jobID uuid.UUID, itemStr string) (int, error) {
+	keyID := jobID.String()
+	leaseKey := JobLeasePrefix + keyID
+	stateKey := JobStatePrefix + keyID
+
+	res, err := removeDuplicateIfLeaseHeldScript.Run(ctx, q.client,
+		[]string{leaseKey, ProcessingQueueKey, DeploymentQueueKey, stateKey},
+		itemStr,
+	).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to execute remove duplicate script: %w", err)
+	}
+	code, ok := res.(int64)
+	if !ok {
+		return 0, fmt.Errorf("unexpected return from remove duplicate script: %v", res)
 	}
 	return int(code), nil
 }
@@ -813,25 +915,40 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 					leaseToken, acquired, err := q.acquireLease(workerCtx, job.ID, workerName)
 					if err != nil {
 						slog.Error("failed to check job idempotency / acquire lease", "job_id", job.ID, "error", err)
-						// Fix stranded job: BRPopLPush moved itemStr from DeploymentQueueKey to ProcessingQueueKey.
-						// Safely re-enqueue the job back to DeploymentQueueKey and remove from ProcessingQueueKey.
-						pipe := q.client.Pipeline()
-						pipe.LRem(context.Background(), ProcessingQueueKey, 1, itemStr)
-						pipe.LPush(context.Background(), DeploymentQueueKey, itemStr)
-						pipe.Set(context.Background(), JobStatePrefix+job.ID.String(), JobStatePending, 24*time.Hour)
-						if _, pipeErr := pipe.Exec(context.Background()); pipeErr != nil {
-							slog.Error("failed to restore stranded job to deployment queue after lease error", "job_id", job.ID, "error", pipeErr)
+
+						canProceed := "1"
+						if workerCtx.Err() != nil {
+							canProceed = "0"
 						}
-						time.Sleep(500 * time.Millisecond)
-						continue
+
+						// Reconcile lease acquisition error atomically to prevent:
+						// 1. Dropping active jobs if lease was never acquired or expired.
+						// 2. Duplicate executions if another worker already holds the lease.
+						// 3. Incorrect state resets of active jobs.
+						reconCode, reconErr := q.ReconcileLeaseError(context.Background(), job.ID, leaseToken, itemStr, canProceed)
+						if reconErr != nil {
+							slog.Error("failed to reconcile lease error with redis; leaving for recovery loop", "job_id", job.ID, "error", reconErr)
+							time.Sleep(500 * time.Millisecond)
+							continue
+						}
+
+						if reconCode == 1 {
+							// Lease was actually acquired on Redis despite client error, and worker can proceed.
+							slog.Info("reconciled ambiguous lease acquisition: worker owns lease, proceeding", "job_id", job.ID, "token", leaseToken)
+							acquired = true
+						} else {
+							// Handled safely (requeued, aborted, or duplicate removed without resetting active state).
+							time.Sleep(500 * time.Millisecond)
+							continue
+						}
 					}
 					if !acquired {
-						// Another worker owns this job. Remove our copy from processing queue,
-						// but only remove ONE entry to avoid stealing the other worker's entry.
-						// This is safe: BRPopLPush added one entry, we remove that one entry.
-						// The other worker's entry (also added by BRPopLPush) remains.
+						// Another worker owns this job. Remove our redundant copy from processing queue
+						// only if lease is still active. If lease expired in the interim, restores to deployment queue.
 						slog.Warn("skipping duplicate deployment job with active lease", "job_id", job.ID)
-						q.client.LRem(context.Background(), ProcessingQueueKey, 1, itemStr)
+						if _, dupErr := q.RemoveDuplicateIfLeaseHeld(context.Background(), job.ID, itemStr); dupErr != nil {
+							slog.Error("failed to remove duplicate job cleanly", "job_id", job.ID, "error", dupErr)
+						}
 						continue
 					}
 

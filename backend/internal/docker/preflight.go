@@ -20,6 +20,7 @@ type PreflightValidationError struct {
 	ServiceName string
 	Field       string
 	Message     string
+	Err         error
 }
 
 func (e *PreflightValidationError) Error() string {
@@ -30,6 +31,10 @@ func (e *PreflightValidationError) Error() string {
 		return fmt.Sprintf("service '%s': %s", e.ServiceName, e.Message)
 	}
 	return e.Message
+}
+
+func (e *PreflightValidationError) Unwrap() error {
+	return e.Err
 }
 
 // PreflightOptions contains parameters for validating a release or service deployment.
@@ -264,6 +269,15 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 				}
 			}
 
+			if isDockerSocketMount(vol.Source) {
+				return &PreflightValidationError{
+					ServiceName: sd.ServiceName,
+					Field:       "volumes",
+					Message:     ErrDockerSocketMountRejected.Error(),
+					Err:         ErrDockerSocketMountRejected,
+				}
+			}
+
 			// Validate and resolve volume mount using unified source-aware resolver
 			_, err := ResolveAndValidateVolumeMount(ctx, opts.Project, vol, opts.SourceService, opts.PathValidator, opts.DockerClient)
 			if err != nil {
@@ -271,6 +285,7 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 					ServiceName: sd.ServiceName,
 					Field:       "volumes",
 					Message:     err.Error(),
+					Err:         err,
 				}
 			}
 		}

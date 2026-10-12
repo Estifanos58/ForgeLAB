@@ -497,6 +497,8 @@ func TestForgeLAB_OwnComposePipeline(t *testing.T) {
 		})
 	}
 
+	// 1. Raw deployment plan contains /var/run/docker.sock on backend service.
+	// Verify that security preflight strictly rejects this self-authorizing Docker socket mount.
 	pv := security.NewPathValidator([]string{repoRoot})
 	proj := &models.Project{
 		ID:             uuid.New(),
@@ -509,14 +511,37 @@ func TestForgeLAB_OwnComposePipeline(t *testing.T) {
 		Deployments:   svcDeploys,
 		PathValidator: pv,
 	})
-	require.NoError(t, err, "ForgeLAB's own deployment plan must pass preflight validation")
+	require.Error(t, err, "Raw deployment with docker socket mount must be rejected")
+	assert.ErrorIs(t, err, ErrDockerSocketMountRejected)
+
+	// 2. Sanitize deployments by stripping docker socket mounts (as required for tenant workloads)
+	var sanitizedDeploys []*models.ServiceDeployment
+	for _, s := range svcDeploys {
+		cloned := *s
+		var safeVols []models.VolumeMountConfig
+		for _, v := range s.Volumes {
+			if !strings.Contains(v.Source, "docker.sock") && !strings.Contains(v.Source, "docker_engine") &&
+				!strings.Contains(v.Target, "docker.sock") && !strings.Contains(v.Target, "docker_engine") {
+				safeVols = append(safeVols, v)
+			}
+		}
+		cloned.Volumes = safeVols
+		sanitizedDeploys = append(sanitizedDeploys, &cloned)
+	}
+
+	err = ValidateDeploymentPreflight(context.Background(), PreflightOptions{
+		Project:       proj,
+		Deployments:   sanitizedDeploys,
+		PathValidator: pv,
+	})
+	require.NoError(t, err, "Sanitized ForgeLAB deployment plan must pass preflight validation")
 
 	// Verify DAG execution tiers:
 	// Tier 1: postgres, redis (infrastructure image)
 	// Tier 2: migrate (depends on postgres)
 	// Tier 3: backend (depends on migrate, postgres, redis)
 	// Tier 4: frontend (depends on backend)
-	tiers := buildServiceDeploymentTiers(svcDeploys)
+	tiers := buildServiceDeploymentTiers(sanitizedDeploys)
 	require.Len(t, tiers, 4, "ForgeLAB release must produce exactly 4 DAG execution tiers")
 
 	tier1Names := map[string]bool{}

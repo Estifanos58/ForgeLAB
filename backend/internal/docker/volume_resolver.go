@@ -581,15 +581,9 @@ func ResolveAndValidateVolumeMount(
 		}, nil
 	}
 
-	// 2. Docker socket detection
-	if vol.Source == "/var/run/docker.sock" || vol.Source == `\\.\pipe\docker_engine` || vol.Source == "/run/docker.sock" {
-		return &ResolvedVolumeMount{
-			IsDockerSocket: true,
-			HostPath:       vol.Source,
-			DaemonPath:     vol.Source,
-			ContainerPath:  cleanTarget,
-			ReadOnly:       vol.ReadOnly,
-		}, nil
+	// 2. Docker socket detection: project configuration must NEVER authorize Docker socket access
+	if isDockerSocketMount(vol.Source) {
+		return nil, ErrDockerSocketMountRejected
 	}
 
 	// 3. Bind mount validation
@@ -768,6 +762,39 @@ func ResolveAndValidateVolumeMount(
 		return nil, err
 	}
 
+	// Administrator-controlled allowlist enforcement:
+	// Absolute host bind mounts must strictly fall within approved administrator source roots or the project's source root.
+	var allowedPrefixes []string
+	if pathValidator != nil {
+		for _, r := range pathValidator.AllowedRoots() {
+			if r != "" {
+				allowedPrefixes = append(allowedPrefixes, r)
+			}
+		}
+		if pathValidator.HostSourceRoot() != "" {
+			allowedPrefixes = append(allowedPrefixes, pathValidator.HostSourceRoot())
+		}
+		if pathValidator.DaemonSourceRoot() != "" {
+			allowedPrefixes = append(allowedPrefixes, pathValidator.DaemonSourceRoot())
+		}
+		if pathValidator.ContainerSourceRoot() != "" {
+			allowedPrefixes = append(allowedPrefixes, pathValidator.ContainerSourceRoot())
+		}
+	}
+	if paths.DaemonPath != "" {
+		allowedPrefixes = append(allowedPrefixes, paths.DaemonPath)
+	}
+	if paths.BackendPath != "" && paths.BackendPath != paths.DaemonPath {
+		allowedPrefixes = append(allowedPrefixes, paths.BackendPath)
+	}
+	if paths.AgentPath != "" && paths.AgentPath != paths.DaemonPath && paths.AgentPath != paths.BackendPath {
+		allowedPrefixes = append(allowedPrefixes, paths.AgentPath)
+	}
+
+	if len(allowedPrefixes) == 0 || (!isPathInAllowlist(resolvedDaemon, allowedPrefixes) && !isPathInAllowlist(resolvedAgent, allowedPrefixes) && !isPathInAllowlist(cleanHost, allowedPrefixes)) {
+		return nil, fmt.Errorf("%w: %s", ErrHostMountNotAllowed, cleanHost)
+	}
+
 	return &ResolvedVolumeMount{
 		AgentPath:     resolvedAgent,
 		BackendPath:   resolvedBackend,
@@ -776,6 +803,38 @@ func ResolveAndValidateVolumeMount(
 		ContainerPath: cleanTarget,
 		ReadOnly:      vol.ReadOnly,
 	}, nil
+}
+
+func isDockerSocketMount(source string) bool {
+	clean := filepath.Clean(source)
+	lower := strings.ToLower(clean)
+	norm := strings.ReplaceAll(lower, "\\", "/")
+	return strings.Contains(norm, "docker.sock") || strings.Contains(norm, "docker_engine")
+}
+
+func isPathInAllowlist(candidate string, allowedPrefixes []string) bool {
+	if len(allowedPrefixes) == 0 || strings.TrimSpace(candidate) == "" {
+		return false
+	}
+	cleanCandidate := strings.ToLower(filepath.Clean(candidate))
+	normCandidate := strings.ReplaceAll(cleanCandidate, "\\", "/")
+
+	for _, prefix := range allowedPrefixes {
+		if strings.TrimSpace(prefix) == "" {
+			continue
+		}
+		cleanPrefix := strings.ToLower(filepath.Clean(prefix))
+		normPrefix := strings.ReplaceAll(cleanPrefix, "\\", "/")
+
+		if normCandidate == normPrefix || strings.HasPrefix(normCandidate, normPrefix+"/") ||
+			cleanCandidate == cleanPrefix || strings.HasPrefix(cleanCandidate, cleanPrefix+string(filepath.Separator)) {
+			return true
+		}
+		if rel, ok := getRelativePathCrossPlatform(prefix, candidate); ok && !strings.HasPrefix(rel, "..") {
+			return true
+		}
+	}
+	return false
 }
 
 func validateRestrictedHostMount(p string) error {

@@ -159,16 +159,22 @@ func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHu
 	hasRepoScope := false
 	authType := "oauth"
 	for _, sc := range scopes {
-		if sc == "repo" || sc == "pat" {
-			hasRepoScope = true
-		}
 		if sc == "pat" {
 			authType = "pat"
 		}
 	}
-	// Fine-grained personal access tokens do not return standard OAuth scope strings
-	if len(scopes) == 0 {
+
+	if authType == "pat" {
+		// PAT: verified for repository access upon connection
 		hasRepoScope = true
+	} else {
+		// OAuth: must explicitly contain "repo" scope. Empty scopes or read:user requires reauth!
+		for _, sc := range scopes {
+			if sc == "repo" {
+				hasRepoScope = true
+				break
+			}
+		}
 	}
 
 	return &GitHubStatus{
@@ -448,10 +454,34 @@ func (s *GitHubService) ConnectWithPAT(ctx context.Context, userID uuid.UUID, pa
 		return nil, errors.New("failed to retrieve GitHub user profile with token")
 	}
 
+	// Verify actual repository access to ensure the token has sufficient permissions
+	repoReq, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/repos?per_page=1", nil)
+	if err != nil {
+		return nil, err
+	}
+	repoReq.Header.Set("Authorization", "Bearer "+cleanToken)
+	repoReq.Header.Set("Accept", "application/vnd.github+json")
+	repoReq.Header.Set("User-Agent", "ForgeLAB-App")
+
+	repoResp, err := s.httpClient.Do(repoReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify GitHub repository access: %w", err)
+	}
+	defer repoResp.Body.Close()
+
+	if repoResp.StatusCode == http.StatusUnauthorized || repoResp.StatusCode == http.StatusForbidden {
+		return nil, errors.New("invalid GitHub token permissions: repository access is not authorized. Please grant repository permissions (Contents, Metadata, etc.).")
+	}
+	if repoResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned status %d when verifying repository access", repoResp.StatusCode)
+	}
+
 	scopeHeader := resp.Header.Get("X-OAuth-Scopes")
-	savedScope := "repo,pat"
+	var savedScope string
 	if scopeHeader != "" {
 		savedScope = scopeHeader + ",pat"
+	} else {
+		savedScope = "pat,fine-grained"
 	}
 
 	encryptedToken, err := s.encryptor.Encrypt([]byte(cleanToken))
@@ -647,14 +677,17 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 	}
 
 	scopes := parseOAuthScopes(scope)
+	isPAT := false
 	hasRepo := false
 	for _, sc := range scopes {
-		if sc == "repo" || sc == "pat" {
+		if sc == "pat" {
+			isPAT = true
+		}
+		if sc == "repo" {
 			hasRepo = true
-			break
 		}
 	}
-	if len(scopes) > 0 && !hasRepo {
+	if !isPAT && !hasRepo {
 		return nil, false, ErrGitHubNeedsReauth
 	}
 

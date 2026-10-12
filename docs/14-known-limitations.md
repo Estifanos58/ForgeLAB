@@ -72,6 +72,30 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Behavior:** CPU millicores (`NanoCPUs`), Memory MB (`Memory`), and PIDs limit (`PidsLimit`) are strictly enforced via Docker SDK `container.Resources`. However, container rootfs ephemeral storage quotas (`ephemeral_storage_mb`) require underlying filesystem storage driver support (e.g. Linux Docker Engine with `overlay2` or `zfs` backing filesystem with project quotas enabled).
 - **Limitation:** On Windows and macOS Docker Desktop environments, container rootfs size quotas are not supported by the underlying storage driver. Ephemeral storage limits are persisted in `service_deployments.ephemeral_storage_mb` for auditing and future enforcement, but strict disk quotas are platform-dependent.
 
+### 6. Host Mount Security & Docker Socket Rejection (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/volume_resolver.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/volume_resolver.go), [`backend/internal/docker/preflight.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/preflight.go)
+- **Resolution:** Strict administrator-controlled allowlist enforced on all absolute host bind mounts via `FORGELAB_ALLOWED_SOURCE_ROOTS`, `FORGELAB_HOST_SOURCE_ROOT`, daemon paths, and project source roots. Host Docker socket mounts (`/var/run/docker.sock` and `\\.\pipe\docker_engine`) are unconditionally rejected in both preflight validation and runtime deployment. Project configurations can never self-authorize Docker socket access.
+
+### 7. Atomic Redis Queue Recovery & Lease Ownership (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/queue/redis_queue.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/queue/redis_queue.go)
+- **Resolution:** Replaced ambiguous lease-acquisition error handling with atomic Lua scripts (`reconcileLeaseErrorScript` and `removeDuplicateIfLeaseHeldScript`). When network timeouts or ambiguous responses occur, workers check if their attempted lease token acquired the lock; if so, execution proceeds; if held by another worker, duplicate copies are purged without altering running state; if orphaned, safely returned to pending. Active jobs cannot disappear, execute multiply, or reset incorrectly.
+
+### 8. Strict Encryption Key Validation & Dev Key Rejection (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/crypto/encryption.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/crypto/encryption.go), [`backend/internal/config/config.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config.go)
+- **Resolution:** Replaced silent padding and truncation with strict 32-byte key size validation (`ParseKey`). In production mode, `ValidateProductionKey` rejects known development keys, template placeholders, and low-entropy keys (<= 4 unique bytes) at startup. Existing 32-byte raw and base64 encrypted data access is preserved.
+
+### 9. Conservative Build Concurrency Defaults (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/config/config.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:** Replaced aggressive concurrency defaults with conservative CPU-aware limits: 1 slot on machines with <= 2 CPUs, 2 slots on <= 4 CPUs, and `cpus / 2` capped at 4 for larger systems. Retains administrator overrides via `FORGELAB_MAX_CONCURRENT_BUILDS` and exposes runtime build semaphore diagnostics via `GetBuildDiagnostics()`.
+
+### 10. GitHub Authorization & PAT Verification (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/github_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/github_service.go)
+- **Resolution:** Distinguishes OAuth tokens from fine-grained Personal Access Tokens. Fine-grained PATs verify actual repository access via `GET /user/repos?per_page=1`. OAuth tokens require explicit `repo` scope and are no longer assumed to have access when scopes are empty or unspecified.
+
+### 11. Incremental Deployment Engine Decomposition (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_health.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_health.go), [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go), [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:** Incrementally decomposed the monolithic deployment engine by extracting health checks and exit diagnostics (`engine_health.go`), container lifecycle and log collectors (`engine_lifecycle.go`), and build slot concurrency, image building, and DAG tier calculation (`engine_build.go`) without modifying deployment pipelines or breaking rollback guarantees.
+
 ---
 
 ## 3. Security Hardening Items (Deferred Backlog)

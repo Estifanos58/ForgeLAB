@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/forgelab/backend/internal/crypto"
 )
 
 // Config holds all application configuration.
@@ -170,13 +172,18 @@ func Load() (*Config, error) {
 	dbURL := getEnv("DATABASE_URL", "postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable")
 	encKey := getEnv("FORGELAB_ENCRYPTION_KEY", "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=")
 
+	// Validate encryption key length in all environments
+	if _, err := crypto.ParseKey(encKey); err != nil {
+		return nil, fmt.Errorf("invalid FORGELAB_ENCRYPTION_KEY: %w", err)
+	}
+
 	if isProd {
 		if jwtSecret == "dev-jwt-secret-change-in-production" || jwtSecret == "your-super-secret-jwt-key" ||
 			jwtSecret == "example-jwt-secret" || len(jwtSecret) < 32 {
 			return nil, fmt.Errorf("production configuration error: JWT_SECRET must be a secure random secret of at least 32 characters in production mode")
 		}
-		if encKey == "" || encKey == "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=" {
-			return nil, fmt.Errorf("production configuration error: default development FORGELAB_ENCRYPTION_KEY is not allowed in production mode")
+		if err := crypto.ValidateProductionKey(encKey); err != nil {
+			return nil, fmt.Errorf("production configuration error: %w", err)
 		}
 		if strings.Contains(dbURL, "forgelab_dev_password") {
 			return nil, fmt.Errorf("production configuration error: default development database password (forgelab_dev_password) is not allowed in production mode")
@@ -306,10 +313,14 @@ func parseStringSlice(s string) []string {
 }
 
 func defaultMaxConcurrentBuilds() int {
-	n := runtime.NumCPU() / 2
-	if n < 2 {
+	cpus := runtime.NumCPU()
+	if cpus <= 2 {
+		return 1
+	}
+	if cpus <= 4 {
 		return 2
 	}
+	n := cpus / 2
 	if n > 4 {
 		return 4
 	}

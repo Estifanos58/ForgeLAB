@@ -161,7 +161,7 @@ func TestGitHubService_ListRepositories_NeedsReauthWhenMissingRepoScope(t *testi
 	svc := services.NewGitHubService(nil, nil, config.OAuthConfig{}, nil)
 	userID := uuid.New()
 
-	// Simulate old token issued with only read:user,user:email
+	// 1. Simulate token issued with only read:user,user:email
 	svc.SetTokenGetterForTest(func(ctx context.Context, uid uuid.UUID) (string, string, error) {
 		return "gho_old_token", "read:user,user:email", nil
 	})
@@ -171,6 +171,17 @@ func TestGitHubService_ListRepositories_NeedsReauthWhenMissingRepoScope(t *testi
 	assert.False(t, hasMore)
 	assert.Nil(t, repos)
 	assert.ErrorIs(t, err, services.ErrGitHubNeedsReauth)
+
+	// 2. Simulate OAuth token with completely empty scopes - MUST NOT assume sufficient permissions
+	svc.SetTokenGetterForTest(func(ctx context.Context, uid uuid.UUID) (string, string, error) {
+		return "gho_empty_scope_token", "", nil
+	})
+
+	reposEmpty, hasMoreEmpty, errEmpty := svc.ListRepositories(context.Background(), userID, 1, 30)
+	require.Error(t, errEmpty)
+	assert.False(t, hasMoreEmpty)
+	assert.Nil(t, reposEmpty)
+	assert.ErrorIs(t, errEmpty, services.ErrGitHubNeedsReauth)
 }
 
 func TestGitHubService_GetStatus_DetectsNeedsReauth(t *testing.T) {
@@ -204,6 +215,21 @@ func TestGitHubService_GetStatus_DetectsNeedsReauth(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, statusOld.Connected)
 	assert.True(t, statusOld.NeedsReauth)
+
+	// Status with empty scopes for OAuth must require reauth
+	svc.SetStatusGetterForTest(func(ctx context.Context, uid uuid.UUID) (*services.GitHubStatus, error) {
+		return &services.GitHubStatus{
+			Connected:   true,
+			Username:    "octocat",
+			Scopes:      []string{},
+			NeedsReauth: true,
+			AuthType:    "oauth",
+		}, nil
+	})
+	statusEmpty, err := svc.GetStatus(context.Background(), userID)
+	require.NoError(t, err)
+	assert.True(t, statusEmpty.Connected)
+	assert.True(t, statusEmpty.NeedsReauth)
 }
 
 type roundTripFunc func(req *http.Request) (*http.Response, error)
