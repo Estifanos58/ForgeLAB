@@ -143,3 +143,40 @@ func TestMountSecurity_NamedVolumesAllowedWithoutHostPath(t *testing.T) {
 	assert.True(t, res.IsNamedVolume)
 	assert.Equal(t, "pgdata", res.VolumeName)
 }
+
+func TestMountSecurity_SanitizeDockerSocketMounts(t *testing.T) {
+	rawVols := []models.VolumeMountConfig{
+		{Source: "/var/run/docker.sock", Target: "/var/run/docker.sock", Type: "bind"},
+		{Source: `\\.\pipe\docker_engine`, Target: `\\.\pipe\docker_engine`, Type: "bind"},
+		{Source: "pgdata", Target: "/var/lib/postgresql/data", Type: "volume"},
+	}
+
+	safeVols, stripped := security.SanitizeServiceVolumes(rawVols)
+	assert.True(t, stripped, "expected forbidden socket mounts to be stripped")
+	require.Len(t, safeVols, 1)
+	assert.Equal(t, "pgdata", safeVols[0].Source)
+
+	// Preflight validation passes after sanitization
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	proj := &models.Project{
+		ID:             uuid.New(),
+		RepositoryPath: tempDir,
+		SourceType:     models.SourceTypeLocalDirectory,
+	}
+	pathVal := security.NewPathValidator([]string{tempDir})
+
+	sd := &models.ServiceDeployment{
+		ServiceName:   "backend",
+		BuildStrategy: models.BuildStrategyAuto,
+		Volumes:       safeVols,
+	}
+
+	err := ValidateDeploymentPreflight(ctx, PreflightOptions{
+		Project:       proj,
+		Deployments:   []*models.ServiceDeployment{sd},
+		PathValidator: pathVal,
+	})
+	require.NoError(t, err, "sanitized deployment must pass preflight validation")
+}
+

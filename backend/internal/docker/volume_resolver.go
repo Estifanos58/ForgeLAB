@@ -806,10 +806,7 @@ func ResolveAndValidateVolumeMount(
 }
 
 func isDockerSocketMount(source string) bool {
-	clean := filepath.Clean(source)
-	lower := strings.ToLower(clean)
-	norm := strings.ReplaceAll(lower, "\\", "/")
-	return strings.Contains(norm, "docker.sock") || strings.Contains(norm, "docker_engine")
+	return security.IsDockerSocketMount(source)
 }
 
 func isPathInAllowlist(candidate string, allowedPrefixes []string) bool {

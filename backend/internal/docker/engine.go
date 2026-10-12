@@ -524,7 +524,23 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 	servicesMap := make(map[string]*models.Service, len(allProjectServices))
 	for _, s := range allProjectServices {
+		if sVols, sStripped := security.SanitizeServiceVolumes(s.Volumes); sStripped {
+			s.Volumes = sVols
+			if e.serviceService != nil {
+				_ = e.serviceService.UpdateServiceVolumes(execCtx, s.ID, sVols)
+			}
+		}
 		servicesMap[s.Name] = s
+	}
+
+	// Sanitize tenant volumes: strip forbidden host Docker socket mounts before preflight validation
+	safeVols, stripped := security.SanitizeServiceVolumes(serviceDeploy.Volumes)
+	if stripped {
+		serviceDeploy.Volumes = safeVols
+		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("[security] Notice: stripped host Docker socket mount from service '%s' (tenant containers are sandboxed and cannot access host Docker engine)", serviceDeploy.ServiceName))
+		if e.deploymentService != nil {
+			_ = e.deploymentService.UpdateServiceDeploymentVolumes(execCtx, serviceDeploy.ID, safeVols)
+		}
 	}
 
 	// Preflight validation for single service deployment: verifies service config and that dependencies exist in project
@@ -1904,8 +1920,26 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		return errors.New(reason)
 	}
 
+	// Sanitize tenant volumes: strip forbidden host Docker socket mounts before preflight validation
+	for _, sd := range svcDeploys {
+		safeVols, stripped := security.SanitizeServiceVolumes(sd.Volumes)
+		if stripped {
+			sd.Volumes = safeVols
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("[security] Notice: stripped host Docker socket mount from service '%s' (tenant containers are sandboxed and cannot access host Docker engine)", sd.ServiceName))
+			if e.deploymentService != nil {
+				_ = e.deploymentService.UpdateServiceDeploymentVolumes(execCtx, sd.ID, safeVols)
+			}
+		}
+	}
+
 	servicesMap := make(map[string]*models.Service, len(allProjectServices))
 	for _, s := range allProjectServices {
+		if sVols, sStripped := security.SanitizeServiceVolumes(s.Volumes); sStripped {
+			s.Volumes = sVols
+			if e.serviceService != nil {
+				_ = e.serviceService.UpdateServiceVolumes(execCtx, s.ID, sVols)
+			}
+		}
 		servicesMap[s.Name] = s
 	}
 

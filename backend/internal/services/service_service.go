@@ -662,3 +662,23 @@ func (s *ServiceService) UpdateServiceResources(ctx context.Context, serviceID u
 	slog.Info("service resources updated", "service_id", serviceID, "cpu", cfg.CpuMillicores, "mem", cfg.MemoryMB, "pids", cfg.PidsLimit)
 	return nil
 }
+
+// UpdateServiceVolumes updates the volumes configuration for a service.
+func (s *ServiceService) UpdateServiceVolumes(ctx context.Context, serviceID uuid.UUID, volumes []models.VolumeMountConfig) error {
+	if s.db == nil {
+		return nil
+	}
+	volsJSON, err := json.Marshal(volumes)
+	if err != nil {
+		return fmt.Errorf("failed to marshal volumes: %w", err)
+	}
+	_, err = s.db.Exec(ctx,
+		`UPDATE services SET volumes = $2, updated_at = NOW() WHERE id = $1`,
+		serviceID, volsJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update service volumes: %w", err)
+	}
+	return nil
+}
+

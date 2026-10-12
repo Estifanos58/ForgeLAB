@@ -480,7 +480,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				Image:               strings.TrimSpace(svcIn.Image),
 				DependsOn:           svcIn.DependsOn,
 				DependsOnConditions: svcIn.DependsOnConditions,
-				Volumes:             svcIn.Volumes,
+				Volumes:             func() []models.VolumeMountConfig { v, _ := security.SanitizeServiceVolumes(svcIn.Volumes); return v }(),
 				Networks:            svcIn.Networks,
 				HealthCheckConfig:   svcIn.HealthCheckConfig,
 				SourcePath:          svcSourcePath,

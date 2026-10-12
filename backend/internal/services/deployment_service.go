@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgelab/backend/internal/models"
+	"github.com/forgelab/backend/internal/security"
 )
 
 var (
@@ -330,7 +331,8 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		}
 
 		dependsOnBytes, _ := json.Marshal(svcItem.DependsOn)
-		volumesBytes, _ := json.Marshal(svcItem.Volumes)
+		safeVols, _ := security.SanitizeServiceVolumes(svcItem.Volumes)
+		volumesBytes, _ := json.Marshal(safeVols)
 		networksBytes, _ := json.Marshal(svcItem.Networks)
 		var hcBytes []byte
 		if svcItem.HealthCheckConfig != nil {
@@ -2093,6 +2095,19 @@ func (s *DeploymentService) UpdateServiceDeploymentContainerByDepAndSvc(ctx cont
 		 host_port = $4
 		 WHERE deployment_id = $1 AND service_id = $2`,
 		deploymentID, serviceID, containerID, hostPort,
+	)
+	return err
+}
+
+// UpdateServiceDeploymentVolumes persists updated volume configurations (e.g. after security sanitization).
+func (s *DeploymentService) UpdateServiceDeploymentVolumes(ctx context.Context, serviceDeploymentID uuid.UUID, volumes []models.VolumeMountConfig) error {
+	volsJSON, err := json.Marshal(volumes)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(ctx,
+		`UPDATE service_deployments SET volumes = $2 WHERE id = $1`,
+		serviceDeploymentID, volsJSON,
 	)
 	return err
 }

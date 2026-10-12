@@ -110,6 +110,21 @@ export interface ConfigurableService {
   expanded?: boolean;
 }
 
+function isDockerSocketMount(srcOrTgt?: string): boolean {
+  if (!srcOrTgt) return false;
+  const lower = srcOrTgt.toLowerCase();
+  return lower.includes('docker.sock') || lower.includes('docker_engine');
+}
+
+function sanitizeVolumes(vols?: any[]): any[] {
+  if (!vols || !Array.isArray(vols)) return [];
+  return vols.filter((v) => {
+    const src = v.source || v.name || '';
+    const tgt = v.target || v.container_path || '';
+    return !isDockerSocketMount(src) && !isDockerSocketMount(tgt);
+  });
+}
+
 function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): ConfigurableService {
   const candidates = def.build_candidates || [];
   const defaultCandidate = candidates.length > 0 ? (candidates.find((c) => c.is_default) || candidates[0]) : null;
@@ -127,7 +142,7 @@ function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): Confi
     image: def.image || '',
     depends_on: def.depends_on || [],
     depends_on_conditions: def.depends_on_conditions || {},
-    volumes: def.volumes || [],
+    volumes: sanitizeVolumes(def.volumes),
     networks: def.networks || [],
     healthcheck_config: def.healthcheck_config,
     build_context: def.build_context || '.',
@@ -1206,7 +1221,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           classification: planned?.classification || svc.classification || 'application',
           depends_on: planned?.depends_on || svc.depends_on || [],
           depends_on_conditions: planned?.depends_on_conditions || svc.depends_on_conditions || {},
-          volumes: planned?.volumes || svc.volumes || [],
+          volumes: sanitizeVolumes(planned?.volumes || svc.volumes),
           networks: planned?.networks || svc.networks || [],
           healthcheck_config: planned?.health_check || svc.healthcheck_config,
           build_context: planned?.build_context || svc.build_context || '.',
