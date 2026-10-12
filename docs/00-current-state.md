@@ -142,11 +142,13 @@ The status classifications strictly follow these definitions:
 | **OpenTelemetry Observability** | NOT IMPLEMENTED | — | Metrics and distributed tracing deferred |
 | **Container Resource Quotas** | IMPLEMENTED | NOT RECORDED | CPU (`NanoCPUs`), Memory (`Memory`), and PIDs (`PidsLimit`) enforced in Docker HostConfig via `ValidateAndBuildSecureHostConfig` |
 | **Docker Trust Boundary Enforcement** | IMPLEMENTED | NOT RECORDED | Reject `/var/run/docker.sock` and sensitive mounts, `CapDrop: [ALL]`, `no-new-privileges: true`, reject host network |
-| **Redis Job Lease Ownership** | IMPLEMENTED | NOT RECORDED | Unique lease owner tokens (`workerID:uuid`), Lua atomic renewal/release/recovery, O(1) state indexing, zero list scans |
+| **Redis Job Lease Ownership & Recovery** | IMPLEMENTED | NOT RECORDED | Unique lease tokens (`workerID:uuid`), Lua atomic renewal/recovery, stranded lease rescue on failure, background abandoned-job recovery, and `/health/queue` diagnostics |
 | **Deep Dependency Readiness Check** | IMPLEMENTED | NOT RECORDED | `/ready` and `/health/ready` probe PostgreSQL, Redis, and Docker Engine concurrently with 0 secret exposure; `/health` remains lightweight liveness |
 | **API & WebSocket Rate Limiting** | IMPLEMENTED | NOT RECORDED | Redis/in-memory fixed-window counter throttling with trusted reverse proxy validation on `/auth/*`, `/sources/*`, deploy/rollback, and WebSocket connect/subscribe returning HTTP 429 |
-| **Deployment Cancellation & Superseding** | IMPLEMENTED | NOT RECORDED | User cancellation of queued/in-progress deployments; newer service deployments atomically supersede obsolete queued deployments |
-| **Automated Multi-Stage CI Pipeline** | IMPLEMENTED | NOT RECORDED | GitHub Actions (`.github/workflows/ci.yml`) covering backend vet/fmt/test, frontend lint/test/build, compose smoke, and migrations |
+| **Deployment Cancellation & Superseding** | IMPLEMENTED | NOT RECORDED | User cancellation of queued/in-progress deployments; newer service deployments atomically supersede obsolete queued deployments across queue and execution entry |
+| **Automated Multi-Stage CI Pipeline** | IMPLEMENTED | NOT RECORDED | GitHub Actions (`.github/workflows/ci.yml`) covering backend vet/fmt/test, frontend lint/test/build, compose smoke, and pre-built migration execution |
+| **Container Reconciliation & Resource Isolation** | IMPLEMENTED | NOT RECORDED | Reconciler excludes terminal deployments from container protection, preserves intentionally stopped services and persistent volumes |
+| **Source Scanning Concurrency & Validation** | IMPLEMENTED | NOT RECORDED | Bounded filesystem scanning concurrency semaphore, timeout and context cancellation propagation, and session deduplication |
 | **Role-Based Access Control (RBAC)**| NOT IMPLEMENTED | — | Single owner model active; teams/roles deferred |
 | **WebSocket Event Replay Service** | NOT IMPLEMENTED | — | Replay from DB; client currently fetches REST logs first |
 | **Multi-Node Workers** | NOT IMPLEMENTED | — | In-process embedded worker active; multi-node deferred |

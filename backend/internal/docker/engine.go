@@ -50,27 +50,27 @@ type sharedBuildPromise struct {
 }
 
 type Engine struct {
-	dockerClient        *client.Client
-	projectService      *services.ProjectService
-	deploymentService   *services.DeploymentService
-	secretService       *services.SecretService
-	sourceService       *services.SourceService
-	githubService       *services.GitHubService
-	serviceService      *services.ServiceService
-	portManager         *network.PortManager
-	pathValidator       *security.PathValidator
-	wsHub               *ws.Hub
-	workDir             string
-	localBuildMode      string
-	maxConcurrentBuilds int
-	buildSem            *BuildSemaphore
-	semMu               sync.Mutex
-	buildMaintenanceMu  sync.RWMutex // synchronizes Docker image builds vs image pruning/maintenance
-	pruneFilterLabel    string       // optional label filter for scoped image pruning
-	activeLogCollectors sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
-	activeCancels       sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
-	activeContainers    sync.Map     // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
-	sharedBuildArtifacts sync.Map    // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
+	dockerClient         *client.Client
+	projectService       *services.ProjectService
+	deploymentService    *services.DeploymentService
+	secretService        *services.SecretService
+	sourceService        *services.SourceService
+	githubService        *services.GitHubService
+	serviceService       *services.ServiceService
+	portManager          *network.PortManager
+	pathValidator        *security.PathValidator
+	wsHub                *ws.Hub
+	workDir              string
+	localBuildMode       string
+	maxConcurrentBuilds  int
+	buildSem             *BuildSemaphore
+	semMu                sync.Mutex
+	buildMaintenanceMu   sync.RWMutex // synchronizes Docker image builds vs image pruning/maintenance
+	pruneFilterLabel     string       // optional label filter for scoped image pruning
+	activeLogCollectors  sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
+	activeCancels        sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	activeContainers     sync.Map     // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
+	sharedBuildArtifacts sync.Map     // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
 	cachedBuilderVer     atomic.Value // stores types.BuilderVersion advertised by Docker daemon
 }
 
@@ -456,6 +456,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	if models.IsDeploymentTerminalStatus(serviceDeploy.Status) {
 		slog.Info("service deployment already in terminal state; skipping execution", "service_deployment_id", serviceDeploymentID, "status", serviceDeploy.Status)
 		return nil
+	}
+	if e.deploymentService != nil {
+		if superseded, err := e.deploymentService.IsServiceDeploymentSuperseded(ctx, serviceDeploy.ServiceID, serviceDeploy.DeployNumber); err == nil && superseded {
+			slog.Info("service deployment superseded by newer deployment; skipping execution", "service_deployment_id", serviceDeploymentID, "deploy_number", serviceDeploy.DeployNumber)
+			return nil
+		}
 	}
 
 	execCtx, execCancel := context.WithCancel(ctx)
@@ -1922,6 +1928,12 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		slog.Info("deployment already in terminal state; skipping execution", "deployment_id", deploymentID, "status", deployment.Status)
 		return nil
 	}
+	if e.deploymentService != nil {
+		if superseded, err := e.deploymentService.IsDeploymentSuperseded(ctx, deployment.ProjectID, deployment.DeployNumber); err == nil && superseded {
+			slog.Info("deployment superseded by newer release; skipping execution", "deployment_id", deploymentID, "deploy_number", deployment.DeployNumber)
+			return nil
+		}
+	}
 
 	execCtx, execCancel := context.WithCancel(ctx)
 	defer execCancel()
@@ -3195,12 +3207,21 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 					}
 					slog.Warn("reconciliation: service container missing, marked failed", "service_id", svc.ID, "container_id", cID)
 				} else if dockCont.State != "running" {
-					// Container is dead or exited
-					_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
-					if svc.CurrentServiceDeploymentID != nil {
-						_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, fmt.Sprintf("Container stopped with state '%s' while backend was offline", dockCont.State))
+					if svc.Status == models.ServiceStatusStopped {
+						// Service was intentionally stopped; preserve its stopped container
+						legitimateContainers[dockCont.ID] = true
+						if len(dockCont.ID) > 12 {
+							legitimateContainers[dockCont.ID[:12]] = true
+						}
+						slog.Info("reconciliation: service container stopped as expected", "service_id", svc.ID, "container_id", cID)
+					} else {
+						// Container is dead or exited while service was expected to be running
+						_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+						if svc.CurrentServiceDeploymentID != nil {
+							_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, fmt.Sprintf("Container stopped with state '%s' while backend was offline", dockCont.State))
+						}
+						slog.Warn("reconciliation: service container exited, marked failed", "service_id", svc.ID, "state", dockCont.State)
 					}
-					slog.Warn("reconciliation: service container exited, marked failed", "service_id", svc.ID, "state", dockCont.State)
 				} else {
 					// Legitimately running
 					legitimateContainers[dockCont.ID] = true
@@ -3324,7 +3345,7 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 			}
 			slog.Info("reconciliation: removing orphaned container", "container_id", cShort, "labels", c.Labels)
 			_ = e.dockerClient.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &stopTimeout})
-			_ = e.dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+			_ = e.dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: false})
 			orphansCleaned++
 		}
 	}
@@ -3557,20 +3578,27 @@ func (e *Engine) buildImage(
 		return err
 	}
 
-	// 1. Acquire shared build-maintenance lock (read side).
-	// Prevents Docker image pruning from running while any ImageBuild is active.
-	if !e.buildMaintenanceMu.TryRLock() {
-		slog.Info("docker build waiting for build-maintenance access")
-		e.buildMaintenanceMu.RLock()
-	}
-	defer e.buildMaintenanceMu.RUnlock()
-
-	// 2. Acquire Docker build slot under configurable concurrency limit (BuildSemaphore) if not already held
+	// 1. Acquire Docker build slot under configurable concurrency limit (BuildSemaphore) if not already held.
+	// Acquired BEFORE the build-maintenance lock so that queued builds waiting for a build slot do not
+	// unnecessarily block Docker image pruning or maintenance operations.
 	if ctx.Value(buildSlotContextKey) == nil {
 		if onLogLine != nil {
 			onLogLine("Waiting for Docker build slot...")
 		}
-		rel, err := e.acquireBuildSlot(ctx)
+		slotInfo := SlotOwnerInfo{
+			ID:          uuid.New().String(),
+			ServiceName: "build_image",
+			Phase:       "waiting_for_build_slot",
+		}
+		rel, err := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
+			if onLogLine != nil {
+				var ownerDesc string
+				if len(actSlots) > 0 {
+					ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
+				}
+				onLogLine(fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
+			}
+		})
 		if err != nil {
 			return fmt.Errorf("Docker build concurrency limit wait cancelled: %w", err)
 		}
@@ -3579,6 +3607,17 @@ func (e *Engine) buildImage(
 			onLogLine("Docker build slot acquired.")
 		}
 	}
+
+	// 2. Acquire shared build-maintenance lock (read side) only once the build slot is held.
+	// Prevents Docker image pruning from running while any ImageBuild is active.
+	if !e.buildMaintenanceMu.TryRLock() {
+		if onLogLine != nil {
+			onLogLine("Docker daemon is currently performing maintenance/image pruning; waiting for maintenance lock...")
+		}
+		slog.Info("docker build waiting for build-maintenance access")
+		e.buildMaintenanceMu.RLock()
+	}
+	defer e.buildMaintenanceMu.RUnlock()
 
 	// 3. Stage and validate build context archive onto disk
 	var validatedArchiveFile *os.File

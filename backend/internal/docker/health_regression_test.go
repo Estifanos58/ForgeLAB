@@ -614,4 +614,3 @@ func TestRegression_Reconciler_PreservesTrackedAndRecentContainers(t *testing.T)
 	eng.untrackActiveContainer(cID)
 	assert.False(t, eng.isContainerTracked(cID), "untracked container must not be tracked")
 }
-

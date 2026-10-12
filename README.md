@@ -11,7 +11,7 @@ ForgeLAB is a single control-plane application deployment platform built in Go. 
 - **Service-First Architecture**: Projects compose multiple autonomous services with independent deployment pipelines (`POST /api/projects/{id}/services/{serviceId}/deploy`), rollbacks, and log streams
 - **Work Queue & Lease Ownership**: Redis 7 (`LPUSH` / `BRPOP` queue with cryptographically unique execution lease tokens, Lua atomic renewal/recovery, and O(1) state indexing)
 - **Runtime Engine & Sandboxing**: Docker Engine SDK with strict trust boundary enforcement (no-new-privileges, capability drop `ALL`, rejection of `/var/run/docker.sock` and sensitive mounts, enforced CPU/RAM/PID resource limits)
-- **Health & Readiness**: Lightweight `/health` liveness probe and deep dependency `/ready` check (probing PostgreSQL, Redis, and Docker Engine concurrently with 0 secret leakage)
+- **Health, Readiness & Diagnostics**: Lightweight `/health` liveness probe, deep dependency `/ready` check (probing PostgreSQL, Redis, and Docker Engine concurrently with 0 secret leakage), and `/health/queue` queue & abandoned-job recovery diagnostics
 - **Rate Limiting**: Configurable sliding-window throttling (`ratelimit`) backed by Redis/in-memory for authentication, uploads, deployments, and WebSockets returning HTTP 429
 - **Deployment Lifecycle**: Cancellation for queued/in-progress builds, atomic superseding of obsolete queued builds, and strict non-regression invariant for healthy containers
 - **Source Ingestion**: Local Agent CLI (`cmd/agent`) streaming local directories securely without browser uploads, optional archive upload fallback (`/api/sources/upload`), & authorized GitHub repository import (`/api/integrations/github`)
@@ -33,8 +33,8 @@ ForgeLAB is a single control-plane application deployment platform built in Go. 
 ## Prerequisites
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Docker Engine 24+ & Compose v2+)
-- [Go 1.21+](https://go.dev/dl/) (required for running the host backend in Workflow A and running migrations)
-- [Node.js 18+](https://nodejs.org/) (required for running the host frontend console in Workflow A)
+- [Go 1.26+](https://go.dev/dl/) (required for compiling the backend, running migrations, and running the host backend in Workflow A)
+- [Node.js 20+](https://nodejs.org/) (required for running the host frontend Next.js 16 console in Workflow A)
 
 ---
 
@@ -92,7 +92,11 @@ You can also launch all services using Docker Compose:
 docker compose up --build
 ```
 
-To run database migrations inside the container:
+To run database migrations using Docker Compose:
+```bash
+docker compose run --rm migrate up
+```
+Or execute directly inside a running backend container:
 ```bash
 docker compose exec backend /app/forgelab-migrate up
 ```

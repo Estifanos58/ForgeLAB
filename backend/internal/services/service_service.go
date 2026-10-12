@@ -210,7 +210,7 @@ func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Serv
 		        internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
 		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
-		 FROM services WHERE status IN ('running', 'deploying', 'starting', 'health_checking') OR container_id IS NOT NULL ORDER BY created_at ASC`,
+		 FROM services WHERE status IN ('running', 'deploying', 'starting', 'health_checking', 'stopped') ORDER BY created_at ASC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active services: %w", err)

@@ -534,27 +534,27 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 
 	svcDeployID := uuid.New()
 	serviceDeployment := &models.ServiceDeployment{
-		ID:                svcDeployID,
-		DeploymentID:      nil,
-		ServiceID:         targetService.ID,
-		ServiceName:       targetService.Name,
-		DeployNumber:      deployNumber,
-		Status:            models.DeployStatusQueued,
-		ImageTag:          &imageTag,
-		InternalPort:      internalPort,
-		BuildStrategy:     buildStrategy,
-		BuildCommand:      buildCommand,
-		StartCommand:      startCommand,
-		RuntimeType:       runtimeType,
-		DockerfilePath:    dockerfilePath,
-		BuildContext:      buildContext,
-		HealthStrategy:    healthStrategy,
-		HealthCheckPath:   healthCheckPath,
-		ResourceConfig:    resConfig,
-		ExecutionMode:     models.ExecutionModeBuild,
-		SourceRevision:    sourceRevision,
-		EnvConfigHash:     envConfigHash,
-		EnvSnapshot:       envSnapshot,
+		ID:                  svcDeployID,
+		DeploymentID:        nil,
+		ServiceID:           targetService.ID,
+		ServiceName:         targetService.Name,
+		DeployNumber:        deployNumber,
+		Status:              models.DeployStatusQueued,
+		ImageTag:            &imageTag,
+		InternalPort:        internalPort,
+		BuildStrategy:       buildStrategy,
+		BuildCommand:        buildCommand,
+		StartCommand:        startCommand,
+		RuntimeType:         runtimeType,
+		DockerfilePath:      dockerfilePath,
+		BuildContext:        buildContext,
+		HealthStrategy:      healthStrategy,
+		HealthCheckPath:     healthCheckPath,
+		ResourceConfig:      resConfig,
+		ExecutionMode:       models.ExecutionModeBuild,
+		SourceRevision:      sourceRevision,
+		EnvConfigHash:       envConfigHash,
+		EnvSnapshot:         envSnapshot,
 		Classification:      targetService.Classification,
 		Image:               targetService.Image,
 		DependsOn:           targetService.DependsOn,
@@ -838,7 +838,7 @@ func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.
 	return deployments, nil
 }
 
-// ListActiveDeployments retrieves all deployments that are currently active or have an associated container.
+// ListActiveDeployments retrieves all deployments that are currently in-flight or actively running.
 func (s *DeploymentService) ListActiveDeployments(ctx context.Context) ([]*models.Deployment, error) {
 	if s.db == nil {
 		return []*models.Deployment{}, nil
@@ -851,7 +851,7 @@ func (s *DeploymentService) ListActiveDeployments(ctx context.Context) ([]*model
 		 COALESCE(execution_mode, 'build'), image_digest, env_config_hash, env_snapshot,
 		 started_at, built_at, deployed_at, finished_at, duration_ms, failure_reason, created_at,
 		 COALESCE(deployment_strategy, 'dockerfile'), deployment_plan
-		 FROM deployments WHERE status IN ('running', 'cloning', 'building', 'starting', 'health_checking') OR container_id IS NOT NULL
+		 FROM deployments WHERE status IN ('running', 'cloning', 'building', 'starting', 'health_checking')
 		 ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -882,7 +882,7 @@ func (s *DeploymentService) ListActiveDeployments(ctx context.Context) ([]*model
 	return deployments, rows.Err()
 }
 
-// ListActiveServiceDeployments retrieves all service deployments that are currently active or have an associated container.
+// ListActiveServiceDeployments retrieves all service deployments that are currently in-flight or actively running.
 func (s *DeploymentService) ListActiveServiceDeployments(ctx context.Context) ([]*models.ServiceDeployment, error) {
 	if s.db == nil {
 		return []*models.ServiceDeployment{}, nil
@@ -891,8 +891,7 @@ func (s *DeploymentService) ListActiveServiceDeployments(ctx context.Context) ([
 	rows, err := s.db.Query(ctx,
 		`SELECT id, service_id, deploy_number, status, container_id, host_port, internal_port
 		 FROM service_deployments
-		 WHERE status IN ('queued', 'cloning', 'building', 'starting', 'health_checking', 'running')
-		    OR container_id IS NOT NULL`,
+		 WHERE status IN ('queued', 'cloning', 'building', 'starting', 'health_checking', 'running')`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active service deployments: %w", err)
@@ -1616,7 +1615,7 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 	}
 
 	return sd, nil
-}// ListServiceDeploymentsByService retrieves all service deployments for a specific service ordered by deploy number.
+} // ListServiceDeploymentsByService retrieves all service deployments for a specific service ordered by deploy number.
 func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context, serviceID uuid.UUID) ([]*models.ServiceDeployment, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, s.public_exposed, sd.deploy_number,
@@ -2272,6 +2271,25 @@ func (s *DeploymentService) ReconcileQueuedDeployments(ctx context.Context, q De
 			continue
 		}
 
+		// Check if this queued deployment has already been superseded by a newer deployment
+		var isSuperseded bool
+		err = s.db.QueryRow(ctx,
+			`SELECT EXISTS(
+				SELECT 1 FROM service_deployments
+				WHERE service_id = $1 AND deploy_number > (
+					SELECT deploy_number FROM service_deployments WHERE id = $2
+				)
+			)`,
+			item.serviceID, item.id,
+		).Scan(&isSuperseded)
+		if err == nil && isSuperseded {
+			reason := "Reconciliation: queued deployment was superseded by a newer deployment"
+			_ = s.FailServiceDeployment(ctx, item.id, reason)
+			slog.Info("marked superseded queued deployment as failed", "service_deployment_id", item.id)
+			reconciled++
+			continue
+		}
+
 		// The Redis job is missing!
 		attempts, _ := q.GetAttempts(ctx, item.id)
 		if attempts < maxRetries {
@@ -2299,7 +2317,7 @@ func (s *DeploymentService) ReconcileQueuedDeployments(ctx context.Context, q De
 // Instead of blindly failing them after a timeout, it inspects whether a worker holds an active lease:
 // - If an active worker lease exists, the deployment is actively processing and not orphaned.
 // - If no active lease exists and it has been abandoned beyond staleDuration:
-//   - If attempts < maxRetries, it resets status to 'queued' and re-enqueues for recovery.
+//   - If attempts < maxRetries, it resets status to 'queued' and re-enqueues for recovery (unless superseded).
 //   - If attempts >= maxRetries, it marks the deployment as failed.
 func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Context, q DeploymentQueueReconciler, staleDuration time.Duration, maxRetries int) (int, error) {
 	if s.db == nil {
@@ -2352,6 +2370,25 @@ func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Co
 			continue
 		}
 
+		// Check if this abandoned deployment has already been superseded by a newer deployment
+		var isSuperseded bool
+		err = s.db.QueryRow(ctx,
+			`SELECT EXISTS(
+				SELECT 1 FROM service_deployments
+				WHERE service_id = $1 AND deploy_number > (
+					SELECT deploy_number FROM service_deployments WHERE id = $2
+				)
+			)`,
+			item.serviceID, item.id,
+		).Scan(&isSuperseded)
+		if err == nil && isSuperseded {
+			reason := "Reconciliation: abandoned deployment was superseded by a newer deployment"
+			_ = s.FailServiceDeployment(ctx, item.id, reason)
+			slog.Info("marked superseded abandoned deployment as failed", "service_deployment_id", item.id)
+			reconciled++
+			continue
+		}
+
 		// Abandoned!
 		attempts, _ := q.GetAttempts(ctx, item.id)
 		if attempts < maxRetries {
@@ -2384,6 +2421,38 @@ func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Co
 	// Also reconcile missing queued deployments
 	queuedRec, _ := s.ReconcileQueuedDeployments(ctx, q, 30*time.Second, maxRetries)
 	return reconciled + queuedRec, nil
+}
+
+// IsServiceDeploymentSuperseded returns true if a newer deployment exists for the same service.
+func (s *DeploymentService) IsServiceDeploymentSuperseded(ctx context.Context, serviceID uuid.UUID, deployNumber int) (bool, error) {
+	if s.db == nil {
+		return false, nil
+	}
+	var exists bool
+	err := s.db.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM service_deployments
+			WHERE service_id = $1 AND deploy_number > $2
+		)`,
+		serviceID, deployNumber,
+	).Scan(&exists)
+	return exists, err
+}
+
+// IsDeploymentSuperseded returns true if a newer release deployment exists for the same project.
+func (s *DeploymentService) IsDeploymentSuperseded(ctx context.Context, projectID uuid.UUID, deployNumber int) (bool, error) {
+	if s.db == nil {
+		return false, nil
+	}
+	var exists bool
+	err := s.db.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM deployments
+			WHERE project_id = $1 AND deploy_number > $2
+		)`,
+		projectID, deployNumber,
+	).Scan(&exists)
+	return exists, err
 }
 
 // ReconcileOrphanedDeployments finds service deployments stuck in active states for too long

@@ -229,10 +229,10 @@ func TestProjectCreation_WithComposeSemanticsRegression(t *testing.T) {
 
 	// Verify directly from PostgreSQL relation
 	var (
-		dbClassification string
-		dbDependsOnJSON  []byte
-		dbVolumesJSON    []byte
-		dbNetworksJSON   []byte
+		dbClassification  string
+		dbDependsOnJSON   []byte
+		dbVolumesJSON     []byte
+		dbNetworksJSON    []byte
 		dbHealthCheckJSON []byte
 	)
 
@@ -380,4 +380,3 @@ func TestProjectCreation_NormalLocalProject_NoFailedToCreateProjectError(t *test
 	assert.NotEmpty(t, createdProject.ID)
 	assert.Equal(t, httpPayload["name"], createdProject.Name)
 }
-

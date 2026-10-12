@@ -1,12 +1,15 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/forgelab/backend/internal/queue"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -111,4 +114,87 @@ func containsSubstring(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+type mockQueueProvider struct {
+	diag queue.QueueDiagnostics
+	err  error
+}
+
+func (m *mockQueueProvider) GetQueueDiagnostics(ctx context.Context) (queue.QueueDiagnostics, error) {
+	return m.diag, m.err
+}
+
+func TestHealthHandler_QueueDiagnostics(t *testing.T) {
+	// 1. Without provider -> 501 Not Implemented
+	h := NewHealthHandler(nil, nil, nil)
+	req := httptest.NewRequest("GET", "/health/queue", nil)
+	rec := httptest.NewRecorder()
+	h.QueueDiagnostics(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 Not Implemented without provider, got %d", rec.Code)
+	}
+
+	// 2. With provider returning error -> 503 Service Unavailable
+	mock := &mockQueueProvider{
+		err: errors.New("redis unavailable"),
+	}
+	h.SetQueueDiagnosticsProvider(mock)
+	rec = httptest.NewRecorder()
+	h.QueueDiagnostics(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on provider error, got %d", rec.Code)
+	}
+
+	// 3. With provider returning stats -> 200 OK
+	mock.err = nil
+	mock.diag = queue.QueueDiagnostics{
+		PendingJobs:        5,
+		ProcessingJobs:     2,
+		DeadLetterJobs:     0,
+		TotalRecoveredJobs: 1,
+	}
+	rec = httptest.NewRecorder()
+	h.QueueDiagnostics(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	var diag queue.QueueDiagnostics
+	if err := json.Unmarshal(rec.Body.Bytes(), &diag); err != nil {
+		t.Fatalf("failed to unmarshal diag: %v", err)
+	}
+	if diag.PendingJobs != 5 || diag.TotalRecoveredJobs != 1 {
+		t.Errorf("unexpected diag content: %+v", diag)
+	}
+}
+
+func TestHealthHandler_Readiness_WithQueueDiagnostics(t *testing.T) {
+	h := NewHealthHandler(nil, nil, nil)
+	h.SetQueueDiagnosticsProvider(&mockQueueProvider{
+		diag: queue.QueueDiagnostics{
+			PendingJobs:        3,
+			ProcessingJobs:     1,
+			TotalRecoveredJobs: 4,
+		},
+	})
+
+	req := httptest.NewRequest("GET", "/ready", nil)
+	rec := httptest.NewRecorder()
+	h.Readiness(rec, req)
+
+	var resp ReadinessResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal readiness response: %v", err)
+	}
+
+	if resp.Queue == nil {
+		t.Fatalf("expected queue diagnostics in readiness response, got nil")
+	}
+	if resp.Queue.PendingJobs != 3 || resp.Queue.TotalRecoveredJobs != 4 {
+		t.Errorf("unexpected queue metrics in readiness response: %+v", resp.Queue)
+	}
 }

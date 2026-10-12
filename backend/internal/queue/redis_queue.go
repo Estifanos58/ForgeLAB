@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -270,15 +271,16 @@ func ParseJob(item string) (Job, error) {
 type TerminalChecker func(ctx context.Context, job Job) (bool, error)
 
 type DeploymentQueue struct {
-	client            *redis.Client
-	maxRetries        int
-	workerCount       int
-	retryBackoff      time.Duration
-	leaseTTL          time.Duration
-	heartbeatInterval time.Duration
-	terminalChecker   TerminalChecker
-	wg                sync.WaitGroup
-	cancel            context.CancelFunc
+	client             *redis.Client
+	maxRetries         int
+	workerCount        int
+	retryBackoff       time.Duration
+	leaseTTL           time.Duration
+	heartbeatInterval  time.Duration
+	terminalChecker    TerminalChecker
+	totalRecoveredJobs int64
+	wg                 sync.WaitGroup
+	cancel             context.CancelFunc
 }
 
 func NewDeploymentQueue(client *redis.Client) *DeploymentQueue {
@@ -721,6 +723,10 @@ func (q *DeploymentQueue) RecoverAbandonedJobs(ctx context.Context) (int, error)
 		}
 	}
 
+	if recovered > 0 {
+		atomic.AddInt64(&q.totalRecoveredJobs, int64(recovered))
+	}
+
 	return recovered, nil
 }
 
@@ -734,6 +740,29 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 		slog.Info("recovered abandoned deployment jobs on startup", "count", recCount)
 	}
 	recoverCancel()
+
+	// Launch periodic abandoned-job recovery to periodically re-enqueue stranded/expired jobs
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				recCtx, recCancel := context.WithTimeout(workerCtx, 10*time.Second)
+				recCount, err := q.RecoverAbandonedJobs(recCtx)
+				recCancel()
+				if err != nil && !errors.Is(err, context.Canceled) {
+					slog.Warn("periodic abandoned job recovery encountered error", "error", err)
+				} else if recCount > 0 {
+					slog.Info("periodic recovery processed abandoned deployment jobs", "count", recCount)
+				}
+			}
+		}
+	}()
 
 	workerCount := q.workerCount
 	if workerCount <= 0 {
@@ -784,6 +813,16 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 					leaseToken, acquired, err := q.acquireLease(workerCtx, job.ID, workerName)
 					if err != nil {
 						slog.Error("failed to check job idempotency / acquire lease", "job_id", job.ID, "error", err)
+						// Fix stranded job: BRPopLPush moved itemStr from DeploymentQueueKey to ProcessingQueueKey.
+						// Safely re-enqueue the job back to DeploymentQueueKey and remove from ProcessingQueueKey.
+						pipe := q.client.Pipeline()
+						pipe.LRem(context.Background(), ProcessingQueueKey, 1, itemStr)
+						pipe.LPush(context.Background(), DeploymentQueueKey, itemStr)
+						pipe.Set(context.Background(), JobStatePrefix+job.ID.String(), JobStatePending, 24*time.Hour)
+						if _, pipeErr := pipe.Exec(context.Background()); pipeErr != nil {
+							slog.Error("failed to restore stranded job to deployment queue after lease error", "job_id", job.ID, "error", pipeErr)
+						}
+						time.Sleep(500 * time.Millisecond)
 						continue
 					}
 					if !acquired {
@@ -933,4 +972,31 @@ func (q *DeploymentQueue) GetQueueStats(ctx context.Context) (pending, processin
 		return 0, 0, 0, err
 	}
 	return pending, processing, deadLetter, nil
+}
+
+// QueueDiagnostics provides diagnostic metrics for queue monitoring and recovery observability.
+type QueueDiagnostics struct {
+	PendingJobs        int64 `json:"pending_jobs"`
+	ProcessingJobs     int64 `json:"processing_jobs"`
+	DeadLetterJobs     int64 `json:"dead_letter_jobs"`
+	TotalRecoveredJobs int64 `json:"total_recovered_jobs"`
+}
+
+// GetQueueDiagnostics returns comprehensive queue counts and recovery metrics.
+func (q *DeploymentQueue) GetQueueDiagnostics(ctx context.Context) (QueueDiagnostics, error) {
+	p, proc, dlq, err := q.GetQueueStats(ctx)
+	if err != nil {
+		return QueueDiagnostics{}, err
+	}
+	return QueueDiagnostics{
+		PendingJobs:        p,
+		ProcessingJobs:     proc,
+		DeadLetterJobs:     dlq,
+		TotalRecoveredJobs: atomic.LoadInt64(&q.totalRecoveredJobs),
+	}, nil
+}
+
+// GetTotalRecoveredJobs returns the total count of abandoned jobs successfully recovered by this queue instance.
+func (q *DeploymentQueue) GetTotalRecoveredJobs() int64 {
+	return atomic.LoadInt64(&q.totalRecoveredJobs)
 }

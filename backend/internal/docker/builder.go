@@ -127,7 +127,6 @@ func DetectDockerfileRequiresBuildKit(content []byte) (bool, string) {
 	return false, ""
 }
 
-
 // extractDockerfileFromTar scans a tar reader to find and extract the Dockerfile content.
 func extractDockerfileFromTar(r io.Reader, targetDockerfile string) ([]byte, error) {
 	if r == nil {

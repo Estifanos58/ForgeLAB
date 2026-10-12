@@ -77,27 +77,27 @@ func (s *ProjectService) SetSecretService(sec *SecretService) {
 }
 
 type CreateServiceInput struct {
-	Name              string                     `json:"name"`
-	Role              string                     `json:"role"`
-	Classification    string                     `json:"classification,omitempty"`
-	SourcePath        string                     `json:"source_path"`
-	Runtime           string                     `json:"runtime"`
-	RuntimeType       string                     `json:"runtime_type"`
-	Framework         string                     `json:"framework"`
-	PackageManager    string                     `json:"package_manager"`
-	BuildStrategy     string                     `json:"build_strategy"`
-	Image             string                     `json:"image,omitempty"`
-	BuildCandidates   []models.BuildCandidate    `json:"build_candidates"`
-	BuildCommand      string                     `json:"build_command"`
-	StartCommand      string                     `json:"start_command"`
-	DockerfilePath    string                     `json:"dockerfile_path"`
-	BuildContext      string                     `json:"build_context"`
-	InternalPort      int                        `json:"internal_port"`
-	HostPort          *int                       `json:"host_port"`
-	PublicExposed     bool                       `json:"public_exposed"`
-	HealthStrategy    string                     `json:"health_strategy"`
-	HealthCheckPath   *string                    `json:"health_check_path"`
-	HealthCheckConfig *models.HealthCheckConfig  `json:"healthcheck_config,omitempty"`
+	Name                string                     `json:"name"`
+	Role                string                     `json:"role"`
+	Classification      string                     `json:"classification,omitempty"`
+	SourcePath          string                     `json:"source_path"`
+	Runtime             string                     `json:"runtime"`
+	RuntimeType         string                     `json:"runtime_type"`
+	Framework           string                     `json:"framework"`
+	PackageManager      string                     `json:"package_manager"`
+	BuildStrategy       string                     `json:"build_strategy"`
+	Image               string                     `json:"image,omitempty"`
+	BuildCandidates     []models.BuildCandidate    `json:"build_candidates"`
+	BuildCommand        string                     `json:"build_command"`
+	StartCommand        string                     `json:"start_command"`
+	DockerfilePath      string                     `json:"dockerfile_path"`
+	BuildContext        string                     `json:"build_context"`
+	InternalPort        int                        `json:"internal_port"`
+	HostPort            *int                       `json:"host_port"`
+	PublicExposed       bool                       `json:"public_exposed"`
+	HealthStrategy      string                     `json:"health_strategy"`
+	HealthCheckPath     *string                    `json:"health_check_path"`
+	HealthCheckConfig   *models.HealthCheckConfig  `json:"healthcheck_config,omitempty"`
 	DependsOn           []string                   `json:"depends_on,omitempty"`
 	DependsOnConditions map[string]string          `json:"depends_on_conditions,omitempty"`
 	Volumes             []models.VolumeMountConfig `json:"volumes,omitempty"`
@@ -483,23 +483,23 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				Volumes:             svcIn.Volumes,
 				Networks:            svcIn.Networks,
 				HealthCheckConfig:   svcIn.HealthCheckConfig,
-				SourcePath:         svcSourcePath,
-				RuntimeType:        rt,
-				Framework:          svcIn.Framework,
-				PackageManager:     svcIn.PackageManager,
-				BuildStrategy:      svcStrat,
-				BuildCandidates:    svcIn.BuildCandidates,
-				BuildCommand:       strings.TrimSpace(svcIn.BuildCommand),
-				StartCommand:       strings.TrimSpace(svcIn.StartCommand),
-				DockerfilePath:     dfPath,
-				BuildContext:       bCtx,
-				InternalPort:       svcPort,
-				HostPort:           svcIn.HostPort,
-				PublicExposed:      svcIn.PublicExposed,
-				HealthStrategy:     svcHealthStrat,
-				HealthCheckPath:    &svcHealthPath,
-				HealthCheckEnabled: true,
-				Status:             models.ProjectStatusInactive,
+				SourcePath:          svcSourcePath,
+				RuntimeType:         rt,
+				Framework:           svcIn.Framework,
+				PackageManager:      svcIn.PackageManager,
+				BuildStrategy:       svcStrat,
+				BuildCandidates:     svcIn.BuildCandidates,
+				BuildCommand:        strings.TrimSpace(svcIn.BuildCommand),
+				StartCommand:        strings.TrimSpace(svcIn.StartCommand),
+				DockerfilePath:      dfPath,
+				BuildContext:        bCtx,
+				InternalPort:        svcPort,
+				HostPort:            svcIn.HostPort,
+				PublicExposed:       svcIn.PublicExposed,
+				HealthStrategy:      svcHealthStrat,
+				HealthCheckPath:     &svcHealthPath,
+				HealthCheckEnabled:  true,
+				Status:              models.ProjectStatusInactive,
 			}
 			servicesToCreate = append(servicesToCreate, svc)
 		}

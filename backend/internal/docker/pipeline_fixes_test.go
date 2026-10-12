@@ -262,10 +262,10 @@ func TestPreflightValidation_AllChecks(t *testing.T) {
 			Project: proj,
 			Deployments: []*models.ServiceDeployment{
 				{
-					ServiceName:    "redis",
-					BuildStrategy:  models.BuildStrategyImage,
-					Image:          "redis:alpine",
-					InternalPort:   6379,
+					ServiceName:   "redis",
+					BuildStrategy: models.BuildStrategyImage,
+					Image:         "redis:alpine",
+					InternalPort:  6379,
 				},
 				{
 					ServiceName:    "backend",
@@ -380,25 +380,25 @@ func TestDAGExecution_TiersAndConditions(t *testing.T) {
 	// backend (depends on migrate with service_completed_successfully) -> Tier 3
 	svcDeploys := []*models.ServiceDeployment{
 		{
-			ServiceName:   "backend",
-			DependsOn:     []string{"migrate"},
+			ServiceName: "backend",
+			DependsOn:   []string{"migrate"},
 			DependsOnConditions: map[string]string{
 				"migrate": "service_completed_successfully",
 			},
 		},
 		{
-			ServiceName:   "migrate",
+			ServiceName:    "migrate",
 			Classification: models.ClassificationJob,
-			DependsOn:     []string{"db"},
+			DependsOn:      []string{"db"},
 			DependsOnConditions: map[string]string{
 				"db": "service_healthy",
 			},
 		},
 		{
-			ServiceName:   "db",
+			ServiceName:    "db",
 			Classification: models.ClassificationInfrastructure,
-			BuildStrategy: models.BuildStrategyImage,
-			Image:         "postgres:15",
+			BuildStrategy:  models.BuildStrategyImage,
+			Image:          "postgres:15",
 		},
 	}
 
@@ -729,4 +729,3 @@ func TestSyntheticAutoStartCommandIgnoredForDockerfile(t *testing.T) {
 	assert.False(t, isSyntheticAutoStartCommand("./forgelab-migrate up"))
 	assert.False(t, isSyntheticAutoStartCommand("npm start"))
 }
-

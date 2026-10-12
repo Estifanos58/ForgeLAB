@@ -34,6 +34,9 @@ services:
 
   migrate:
     image: forgelab-backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     container_name: forgelab-migrate
     restart: "no"
     command: ["./forgelab-migrate", "up"]
@@ -52,6 +55,8 @@ services:
       dockerfile: Dockerfile
     container_name: forgelab-backend
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "8080:8080"
     extra_hosts:

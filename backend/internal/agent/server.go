@@ -51,6 +51,7 @@ type LocalSourceSession struct {
 	Token         string                     `json:"-"`
 	mu            sync.RWMutex               `json:"-"`
 }
+
 var (
 	globalSourceSessionsMu sync.RWMutex
 	globalSourceSessions   = make(map[uuid.UUID]*LocalSourceSession)

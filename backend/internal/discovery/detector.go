@@ -405,7 +405,7 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 		port = 8080
 	}
 
-	installCmd := "(npm pkg delete scripts.prepare 2>/dev/null || true) && (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then (npm ci || npm install); else npm install; fi)"
+	installCmd := "if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then (npm ci || npm install); else npm install; fi"
 	runBuildCmd := "npm run build"
 	runStartCmd := "npm start"
 	runnerSetup := ""
@@ -414,23 +414,23 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 
 	switch pkgManager {
 	case "pnpm":
-		installCmd = "corepack enable && pnpm config set fetch-retries 5 && pnpm config set fetch-retry-maxtimeout 180000 && (npm pkg delete scripts.prepare 2>/dev/null || true) && (pnpm install --frozen-lockfile --dangerously-allow-all-builds 2>/dev/null || pnpm install --frozen-lockfile 2>/dev/null || pnpm install)"
+		installCmd = "corepack enable && pnpm config set fetch-retries 5 && pnpm config set fetch-retry-maxtimeout 180000 && (pnpm install --frozen-lockfile --dangerously-allow-all-builds 2>/dev/null || pnpm install --frozen-lockfile 2>/dev/null || pnpm install)"
 		runBuildCmd = "pnpm run build"
 		runStartCmd = "pnpm start"
 		runnerSetup = "RUN corepack enable\n"
 	case "yarn":
-		installCmd = "corepack enable && (yarn config set network-timeout 300000 2>/dev/null || true) && (npm pkg delete scripts.prepare 2>/dev/null || true) && (yarn install --immutable 2>/dev/null || yarn install --frozen-lockfile 2>/dev/null || yarn install)"
+		installCmd = "corepack enable && (yarn config set network-timeout 300000 2>/dev/null || true) && (yarn install --immutable 2>/dev/null || yarn install --frozen-lockfile 2>/dev/null || yarn install)"
 		runBuildCmd = "yarn build"
 		runStartCmd = "yarn start"
 		runnerSetup = "RUN corepack enable\n"
 	case "bun":
 		builderImage = "oven/bun:1-alpine"
 		runnerImage = "oven/bun:1-alpine"
-		installCmd = "(bun -e \"try{const f='package.json',p=JSON.parse(require('fs').readFileSync(f));if(p.scripts&&p.scripts.prepare){delete p.scripts.prepare;require('fs').writeFileSync(f,JSON.stringify(p,null,2))}}catch(e){}\" 2>/dev/null || true) && (bun install --frozen-lockfile 2>/dev/null || bun install)"
+		installCmd = "bun install --frozen-lockfile 2>/dev/null || bun install"
 		runBuildCmd = "bun run build"
 		runStartCmd = "bun run start"
 	case "npm":
-		installCmd = "npm config set fetch-retries 5 && npm config set fetch-retry-maxtimeout 180000 && (npm pkg delete scripts.prepare 2>/dev/null || true) && (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then (npm ci || npm install); else npm install; fi)"
+		installCmd = "npm config set fetch-retries 5 && npm config set fetch-retry-maxtimeout 180000 && (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then (npm ci || npm install); else npm install; fi)"
 		runBuildCmd = "npm run build"
 		runStartCmd = "npm start"
 	}

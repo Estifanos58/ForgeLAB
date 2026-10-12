@@ -11,32 +11,32 @@ import (
 
 // ServiceDefinition represents a discovered service and its detected build candidates.
 type ServiceDefinition struct {
-	Name                string                    `json:"name"`
-	Role                string                    `json:"role"` // "frontend", "backend", "worker", "other"
-	Classification      string                    `json:"classification"`
-	Image               string                    `json:"image,omitempty"`
-	DependsOn           []string                  `json:"depends_on"`
-	DependsOnConditions map[string]string         `json:"depends_on_conditions,omitempty"`
+	Name                string                     `json:"name"`
+	Role                string                     `json:"role"` // "frontend", "backend", "worker", "other"
+	Classification      string                     `json:"classification"`
+	Image               string                     `json:"image,omitempty"`
+	DependsOn           []string                   `json:"depends_on"`
+	DependsOnConditions map[string]string          `json:"depends_on_conditions,omitempty"`
 	Volumes             []models.VolumeMountConfig `json:"volumes,omitempty"`
-	Networks            []string                  `json:"networks,omitempty"`
-	HealthCheckConfig   *models.HealthCheckConfig `json:"healthcheck_config,omitempty"`
-	SourcePath          string                    `json:"source_path"`
-	Runtime             string                    `json:"runtime"`
-	RuntimeType         string                    `json:"runtime_type"`
-	Framework           string                    `json:"framework"`
-	PackageManager      string                    `json:"package_manager"`
-	BuildStrategy       string                    `json:"build_strategy"`
-	BuildCandidates     []models.BuildCandidate   `json:"build_candidates"`
-	BuildCommand        string                    `json:"build_command"`
-	StartCommand        string                    `json:"start_command"`
-	DockerfilePath      string                    `json:"dockerfile_path"`
-	BuildContext        string                    `json:"build_context"`
-	InternalPort        int                       `json:"internal_port"`
-	HealthStrategy      string                    `json:"health_strategy"`
-	HealthCheckPath     string                    `json:"health_check_path"`
-	HealthCheckEnabled  bool                      `json:"health_check_enabled"`
-	FilesCount          int                       `json:"files_count"`
-	TotalBytes          int64                     `json:"total_bytes"`
+	Networks            []string                   `json:"networks,omitempty"`
+	HealthCheckConfig   *models.HealthCheckConfig  `json:"healthcheck_config,omitempty"`
+	SourcePath          string                     `json:"source_path"`
+	Runtime             string                     `json:"runtime"`
+	RuntimeType         string                     `json:"runtime_type"`
+	Framework           string                     `json:"framework"`
+	PackageManager      string                     `json:"package_manager"`
+	BuildStrategy       string                     `json:"build_strategy"`
+	BuildCandidates     []models.BuildCandidate    `json:"build_candidates"`
+	BuildCommand        string                     `json:"build_command"`
+	StartCommand        string                     `json:"start_command"`
+	DockerfilePath      string                     `json:"dockerfile_path"`
+	BuildContext        string                     `json:"build_context"`
+	InternalPort        int                        `json:"internal_port"`
+	HealthStrategy      string                     `json:"health_strategy"`
+	HealthCheckPath     string                     `json:"health_check_path"`
+	HealthCheckEnabled  bool                       `json:"health_check_enabled"`
+	FilesCount          int                        `json:"files_count"`
+	TotalBytes          int64                      `json:"total_bytes"`
 }
 
 // AnalysisResult represents the overall repository inspection result.

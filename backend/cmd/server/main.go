@@ -206,13 +206,25 @@ func main() {
 				if err != nil {
 					return false, err
 				}
-				return models.IsDeploymentTerminalStatus(sd.Status), nil
+				if models.IsDeploymentTerminalStatus(sd.Status) {
+					return true, nil
+				}
+				if superseded, _ := deploymentService.IsServiceDeploymentSuperseded(ctx, sd.ServiceID, sd.DeployNumber); superseded {
+					return true, nil
+				}
+				return false, nil
 			}
 			dep, err := deploymentService.GetDeployment(ctx, job.ID)
 			if err != nil {
 				return false, err
 			}
-			return models.IsDeploymentTerminalStatus(dep.Status), nil
+			if models.IsDeploymentTerminalStatus(dep.Status) {
+				return true, nil
+			}
+			if superseded, _ := deploymentService.IsDeploymentSuperseded(ctx, dep.ProjectID, dep.DeployNumber); superseded {
+				return true, nil
+			}
+			return false, nil
 		})
 		deployQueue.StartJobWorker(ctx, func(workerCtx context.Context, job queue.Job) error {
 			if job.Type == queue.JobTypeServiceDeployment {
@@ -231,6 +243,13 @@ func main() {
 		}
 
 		if deployQueue != nil {
+			// Periodic recovery of abandoned/expired Redis queue jobs
+			if recCount, err := deployQueue.RecoverAbandonedJobs(ctx); err != nil {
+				slog.Warn("failed to recover abandoned queue jobs during reconciliation", "error", err)
+			} else if recCount > 0 {
+				slog.Info("reconciled abandoned queue jobs", "count", recCount)
+			}
+
 			if reconciled, err := deploymentService.ReconcileOrphanedDeploymentsWithQueue(ctx, deployQueue, 10*time.Minute, queue.DefaultMaxRetries); err != nil {
 				slog.Warn("failed to reconcile orphaned deployments", "error", err)
 			} else if reconciled > 0 {
@@ -296,6 +315,7 @@ func main() {
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
 	discoveryHandler := handlers.NewDiscoveryHandler(githubService, sourceService, pathValidator, secretService)
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
+	healthHandler.SetQueueDiagnosticsProvider(deployQueue)
 
 	// Setup router
 	r := chi.NewRouter()
@@ -312,6 +332,7 @@ func main() {
 	r.Get("/health", healthHandler.Liveness)
 	r.Get("/ready", healthHandler.Readiness)
 	r.Get("/health/ready", healthHandler.Readiness)
+	r.Get("/health/queue", healthHandler.QueueDiagnostics)
 
 	// Throttles for sensitive endpoints
 	authThrottle := ratelimit.Middleware(rateLimiter, "auth", cfg.RateLimit.AuthLimit, time.Minute)

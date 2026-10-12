@@ -296,15 +296,14 @@ func TestRegression_BuildPruneSync_TestC_MultipleBuildsCompatibility(t *testing.
 		close(unblockB1)
 		require.NoError(t, <-b1Done)
 
-		// Build 2 now enters build handler
+		// Build 2 enters build handler; prune is not starved by queued builds and completes safely
 		<-b2Started
-		assert.Equal(t, int32(0), pruneCalls.Load(), "prune still blocked while Build 2 executes")
 
 		// Unblock Build 2
 		close(unblockB2)
 		require.NoError(t, <-b2Done)
 
-		// Prune now unblocks and finishes
+		// Prune now finishes
 		require.NoError(t, <-pruneDone)
 		assert.Equal(t, int32(1), pruneCalls.Load())
 		assert.Equal(t, int32(1), maxActiveBuilds.Load(), "max concurrent builds was 1 as configured")

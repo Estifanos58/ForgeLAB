@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -36,12 +37,14 @@ type SourceHandler struct {
 	sourceService           *services.SourceService
 	pathValidator           *security.PathValidator
 	localValidationSessions sync.Map
+	scanSemaphore           chan struct{}
 }
 
 func NewSourceHandler(sourceService *services.SourceService, pathValidator *security.PathValidator) *SourceHandler {
 	return &SourceHandler{
 		sourceService: sourceService,
 		pathValidator: pathValidator,
+		scanSemaphore: make(chan struct{}, 4), // Bound filesystem scanning concurrency to 4
 	}
 }
 
@@ -303,6 +306,51 @@ func (h *SourceHandler) ValidateLocalPath(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Avoid unnecessary repeated scans:
+	// Check for an existing in-flight scan or recent completed scan (<30s) for the same user and canonical path
+	var existingSession *LocalValidationSession
+	h.localValidationSessions.Range(func(key, value any) bool {
+		sess, ok := value.(*LocalValidationSession)
+		if ok && sess.UserID == userID && sess.RepositoryPath == canonicalPath {
+			sess.mu.RLock()
+			status := sess.Status
+			createdAt := sess.CreatedAt
+			sess.mu.RUnlock()
+
+			if status == "scanning" {
+				existingSession = sess
+				return false
+			}
+			if (status == "ready" || status == "failed") && time.Since(createdAt) < 30*time.Second {
+				existingSession = sess
+				return false
+			}
+		}
+		return true
+	})
+
+	if existingSession != nil {
+		existingSession.mu.RLock()
+		sID := existingSession.SessionID
+		status := existingSession.Status
+		res := existingSession.Result
+		existingSession.mu.RUnlock()
+
+		if req.Async || status == "scanning" {
+			writeJSON(w, http.StatusAccepted, ValidateLocalPathResponse{
+				SessionID:      sID,
+				Status:         status,
+				Valid:          status == "ready",
+				RepositoryPath: canonicalPath,
+			})
+			return
+		}
+		if res != nil {
+			writeJSON(w, http.StatusOK, res)
+			return
+		}
+	}
+
 	sessionID := uuid.New().String()
 	session := &LocalValidationSession{
 		SessionID:      sessionID,
@@ -318,15 +366,49 @@ func (h *SourceHandler) ValidateLocalPath(w http.ResponseWriter, r *http.Request
 
 	doneCh := make(chan struct{})
 
+	// Respect cancellation and timeouts
+	scanCtx, scanCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+
 	go func() {
 		defer close(doneCh)
+		defer scanCancel()
+
+		// Bound filesystem scanning concurrency
+		select {
+		case h.scanSemaphore <- struct{}{}:
+			defer func() { <-h.scanSemaphore }()
+		case <-scanCtx.Done():
+			session.mu.Lock()
+			session.Status = "failed"
+			session.Error = "Scanning queue timed out waiting for scanner capacity"
+			session.UpdatedAt = time.Now()
+			session.Result = &ValidateLocalPathResponse{
+				SessionID:      sessionID,
+				Status:         "failed",
+				Valid:          false,
+				RepositoryPath: canonicalPath,
+				Error:          session.Error,
+			}
+			session.mu.Unlock()
+			return
+		}
+
 		matcher, _ := docker.LoadDockerignore(canonicalPath)
 		filesCount := 0
 		var totalBytes int64
 
-		_ = filepath.WalkDir(canonicalPath, func(path string, d os.DirEntry, err error) error {
+		walkErr := filepath.WalkDir(canonicalPath, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
+				if path == canonicalPath {
+					return err
+				}
+				if scanCtx.Err() != nil {
+					return scanCtx.Err()
+				}
 				return nil
+			}
+			if err := scanCtx.Err(); err != nil {
+				return err
 			}
 			rel, err := filepath.Rel(canonicalPath, path)
 			if err != nil || rel == "." || rel == "" {
@@ -363,6 +445,23 @@ func (h *SourceHandler) ValidateLocalPath(w http.ResponseWriter, r *http.Request
 			}
 			return nil
 		})
+
+		if walkErr != nil {
+			errMsg := fmt.Sprintf("Filesystem scan failed: %v", walkErr)
+			session.mu.Lock()
+			session.Status = "failed"
+			session.Error = errMsg
+			session.UpdatedAt = time.Now()
+			session.Result = &ValidateLocalPathResponse{
+				SessionID:      sessionID,
+				Status:         "failed",
+				Valid:          false,
+				RepositoryPath: canonicalPath,
+				Error:          errMsg,
+			}
+			session.mu.Unlock()
+			return
+		}
 
 		detectionRes, err := detector.Detect(canonicalPath)
 		if err != nil {

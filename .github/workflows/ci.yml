@@ -94,6 +94,10 @@ jobs:
           timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U forgelab -d forgelab; do sleep 2; done'
           timeout 30 bash -c 'until docker compose exec -T redis redis-cli ping; do sleep 2; done'
 
+      - name: Build Backend Image
+        run: |
+          docker compose build backend
+
       - name: Validate Database Migration
         run: |
           docker compose run --rm migrate

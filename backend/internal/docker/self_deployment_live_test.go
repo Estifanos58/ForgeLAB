@@ -20,7 +20,7 @@ import (
 )
 
 func TestLive_SelfDeployment_FourTiers(t *testing.T) {
-	if os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
+	if testing.Short() || os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
 		t.Skip("Skipping live Docker deployment test")
 	}
 

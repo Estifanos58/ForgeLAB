@@ -87,8 +87,8 @@ type GitHubOrg struct {
 }
 
 type GitHubService struct {
-	db          *pgxpool.Pool
-	encryptor   *crypto.Encryptor
+	db           *pgxpool.Pool
+	encryptor    *crypto.Encryptor
 	githubCfg    config.OAuthConfig
 	redis        *redis.Client
 	httpClient   *http.Client

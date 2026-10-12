@@ -8,9 +8,14 @@ import (
 	"time"
 
 	"github.com/docker/docker/client"
+	"github.com/forgelab/backend/internal/queue"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
+
+type QueueDiagnosticsProvider interface {
+	GetQueueDiagnostics(ctx context.Context) (queue.QueueDiagnostics, error)
+}
 
 type DependencyStatus struct {
 	Status    string `json:"status"`               // "up" or "down"
@@ -22,12 +27,14 @@ type ReadinessResponse struct {
 	Status       string                      `json:"status"` // "ready" or "not_ready"
 	Timestamp    string                      `json:"timestamp"`
 	Dependencies map[string]DependencyStatus `json:"dependencies"`
+	Queue        *queue.QueueDiagnostics     `json:"queue,omitempty"`
 }
 
 type HealthHandler struct {
-	db           *pgxpool.Pool
-	redisClient  *redis.Client
-	dockerClient *client.Client
+	db            *pgxpool.Pool
+	redisClient   *redis.Client
+	dockerClient  *client.Client
+	queueProvider QueueDiagnosticsProvider
 }
 
 func NewHealthHandler(db *pgxpool.Pool, redisClient *redis.Client, dockerClient *client.Client) *HealthHandler {
@@ -36,6 +43,10 @@ func NewHealthHandler(db *pgxpool.Pool, redisClient *redis.Client, dockerClient 
 		redisClient:  redisClient,
 		dockerClient: dockerClient,
 	}
+}
+
+func (h *HealthHandler) SetQueueDiagnosticsProvider(provider QueueDiagnosticsProvider) {
+	h.queueProvider = provider
 }
 
 // Liveness handles GET /health (lightweight liveness probe)
@@ -145,6 +156,13 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 
+	var queueDiag *queue.QueueDiagnostics
+	if h.queueProvider != nil {
+		if qd, err := h.queueProvider.GetQueueDiagnostics(ctx); err == nil {
+			queueDiag = &qd
+		}
+	}
+
 	overallStatus := "ready"
 	httpStatus := http.StatusOK
 	if !allReady {
@@ -156,9 +174,35 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 		Status:       overallStatus,
 		Timestamp:    time.Now().UTC().Format(time.RFC3339),
 		Dependencies: deps,
+		Queue:        queueDiag,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatus)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// QueueDiagnostics handles GET /health/queue (queue metrics and recovery statistics)
+func (h *HealthHandler) QueueDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if h.queueProvider == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "queue diagnostics provider not configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	diag, err := h.queueProvider.GetQueueDiagnostics(ctx)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to retrieve queue diagnostics"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(diag)
 }

@@ -23,14 +23,14 @@ import (
 
 // GeneratePlanRequest specifies input parameters for generating a deployment plan across any source type.
 type GeneratePlanRequest struct {
-	SourceType      string                     `json:"source_type"`      // "github", "local_directory", "local_upload", "local_agent"
-	SourceReference string                     `json:"source_reference"` // "owner/repo" or upload source UUID
-	RepositoryPath  string                     `json:"repository_path"`  // local filesystem path
-	Branch          string                     `json:"branch"`           // git branch
-	RootDir         string                     `json:"root_dir"`         // optional subfolder
-	AgentID         string                     `json:"agent_id"`         // optional local agent ID
-	AgentToken      string                     `json:"agent_token"`      // optional local agent session token
-	ProjectID       string                     `json:"project_id"`       // optional existing project ID for env conflict checks
+	SourceType      string                     `json:"source_type"`         // "github", "local_directory", "local_upload", "local_agent"
+	SourceReference string                     `json:"source_reference"`    // "owner/repo" or upload source UUID
+	RepositoryPath  string                     `json:"repository_path"`     // local filesystem path
+	Branch          string                     `json:"branch"`              // git branch
+	RootDir         string                     `json:"root_dir"`            // optional subfolder
+	AgentID         string                     `json:"agent_id"`            // optional local agent ID
+	AgentToken      string                     `json:"agent_token"`         // optional local agent session token
+	ProjectID       string                     `json:"project_id"`          // optional existing project ID for env conflict checks
 	Discovery       *discovery.DiscoveryResult `json:"discovery,omitempty"` // authoritative discovery from client or agent
 }
 
