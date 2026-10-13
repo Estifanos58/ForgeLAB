@@ -441,14 +441,14 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex flex-col bg-background">
+      <div className="h-screen max-h-screen flex flex-col bg-background overflow-hidden">
         <AppHeader breadcrumbs={[{ label: 'Loading...' }]} />
-        <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-4">
-          <Skeleton className="h-14 w-full" />
-          <Skeleton className="h-10 w-96" />
-          <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-            <Skeleton className="h-96 md:col-span-5" />
-            <Skeleton className="h-96 md:col-span-7" />
+        <main className="flex-1 min-h-0 max-w-7xl w-full mx-auto px-4 sm:px-6 py-4 space-y-4 overflow-hidden">
+          <Skeleton className="h-14 w-full shrink-0" />
+          <Skeleton className="h-10 w-96 shrink-0" />
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 flex-1 min-h-0">
+            <Skeleton className="h-full md:col-span-5" />
+            <Skeleton className="h-full md:col-span-7" />
           </div>
         </main>
       </div>
@@ -457,7 +457,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
   if (!project) {
     return (
-      <div className="min-h-screen flex flex-col bg-background">
+      <div className="h-screen max-h-screen flex flex-col bg-background overflow-hidden">
         <AppHeader breadcrumbs={[{ label: 'Not Found' }]} />
         <div className="flex-1 max-w-md mx-auto p-8 text-center flex flex-col items-center justify-center">
           <h2 className="text-base font-semibold text-white mb-1">Project Not Found</h2>
@@ -482,27 +482,31 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     Object.values(deployingServices).some(Boolean);
 
   return (
-    <div className="min-h-screen flex flex-col bg-background">
+    <div className="h-screen max-h-screen flex flex-col bg-background overflow-hidden">
       <AppHeader breadcrumbs={[{ label: project.name }]} />
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-5">
+      <main className="flex-1 min-h-0 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-3 pb-3 sm:pt-4 sm:pb-4 flex flex-col overflow-hidden">
         {/* Error Banner */}
         {error && (
-          <Alert variant="error" onClose={() => setError(null)}>
-            {error}
-          </Alert>
+          <div className="shrink-0 mb-3">
+            <Alert variant="error" onClose={() => setError(null)}>
+              {error}
+            </Alert>
+          </div>
         )}
 
         {/* Project Header Bar */}
-        <ProjectHeader
-          project={project}
-          onActionComplete={loadData}
-          onError={(msg) => setError(msg)}
-          onDeploymentCreated={handleDeploymentCreated}
-        />
+        <div className="shrink-0 mb-3">
+          <ProjectHeader
+            project={project}
+            onActionComplete={loadData}
+            onError={(msg) => setError(msg)}
+            onDeploymentCreated={handleDeploymentCreated}
+          />
+        </div>
 
         {/* Secondary Navigation Tabs */}
-        <div className="flex items-center gap-1 border-b border-surface-border pb-px text-xs font-medium">
+        <div className="shrink-0 flex items-center gap-1 border-b border-surface-border pb-px text-xs font-medium mb-3">
           <button
             type="button"
             onClick={() => setActiveTab('overview')}
@@ -566,9 +570,9 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
         {/* Tab 1: Overview */}
         {activeTab === 'overview' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 flex-1 min-h-0 overflow-y-auto lg:overflow-hidden">
             {/* Left Column: Services & Releases (5 cols) */}
-            <div className="lg:col-span-5 space-y-4">
+            <div className="lg:col-span-5 flex flex-col min-h-0 lg:h-full lg:overflow-y-auto pr-0 lg:pr-2 space-y-4">
               <ServicesSection
                 project={project}
                 deployingServices={deployingServices}
@@ -586,7 +590,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               />
 
               {/* Recent Releases Card */}
-              <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-3">
+              <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-3 shrink-0">
                 <div className="flex items-center justify-between">
                   <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-400 font-semibold">
                     Releases ({deployments.length})
@@ -608,7 +612,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
             </div>
 
             {/* Right Column: Live Terminal (7 cols) */}
-            <div className="lg:col-span-7">
+            <div className="lg:col-span-7 flex flex-col min-h-0 lg:h-full lg:overflow-hidden">
               <LogsSection
                 deployments={deployments}
                 selectedDeployment={selectedDeployment}
@@ -628,9 +632,9 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
         {/* Tab 2: Deployments */}
         {activeTab === 'deployments' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div className="lg:col-span-5 space-y-3">
-              <div className="text-xs text-neutral-400 flex items-center justify-between">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 flex-1 min-h-0 overflow-y-auto lg:overflow-hidden">
+            <div className="lg:col-span-5 flex flex-col min-h-0 lg:h-full lg:overflow-y-auto pr-0 lg:pr-2 space-y-3">
+              <div className="text-xs text-neutral-400 flex items-center justify-between shrink-0">
                 <span>Select release to view terminal logs</span>
                 <span className="font-mono text-[11px]">{deployments.length} releases</span>
               </div>
@@ -641,7 +645,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               />
             </div>
 
-            <div className="lg:col-span-7">
+            <div className="lg:col-span-7 flex flex-col min-h-0 lg:h-full lg:overflow-hidden">
               <LogsSection
                 deployments={deployments}
                 selectedDeployment={selectedDeployment}
@@ -661,7 +665,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
         {/* Tab 3: Logs */}
         {activeTab === 'logs' && (
-          <div className="space-y-4">
+          <div className="flex-1 min-h-0 h-full overflow-hidden flex flex-col">
             <LogsSection
               deployments={deployments}
               selectedDeployment={selectedDeployment}
@@ -680,7 +684,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
         {/* Tab 4: Environment Variables & Secrets */}
         {activeTab === 'env' && (
-          <div className="max-w-4xl">
+          <div className="flex-1 min-h-0 h-full overflow-y-auto max-w-4xl pr-2">
             <EnvManager projectId={project.id} services={services} />
           </div>
         )}

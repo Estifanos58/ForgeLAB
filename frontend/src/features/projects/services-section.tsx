@@ -56,9 +56,9 @@ export function ServicesSection({
 
   if (services.length > 0) {
     return (
-      <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-5">
+      <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-5 flex-1 overflow-y-auto">
         {/* Top Header & Release Deploy All Button */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-surface-border/70">
+        <div className="sticky top-0 bg-surface/95 backdrop-blur-sm z-10 -mx-4 -mt-4 px-4 pt-4 sm:-mx-5 sm:-mt-5 sm:px-5 sm:pt-5 pb-3 border-b border-surface-border/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-400 font-semibold flex items-center gap-1.5">
               <Layers className="w-3.5 h-3.5 text-emerald-400" />

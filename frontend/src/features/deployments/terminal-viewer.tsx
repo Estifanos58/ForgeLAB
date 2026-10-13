@@ -208,7 +208,7 @@ export function TerminalViewer({
   return (
     <div className="flex flex-col h-full rounded-md border border-surface-border bg-[#09090b] shadow-subtle overflow-hidden font-mono text-xs">
       {/* Terminal Toolbar */}
-      <div className="flex items-center justify-between px-3.5 py-2 bg-surface-elevated/70 border-b border-surface-border select-none">
+      <div className="shrink-0 flex items-center justify-between px-3.5 py-2 bg-surface-elevated/70 border-b border-surface-border select-none">
         <div className="flex items-center gap-2">
           <Terminal className="w-3.5 h-3.5 text-neutral-400" />
           <span className="text-white text-xs font-semibold font-sans">
@@ -272,7 +272,7 @@ export function TerminalViewer({
       <div
         ref={containerRef}
         onScroll={handleScroll}
-        className="flex-1 p-3.5 overflow-y-auto space-y-1 min-h-[360px] max-h-[580px] bg-[#070709] text-[11px] leading-relaxed"
+        className="flex-1 min-h-0 p-3.5 overflow-y-auto space-y-1 bg-[#070709] text-[11px] leading-relaxed"
       >
         {isTrimmed && (
           <div className="text-center py-1 mb-2 text-[10px] text-neutral-500 border-b border-surface-border font-sans">
@@ -280,7 +280,7 @@ export function TerminalViewer({
           </div>
         )}
         {displayedLogs.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-48 text-neutral-500 font-sans text-xs">
+          <div className="flex flex-col items-center justify-center h-full min-h-[160px] text-neutral-500 font-sans text-xs">
             <Terminal className="w-6 h-6 mb-2 opacity-30" />
             <p>No log records for this release. Trigger a deployment to view telemetry.</p>
           </div>

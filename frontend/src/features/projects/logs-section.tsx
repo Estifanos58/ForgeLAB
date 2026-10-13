@@ -57,10 +57,10 @@ export function LogsSection({
       : selectedDeployment?.id;
 
   return (
-    <div className="space-y-3.5">
+    <div className="h-full flex flex-col min-h-0 space-y-3">
       {/* Service Target Active Pill */}
       {selectedLogTarget?.type === 'service' && (
-        <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-surface border border-surface-border text-xs font-mono">
+        <div className="shrink-0 flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-surface border border-surface-border text-xs font-mono">
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-[10px] text-neutral-500 uppercase tracking-wider font-semibold">Service Target:</span>
             <span className="font-semibold text-emerald-400 truncate">
@@ -87,10 +87,10 @@ export function LogsSection({
       )}
 
       {/* Scope Toolbar: Release Selector & Service Scope Filter */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <div className="shrink-0 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 min-w-0">
         {/* Release Selector Bar */}
         {deployments.length > 0 && (
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs font-mono">
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs font-mono min-w-0 max-w-full">
             <span className="text-neutral-500 shrink-0 text-[11px] uppercase tracking-wider font-semibold">
               Release:
             </span>
@@ -119,15 +119,15 @@ export function LogsSection({
 
         {/* Service Scope Tabs */}
         {services.length > 0 && (
-          <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono ml-auto">
-            <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold">
+          <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono sm:ml-auto overflow-x-auto max-w-full min-w-0 shrink-0">
+            <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold shrink-0">
               Scope:
             </span>
             <button
               type="button"
               onClick={() => onSelectServiceScope(null)}
               className={cn(
-                'px-2.5 py-1 rounded transition-colors text-xs font-medium',
+                'px-2.5 py-1 rounded transition-colors text-xs font-medium shrink-0 whitespace-nowrap',
                 selectedLogTarget?.type === 'release' && selectedServiceId === null
                   ? 'bg-white text-black font-semibold shadow-sm'
                   : 'text-neutral-400 hover:text-white'
@@ -145,7 +145,7 @@ export function LogsSection({
                   type="button"
                   onClick={() => onSelectServiceScope(svc.id)}
                   className={cn(
-                    'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5',
+                    'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5 shrink-0 whitespace-nowrap',
                     isServiceActive
                       ? 'bg-white text-black font-semibold shadow-sm'
                       : 'text-neutral-400 hover:text-white'
@@ -153,7 +153,7 @@ export function LogsSection({
                 >
                   <span
                     className={cn(
-                      'w-1.5 h-1.5 rounded-full',
+                      'w-1.5 h-1.5 rounded-full shrink-0',
                       svc.status === 'running'
                         ? 'bg-emerald-500'
                         : svc.status === 'failed'
@@ -173,16 +173,18 @@ export function LogsSection({
       </div>
 
       {/* Terminal Logs Output */}
-      <TerminalViewer
-        logs={displayedLogs}
-        connected={connected}
-        connectionState={connectionState}
-        onClear={onClearLogs}
-        deploymentNumber={currentDeployNumber}
-        deploymentId={currentDeployId}
-        services={services}
-        selectedServiceId={selectedServiceId}
-      />
+      <div className="flex-1 min-h-0 flex flex-col">
+        <TerminalViewer
+          logs={displayedLogs}
+          connected={connected}
+          connectionState={connectionState}
+          onClear={onClearLogs}
+          deploymentNumber={currentDeployNumber}
+          deploymentId={currentDeployId}
+          services={services}
+          selectedServiceId={selectedServiceId}
+        />
+      </div>
     </div>
   );
 }
