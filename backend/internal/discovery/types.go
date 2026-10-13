@@ -100,6 +100,7 @@ type DiscoveredTopology struct {
 	Volumes         []string                `json:"volumes"`   // declared named volumes
 	EnvFiles        []string                `json:"env_files"` // detected env files
 	RootEnvVars     []EnvironmentProvenance `json:"root_env_vars"`
+	Warnings        []string                `json:"warnings,omitempty"`
 }
 
 // DiscoveryResult is the authoritative result of repository inspection
@@ -112,15 +113,18 @@ type DiscoveryResult struct {
 	TotalBytes      int64               `json:"total_bytes"`
 	Dependencies    map[string][]string `json:"dependencies"` // service -> depends_on
 	Fingerprint     string              `json:"fingerprint,omitempty"`
+	Warnings        []string            `json:"warnings,omitempty"`
 }
 
 // PlannedEndpoint describes a network endpoint
 type PlannedEndpoint struct {
-	ServiceName string `json:"service_name"`
-	Port        int    `json:"port"`
-	Type        string `json:"type"` // "public" or "internal"
-	Protocol    string `json:"protocol"`
-	Address     string `json:"address"` // e.g. "0.0.0.0:8080" or "backend:8080"
+	ServiceName string  `json:"service_name"`
+	Port        int     `json:"port"`
+	Type        string  `json:"type"` // "public" or "internal"
+	Protocol    string  `json:"protocol"`
+	Address     string  `json:"address"` // e.g. "0.0.0.0:8080" or "backend:8080"
+	Domain      *string `json:"domain,omitempty"`
+	TLSEnabled  bool    `json:"tls_enabled,omitempty"`
 }
 
 // PlannedService represents a service ready for execution under a DeploymentPlan
@@ -167,5 +171,6 @@ type DeploymentPlan struct {
 	Environment       []EnvironmentProvenance `json:"environment"`
 	PublicEndpoints   []PlannedEndpoint       `json:"public_endpoints"`
 	InternalEndpoints []PlannedEndpoint       `json:"internal_endpoints"`
+	Warnings          []string                `json:"warnings,omitempty"`
 	CreatedAt         time.Time               `json:"created_at"`
 }

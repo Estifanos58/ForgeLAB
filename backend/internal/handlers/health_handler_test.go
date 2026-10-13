@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/forgelab/backend/internal/docker"
 	"github.com/forgelab/backend/internal/queue"
 	"github.com/redis/go-redis/v9"
 )
@@ -196,5 +197,38 @@ func TestHealthHandler_Readiness_WithQueueDiagnostics(t *testing.T) {
 	}
 	if resp.Queue.PendingJobs != 3 || resp.Queue.TotalRecoveredJobs != 4 {
 		t.Errorf("unexpected queue metrics in readiness response: %+v", resp.Queue)
+	}
+}
+
+type mockBuildQueueProvider struct {
+	diag docker.SharedBuildDiagnostics
+}
+
+func (m *mockBuildQueueProvider) GetSharedBuildDiagnostics() docker.SharedBuildDiagnostics {
+	return m.diag
+}
+
+func TestHealthHandler_BuildQueueDiagnostics(t *testing.T) {
+	h := NewHealthHandler(nil, nil, nil)
+	buildData := docker.SharedBuildDiagnostics{
+		TotalEntries: 2,
+		ActiveBuilds: 1,
+	}
+	h.SetBuildQueueDiagnosticsProvider(&mockBuildQueueProvider{diag: buildData})
+
+	req := httptest.NewRequest("GET", "/health/queue", nil)
+	rec := httptest.NewRecorder()
+	h.QueueDiagnostics(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK with build queue provider, got %d", rec.Code)
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("failed to unmarshal queue diagnostics: %v", err)
+	}
+	if raw["build_queue"] == nil {
+		t.Errorf("expected build_queue in response, got %v", raw)
 	}
 }

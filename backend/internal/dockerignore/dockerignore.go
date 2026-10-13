@@ -104,16 +104,53 @@ func LoadDockerignore(rootDir string) (*DockerignoreMatcher, error) {
 	return NewDockerignoreMatcher(patterns), nil
 }
 
-// Matches returns true if relPath should be ignored.
-// Evaluates rules sequentially from top to bottom (last matching rule wins).
-func (m *DockerignoreMatcher) Matches(relPath string, isDir bool) bool {
-	if m == nil || len(m.rules) == 0 {
-		return false
-	}
+// MandatorySecretPatterns are non-negotiable secret patterns that must NEVER be packaged
+// into build contexts, regardless of whether a custom .dockerignore exists or attempts to negate them.
+var MandatorySecretPatterns = []string{
+	".env",
+	".env.*",
+	".env.local",
+	".env.*.local",
+	"*.pem",
+	"*.key",
+	"id_rsa*",
+	"id_ed25519*",
+}
 
+// IsMandatorySecret returns true if the relative path represents a sensitive secret file
+// that must never be added to a Docker build context.
+func IsMandatorySecret(relPath string) bool {
+	cleanRel := filepath.ToSlash(filepath.Clean(relPath))
+	baseName := strings.ToLower(filepath.Base(cleanRel))
+
+	if baseName == ".env" || strings.HasPrefix(baseName, ".env.") || strings.HasSuffix(baseName, ".env") {
+		return true
+	}
+	if strings.HasSuffix(baseName, ".pem") || strings.HasSuffix(baseName, ".key") {
+		return true
+	}
+	if strings.HasPrefix(baseName, "id_rsa") || strings.HasPrefix(baseName, "id_ed25519") {
+		return true
+	}
+	return false
+}
+
+// Matches returns true if relPath should be ignored.
+// Evaluates rules sequentially from top to bottom (last matching rule wins),
+// except mandatory secrets which can NEVER be negated or included.
+func (m *DockerignoreMatcher) Matches(relPath string, isDir bool) bool {
 	cleanRel := filepath.ToSlash(filepath.Clean(relPath))
 	cleanRel = strings.TrimPrefix(cleanRel, "/")
 	if cleanRel == "." || cleanRel == "" {
+		return false
+	}
+
+	// Non-negotiable secrets are always ignored regardless of custom rules or negations
+	if !isDir && IsMandatorySecret(cleanRel) {
+		return true
+	}
+
+	if m == nil || len(m.rules) == 0 {
 		return false
 	}
 

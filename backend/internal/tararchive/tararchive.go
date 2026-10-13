@@ -155,6 +155,11 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 			slashRelPath := filepath.ToSlash(relPath)
 			isDir := d.IsDir()
 
+			// Defense-in-depth: Unconditionally exclude mandatory secrets regardless of matcher
+			if !isDir && dockerignore.IsMandatorySecret(slashRelPath) {
+				return nil
+			}
+
 			// Check .dockerignore early pruning
 			if opts.Matcher != nil {
 				if isDir && opts.Matcher.CanSkipDir(slashRelPath) {

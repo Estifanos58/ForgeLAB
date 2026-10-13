@@ -3,6 +3,7 @@ package discovery
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -84,56 +85,66 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 	// 1. Check for Docker Compose definition first
 	if composePath, found := FindComposeFile(cleanRoot); found {
 		topology, services, err := ParseComposeFile(composePath, cleanRoot)
-		if err == nil && len(services) > 0 {
-			// For services with build contexts, enrich with technology detection
-			for i := range services {
-				if services[i].BuildStrategy != "image" && services[i].BuildContext != "" {
-					bDir := filepath.Join(cleanRoot, filepath.FromSlash(services[i].BuildContext))
-					if files, err := readDirectoryManifests(bDir); err == nil && len(files) > 0 {
-						rt, fw, pm, port, hp, hs, bc, sc := DetectTechnology(files)
-						if services[i].Runtime == "compose" && rt != "generic" {
-							services[i].Runtime = rt
-							services[i].RuntimeType = rt
-							services[i].Framework = fw
-							services[i].PackageManager = pm
+		if err != nil {
+			return nil, fmt.Errorf("malformed compose file '%s': %w", filepath.Base(composePath), err)
+		}
+		if len(services) == 0 {
+			return nil, fmt.Errorf("compose file '%s' contains no valid services", filepath.Base(composePath))
+		}
+
+		// For services with build contexts, enrich with technology detection
+		for i := range services {
+			if services[i].BuildStrategy != "image" && services[i].BuildContext != "" {
+				bDir := filepath.Join(cleanRoot, filepath.FromSlash(services[i].BuildContext))
+				if files, err := readDirectoryManifests(bDir); err == nil && len(files) > 0 {
+					rt, fw, pm, port, hp, hs, bc, sc := DetectTechnology(files)
+					if services[i].Runtime == "compose" && rt != "generic" {
+						services[i].Runtime = rt
+						services[i].RuntimeType = rt
+						services[i].Framework = fw
+						services[i].PackageManager = pm
+					}
+					if services[i].InternalPort == 8080 && port != 8080 {
+						services[i].InternalPort = port
+					}
+					if services[i].HealthCheckPath == "/" && hp != "/" {
+						services[i].HealthCheckPath = hp
+					}
+					if services[i].HealthStrategy == models.HealthStrategyAuto && hs != models.HealthStrategyAuto {
+						services[i].HealthStrategy = hs
+					}
+					// Only enrich build/start commands if NOT using Dockerfile build strategy
+					if services[i].BuildStrategy != models.BuildStrategyDockerfile && services[i].DockerfilePath == "" {
+						if services[i].BuildCommand == "" && bc != "" {
+							services[i].BuildCommand = bc
 						}
-						if services[i].InternalPort == 8080 && port != 8080 {
-							services[i].InternalPort = port
-						}
-						if services[i].HealthCheckPath == "/" && hp != "/" {
-							services[i].HealthCheckPath = hp
-						}
-						if services[i].HealthStrategy == models.HealthStrategyAuto && hs != models.HealthStrategyAuto {
-							services[i].HealthStrategy = hs
-						}
-						// Only enrich build/start commands if NOT using Dockerfile build strategy
-						if services[i].BuildStrategy != models.BuildStrategyDockerfile && services[i].DockerfilePath == "" {
-							if services[i].BuildCommand == "" && bc != "" {
-								services[i].BuildCommand = bc
-							}
-							if services[i].StartCommand == "" && sc != "" {
-								services[i].StartCommand = sc
-							}
+						if services[i].StartCommand == "" && sc != "" {
+							services[i].StartCommand = sc
 						}
 					}
 				}
 			}
-
-			depMap, _, _ := BuildDAG(services)
-
-			totalFiles, totalBytes := quickStatScan(cleanRoot)
-			fp, _ := ComputeLightweightDirectoryFingerprint(cleanRoot)
-			return &DiscoveryResult{
-				RepositoryName:  repoName,
-				Topology:        *topology,
-				PrimaryStrategy: StrategyCompose,
-				Services:        services,
-				TotalFiles:      totalFiles,
-				TotalBytes:      totalBytes,
-				Dependencies:    depMap,
-				Fingerprint:     fp,
-			}, nil
 		}
+
+		depMap, _, _ := BuildDAG(services)
+
+		totalFiles, totalBytes := quickStatScan(cleanRoot)
+		fp, _ := ComputeLightweightDirectoryFingerprint(cleanRoot)
+		var warnings []string
+		if topology != nil && len(topology.Warnings) > 0 {
+			warnings = append(warnings, topology.Warnings...)
+		}
+		return &DiscoveryResult{
+			RepositoryName:  repoName,
+			Topology:        *topology,
+			PrimaryStrategy: StrategyCompose,
+			Services:        services,
+			TotalFiles:      totalFiles,
+			TotalBytes:      totalBytes,
+			Dependencies:    depMap,
+			Fingerprint:     fp,
+			Warnings:        warnings,
+		}, nil
 	}
 
 	// 2. Discover independent application subdirectories
@@ -224,7 +235,13 @@ func quickStatScan(cleanRoot string) (totalFiles int, totalBytes int64) {
 }
 
 func readDirectoryManifests(dirPath string) (map[string][]byte, error) {
+	const (
+		maxManifestFiles      = 64
+		maxTotalManifestBytes = 2 * 1024 * 1024 // 2 MB
+	)
 	files := make(map[string][]byte)
+	var totalBytes int64
+
 	_ = filepath.WalkDir(dirPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -235,6 +252,9 @@ func readDirectoryManifests(dirPath string) (map[string][]byte, error) {
 			}
 			return nil
 		}
+		if len(files) >= maxManifestFiles || totalBytes >= maxTotalManifestBytes {
+			return filepath.SkipAll
+		}
 		if IsSecretFile(d.Name()) {
 			return nil
 		}
@@ -244,6 +264,7 @@ func readDirectoryManifests(dirPath string) (map[string][]byte, error) {
 		if strings.Count(slashRel, "/") <= 2 && isManifestOrConfigFile(filepath.Base(path)) {
 			if data, err := readSmallFile(path, 256*1024); err == nil {
 				files[slashRel] = data
+				totalBytes += int64(len(data))
 			}
 		}
 		return nil
@@ -642,10 +663,24 @@ func readSmallFile(path string, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	buf := make([]byte, maxBytes)
-	n, err := f.Read(buf)
-	if err != nil && n == 0 {
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	size := info.Size()
+	if size <= 0 {
 		return []byte{}, nil
+	}
+	if size > maxBytes {
+		size = maxBytes
+	}
+
+	buf := make([]byte, size)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, err
 	}
 	return buf[:n], nil
 }
@@ -858,6 +893,7 @@ func GeneratePlan(res *DiscoveryResult, opts PlanOptions) (*DeploymentPlan, erro
 		Environment:       allEnv,
 		PublicEndpoints:   publicEndpoints,
 		InternalEndpoints: internalEndpoints,
+		Warnings:          append([]string(nil), res.Warnings...),
 		CreatedAt:         time.Now(),
 	}, nil
 }

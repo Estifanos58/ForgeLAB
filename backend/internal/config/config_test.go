@@ -58,8 +58,17 @@ func TestConfigLoadProductionRejectsDefaultSecrets(t *testing.T) {
 		t.Errorf("expected error for default db password in production mode, got nil")
 	}
 
-	// 4. Valid production configuration
+	// 4. Missing allowed source roots
 	os.Setenv("DATABASE_URL", "postgres://forgelab:strong_prod_pass_123@db:5432/forgelab")
+	os.Unsetenv("FORGELAB_ALLOWED_SOURCE_ROOTS")
+	_, err = Load()
+	if err == nil {
+		t.Errorf("expected error for missing FORGELAB_ALLOWED_SOURCE_ROOTS in production mode, got nil")
+	}
+
+	// 5. Valid production configuration
+	os.Setenv("FORGELAB_ALLOWED_SOURCE_ROOTS", "/var/forgelab/sources")
+	defer os.Unsetenv("FORGELAB_ALLOWED_SOURCE_ROOTS")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("expected successful load with strong secrets in production mode, got: %v", err)

@@ -7,13 +7,16 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	dockerimage "github.com/docker/docker/api/types/image"
 	dockernetwork "github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/client"
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/logging"
@@ -691,5 +694,106 @@ func (e *Engine) verifyDockerDaemon(ctx context.Context) error {
 		return err
 	}
 	e.setCachedBuilderVersion(ping.BuilderVersion)
+	return nil
+}
+
+// PruneOldProjectImages prunes older Docker images created for a specific project,
+// preserving the latest keepRecent images to maintain fast rollbacks while freeing disk space.
+func (e *Engine) PruneOldProjectImages(ctx context.Context, projectID string, keepRecent int) (int, error) {
+	if e.dockerClient == nil || projectID == "" {
+		return 0, nil
+	}
+	if keepRecent <= 0 {
+		keepRecent = 3
+	}
+
+	opts := dockerimage.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("label", fmt.Sprintf("forgelab.project_id=%s", projectID)),
+		),
+	}
+
+	images, err := e.dockerClient.ImageList(ctx, opts)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list project images for pruning: %w", err)
+	}
+
+	if len(images) <= keepRecent {
+		return 0, nil
+	}
+
+	// Sort images by Created timestamp descending (newest first)
+	sort.Slice(images, func(i, j int) bool {
+		return images[i].Created > images[j].Created
+	})
+
+	prunedCount := 0
+	for _, img := range images[keepRecent:] {
+		_, pruneErr := e.dockerClient.ImageRemove(ctx, img.ID, dockerimage.RemoveOptions{
+			PruneChildren: true,
+		})
+		if pruneErr == nil {
+			prunedCount++
+			shortID := img.ID
+			if len(shortID) > 12 {
+				shortID = shortID[:12]
+			}
+			slog.Info("pruned old project image", "project_id", projectID, "image_id", shortID)
+		}
+	}
+
+	return prunedCount, nil
+}
+
+// CheckContinuousRuntimeHealth inspects all active service containers to detect unexpected exits,
+// kernel OOM kills, and Docker health-check degradation.
+func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
+	if e.dockerClient == nil || e.serviceService == nil {
+		return nil
+	}
+
+	services, err := e.serviceService.ListActiveServices(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, svc := range services {
+		if svc.ContainerID == nil || *svc.ContainerID == "" {
+			continue
+		}
+
+		insp, err := e.dockerClient.ContainerInspect(ctx, *svc.ContainerID)
+		if err != nil {
+			if client.IsErrNotFound(err) {
+				_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+				if svc.CurrentServiceDeploymentID != nil && e.deploymentService != nil {
+					_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, "Runtime container terminated or disappeared from Docker daemon")
+				}
+				slog.Warn("continuous health: container not found, marked service failed", "service_id", svc.ID, "container_id", *svc.ContainerID)
+			}
+			continue
+		}
+
+		if insp.State == nil {
+			continue
+		}
+
+		if insp.State.OOMKilled {
+			reason := "Container was terminated by kernel OOM (Out Of Memory) killer. Review memory quota or memory limits."
+			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+			if svc.CurrentServiceDeploymentID != nil && e.deploymentService != nil {
+				_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, reason)
+			}
+			slog.Warn("continuous health: container OOM killed", "service_id", svc.ID, "container_id", *svc.ContainerID)
+		} else if !insp.State.Running && insp.State.Status == "exited" && insp.State.ExitCode != 0 {
+			reason := fmt.Sprintf("Container crashed with non-zero exit code (%d)", insp.State.ExitCode)
+			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+			if svc.CurrentServiceDeploymentID != nil && e.deploymentService != nil {
+				_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, reason)
+			}
+			slog.Warn("continuous health: container exited with failure", "service_id", svc.ID, "exit_code", insp.State.ExitCode)
+		}
+	}
+
 	return nil
 }

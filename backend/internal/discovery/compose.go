@@ -41,6 +41,8 @@ type RawComposeData struct {
 	Services map[string]RawComposeService `yaml:"services"`
 	Networks map[string]RawComposeNetwork `yaml:"networks"`
 	Volumes  map[string]interface{}       `yaml:"volumes"`
+	Secrets  map[string]interface{}       `yaml:"secrets"`
+	Configs  map[string]interface{}       `yaml:"configs"`
 }
 
 type RawComposeNetwork struct {
@@ -61,6 +63,14 @@ type RawComposeService struct {
 	Command     interface{}            `yaml:"command"`
 	HealthCheck *RawComposeHealthCheck `yaml:"healthcheck"`
 	Restart     string                 `yaml:"restart"`
+	Profiles    []string               `yaml:"profiles"`
+	Deploy      interface{}            `yaml:"deploy"`
+	Extends     interface{}            `yaml:"extends"`
+	Privileged  bool                   `yaml:"privileged"`
+	CapAdd      []string               `yaml:"cap_add"`
+	Ipc         string                 `yaml:"ipc"`
+	Pid         string                 `yaml:"pid"`
+	NetworkMode string                 `yaml:"network_mode"`
 }
 
 type RawComposeHealthCheck struct {
@@ -153,8 +163,37 @@ func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []Discove
 	sort.Strings(svcNames)
 
 	composeDir := filepath.Dir(filePath)
+	var warnings []string
+	if len(raw.Secrets) > 0 {
+		warnings = append(warnings, "Compose top-level 'secrets' is unsupported; inject secrets via ForgeLAB Environment Variables")
+	}
+	if len(raw.Configs) > 0 {
+		warnings = append(warnings, "Compose top-level 'configs' is unsupported in ForgeLAB")
+	}
+
 	for _, name := range svcNames {
 		rawSvc := raw.Services[name]
+		if len(rawSvc.Profiles) > 0 {
+			warnings = append(warnings, fmt.Sprintf("Service '%s': 'profiles' is unsupported; ForgeLAB deploys declared services in DAG tiers", name))
+		}
+		if rawSvc.Deploy != nil {
+			warnings = append(warnings, fmt.Sprintf("Service '%s': 'deploy' specification is unsupported; single container instances run under ForgeLAB", name))
+		}
+		if rawSvc.Extends != nil {
+			warnings = append(warnings, fmt.Sprintf("Service '%s': 'extends' is unsupported", name))
+		}
+		if rawSvc.Privileged {
+			warnings = append(warnings, fmt.Sprintf("Service '%s': 'privileged: true' is rejected by security policy and will run unprivileged", name))
+		}
+		if len(rawSvc.CapAdd) > 0 {
+			warnings = append(warnings, fmt.Sprintf("Service '%s': capabilities in 'cap_add' are restricted by ForgeLAB security policy", name))
+		}
+		if rawSvc.Ipc != "" || rawSvc.Pid != "" {
+			warnings = append(warnings, fmt.Sprintf("Service '%s': host namespace sharing ('ipc'/'pid') is unsupported", name))
+		}
+		if strings.EqualFold(rawSvc.NetworkMode, "host") {
+			warnings = append(warnings, fmt.Sprintf("Service '%s': host networking is rejected; service will run on isolated project bridge network", name))
+		}
 		svc := parseComposeService(name, rawSvc, repoRoot, composeDir, declaredVolMap)
 		services = append(services, svc)
 	}
@@ -203,6 +242,7 @@ func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []Discove
 		Networks:        networks,
 		Volumes:         declaredVolumes,
 		EnvFiles:        discoverEnvFiles(repoRoot),
+		Warnings:        warnings,
 	}
 
 	return topology, services, nil

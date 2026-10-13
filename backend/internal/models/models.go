@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -185,6 +186,9 @@ type Project struct {
 	CurrentDeploymentID *uuid.UUID      `json:"current_deployment_id"`
 	Port                *int            `json:"port"`
 	PreviewURL          *string         `json:"preview_url,omitempty"`
+	CustomDomain        *string         `json:"custom_domain,omitempty"`
+	MaxTotalMemoryMB    *int            `json:"max_total_memory_mb,omitempty"`
+	MaxTotalCpuMillicores *int          `json:"max_total_cpu_millicores,omitempty"`
 	Services            []*Service      `json:"services,omitempty"`
 	CreatedAt           time.Time       `json:"created_at"`
 	UpdatedAt           time.Time       `json:"updated_at"`
@@ -237,6 +241,41 @@ func DefaultResourceConfig() ResourceConfig {
 	}
 }
 
+// ValidateProjectResourceQuota validates cumulative service resource requests against project limits.
+func ValidateProjectResourceQuota(services []*Service, maxMemoryMB, maxCpuMillicores *int) error {
+	if maxMemoryMB == nil && maxCpuMillicores == nil {
+		return nil
+	}
+
+	totalMem := 0
+	totalCpu := 0
+	for _, svc := range services {
+		if svc == nil {
+			continue
+		}
+		mem := svc.MemoryMB
+		if mem <= 0 {
+			mem = DefaultResourceConfig().MemoryMB
+		}
+		cpu := svc.CpuMillicores
+		if cpu <= 0 {
+			cpu = DefaultResourceConfig().CpuMillicores
+		}
+		totalMem += mem
+		totalCpu += cpu
+	}
+
+	if maxMemoryMB != nil && *maxMemoryMB > 0 && totalMem > *maxMemoryMB {
+		return fmt.Errorf("project memory quota exceeded: services request total %d MB, quota limit is %d MB", totalMem, *maxMemoryMB)
+	}
+
+	if maxCpuMillicores != nil && *maxCpuMillicores > 0 && totalCpu > *maxCpuMillicores {
+		return fmt.Errorf("project CPU quota exceeded: services request total %d millicores, quota limit is %d millicores", totalCpu, *maxCpuMillicores)
+	}
+
+	return nil
+}
+
 // Service represents an individual deployable service within a parent Project.
 type Service struct {
 	ID                         uuid.UUID           `json:"id"`
@@ -271,6 +310,7 @@ type Service struct {
 	ContainerID                *string             `json:"container_id"`
 	ImageTag                   *string             `json:"image_tag"`
 	PreviewURL                 *string             `json:"preview_url,omitempty"`
+	CustomDomain               *string             `json:"custom_domain,omitempty"`
 	CurrentServiceDeploymentID *uuid.UUID          `json:"current_service_deployment_id"`
 	ResourceConfig                                 // embedded resource limits
 	CreatedAt                  time.Time           `json:"created_at"`

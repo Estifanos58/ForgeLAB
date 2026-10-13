@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/client"
+	"github.com/forgelab/backend/internal/docker"
 	"github.com/forgelab/backend/internal/queue"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -15,6 +16,10 @@ import (
 
 type QueueDiagnosticsProvider interface {
 	GetQueueDiagnostics(ctx context.Context) (queue.QueueDiagnostics, error)
+}
+
+type BuildQueueDiagnosticsProvider interface {
+	GetSharedBuildDiagnostics() docker.SharedBuildDiagnostics
 }
 
 type DependencyStatus struct {
@@ -28,13 +33,15 @@ type ReadinessResponse struct {
 	Timestamp    string                      `json:"timestamp"`
 	Dependencies map[string]DependencyStatus `json:"dependencies"`
 	Queue        *queue.QueueDiagnostics     `json:"queue,omitempty"`
+	BuildQueue   interface{}                 `json:"build_queue,omitempty"`
 }
 
 type HealthHandler struct {
-	db            *pgxpool.Pool
-	redisClient   *redis.Client
-	dockerClient  *client.Client
-	queueProvider QueueDiagnosticsProvider
+	db                 *pgxpool.Pool
+	redisClient        *redis.Client
+	dockerClient       *client.Client
+	queueProvider      QueueDiagnosticsProvider
+	buildQueueProvider BuildQueueDiagnosticsProvider
 }
 
 func NewHealthHandler(db *pgxpool.Pool, redisClient *redis.Client, dockerClient *client.Client) *HealthHandler {
@@ -47,6 +54,10 @@ func NewHealthHandler(db *pgxpool.Pool, redisClient *redis.Client, dockerClient 
 
 func (h *HealthHandler) SetQueueDiagnosticsProvider(provider QueueDiagnosticsProvider) {
 	h.queueProvider = provider
+}
+
+func (h *HealthHandler) SetBuildQueueDiagnosticsProvider(provider BuildQueueDiagnosticsProvider) {
+	h.buildQueueProvider = provider
 }
 
 // Liveness handles GET /health (lightweight liveness probe)
@@ -163,6 +174,11 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var buildDiag interface{}
+	if h.buildQueueProvider != nil {
+		buildDiag = h.buildQueueProvider.GetSharedBuildDiagnostics()
+	}
+
 	overallStatus := "ready"
 	httpStatus := http.StatusOK
 	if !allReady {
@@ -175,6 +191,7 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 		Timestamp:    time.Now().UTC().Format(time.RFC3339),
 		Dependencies: deps,
 		Queue:        queueDiag,
+		BuildQueue:   buildDiag,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -184,7 +201,7 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 
 // QueueDiagnostics handles GET /health/queue (queue metrics and recovery statistics)
 func (h *HealthHandler) QueueDiagnostics(w http.ResponseWriter, r *http.Request) {
-	if h.queueProvider == nil {
+	if h.queueProvider == nil && h.buildQueueProvider == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotImplemented)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "queue diagnostics provider not configured"})
@@ -194,15 +211,32 @@ func (h *HealthHandler) QueueDiagnostics(w http.ResponseWriter, r *http.Request)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	diag, err := h.queueProvider.GetQueueDiagnostics(ctx)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to retrieve queue diagnostics"})
-		return
+	var queueDiag queue.QueueDiagnostics
+	if h.queueProvider != nil {
+		diag, err := h.queueProvider.GetQueueDiagnostics(ctx)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to retrieve queue diagnostics"})
+			return
+		}
+		queueDiag = diag
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(diag)
+
+	if h.buildQueueProvider != nil {
+		result := struct {
+			queue.QueueDiagnostics
+			BuildQueue interface{} `json:"build_queue,omitempty"`
+		}{
+			QueueDiagnostics: queueDiag,
+			BuildQueue:       h.buildQueueProvider.GetSharedBuildDiagnostics(),
+		}
+		_ = json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(queueDiag)
 }

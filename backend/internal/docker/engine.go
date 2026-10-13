@@ -39,12 +39,7 @@ import (
 	ws "github.com/forgelab/backend/internal/websocket"
 )
 
-type sharedBuildPromise struct {
-	done     chan struct{}
-	imageTag string
-	digest   string
-	err      error
-}
+type sharedBuildPromise = SharedBuildPromise
 
 type Engine struct {
 	dockerClient         *client.Client
@@ -68,6 +63,7 @@ type Engine struct {
 	activeCancels        sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
 	activeContainers     sync.Map     // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
 	sharedBuildArtifacts sync.Map     // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
+	sharedCoordinator    *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
 	cachedBuilderVer     atomic.Value // stores types.BuilderVersion advertised by Docker daemon
 }
 
@@ -137,8 +133,9 @@ func NewEngine(
 		wsHub:               wsHub,
 		workDir:             workDir,
 		localBuildMode:      "snapshot",
-		maxConcurrentBuilds: 1,
-		buildSem:            NewBuildSemaphore(1),
+		maxConcurrentBuilds: DefaultMaxConcurrentBuilds(),
+		buildSem:            NewBuildSemaphore(DefaultMaxConcurrentBuilds()),
+		sharedCoordinator:   NewSharedBuildCoordinator(),
 	}
 }
 
@@ -148,7 +145,7 @@ func (e *Engine) getBuildSemaphore() *BuildSemaphore {
 	if e.buildSem == nil {
 		lim := e.maxConcurrentBuilds
 		if lim <= 0 {
-			lim = 1
+			lim = DefaultMaxConcurrentBuilds()
 		}
 		e.buildSem = NewBuildSemaphore(lim)
 	}
@@ -169,15 +166,12 @@ func (e *Engine) GetMaxConcurrentBuilds() int {
 }
 
 func (e *Engine) getOrInitSharedBuild(key string) (*sharedBuildPromise, bool) {
-	val, loaded := e.sharedBuildArtifacts.Load(key)
-	if loaded {
-		return val.(*sharedBuildPromise), true
+	if e.sharedCoordinator == nil {
+		e.sharedCoordinator = NewSharedBuildCoordinator()
 	}
-	newPromise := &sharedBuildPromise{
-		done: make(chan struct{}),
-	}
-	actual, loaded := e.sharedBuildArtifacts.LoadOrStore(key, newPromise)
-	return actual.(*sharedBuildPromise), loaded
+	p, loaded := e.sharedCoordinator.GetOrInit(key, "")
+	e.sharedBuildArtifacts.Store(key, p)
+	return p, loaded
 }
 
 func isSyntheticAutoStartCommand(cmd string) bool {
@@ -249,6 +243,22 @@ func (e *Engine) GetBuildWaitersCount() int {
 // GetBuildDiagnostics returns a structured snapshot of current build slot capacity, active slots, and waiting builds.
 func (e *Engine) GetBuildDiagnostics() SemaphoreDiagnostics {
 	return e.getBuildSemaphore().GetDiagnostics()
+}
+
+// GetSharedBuildDiagnostics returns a diagnostic snapshot of in-flight and completed shared build artifacts.
+func (e *Engine) GetSharedBuildDiagnostics() SharedBuildDiagnostics {
+	if e.sharedCoordinator == nil {
+		return SharedBuildDiagnostics{}
+	}
+	return e.sharedCoordinator.GetDiagnostics()
+}
+
+// CleanupDeploymentSharedBuilds cleans up completed shared build entries for a project.
+func (e *Engine) CleanupDeploymentSharedBuilds(projectID string) int {
+	if e.sharedCoordinator == nil {
+		return 0
+	}
+	return e.sharedCoordinator.CleanupDeployment(projectID)
 }
 
 // RegisterActiveCancel registers a cancellation function for an active deployment execution.
@@ -698,33 +708,55 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		// Detect if this service can share a build artifact with another service
 		isSharedCandidate := (service.BuildStrategy == models.BuildStrategyDockerfile || serviceDeploy.BuildStrategy == models.BuildStrategyDockerfile)
 		if isSharedCandidate {
-			sharedKey = fmt.Sprintf("%s:%s:%s:%s", project.ID.String(), srcRev, cleanCtx, cleanDF)
+			buildArgsMap := make(map[string]*string)
+			for k, v := range normalBuildArgs {
+				val := v
+				buildArgsMap[k] = &val
+			}
+			strat := service.BuildStrategy
+			if strat == "" {
+				strat = serviceDeploy.BuildStrategy
+			}
+			sharedKey = ComputeSharedBuildKey(
+				project.ID.String(),
+				srcRev,
+				cleanCtx,
+				cleanDF,
+				strat,
+				"",
+				buildArgsMap,
+				service.RuntimeType,
+				service.InternalPort,
+				service.StartCommand,
+				service.PackageManager,
+			)
 			p, loaded := e.getOrInitSharedBuild(sharedKey)
 			sharedPromise = p
 			if loaded {
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Service '%s' shares build context and Dockerfile ('%s', '%s') with another service. Waiting for shared build artifact...", service.Name, cleanCtx, cleanDF))
 				select {
-				case <-sharedPromise.done:
-					if sharedPromise.err != nil {
-						reason := fmt.Sprintf("Shared image build failed: %v", sharedPromise.err)
+				case <-sharedPromise.Done():
+					tag, dig, sErr := sharedPromise.Result()
+					if sErr != nil {
+						reason := fmt.Sprintf("Shared image build failed: %v", sErr)
 						emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 						emitStatus(models.DeployStatusFailed, nil, &reason)
 						return errors.New(reason)
 					}
-					if sharedPromise.imageTag != "" {
-						runImage = sharedPromise.imageTag
+					if tag != "" {
+						runImage = tag
 						if e.dockerClient != nil {
-							_ = e.dockerClient.ImageTag(execCtx, sharedPromise.imageTag, svcTag)
+							_ = e.dockerClient.ImageTag(execCtx, tag, svcTag)
 							runImage = svcTag
 							if service.Image != "" {
-								_ = e.dockerClient.ImageTag(execCtx, sharedPromise.imageTag, service.Image)
+								_ = e.dockerClient.ImageTag(execCtx, tag, service.Image)
 							}
 						}
-						if sharedPromise.digest != "" && e.deploymentService != nil {
-							_ = e.deploymentService.UpdateServiceDeploymentImageDigest(ctx, serviceDeploy.ID, sharedPromise.digest)
+						if dig != "" && e.deploymentService != nil {
+							_ = e.deploymentService.UpdateServiceDeploymentImageDigest(ctx, serviceDeploy.ID, dig)
 						}
 						reusingExistingImage = true
-						emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Reusing shared build artifact '%s' (build context: '%s', dockerfile: '%s'). Skipping Docker build.", sharedPromise.imageTag, cleanCtx, cleanDF))
+						emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Reusing shared build artifact '%s' (build context: '%s', dockerfile: '%s'). Skipping Docker build.", tag, cleanCtx, cleanDF))
 					}
 				case <-execCtx.Done():
 					reason := "Context cancelled while waiting for shared image build"
@@ -736,6 +768,22 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	if !reusingExistingImage {
+		if sharedPromise != nil {
+			defer func() {
+				if !sharedPromise.IsDone() {
+					failErr := execCtx.Err()
+					if failErr == nil {
+						failErr = errors.New("shared image build aborted or cancelled before completion")
+					}
+					sharedPromise.Fail(failErr)
+					if e.sharedCoordinator != nil {
+						e.sharedCoordinator.Remove(sharedKey)
+					}
+					e.sharedBuildArtifacts.Delete(sharedKey)
+				}
+			}()
+		}
+
 		// 1. Source acquisition & resolution
 		emitStatus(models.DeployStatusCloning, nil, nil)
 		srcRev := ""
@@ -1153,8 +1201,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 		}); err != nil {
 			if sharedPromise != nil {
-				sharedPromise.err = err
-				close(sharedPromise.done)
+				sharedPromise.Fail(err)
+				if e.sharedCoordinator != nil {
+					e.sharedCoordinator.Remove(sharedKey)
+				}
 				e.sharedBuildArtifacts.Delete(sharedKey)
 			}
 			reason := err.Error()
@@ -1185,9 +1235,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			}
 		}
 		if sharedPromise != nil {
-			sharedPromise.imageTag = svcTag
-			sharedPromise.digest = digest
-			close(sharedPromise.done)
+			sharedPromise.Complete(svcTag, digest)
 		}
 		if service.Image != "" && e.dockerClient != nil {
 			_ = e.dockerClient.ImageTag(ctx, svcTag, service.Image)

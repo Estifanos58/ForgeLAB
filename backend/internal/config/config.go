@@ -199,6 +199,10 @@ func Load() (*Config, error) {
 		if len(trustedProxies) == 0 {
 			return nil, fmt.Errorf("production configuration error: RATE_LIMIT_TRUSTED_PROXIES must be configured with at least one trusted reverse proxy IP/CIDR in production mode")
 		}
+		allowedRoots := parseStringSlice(getEnv("FORGELAB_ALLOWED_SOURCE_ROOTS", ""))
+		if len(allowedRoots) == 0 {
+			return nil, fmt.Errorf("production configuration error: FORGELAB_ALLOWED_SOURCE_ROOTS must be configured with at least one explicit allowed source directory in production mode")
+		}
 	}
 
 	cfg := &Config{

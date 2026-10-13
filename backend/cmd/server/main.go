@@ -242,6 +242,11 @@ func main() {
 			slog.Warn("failed to reconcile daemon containers", "error", err)
 		}
 
+		// Perform continuous runtime health inspection to detect OOM kills and crash loops
+		if err := dockerEngine.CheckContinuousRuntimeHealth(ctx); err != nil {
+			slog.Warn("failed to inspect continuous runtime container health", "error", err)
+		}
+
 		if deployQueue != nil {
 			// Periodic recovery of abandoned/expired Redis queue jobs
 			if recCount, err := deployQueue.RecoverAbandonedJobs(ctx); err != nil {
@@ -316,6 +321,7 @@ func main() {
 	discoveryHandler := handlers.NewDiscoveryHandler(githubService, sourceService, pathValidator, secretService)
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
 	healthHandler.SetQueueDiagnosticsProvider(deployQueue)
+	healthHandler.SetBuildQueueDiagnosticsProvider(dockerEngine)
 
 	// Setup router
 	r := chi.NewRouter()

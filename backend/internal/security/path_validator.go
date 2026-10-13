@@ -144,7 +144,8 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 		}
 	}
 
-	return trimmed, nil
+	// Fail closed: if containerRoot is configured, unmapped host/daemon paths must be rejected
+	return "", fmt.Errorf("%w: path %q cannot be mapped to container source root %q", ErrPathNotAllowed, candidatePath, containerRoot)
 }
 
 // HostSourceRoot returns the configured host source root directory.
@@ -252,7 +253,8 @@ func (v *PathValidator) TranslateContainerToHost(candidatePath string) (string, 
 		return joinHostPath(hostRoot, cleanRel), nil
 	}
 
-	return trimmed, nil
+	// Fail closed: if container mapping is configured, candidate must reside inside containerRoot
+	return "", fmt.Errorf("%w: container path %q cannot be mapped outside container source root %q", ErrPathNotAllowed, candidatePath, containerRoot)
 }
 
 // TranslateContainerToDaemon translates a container path to its Docker daemon mount source path.
@@ -301,7 +303,8 @@ func (v *PathValidator) TranslateContainerToDaemon(candidatePath string) (string
 		return joinHostPath(daemonRoot, cleanRel), nil
 	}
 
-	return trimmed, nil
+	// Fail closed: if container mapping is configured, candidate must reside inside containerRoot
+	return "", fmt.Errorf("%w: container path %q cannot be mapped outside container source root %q", ErrPathNotAllowed, candidatePath, containerRoot)
 }
 
 func joinHostPath(base, rel string) string {
@@ -385,11 +388,10 @@ func (v *PathValidator) ValidateSourcePath(candidatePath string) (string, error)
 	}
 
 	// 6. Check containerSourceRoot boundary if mapping is enabled
-	if v.containerSourceRoot != "" && (v.hostSourceRoot != "" || len(v.allowedRoots) == 0) {
-		// If containerSourceRoot is set and candidate was mapped into it, verify boundary
+	if v.containerSourceRoot != "" {
 		relContainer, err := filepath.Rel(v.containerSourceRoot, canonicalPath)
-		if err == nil && !strings.HasPrefix(relContainer, "..") && relContainer != ".." {
-			return canonicalPath, nil
+		if err != nil || strings.HasPrefix(relContainer, "..") || relContainer == ".." {
+			return "", fmt.Errorf("%w: source path escapes container source root boundary %s", ErrPathNotAllowed, v.containerSourceRoot)
 		}
 	}
 

@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -161,26 +161,73 @@ func extractDockerfileFromTar(r io.Reader, targetDockerfile string) ([]byte, err
 	return nil, nil
 }
 
-// peekDockerfileFromTar reads and buffers the tar stream into an intact, unfragmented reader
+type autoCleaningFile struct {
+	*os.File
+}
+
+func (f autoCleaningFile) Close() error {
+	name := f.File.Name()
+	err := f.File.Close()
+	_ = os.Remove(name)
+	return err
+}
+
+// peekDockerfileFromTar inspects the tar stream into an intact, unfragmented reader
 // ensuring BuildKit and legacy builders receive complete, properly formatted tar archives without
 // pipe chunking artifacts, while extracting the Dockerfile contents for capability detection.
+// It avoids unbounded RAM buffering by using seekable files on disk.
 func peekDockerfileFromTar(tarArchive io.ReadCloser, targetDockerfile string) (io.ReadCloser, []byte, error) {
 	if tarArchive == nil {
 		return nil, nil, nil
 	}
-	defer tarArchive.Close()
 
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, tarArchive); err != nil {
-		return nil, nil, fmt.Errorf("failed buffering build context tar: %w", err)
+	if file, ok := tarArchive.(*os.File); ok {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return nil, nil, fmt.Errorf("failed rewinding tar archive file: %w", err)
+		}
+		dfContent, err := extractDockerfileFromTar(file, targetDockerfile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed extracting dockerfile from tar file: %w", err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return nil, nil, fmt.Errorf("failed rewinding tar archive file after peek: %w", err)
+		}
+		return file, dfContent, nil
 	}
 
-	rawBytes := buf.Bytes()
-	dfContent, _ := extractDockerfileFromTar(bytes.NewReader(rawBytes), targetDockerfile)
-	slog.Info("buffered tar context", "total_bytes", len(rawBytes), "df_bytes", len(dfContent))
+	defer tarArchive.Close()
 
-	rc := io.NopCloser(bytes.NewReader(rawBytes))
-	return rc, dfContent, nil
+	tmp, err := os.CreateTemp("", "forgelab-tar-peek-*.tar")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed creating temporary file for tar peek: %w", err)
+	}
+
+	if _, err := io.Copy(tmp, tarArchive); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, nil, fmt.Errorf("failed staging build context tar to disk: %w", err)
+	}
+
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, nil, fmt.Errorf("failed rewinding staged tar file: %w", err)
+	}
+
+	dfContent, err := extractDockerfileFromTar(tmp, targetDockerfile)
+	if err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, nil, fmt.Errorf("failed extracting dockerfile from staged tar: %w", err)
+	}
+
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, nil, fmt.Errorf("failed rewinding staged tar file after peek: %w", err)
+	}
+
+	return autoCleaningFile{tmp}, dfContent, nil
 }
 
 func (e *Engine) getCachedBuilderVersion() (types.BuilderVersion, bool) {

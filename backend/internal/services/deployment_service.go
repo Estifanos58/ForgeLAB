@@ -2343,10 +2343,9 @@ func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Co
 	}
 
 	rows, err := s.db.Query(ctx,
-		`SELECT id, service_id, status, created_at, started_at
+		`SELECT id, service_id, deployment_id, status, created_at, started_at
 		 FROM service_deployments
 		 WHERE status IN ($1, $2, $3, $4)
-		   AND deployment_id IS NULL
 		   AND COALESCE(started_at, created_at) < NOW() - $5::interval
 		 ORDER BY created_at ASC`,
 		models.DeployStatusCloning, models.DeployStatusBuilding,
@@ -2359,16 +2358,17 @@ func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Co
 	defer rows.Close()
 
 	type activeItem struct {
-		id        uuid.UUID
-		serviceID uuid.UUID
-		status    string
-		createdAt time.Time
-		startedAt *time.Time
+		id           uuid.UUID
+		serviceID    uuid.UUID
+		deploymentID *uuid.UUID
+		status       string
+		createdAt    time.Time
+		startedAt    *time.Time
 	}
 	var items []activeItem
 	for rows.Next() {
 		var it activeItem
-		if err := rows.Scan(&it.id, &it.serviceID, &it.status, &it.createdAt, &it.startedAt); err == nil {
+		if err := rows.Scan(&it.id, &it.serviceID, &it.deploymentID, &it.status, &it.createdAt, &it.startedAt); err == nil {
 			items = append(items, it)
 		}
 	}
@@ -2379,6 +2379,12 @@ func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Co
 		if err != nil {
 			slog.Warn("reconciliation: error checking active status in queue", "id", item.id, "error", err)
 			continue
+		}
+		if !active && item.deploymentID != nil {
+			// Check if parent release job is heartbeating or enqueued
+			if pActive, pErr := q.IsJobEnqueuedOrActive(ctx, *item.deploymentID); pErr == nil && pActive {
+				active = true
+			}
 		}
 		if active {
 			// Worker is heartbeating or job is in queue
@@ -2485,7 +2491,6 @@ func (s *DeploymentService) ReconcileOrphanedDeployments(ctx context.Context, st
 		 finished_at = NOW(),
 		 duration_ms = EXTRACT(EPOCH FROM (NOW() - COALESCE(started_at, created_at))) * 1000
 		 WHERE status IN ($3, $4, $5, $6, $7)
-		   AND deployment_id IS NULL
 		   AND created_at < NOW() - $8::interval`,
 		models.DeployStatusFailed, reason,
 		models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
@@ -2495,6 +2500,21 @@ func (s *DeploymentService) ReconcileOrphanedDeployments(ctx context.Context, st
 	if err != nil {
 		return 0, fmt.Errorf("failed to reconcile orphaned deployments: %w", err)
 	}
+
+	// Also reconcile parent deployments table
+	_, _ = s.db.Exec(ctx,
+		`UPDATE deployments SET
+		 status = $1,
+		 failure_reason = $2,
+		 finished_at = NOW(),
+		 duration_ms = EXTRACT(EPOCH FROM (NOW() - COALESCE(started_at, created_at))) * 1000
+		 WHERE status IN ($3, $4, $5, $6, $7)
+		   AND created_at < NOW() - $8::interval`,
+		models.DeployStatusFailed, reason,
+		models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
+		models.DeployStatusStarting, models.DeployStatusHealthChecking,
+		staleDuration.String(),
+	)
 
 	count := int(tag.RowsAffected())
 	if count > 0 {

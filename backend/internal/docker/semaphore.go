@@ -2,11 +2,28 @@ package docker
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// DefaultMaxConcurrentBuilds calculates conservative, CPU-aware build concurrency.
+func DefaultMaxConcurrentBuilds() int {
+	cpus := runtime.NumCPU()
+	if cpus <= 2 {
+		return 1
+	}
+	if cpus <= 4 {
+		return 2
+	}
+	n := cpus / 2
+	if n > 4 {
+		return 4
+	}
+	return n
+}
 
 // SlotOwnerInfo captures rich, non-sensitive diagnostic metadata for an
 // active or queued build-slot participant.

@@ -66,17 +66,17 @@ ForgeLAB is a single control-plane, self-hosted application deployment platform.
   - `Deployment` represents the release orchestration layer, executing services in sequential DAG tiers while preserving semaphore-controlled concurrency within each tier. Dependent services fail gracefully if their prerequisites fail to start or pass health checks.
   - Pre-built infrastructure images (`classification == "infrastructure"`) are pulled directly via `dockerClient.ImagePull` without source builds.
   - Every service retains independent logs, status, resources, container, deployment history, and rollback capabilities.
-  - The deployment engine is modularized across focused components (`engine_health.go`, `engine_lifecycle.go`, `engine_build.go`, `engine.go`) maintaining strict rollback safety and deployment state guarantees. Build concurrency is conservatively throttled (defaulting to 1-2 slots on resource-constrained hosts, up to 4 on multi-core hosts) with full queue semaphore diagnostics.
+  - The deployment engine is modularized across focused components (`engine_health.go`, `engine_lifecycle.go`, `engine_build.go`, `shared_build_coordinator.go`, `engine.go`) maintaining strict rollback safety and deployment state guarantees. Build concurrency is conservatively throttled dynamically by CPU cores (1 slot on <=2 CPUs, 2 slots on <=4 CPUs, up to 4 on multi-core hosts) with full build queue diagnostics exposed via `/health/queue`. Shared builds are coordinated via `SharedBuildCoordinator` with fail-safe promise resolution and comprehensive configuration cache hashing.
 - **Port Allocation:** Dynamic host port allocation in the range **`10000–60000`** managed by `internal/network/PortManager`.
 - **Realtime Pipeline:** Deployment events and container logs are pushed to Redis Pub/Sub channels (`forgelab:pubsub:deployment:<uuid>`), bridged to an in-memory WebSocket Hub, and streamed to authenticated client subscriptions.
 - **Rollback & Safety Invariant:** When a deployment fails at any stage (build, container startup, or readiness check), the previous running deployment container remains untouched, and `projects.current_deployment_id` remains unchanged. Rollback creates a new deployment referencing the prior known-good Docker image.
-- **Container Restart vs. Platform Self-Healing:**
+- **Container Restart & Runtime Health Monitoring:**
   - **Docker Runtime Restart Policy:** Containers are created with `RestartPolicy: "unless-stopped"`. The Docker daemon itself automatically restarts crashed containers.
-  - **ForgeLAB-Level Self-Healing:** ForgeLAB does **not** implement continuous background runtime health monitoring, crash-loop detection, or automated application rollback after promotion. Kubernetes, VM scheduling, and multi-node orchestration are explicitly deferred.
+  - **ForgeLAB Continuous Runtime Health Monitoring:** The background deployment reconciler continuously monitors running containers (`CheckContinuousRuntimeHealth`), detecting stopped/exited containers or kernel OOM kills (`insp.State.OOMKilled`), marking service records as `FAILED` with actionable failure diagnostics. Automated rollback and multi-node orchestration remain deferred.
 
 ### Current Implementation vs. Verification Stage
 - **Implementation Stage:** The full-stack platform (Go backend, Next.js 16 frontend, PostgreSQL, Redis, Migrations, Worker, Google/GitHub OAuth, Unified Source Ingestion, Authoritative Discovery Engine, Deployment Plan Review, and DAG-ordered ServiceDeployments) is **IMPLEMENTED** in the codebase.
-- **Verification Stage:** **NOT RECORDED** (or verified in live Docker stack). Per project policy, automated unit tests and static builds are non-authoritative artifacts. No capability may be classified as `PHYSICALLY VERIFIED` until the project owner executes the manual procedures defined in [docs/12-manual-verification.md](12-manual-verification.md) in the live development environment. live development environment.
+- **Verification Stage:** **NOT RECORDED** (or verified in live Docker stack). Per project policy, automated unit tests and static builds are non-authoritative artifacts. No capability may be classified as `PHYSICALLY VERIFIED` until the project owner executes the manual procedures defined in [docs/12-manual-verification.md](12-manual-verification.md) in the live development environment.
 
 ---
 
