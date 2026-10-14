@@ -508,7 +508,8 @@ func TestEngine_LocalAgent_TwoProcessDeploymentRegression(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	agentCmd := exec.CommandContext(ctx, agentExePath, "-port", fmt.Sprint(agentPort), "-backend", backendServer.URL)
+	testAgentID := fmt.Sprintf("test-deploy-agent-%d", agentPort)
+	agentCmd := exec.CommandContext(ctx, agentExePath, "-port", fmt.Sprint(agentPort), "-backend", backendServer.URL, "-agent-id", testAgentID)
 	var agentOutput safeBuffer
 	agentCmd.Stdout = &agentOutput
 	agentCmd.Stderr = &agentOutput
@@ -540,7 +541,7 @@ func TestEngine_LocalAgent_TwoProcessDeploymentRegression(t *testing.T) {
 				AgentID string `json:"agent_id"`
 			}
 			if decErr := json.NewDecoder(resp.Body).Decode(&statusData); decErr == nil && statusData.Status == "online" {
-				agentID = statusData.AgentID
+				agentID = testAgentID
 				resp.Body.Close()
 				ready = true
 				break

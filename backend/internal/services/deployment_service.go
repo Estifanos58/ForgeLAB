@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
 )
@@ -115,6 +116,15 @@ func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *
 		ref = project.RepositoryPath
 	}
 	if ref != "" {
+		// If source is a local directory accessible on host, compute accurate revision from directory content/metadata so local changes produce accurate revisions
+		if (project.SourceType == models.SourceTypeLocalDirectory || project.SourceType == models.SourceTypeLocal) && project.RepositoryPath != "" {
+			if fi, err := os.Stat(project.RepositoryPath); err == nil && fi.IsDir() {
+				if fp, fpErr := discovery.ComputeLightweightDirectoryFingerprint(project.RepositoryPath); fpErr == nil && fp != "" {
+					return &fp
+				}
+			}
+		}
+
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%s", project.SourceType, ref)))
 		fp := fmt.Sprintf("fp_%s", hex.EncodeToString(h[:16]))
 		return &fp
@@ -2235,6 +2245,7 @@ func (s *DeploymentService) GetServiceDeploymentLogsAfter(ctx context.Context, s
 type DeploymentQueueReconciler interface {
 	IsJobEnqueuedOrActive(ctx context.Context, jobID uuid.UUID) (bool, error)
 	EnqueueServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) error
+	EnqueueDeployment(ctx context.Context, deploymentID uuid.UUID) error
 	GetAttempts(ctx context.Context, jobID uuid.UUID) (int, error)
 	IncrementAttempts(ctx context.Context, jobID uuid.UUID) (int64, error)
 }
@@ -2322,6 +2333,60 @@ func (s *DeploymentService) ReconcileQueuedDeployments(ctx context.Context, q De
 			slog.Warn("marked missing queued deployment as failed after exceeding recovery attempts",
 				"service_deployment_id", item.id, "attempts", attempts)
 			reconciled++
+		}
+	}
+
+	// Also reconcile parent release deployments in deployments table
+	depRows, dErr := s.db.Query(ctx,
+		`SELECT id, project_id, deploy_number, created_at
+		 FROM deployments
+		 WHERE status = $1
+		   AND created_at < NOW() - $2::interval
+		 ORDER BY created_at ASC`,
+		models.DeployStatusQueued, minAge.String(),
+	)
+	if dErr == nil {
+		defer depRows.Close()
+		type queuedDepItem struct {
+			id           uuid.UUID
+			projectID    uuid.UUID
+			deployNumber int
+			createdAt    time.Time
+		}
+		var depItems []queuedDepItem
+		for depRows.Next() {
+			var it queuedDepItem
+			if err := depRows.Scan(&it.id, &it.projectID, &it.deployNumber, &it.createdAt); err == nil {
+				depItems = append(depItems, it)
+			}
+		}
+
+		for _, item := range depItems {
+			activeOrQueued, err := q.IsJobEnqueuedOrActive(ctx, item.id)
+			if err != nil || activeOrQueued {
+				continue
+			}
+
+			if isSuperseded, _ := s.IsDeploymentSuperseded(ctx, item.projectID, item.deployNumber); isSuperseded {
+				reason := "Reconciliation: queued deployment was superseded by a newer deployment"
+				_ = s.UpdateDeploymentStatus(ctx, item.id, models.DeployStatusFailed, &reason)
+				reconciled++
+				continue
+			}
+
+			attempts, _ := q.GetAttempts(ctx, item.id)
+			if attempts < maxRetries {
+				if err := q.EnqueueDeployment(ctx, item.id); err == nil {
+					_, _ = q.IncrementAttempts(ctx, item.id)
+					slog.Info("re-enqueued missing queued project release deployment via reconciliation",
+						"deployment_id", item.id, "attempts", attempts+1)
+					reconciled++
+				}
+			} else {
+				reason := fmt.Sprintf("Reconciliation: queued deployment was missing from queue and exceeded max recovery attempts (%d)", maxRetries)
+				_ = s.UpdateDeploymentStatus(ctx, item.id, models.DeployStatusFailed, &reason)
+				reconciled++
+			}
 		}
 	}
 

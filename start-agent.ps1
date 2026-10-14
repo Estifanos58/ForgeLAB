@@ -2,7 +2,7 @@
 # Launches the ForgeLAB Local Agent on http://127.0.0.1:4142
 
 param(
-    [string]$HostAddr = "0.0.0.0",
+    [string]$HostAddr = "127.0.0.1",
     [int]$Port = 4142,
     [string]$Backend = "http://localhost:8080",
     [string]$AllowedRoots = "",

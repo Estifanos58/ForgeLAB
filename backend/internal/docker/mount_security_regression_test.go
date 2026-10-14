@@ -179,4 +179,3 @@ func TestMountSecurity_SanitizeDockerSocketMounts(t *testing.T) {
 	})
 	require.NoError(t, err, "sanitized deployment must pass preflight validation")
 }
-

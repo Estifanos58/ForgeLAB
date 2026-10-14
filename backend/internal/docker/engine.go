@@ -57,14 +57,14 @@ type Engine struct {
 	maxConcurrentBuilds  int
 	buildSem             *BuildSemaphore
 	semMu                sync.Mutex
-	buildMaintenanceMu   sync.RWMutex // synchronizes Docker image builds vs image pruning/maintenance
-	pruneFilterLabel     string       // optional label filter for scoped image pruning
-	activeLogCollectors  sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
-	activeCancels        sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
-	activeContainers     sync.Map     // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
-	sharedBuildArtifacts sync.Map     // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
+	buildMaintenanceMu   sync.RWMutex            // synchronizes Docker image builds vs image pruning/maintenance
+	pruneFilterLabel     string                  // optional label filter for scoped image pruning
+	activeLogCollectors  sync.Map                // map[string]context.CancelFunc — tracks running log collector goroutines
+	activeCancels        sync.Map                // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	activeContainers     sync.Map                // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
+	sharedBuildArtifacts sync.Map                // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
 	sharedCoordinator    *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
-	cachedBuilderVer     atomic.Value // stores types.BuilderVersion advertised by Docker daemon
+	cachedBuilderVer     atomic.Value            // stores types.BuilderVersion advertised by Docker daemon
 }
 
 func (e *Engine) trackActiveContainer(id string) {
@@ -358,12 +358,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	// Stale / superseded deployment check: if already terminal (e.g. superseded while in queue or cancelled), do not run!
 	if models.IsDeploymentTerminalStatus(serviceDeploy.Status) {
 		slog.Info("service deployment already in terminal state; skipping execution", "service_deployment_id", serviceDeploymentID, "status", serviceDeploy.Status)
-		return nil
+		if serviceDeploy.Status == models.DeployStatusRunning {
+			return nil
+		}
+		return fmt.Errorf("service deployment %s is already in terminal state '%s'", serviceDeploymentID, serviceDeploy.Status)
 	}
 	if e.deploymentService != nil {
 		if superseded, err := e.deploymentService.IsServiceDeploymentSuperseded(ctx, serviceDeploy.ServiceID, serviceDeploy.DeployNumber); err == nil && superseded {
 			slog.Info("service deployment superseded by newer deployment; skipping execution", "service_deployment_id", serviceDeploymentID, "deploy_number", serviceDeploy.DeployNumber)
-			return nil
+			return fmt.Errorf("service deployment %s superseded by newer deployment", serviceDeploymentID)
 		}
 	}
 
@@ -1269,16 +1272,20 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	if shouldExposePort {
 		allocated, err := e.portManager.AllocatePort()
-		if err == nil {
-			hostPort = &allocated
-			portBindings = nat.PortMap{
-				nat.Port(targetPortStr): []nat.PortBinding{
-					{
-						HostIP:   "0.0.0.0",
-						HostPort: fmt.Sprintf("%d", allocated),
-					},
+		if err != nil {
+			reason := fmt.Sprintf("Failed to allocate host port for exposed service '%s': %v", service.Name, err)
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
+		}
+		hostPort = &allocated
+		portBindings = nat.PortMap{
+			nat.Port(targetPortStr): []nat.PortBinding{
+				{
+					HostIP:   "0.0.0.0",
+					HostPort: fmt.Sprintf("%d", allocated),
 				},
-			}
+			},
 		}
 	}
 
@@ -1634,18 +1641,25 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	if targetPidsLimit <= 0 && service.PidsLimit > 0 {
 		targetPidsLimit = service.PidsLimit
 	}
+	targetEphemeralStorageMB := 0
+	if serviceDeploy.EphemeralStorageMB != nil && *serviceDeploy.EphemeralStorageMB > 0 {
+		targetEphemeralStorageMB = *serviceDeploy.EphemeralStorageMB
+	} else if service.EphemeralStorageMB != nil && *service.EphemeralStorageMB > 0 {
+		targetEphemeralStorageMB = *service.EphemeralStorageMB
+	}
 
 	isJob := (service.Classification == models.ClassificationJob || serviceDeploy.Classification == models.ClassificationJob)
 	hostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
-		PortBindings:         portBindings,
-		TargetCpuMillicores:  targetCpuMillicores,
-		TargetMemoryMB:       targetMemoryMB,
-		TargetPidsLimit:      targetPidsLimit,
-		Binds:                binds,
-		NetworkMode:          "",
-		AllowedMountPrefixes: allowedMountPrefixes,
-		AllowDockerSocket:    false, // NEVER authorize Docker socket for tenant project configurations
-		IsJob:                isJob,
+		PortBindings:             portBindings,
+		TargetCpuMillicores:      targetCpuMillicores,
+		TargetMemoryMB:           targetMemoryMB,
+		TargetPidsLimit:          targetPidsLimit,
+		TargetEphemeralStorageMB: targetEphemeralStorageMB,
+		Binds:                    binds,
+		NetworkMode:              "",
+		AllowedMountPrefixes:     allowedMountPrefixes,
+		AllowDockerSocket:        false, // NEVER authorize Docker socket for tenant project configurations
+		IsJob:                    isJob,
 	})
 	if err != nil {
 		if hostPort != nil {
@@ -2066,6 +2080,28 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Executing Tier %d (%d service(s))...", tierIdx+1, len(tier)))
 		var tierWg sync.WaitGroup
 		for _, sd := range tier {
+			// If service deployment is already terminal failed or skipped from a prior attempt, mark as failed
+			if sd.Status == models.DeployStatusFailed || sd.Status == models.DeployStatusSkipped || sd.Status == models.DeployStatusCrashed {
+				mu.Lock()
+				allHealthy = false
+				failedServices[sd.ServiceName] = true
+				serviceExitCodes[sd.ServiceName] = 1
+				serviceHealthy[sd.ServiceName] = false
+				errList = append(errList, fmt.Sprintf("%s: service deployment is already in terminal state '%s'", sd.ServiceName, sd.Status))
+				mu.Unlock()
+				continue
+			}
+
+			// If already running from a prior healthy deployment in this release, preserve healthy state
+			if sd.Status == models.DeployStatusRunning {
+				mu.Lock()
+				anyHealthy = true
+				serviceExitCodes[sd.ServiceName] = 0
+				serviceHealthy[sd.ServiceName] = true
+				mu.Unlock()
+				continue
+			}
+
 			// Check if any dependencies failed or did not satisfy required conditions
 			hasFailedDep := false
 			var failedDepName string

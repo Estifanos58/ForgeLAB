@@ -26,16 +26,17 @@ const (
 )
 
 var (
-	ErrDockerSocketMountRejected    = errors.New("security violation: mounting host Docker socket into deployed containers is strictly forbidden")
-	ErrSensitiveHostMountRejected   = errors.New("security violation: mounting sensitive host filesystem paths into deployed containers is forbidden")
-	ErrPrivilegedModeRejected       = errors.New("security violation: running deployed containers in privileged mode is forbidden")
-	ErrHostNetworkingRejected       = errors.New("security violation: host networking mode for deployed containers is forbidden")
-	ErrHostMountNotAllowed          = errors.New("security violation: host mount path is not within the approved ForgeLAB mount allowlist")
-	ErrCpuOutOfRange                = fmt.Errorf("cpu_millicores must be between %d and %d (0.1 to 16 cores)", MinCpuMillicores, MaxCpuMillicores)
-	ErrMemoryOutOfRange             = fmt.Errorf("memory_mb must be between %d and %d (64MB to 32GB)", MinMemoryMB, MaxMemoryMB)
-	ErrPidsOutOfRange               = fmt.Errorf("pids_limit must be between %d and %d", MinPidsLimit, MaxPidsLimit)
-	ErrNofileOutOfRange             = fmt.Errorf("nofile limits must be between %d and %d, with soft <= hard", MinNofileLimit, MaxNofileLimit)
-	ErrEphemeralStorageNotSupported = errors.New("ephemeral_storage_mb is not supported on this host environment; remove or leave empty")
+	ErrDockerSocketMountRejected       = errors.New("security violation: mounting host Docker socket into deployed containers is strictly forbidden")
+	ErrSensitiveHostMountRejected      = errors.New("security violation: mounting sensitive host filesystem paths into deployed containers is forbidden")
+	ErrPrivilegedModeRejected          = errors.New("security violation: running deployed containers in privileged mode is forbidden")
+	ErrHostNetworkingRejected          = errors.New("security violation: host networking mode for deployed containers is forbidden")
+	ErrContainerNetworkSharingRejected = errors.New("security violation: container network namespace sharing is forbidden")
+	ErrHostMountNotAllowed             = errors.New("security violation: host mount path is not within the approved ForgeLAB mount allowlist")
+	ErrCpuOutOfRange                   = fmt.Errorf("cpu_millicores must be between %d and %d (0.1 to 16 cores)", MinCpuMillicores, MaxCpuMillicores)
+	ErrMemoryOutOfRange                = fmt.Errorf("memory_mb must be between %d and %d (64MB to 32GB)", MinMemoryMB, MaxMemoryMB)
+	ErrPidsOutOfRange                  = fmt.Errorf("pids_limit must be between %d and %d", MinPidsLimit, MaxPidsLimit)
+	ErrNofileOutOfRange                = fmt.Errorf("nofile limits must be between %d and %d, with soft <= hard", MinNofileLimit, MaxNofileLimit)
+	ErrEphemeralStorageNotSupported    = errors.New("ephemeral_storage_mb is not supported on this host environment; remove or leave empty")
 )
 
 // Sensitive host paths that must never be mounted into tenant containers.
@@ -54,19 +55,20 @@ var restrictedHostMounts = []string{
 
 // ContainerSecurityOptions parameters for creating a strictly sandboxed container.
 type ContainerSecurityOptions struct {
-	PortBindings         nat.PortMap
-	TargetCpuMillicores  int
-	TargetMemoryMB       int
-	TargetPidsLimit      int
-	TargetNofileSoft     int
-	TargetNofileHard     int
-	Binds                []string
-	NetworkMode          string
-	AllowedMountPrefixes []string
-	AllowDockerSocket    bool
-	CapAdd               []string
-	IsJob                bool
-	RestartPolicy        string
+	PortBindings             nat.PortMap
+	TargetCpuMillicores      int
+	TargetMemoryMB           int
+	TargetPidsLimit          int
+	TargetNofileSoft         int
+	TargetNofileHard         int
+	TargetEphemeralStorageMB int
+	Binds                    []string
+	NetworkMode              string
+	AllowedMountPrefixes     []string
+	AllowDockerSocket        bool
+	CapAdd                   []string
+	IsJob                    bool
+	RestartPolicy            string
 }
 
 func splitDockerBind(bind string) (hostPath, containerPath, mode string) {
@@ -100,9 +102,18 @@ func splitDockerBind(bind string) (hostPath, containerPath, mode string) {
 // ValidateAndBuildSecureHostConfig creates a centralized, strictly validated Docker HostConfig
 // that enforces the platform trust boundary invariants.
 func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container.HostConfig, error) {
-	// 1. Validate NetworkMode: Reject host networking
-	if strings.EqualFold(opts.NetworkMode, "host") {
+	// 1. Validate NetworkMode: Reject host networking and container namespace sharing
+	cleanNetMode := strings.ToLower(strings.TrimSpace(opts.NetworkMode))
+	if cleanNetMode == "host" {
 		return nil, ErrHostNetworkingRejected
+	}
+	if strings.HasPrefix(cleanNetMode, "container:") {
+		return nil, ErrContainerNetworkSharingRejected
+	}
+
+	// 1b. Reject unsupported ephemeral storage limits without silent claiming
+	if opts.TargetEphemeralStorageMB > 0 {
+		return nil, ErrEphemeralStorageNotSupported
 	}
 
 	// 2. Validate Binds: Ensure zero access to docker socket or sensitive host paths

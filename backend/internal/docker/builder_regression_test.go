@@ -453,7 +453,7 @@ func TestRegression_StreamBuildContext_PeekTar(t *testing.T) {
 }
 
 func TestLive_BuildKit_BuildImage(t *testing.T) {
-	if os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
+	if testing.Short() || os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
 		t.Skip("Skipping live Docker test")
 	}
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -492,4 +492,71 @@ func TestLive_BuildKit_BuildImage(t *testing.T) {
 		t.Log(s)
 	})
 	require.NoError(t, err)
+}
+
+func TestRegression_BuildImage_SetsContentLengthAndDisablesChunkedEncoding(t *testing.T) {
+	var (
+		receivedContentLength int64
+		isChunked             bool
+	)
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/_ping"):
+			w.Header().Set("API-Version", "1.41")
+			w.Header().Set("Builder-Version", "2")
+			w.Header().Set("Ostype", "linux")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+		case strings.Contains(r.URL.Path, "/build"):
+			receivedContentLength = r.ContentLength
+			for _, te := range r.TransferEncoding {
+				if strings.EqualFold(te, "chunked") {
+					isChunked = true
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintln(w, `{"stream":"Successfully built test-image\n"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockServer.Close()
+
+	cli, err := client.NewClientWithOpts(
+		client.WithHost(mockServer.URL),
+		client.WithHTTPClient(mockServer.Client()),
+		client.WithVersion("1.41"),
+	)
+	require.NoError(t, err)
+	defer cli.Close()
+
+	eng := &Engine{dockerClient: cli, workDir: t.TempDir()}
+
+	// Create a temporary tar archive file on disk (as done during build context staging)
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test-build-*.tar")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	tarData := createTarArchiveWithFiles(t, map[string][]byte{
+		"Dockerfile": []byte("FROM alpine\nRUN echo hello\n"),
+	})
+	_, err = tmpFile.Write(tarData)
+	require.NoError(t, err)
+	_, err = tmpFile.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+
+	opts := types.ImageBuildOptions{
+		Tags:       []string{"forgelab/test-cl:latest"},
+		Dockerfile: "Dockerfile",
+	}
+
+	buildErr := eng.buildImage(context.Background(), tmpFile, opts, nil)
+	require.NoError(t, buildErr)
+
+	// Verify Content-Length is explicitly positive and Transfer-Encoding is not chunked
+	assert.Greater(t, receivedContentLength, int64(0), "HTTP request to Docker ImageBuild must have Content-Length > 0")
+	assert.Equal(t, int64(len(tarData)), receivedContentLength, "HTTP Content-Length must match exact archive size")
+	assert.False(t, isChunked, "HTTP request must not use chunked transfer encoding over named pipes")
 }

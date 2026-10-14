@@ -99,8 +99,8 @@ func (p *SharedBuildPromise) Fail(err error) {
 
 // SharedBuildDiagnostics captures runtime snapshot of shared builds.
 type SharedBuildDiagnostics struct {
-	TotalEntries int                      `json:"total_entries"`
-	ActiveBuilds int                      `json:"active_builds"`
+	TotalEntries int                       `json:"total_entries"`
+	ActiveBuilds int                       `json:"active_builds"`
 	Entries      map[string]SharedItemInfo `json:"entries"`
 }
 

@@ -104,8 +104,8 @@ func NewSourceService(db *pgxpool.Pool, sourcesDir string, encryptor ...*crypto.
 	if sourcesDir == "" {
 		sourcesDir = "./data/sources"
 	}
-	_ = os.MkdirAll(sourcesDir, 0755)
-	_ = os.MkdirAll(filepath.Join(sourcesDir, ".uploads"), 0755)
+	_ = os.MkdirAll(sourcesDir, 0700)
+	_ = os.MkdirAll(filepath.Join(sourcesDir, ".uploads"), 0700)
 
 	var enc *crypto.Encryptor
 	if len(encryptor) > 0 && encryptor[0] != nil {
@@ -452,7 +452,7 @@ func (s *SourceService) IngestMultipartStream(ctx context.Context, ownerID uuid.
 	uploadDir := filepath.Join(s.sourcesDir, ".uploads", sourceID.String())
 	targetDir := filepath.Join(s.sourcesDir, sourceID.String())
 
-	if err := os.MkdirAll(uploadDir, 0755); err != nil {
+	if err := os.MkdirAll(uploadDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create upload staging directory: %w", err)
 	}
 
@@ -543,12 +543,12 @@ func (s *SourceService) IngestMultipartStream(ctx context.Context, ownerID uuid.
 			return nil, ErrPathTraversalDetected
 		}
 
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
 			_ = part.Close()
 			return nil, err
 		}
 
-		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			_ = part.Close()
 			return nil, err
@@ -695,11 +695,11 @@ func (s *SourceService) ingestArchivePart(
 			}
 
 			if f.FileInfo().IsDir() {
-				_ = os.MkdirAll(destPath, 0755)
+				_ = os.MkdirAll(destPath, 0700)
 				continue
 			}
 
-			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
 				zipFile.Close()
 				_ = os.Remove(tempZip)
 				return nil, err
@@ -711,7 +711,7 @@ func (s *SourceService) ingestArchivePart(
 				_ = os.Remove(tempZip)
 				return nil, err
 			}
-			outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+			outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 			if err != nil {
 				rc.Close()
 				zipFile.Close()
@@ -774,12 +774,12 @@ func (s *SourceService) ingestArchivePart(
 
 			switch header.Typeflag {
 			case tar.TypeDir:
-				_ = os.MkdirAll(destPath, 0755)
+				_ = os.MkdirAll(destPath, 0700)
 			case tar.TypeReg:
-				if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
 					return nil, err
 				}
-				outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, header.FileInfo().Mode())
+				outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 				if err != nil {
 					return nil, err
 				}
@@ -965,11 +965,11 @@ func (s *SourceService) IngestZip(ctx context.Context, ownerID uuid.UUID, r io.R
 		}
 
 		if f.FileInfo().IsDir() {
-			_ = os.MkdirAll(destPath, 0755)
+			_ = os.MkdirAll(destPath, 0700)
 			continue
 		}
 
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
 			_ = os.RemoveAll(targetDir)
 			return nil, err
 		}
@@ -980,7 +980,7 @@ func (s *SourceService) IngestZip(ctx context.Context, ownerID uuid.UUID, r io.R
 			return nil, err
 		}
 
-		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			rc.Close()
 			_ = os.RemoveAll(targetDir)
@@ -1115,13 +1115,13 @@ func (s *SourceService) IngestTarGz(ctx context.Context, ownerID uuid.UUID, r io
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			_ = os.MkdirAll(destPath, 0755)
+			_ = os.MkdirAll(destPath, 0700)
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
 				_ = os.RemoveAll(targetDir)
 				return nil, err
 			}
-			outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, header.FileInfo().Mode())
+			outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 			if err != nil {
 				_ = os.RemoveAll(targetDir)
 				return nil, err
@@ -1257,7 +1257,7 @@ func (s *SourceService) IngestMultipartFiles(ctx context.Context, ownerID uuid.U
 			return nil, ErrPathTraversalDetected
 		}
 
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
 			_ = os.RemoveAll(targetDir)
 			return nil, err
 		}
@@ -1268,7 +1268,7 @@ func (s *SourceService) IngestMultipartFiles(ctx context.Context, ownerID uuid.U
 			return nil, err
 		}
 
-		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			srcFile.Close()
 			_ = os.RemoveAll(targetDir)

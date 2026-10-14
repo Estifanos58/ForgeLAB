@@ -161,37 +161,37 @@ func (h *HealthCheckConfig) UnmarshalJSON(data []byte) error {
 // Project represents a registered project in ForgeLab.
 // A project is an application that ForgeLab manages, containing one or more services.
 type Project struct {
-	ID                  uuid.UUID       `json:"id"`
-	OwnerID             uuid.UUID       `json:"owner_id"`
-	SourceID            *uuid.UUID      `json:"source_id,omitempty"`
-	Name                string          `json:"name"`
-	Slug                string          `json:"slug"`
-	SourceType          string          `json:"source_type"`      // "local_agent", "local_directory", "local_upload", "github", or legacy "local"
-	SourceReference     string          `json:"source_reference"` // repo "owner/repo" or local upload source_id
-	RepositoryPath      string          `json:"repository_path"`  // host path for local_directory projects
-	Branch              string          `json:"branch"`
-	DeploymentStrategy  string          `json:"deployment_strategy"` // "auto", "compose", "dockerfile", "custom"
-	DeploymentPlan      json.RawMessage `json:"deployment_plan,omitempty"`
-	DockerfilePath      string          `json:"dockerfile_path"`
-	BuildContext        string          `json:"build_context"`
-	BuildStrategy       string          `json:"build_strategy"` // "auto" or "dockerfile"
-	BuildCommand        string          `json:"build_command"`
-	StartCommand        string          `json:"start_command"`
-	RuntimeType         string          `json:"runtime_type"`      // "nextjs", "nodejs", "python-fastapi", "go", etc.
-	InternalPort        int             `json:"internal_port"`     // 3000, 8000, 8080, etc.
-	HealthCheckPath     *string         `json:"health_check_path"` // Nullable
-	HealthCheckEnabled  bool            `json:"health_check_enabled"`
-	HealthStrategy      string          `json:"health_strategy"` // "auto", "http", "tcp", "none"
-	Status              string          `json:"status"`          // inactive, deploying, running, partially_running, stopped, failed
-	CurrentDeploymentID *uuid.UUID      `json:"current_deployment_id"`
-	Port                *int            `json:"port"`
-	PreviewURL          *string         `json:"preview_url,omitempty"`
-	CustomDomain        *string         `json:"custom_domain,omitempty"`
-	MaxTotalMemoryMB    *int            `json:"max_total_memory_mb,omitempty"`
-	MaxTotalCpuMillicores *int          `json:"max_total_cpu_millicores,omitempty"`
-	Services            []*Service      `json:"services,omitempty"`
-	CreatedAt           time.Time       `json:"created_at"`
-	UpdatedAt           time.Time       `json:"updated_at"`
+	ID                    uuid.UUID       `json:"id"`
+	OwnerID               uuid.UUID       `json:"owner_id"`
+	SourceID              *uuid.UUID      `json:"source_id,omitempty"`
+	Name                  string          `json:"name"`
+	Slug                  string          `json:"slug"`
+	SourceType            string          `json:"source_type"`      // "local_agent", "local_directory", "local_upload", "github", or legacy "local"
+	SourceReference       string          `json:"source_reference"` // repo "owner/repo" or local upload source_id
+	RepositoryPath        string          `json:"repository_path"`  // host path for local_directory projects
+	Branch                string          `json:"branch"`
+	DeploymentStrategy    string          `json:"deployment_strategy"` // "auto", "compose", "dockerfile", "custom"
+	DeploymentPlan        json.RawMessage `json:"deployment_plan,omitempty"`
+	DockerfilePath        string          `json:"dockerfile_path"`
+	BuildContext          string          `json:"build_context"`
+	BuildStrategy         string          `json:"build_strategy"` // "auto" or "dockerfile"
+	BuildCommand          string          `json:"build_command"`
+	StartCommand          string          `json:"start_command"`
+	RuntimeType           string          `json:"runtime_type"`      // "nextjs", "nodejs", "python-fastapi", "go", etc.
+	InternalPort          int             `json:"internal_port"`     // 3000, 8000, 8080, etc.
+	HealthCheckPath       *string         `json:"health_check_path"` // Nullable
+	HealthCheckEnabled    bool            `json:"health_check_enabled"`
+	HealthStrategy        string          `json:"health_strategy"` // "auto", "http", "tcp", "none"
+	Status                string          `json:"status"`          // inactive, deploying, running, partially_running, stopped, failed
+	CurrentDeploymentID   *uuid.UUID      `json:"current_deployment_id"`
+	Port                  *int            `json:"port"`
+	PreviewURL            *string         `json:"preview_url,omitempty"`
+	CustomDomain          *string         `json:"custom_domain,omitempty"`
+	MaxTotalMemoryMB      *int            `json:"max_total_memory_mb,omitempty"`
+	MaxTotalCpuMillicores *int            `json:"max_total_cpu_millicores,omitempty"`
+	Services              []*Service      `json:"services,omitempty"`
+	CreatedAt             time.Time       `json:"created_at"`
+	UpdatedAt             time.Time       `json:"updated_at"`
 }
 
 // Source represents an abstracted code origin (local agent session, archive upload, or GitHub repo).

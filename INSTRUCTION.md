@@ -124,9 +124,10 @@ Deployment C is promoted to current ONLY after passing health check
 
 ### Invariant 3: Direct Build Mode & Streaming Docker Build Context
 - For direct local-directory deployments (`source_type: "local_directory"`), ForgeLAB builds directly from the validated host directory without duplicating tens of thousands of files into `data/builds/<deployment-id>`.
-- The Docker build context is streamed concurrently using `io.Pipe()` and `tar.Writer`, completely eliminating in-memory `bytes.Buffer` buffering.
+- The Docker build context is streamed concurrently using `io.Pipe()` and `tar.Writer`, completely eliminating in-memory `bytes.Buffer` and `io.ReadAll` memory buffering.
+- Build log streams are bounded with maximum line sizes (64KB) to prevent runaway memory consumption.
 - `.dockerignore` rules early-prune ignored directories (e.g. `node_modules`, `.git`, `.next`, cache dirs) before filesystem descent.
-- Snapshot mode is preserved as a configurable option or for uploaded archives (`data/sources/<source-id>`) where isolated extraction is appropriate.
+- Snapshot mode is preserved as a configurable option or for uploaded archives (`data/sources/<source-id>`) where isolated extraction is appropriate with restricted `0700`/`0600` permissions.
 
 ### Invariant 4: Server-Side Authorization & Channel Isolation
 - Projects and deployments belong to a specific `owner_id` (User UUID).
@@ -137,6 +138,19 @@ Deployment C is promoted to current ONLY after passing health check
 - All durable entities (`users`, `projects`, `deployments`, `environment_variables`) use **UUIDv4**.
 - ULID proposals from past discussions remain deferred. Do not migrate identifiers to ULID without an explicit architectural change.
 
+### Invariant 6: Container Isolation & Trust Boundaries
+- Containers must never mount the host Docker socket (`/var/run/docker.sock` or `\\.\pipe\docker_engine`) or sensitive host system directories.
+- Privileged mode is strictly forbidden; all containers run with `no-new-privileges:true` and `CapDrop: ["ALL"]`.
+- Network isolation strictly rejects `host` networking and `container:` network namespace sharing.
+- Resource limits are truthful: unsupported `ephemeral_storage_mb` limits are rejected with an explicit error rather than silently accepted.
+
+### Invariant 7: Hardened Source Ingestion & Agent Privacy
+- GitHub imports enforce strict limits: 100MB compressed, 100MB uncompressed, 10,000 files, 50MB single file, and a 3-minute extraction timeout.
+- Source archives use atomic cache creation (`.tmp.<uuid>` directories renamed to destination upon completion marker verification) with restricted `0700` directory and `0600` file permissions. Partial or failed extractions are cleaned up reliably.
+- The local agent (`cmd/agent`) binds strictly to loopback `127.0.0.1` by default unless explicitly configured otherwise.
+- The agent's `/api/agent/status` endpoint scrubs `agent_id` and active session counts for unauthenticated requests, preventing credential discovery and enumeration.
+- Asynchronous queue workers perform heartbeat cancellation checks to abort cancelled jobs promptly, and queue reconciliation covers parent release deployments.
+
 ---
 
 ## 5. Scope Boundaries (Current MVP vs. Future)
@@ -145,9 +159,10 @@ Deployment C is promoted to current ONLY after passing health check
 - User registration, login, JWT token auth, atomic refresh token rotation
 - Project CRUD, ownership enforcement, host path security validation (`PathValidator` with allowed roots and host-to-container translation)
 - Direct local-directory deployment (`source_type: "local_directory"`): directory validation (`POST /api/sources/local/validate`), zero-upload ingestion, direct filesystem build source
-- Streaming Docker build context (`io.Pipe()`) with `.dockerignore` early directory pruning (eliminating in-memory `bytes.Buffer`)
-- Local archive upload fallback (`source_type: "local_upload"`) via `/api/sources/upload` and isolated source workspaces
-- Authorized GitHub repository import (`source_type: "github"`) with encrypted tokens and remote detection
+- Streaming Docker build context (`io.Pipe()`) without in-memory archive buffering; bounded 64KB log lines
+- Local archive upload fallback (`source_type: "local_upload"`) via `/api/sources/upload` and isolated source workspaces with restricted 0700/0600 permissions
+- Authorized GitHub repository import (`source_type: "github"`) with hardened resource quotas, atomic cache creation, and pinned commit SHA resolution
+- Local agent CLI (`cmd/agent`) with loopback `127.0.0.1` default binding and unauthenticated status protection
 - Docker SDK image builds, dynamic host port allocation (`10000–60000`)
 - Deployment state transitions (`QUEUED` → `CLONING` → `BUILDING` → `STARTING` → `HEALTH_CHECKING` → `RUNNING` / `FAILED`)
 - Deployment-time HTTP health check gating (10 attempts, 2-second interval)

@@ -605,10 +605,11 @@ func (q *DeploymentQueue) RecoverJobAtomic(ctx context.Context, itemStr string, 
 
 // ReconcileLeaseError atomically reconciles the state of a job when acquireLease encounters an ambiguous error.
 // Returns:
-//   1: caller holds the lease and can proceed
-//   2: caller held the lease, aborted, released lease and requeued
-//   3: another worker holds active lease; duplicate removed from processing queue only (state and deployment queue untouched)
-//   4: no active lease found; stranded job safely requeued to deployment queue with pending state
+//
+//	1: caller holds the lease and can proceed
+//	2: caller held the lease, aborted, released lease and requeued
+//	3: another worker holds active lease; duplicate removed from processing queue only (state and deployment queue untouched)
+//	4: no active lease found; stranded job safely requeued to deployment queue with pending state
 func (q *DeploymentQueue) ReconcileLeaseError(ctx context.Context, jobID uuid.UUID, leaseToken, itemStr, canProceed string) (int, error) {
 	keyID := jobID.String()
 	leaseKey := JobLeasePrefix + keyID
@@ -631,8 +632,9 @@ func (q *DeploymentQueue) ReconcileLeaseError(ctx context.Context, jobID uuid.UU
 // RemoveDuplicateIfLeaseHeld removes a redundant job entry from processing queue only if an active lease is held.
 // If the lease expired in the interim, it safely restores the job to the deployment queue so it cannot be lost.
 // Returns:
-//   1: duplicate removed while active lease held
-//   2: lease expired; restored to deployment queue
+//
+//	1: duplicate removed while active lease held
+//	2: lease expired; restored to deployment queue
 func (q *DeploymentQueue) RemoveDuplicateIfLeaseHeld(ctx context.Context, jobID uuid.UUID, itemStr string) (int, error) {
 	keyID := jobID.String()
 	leaseKey := JobLeasePrefix + keyID
@@ -956,6 +958,7 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 					jobCtx, cancelJob := context.WithCancel(workerCtx)
 
 					// Heartbeat ticker to continuously extend the lease during long builds/deploys
+					// and promptly abort execution if job was cancelled or superseded
 					hbCtx, cancelHb := context.WithCancel(workerCtx)
 					go func() {
 						ticker := time.NewTicker(q.heartbeatInterval)
@@ -965,6 +968,19 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 							case <-hbCtx.Done():
 								return
 							case <-ticker.C:
+								// Check if deployment was cancelled or became terminal in DB
+								if q.terminalChecker != nil {
+									checkCtx, checkCancel := context.WithTimeout(context.Background(), 3*time.Second)
+									term, checkErr := q.terminalChecker(checkCtx, job)
+									checkCancel()
+									if checkErr == nil && term {
+										slog.Info("job became terminal or cancelled; aborting execution",
+											"job_id", job.ID)
+										cancelJob()
+										return
+									}
+								}
+
 								if err := q.extendLease(context.Background(), job.ID, leaseToken); err != nil {
 									slog.Warn("failed to extend lease, canceling job execution",
 										"job_id", job.ID, "error", err)

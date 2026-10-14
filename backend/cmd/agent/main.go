@@ -23,7 +23,7 @@ var (
 
 func main() {
 	versionFlag := flag.Bool("version", false, "Print version and exit")
-	hostFlag := flag.String("host", "0.0.0.0", "Local agent listening host address (0.0.0.0 to allow container and local access)")
+	hostFlag := flag.String("host", "127.0.0.1", "Local agent listening host address (defaults to secure loopback 127.0.0.1; specify 0.0.0.0 or network IP for explicit Docker/network access)")
 	port := flag.Int("port", 4142, "Local agent listening port")
 	backendURL := flag.String("backend", "http://localhost:8080", "ForgeLAB backend URL")
 	agentIDFlag := flag.String("agent-id", "", "Unique agent identifier")
@@ -40,7 +40,7 @@ func main() {
 		listenHost = strings.TrimSpace(envHost)
 	}
 	if listenHost == "" {
-		listenHost = "0.0.0.0"
+		listenHost = "127.0.0.1"
 	}
 
 	var allowedRoots []string

@@ -103,6 +103,35 @@ func TestTrustBoundary_RejectsHostNetworking(t *testing.T) {
 	}
 }
 
+func TestTrustBoundary_RejectsContainerNetworkSharing(t *testing.T) {
+	cases := []string{
+		"container:other-app",
+		"container:1234567890ab",
+		"CONTAINER:peer-service",
+	}
+
+	for _, mode := range cases {
+		opts := ContainerSecurityOptions{
+			NetworkMode: mode,
+		}
+		_, err := ValidateAndBuildSecureHostConfig(opts)
+		if err == nil || !errors.Is(err, ErrContainerNetworkSharingRejected) {
+			t.Errorf("expected ErrContainerNetworkSharingRejected for network mode %q, got %v", mode, err)
+		}
+	}
+}
+
+func TestTrustBoundary_RejectsUnsupportedEphemeralStorage(t *testing.T) {
+	opts := ContainerSecurityOptions{
+		TargetEphemeralStorageMB: 500,
+	}
+
+	_, err := ValidateAndBuildSecureHostConfig(opts)
+	if err == nil || !errors.Is(err, ErrEphemeralStorageNotSupported) {
+		t.Errorf("expected ErrEphemeralStorageNotSupported, got %v", err)
+	}
+}
+
 func TestTrustBoundary_EnforcesTruthfulResourceLimitsAndIsolation(t *testing.T) {
 	// Rejects unsupported/excessive CPU
 	_, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{

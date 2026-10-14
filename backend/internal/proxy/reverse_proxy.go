@@ -10,11 +10,11 @@ import (
 )
 
 var (
-	ErrInvalidDomain    = errors.New("invalid custom domain name")
-	ErrIPNotAllowed     = errors.New("IP addresses are not allowed as custom domains")
-	ErrReservedDomain   = errors.New("domain name is reserved")
-	ErrDomainTooLong    = errors.New("domain name exceeds maximum length of 253 characters")
-	ErrLabelTooLong     = errors.New("domain label exceeds maximum length of 63 characters")
+	ErrInvalidDomain  = errors.New("invalid custom domain name")
+	ErrIPNotAllowed   = errors.New("IP addresses are not allowed as custom domains")
+	ErrReservedDomain = errors.New("domain name is reserved")
+	ErrDomainTooLong  = errors.New("domain name exceeds maximum length of 253 characters")
+	ErrLabelTooLong   = errors.New("domain label exceeds maximum length of 63 characters")
 )
 
 var validDomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)

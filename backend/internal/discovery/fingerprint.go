@@ -161,10 +161,10 @@ func ComputeDirectoryContentFingerprint(dirPath string) (string, error) {
 		if openErr != nil {
 			return nil
 		}
-		defer f.Close()
 
 		h := sha256.New()
 		copiedSz, copyErr := io.Copy(h, f)
+		_ = f.Close()
 		if copyErr != nil {
 			return nil
 		}

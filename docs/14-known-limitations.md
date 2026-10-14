@@ -67,10 +67,10 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Location:** [`frontend/next.config.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.ts), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml)
 - **Resolution:** `next.config.ts` dynamically configures rewrite destinations using `${process.env.BACKEND_INTERNAL_URL || 'http://backend:8080'}/api/:path*`, allowing transparent proxying between containers on the internal Docker Compose bridge network.
 
-### 5. Platform-Dependent Ephemeral Storage Quotas
-- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/models/models.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/models/models.go)
+### 5. Platform-Dependent Ephemeral Storage Quotas (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/trust_boundary.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/trust_boundary.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/models/models.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/models/models.go)
 - **Behavior:** CPU millicores (`NanoCPUs`), Memory MB (`Memory`), and PIDs limit (`PidsLimit`) are strictly enforced via Docker SDK `container.Resources`. However, container rootfs ephemeral storage quotas (`ephemeral_storage_mb`) require underlying filesystem storage driver support (e.g. Linux Docker Engine with `overlay2` or `zfs` backing filesystem with project quotas enabled).
-- **Limitation:** On Windows and macOS Docker Desktop environments, container rootfs size quotas are not supported by the underlying storage driver. Ephemeral storage limits are persisted in `service_deployments.ephemeral_storage_mb` for auditing and future enforcement, but strict disk quotas are platform-dependent.
+- **Resolution:** Rather than silently accepting unsupported ephemeral storage quotas, `ValidateAndBuildSecureHostConfig` truthfully enforces this trust boundary: if a service requests `ephemeral_storage_mb > 0`, it returns `ErrEphemeralStorageNotSupported`, failing closed before container creation rather than falsely claiming enforcement.
 
 ### 6. Host Mount Security & Docker Socket Rejection (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/docker/volume_resolver.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/volume_resolver.go), [`backend/internal/docker/preflight.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/preflight.go), [`backend/internal/security/volume_security.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/security/volume_security.go)
@@ -114,11 +114,27 @@ These are identified codebase behaviors that require investigation and resolutio
 
 ### 16. Continuous Runtime Health Monitoring & Stuck Deployment Reconciliation (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go), [`backend/internal/services/deployment_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/deployment_service.go), [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go)
-- **Resolution:** Periodic reconciler continuously monitors running containers via `CheckContinuousRuntimeHealth`, detecting unexpected crashes, crash loops, and kernel OOM kills (`insp.State.OOMKilled`) with actionable failure logs. Fixed orphan reconciler query to monitor both parent deployment IDs and service deployment IDs without restrictive null constraints.
+- **Resolution:** Periodic reconciler continuously monitors running containers via `CheckContinuousRuntimeHealth`, detecting unexpected crashes, crash loops, and kernel OOM kills (`insp.State.OOMKilled`) with actionable failure logs. Fixed orphan reconciler query to monitor both parent deployment IDs and service deployment IDs without restrictive null constraints. Extended `ReconcileQueuedDeployments` to query and re-enqueue orphaned records from the `deployments` table stuck in `queued` status.
 
 ### 17. Reverse-Proxy Preparation & Project Resource Quotas (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/models/models.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/models/models.go), [`backend/internal/proxy/reverse_proxy.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/proxy/reverse_proxy.go), [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go)
 - **Resolution:** Added custom domain validation and automated Caddyfile generation supporting custom domains and HTTPS routing. Added `ValidateProjectResourceQuota` enforcing project-level CPU and memory caps. Implemented `PruneOldProjectImages` to prune stale Docker images while preserving recent images for instant rollbacks.
+
+### 18. Hardened GitHub Source Import Quotas & Atomic Cache (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/github_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/github_service.go), [`backend/internal/services/source_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/source_service.go)
+- **Resolution:** Hardened GitHub import against zip-bombs and decompression attacks with cumulative limits: 100MB compressed, 100MB uncompressed, 10,000 files, 50MB single file, and 3-minute extraction timeout. Rejects path traversal and dangerous archive entry types. Implemented atomic cache directory creation via unique `.tmp.<uuid>` directories validated by `.complete` marker before atomic renaming, with strict `0700` directory and `0600` file permissions. Failed or aborted extractions are cleaned up reliably via deferrals.
+
+### 19. Local Agent Privacy & Loopback Hardening (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/cmd/agent/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/agent/main.go), [`backend/internal/agent/server.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/server.go), [`start-agent.ps1`](file:///c:/Users/estif/Desktop/ForgeLAB/start-agent.ps1)
+- **Resolution:** Local agent defaults strictly to loopback `127.0.0.1` binding to prevent unauthorized LAN exposure. The `/api/agent/status` endpoint scrubs internal `agent_id` and active session counts for unauthenticated requests, preventing credential discovery and enumeration while returning online status and system architecture.
+
+### 20. Direct Build Context Streaming & Bounded Log Lines (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go)
+- **Resolution:** In `parseDockerStream`, bounded buffer growth and line length to 64KB, preventing uncontrolled memory consumption or CPU starvation on malformed or exceptionally long build log lines without newlines. Retained the Windows named pipe invariant for BuildKit context submission (`bytes.NewReader(archiveBytes)` for contexts <= 512MB) to ensure `Content-Length` is explicitly populated by Go's `net/http` client, preventing chunked transfer encoding corruptions (`failed to read dockerfile: archive/tar: invalid tar header`) over `//./pipe/docker_engine`.
+
+### 21. Container Network Namespace Isolation (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/trust_boundary.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/trust_boundary.go), [`backend/internal/discovery/compose.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/compose.go)
+- **Resolution:** `ValidateAndBuildSecureHostConfig` actively rejects `container:` network namespace sharing (`ErrContainerNetworkSharingRejected`), preventing inter-container cross-boundary tampering or network interception. Compose parsing emits an explicit security warning and maps services to isolated bridge networks.
 
 ---
 

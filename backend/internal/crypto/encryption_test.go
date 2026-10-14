@@ -54,8 +54,8 @@ func TestKeyValidation_RejectsInvalidKeySize(t *testing.T) {
 		{"short raw string", "too-short-key"},
 		{"31 bytes raw string", "1234567890123456789012345678901"},
 		{"33 bytes raw string", "123456789012345678901234567890123"},
-		{"short base64", "c2hvcnQ="},                                       // decodes to "short" (5 bytes)
-		{"invalid base64 non-32", "dGhpcy1pcy1ub3QtMzItYnl0ZXM="},        // decodes to 19 bytes
+		{"short base64", "c2hvcnQ="},                              // decodes to "short" (5 bytes)
+		{"invalid base64 non-32", "dGhpcy1pcy1ub3QtMzItYnl0ZXM="}, // decodes to 19 bytes
 	}
 
 	for _, tc := range invalidKeys {

@@ -9,13 +9,13 @@ ForgeLAB is a single control-plane application deployment platform built in Go. 
 - **Backend Control Plane**: Go (REST API via `chi` + WebSockets via `gorilla/websocket` with Redis Pub/Sub)
 - **Database**: PostgreSQL 16 (Durable records for users, identities, projects, services, service deployments, secrets, github integrations, and logs)
 - **Service-First Architecture**: Projects compose multiple autonomous services with independent deployment pipelines (`POST /api/projects/{id}/services/{serviceId}/deploy`), rollbacks, and log streams
-- **Work Queue & Lease Ownership**: Redis 7 (`LPUSH` / `BRPOP` queue with cryptographically unique execution lease tokens, Lua atomic renewal/recovery, and O(1) state indexing)
-- **Runtime Engine & Sandboxing**: Docker Engine SDK with strict trust boundary enforcement (no-new-privileges, capability drop `ALL`, rejection of `/var/run/docker.sock` and sensitive mounts, enforced CPU/RAM/PID resource limits)
+- **Work Queue & Lease Ownership**: Redis 7 (`LPUSH` / `BRPOP` queue with cryptographically unique execution lease tokens, Lua atomic renewal/recovery, heartbeat cancellation check, automatic orphaned release reconciler, and O(1) state indexing)
+- **Runtime Engine & Sandboxing**: Docker Engine SDK with strict trust boundary enforcement (no-new-privileges, capability drop `ALL`, rejection of `/var/run/docker.sock` and sensitive mounts, rejection of `host` and `container:` network namespace sharing, enforced CPU/RAM/PID resource limits, and truthful rejection of unsupported `ephemeral_storage_mb` disk quotas)
 - **Health, Readiness & Diagnostics**: Lightweight `/health` liveness probe, deep dependency `/ready` check (probing PostgreSQL, Redis, and Docker Engine concurrently with 0 secret leakage), and `/health/queue` queue & abandoned-job recovery diagnostics
 - **Rate Limiting**: Configurable sliding-window throttling (`ratelimit`) backed by Redis/in-memory for authentication, uploads, deployments, and WebSockets returning HTTP 429
-- **Deployment Lifecycle**: Cancellation for queued/in-progress builds, atomic superseding of obsolete queued builds, and strict non-regression invariant for healthy containers
-- **Source Ingestion**: Local Agent CLI (`cmd/agent`) streaming local directories securely without browser uploads, optional archive upload fallback (`/api/sources/upload`), & authorized GitHub repository import (`/api/integrations/github`)
-- **Build Strategy**: Automatic heuristic multi-stage container build generation & custom Dockerfile build strategy
+- **Deployment Lifecycle**: Immediate cancellation abort during heartbeats, atomic superseding of obsolete queued builds, and strict non-regression invariant for healthy containers
+- **Source Ingestion**: Local Agent CLI (`cmd/agent`) with loopback `127.0.0.1` default binding and unauthenticated status protection, optional archive upload fallback (`/api/sources/upload`) with restricted `0700`/`0600` permissions, & authorized GitHub repository import (`/api/integrations/github`) with hardened decompression quotas (100MB compressed/uncompressed, 10k files, 50MB/file, 3m timeout) and atomic cache creation
+- **Build Strategy**: Direct build context streaming (`io.Pipe()`) without in-memory archive buffering, bounded 64KB log lines, automatic heuristic multi-stage container build generation & custom Dockerfile build strategy
 - **Host Port Range**: Dynamic port allocation in the range **`10000–60000`** with dynamic container internal port mapping
 - **Frontend**: Next.js 16.3.6 LTS + React 19 + TypeScript + Tailwind CSS (Operational developer console)
 - **Deployment Safety Invariant**: Failed releases never terminate or replace the previous running deployment.

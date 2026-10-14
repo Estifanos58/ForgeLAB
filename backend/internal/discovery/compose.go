@@ -194,6 +194,9 @@ func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []Discove
 		if strings.EqualFold(rawSvc.NetworkMode, "host") {
 			warnings = append(warnings, fmt.Sprintf("Service '%s': host networking is rejected; service will run on isolated project bridge network", name))
 		}
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawSvc.NetworkMode)), "container:") || strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawSvc.NetworkMode)), "service:") {
+			warnings = append(warnings, fmt.Sprintf("Service '%s': container network sharing is rejected; service will run on isolated project bridge network", name))
+		}
 		svc := parseComposeService(name, rawSvc, repoRoot, composeDir, declaredVolMap)
 		services = append(services, svc)
 	}

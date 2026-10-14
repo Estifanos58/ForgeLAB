@@ -1628,4 +1628,3 @@ func TestDeploymentQueue_RemoveDuplicateIfLeaseHeld(t *testing.T) {
 		t.Fatalf("expected state to be pending, got %s", state)
 	}
 }
-

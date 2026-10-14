@@ -38,12 +38,15 @@ func (pm *PortManager) AllocatePort() (int, error) {
 			continue
 		}
 
-		addr := fmt.Sprintf("127.0.0.1:%d", port)
-		l, err := net.Listen("tcp", addr)
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
-			l.Close()
-			pm.usedPorts[port] = true
-			return port, nil
+			_ = l.Close()
+			lLoop, errLoop := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			if errLoop == nil {
+				_ = lLoop.Close()
+				pm.usedPorts[port] = true
+				return port, nil
+			}
 		}
 	}
 

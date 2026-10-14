@@ -306,7 +306,7 @@ func (e *Engine) buildImage(
 			}
 			if _, seekErr := validatedArchiveFile.Seek(0, io.SeekStart); seekErr == nil {
 				fallbackOpts := options
-				fallbackOpts.Version = ""
+				fallbackOpts.Version = types.BuilderV1
 				retryCtx, retryCancel := context.WithTimeout(ctx, buildTimeout)
 				defer retryCancel()
 				var retryReader io.Reader = validatedArchiveFile
@@ -335,6 +335,7 @@ func (e *Engine) buildImage(
 }
 
 func (e *Engine) parseDockerStream(r io.Reader, onLogLine func(string)) error {
+	const maxLineBytes = 64 * 1024
 	buf := make([]byte, 4096)
 	var rawBuffer bytes.Buffer
 
@@ -342,6 +343,16 @@ func (e *Engine) parseDockerStream(r io.Reader, onLogLine func(string)) error {
 		n, err := r.Read(buf)
 		if n > 0 {
 			rawBuffer.Write(buf[:n])
+
+			// Bound buffer size if no newline encountered to prevent runaway memory usage
+			if rawBuffer.Len() > maxLineBytes*2 && !bytes.Contains(rawBuffer.Bytes(), []byte("\n")) {
+				line := rawBuffer.String()[:maxLineBytes] + " ...[truncated log line]"
+				rawBuffer.Reset()
+				if onLogLine != nil {
+					onLogLine(line)
+				}
+			}
+
 			lines := strings.Split(rawBuffer.String(), "\n")
 			// Keep incomplete line in buffer
 			rawBuffer.Reset()
@@ -351,6 +362,11 @@ func (e *Engine) parseDockerStream(r io.Reader, onLogLine func(string)) error {
 				line := lines[i]
 				if strings.TrimSpace(line) == "" {
 					continue
+				}
+
+				// Bound line size before processing
+				if len(line) > maxLineBytes {
+					line = line[:maxLineBytes] + " ...[truncated log line]"
 				}
 
 				// Docker JSON output parsing
@@ -382,6 +398,9 @@ func (e *Engine) parseDockerStream(r io.Reader, onLogLine func(string)) error {
 	if rawBuffer.Len() > 0 {
 		line := strings.TrimSpace(rawBuffer.String())
 		rawBuffer.Reset()
+		if len(line) > maxLineBytes {
+			line = line[:maxLineBytes] + " ...[truncated log line]"
+		}
 		if line != "" {
 			var jsonMsg struct {
 				Stream string `json:"stream"`

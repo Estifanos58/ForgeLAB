@@ -36,6 +36,20 @@ var (
 	ErrGitHubSSORequired  = errors.New("github organization saml sso authorization required")
 	ErrGitHubRateLimited  = errors.New("github api rate limit exceeded")
 	ErrGitHubRepoNotFound = errors.New("github repository not found or access denied")
+
+	ErrGitHubArchiveTooLarge   = errors.New("github repository archive exceeds maximum allowed size (100MB)")
+	ErrGitHubTooManyFiles      = errors.New("github repository archive exceeds maximum allowed file count (10,000)")
+	ErrGitHubFileTooLarge      = errors.New("github repository archive contains a file exceeding maximum single file size (50MB)")
+	ErrGitHubMaliciousArchive  = errors.New("malicious github repository archive detected")
+	ErrGitHubExtractionTimeout = errors.New("github repository archive extraction timed out")
+)
+
+const (
+	MaxGitHubCompressedBytes   int64         = 100 * 1024 * 1024 // 100MB compressed
+	MaxGitHubUncompressedBytes int64         = 100 * 1024 * 1024 // 100MB total uncompressed
+	MaxGitHubArchiveFiles      int           = 10000             // 10,000 files
+	MaxGitHubSingleFileBytes   int64         = 50 * 1024 * 1024  // 50MB single file
+	GitHubExtractionTimeout    time.Duration = 3 * time.Minute
 )
 
 // parseOAuthScopes splits comma- and/or whitespace-separated OAuth scopes reliably.
@@ -1055,6 +1069,11 @@ func (s *GitHubService) AnalyzeRepo(ctx context.Context, userID uuid.UUID, owner
 
 // copyDirectoryContents copies files from src into dst without leaking file descriptors.
 func copyDirectoryContents(src, dst string) error {
+	return copyDirectoryContentsWithPerms(src, dst, 0755, 0644)
+}
+
+// copyDirectoryContentsWithPerms copies files with explicit directory and file permission boundaries.
+func copyDirectoryContentsWithPerms(src, dst string, dirPerm os.FileMode, filePerm os.FileMode) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -1068,9 +1087,9 @@ func copyDirectoryContents(src, dst string) error {
 		}
 		targetPath := filepath.Join(dst, rel)
 		if info.IsDir() {
-			return os.MkdirAll(targetPath, 0755)
+			return os.MkdirAll(targetPath, dirPerm)
 		}
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(targetPath), dirPerm); err != nil {
 			return err
 		}
 
@@ -1078,7 +1097,7 @@ func copyDirectoryContents(src, dst string) error {
 		if err != nil {
 			return err
 		}
-		outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+		outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, filePerm)
 		if err != nil {
 			inFile.Close()
 			return err
@@ -1107,7 +1126,6 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	}
 
 	destClean := filepath.Clean(targetDir)
-	_ = os.MkdirAll(destClean, 0755)
 
 	// Security requirement: Always verify that the requesting user's credentials are authorized
 	// to access this specific repository BEFORE returning any cached data or downloading anew.
@@ -1125,20 +1143,32 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 		return fmt.Errorf("invalid commit SHA resolved for %s/%s@%s: %s", owner, repo, branch, resolvedSHA)
 	}
 
-	// Authorization boundary isolation:
-	// Private snapshots are isolated by user ID so another user cannot retrieve cached private code.
+	// Permission isolation: private repositories use strict 0700/0600 modes
+	dirPerm := os.FileMode(0755)
+	filePerm := os.FileMode(0644)
 	var cacheDir string
 	if repoMeta.Private {
-		cacheDir = filepath.Join(os.TempDir(), "forgelab_gh_cache", "private", userID.String(), owner, repo, resolvedSHA)
+		dirPerm = 0700
+		filePerm = 0600
+		privateBase := filepath.Join(os.TempDir(), "forgelab_gh_cache", "private")
+		_ = os.MkdirAll(privateBase, 0700)
+		userPrivateBase := filepath.Join(privateBase, userID.String())
+		_ = os.MkdirAll(userPrivateBase, 0700)
+		cacheDir = filepath.Join(userPrivateBase, owner, repo, resolvedSHA)
 	} else {
-		cacheDir = filepath.Join(os.TempDir(), "forgelab_gh_cache", "public", owner, repo, resolvedSHA)
+		publicBase := filepath.Join(os.TempDir(), "forgelab_gh_cache", "public")
+		_ = os.MkdirAll(publicBase, 0755)
+		cacheDir = filepath.Join(publicBase, owner, repo, resolvedSHA)
 	}
 
+	_ = os.MkdirAll(destClean, dirPerm)
+
+	// Check existing verified cache
 	completeMarker := filepath.Join(cacheDir, ".complete")
 	if fi, err := os.Stat(completeMarker); err == nil && !fi.IsDir() {
 		if content, readErr := os.ReadFile(completeMarker); readErr == nil && strings.TrimSpace(string(content)) == resolvedSHA {
 			slog.Info("reusing authorized cached github snapshot", "owner", owner, "repo", repo, "sha", resolvedSHA, "private", repoMeta.Private, "user_id", userID)
-			return copyDirectoryContents(cacheDir, destClean)
+			return copyDirectoryContentsWithPerms(cacheDir, destClean, dirPerm, filePerm)
 		}
 	}
 	// Purge incomplete or corrupt cache directory
@@ -1182,7 +1212,10 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 		return fmt.Errorf("github returned HTTP %d when downloading repository archive", resp.StatusCode)
 	}
 
-	gzReader, err := gzip.NewReader(resp.Body)
+	// Enforce compressed archive size limit
+	limitedBody := io.LimitReader(resp.Body, MaxGitHubCompressedBytes+1)
+
+	gzReader, err := gzip.NewReader(limitedBody)
 	if err != nil {
 		return fmt.Errorf("failed to decompress gzip stream: %w", err)
 	}
@@ -1193,22 +1226,48 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	if err != nil {
 		stagingDir = filepath.Join(os.TempDir(), fmt.Sprintf("forgelab-extract-%s-%s-%s", owner, repo, resolvedSHA))
 		_ = os.RemoveAll(stagingDir)
-		_ = os.MkdirAll(stagingDir, 0755)
+		_ = os.MkdirAll(stagingDir, dirPerm)
 	}
 	defer func() {
 		_ = os.RemoveAll(stagingDir)
 	}()
 
+	var extractionSuccess bool
+	defer func() {
+		if !extractionSuccess {
+			_ = os.RemoveAll(destClean)
+			if cacheDir != "" {
+				_ = os.RemoveAll(cacheDir)
+			}
+		}
+	}()
+
+	extractCtx, extractCancel := context.WithTimeout(ctx, GitHubExtractionTimeout)
+	defer extractCancel()
+
 	tarReader := tar.NewReader(gzReader)
 	var rootPrefix string
+	var totalUncompressedBytes int64
+	var filesCount int
 
 	for {
+		select {
+		case <-extractCtx.Done():
+			return ErrGitHubExtractionTimeout
+		default:
+		}
+
 		header, err := tarReader.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("tar reading error: %w", err)
+		}
+
+		filesCount++
+		if filesCount > MaxGitHubArchiveFiles {
+			return ErrGitHubTooManyFiles
 		}
 
 		// GitHub tarballs contain a top-level directory like "owner-repo-commit/"
@@ -1224,44 +1283,84 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 		relPath := strings.Join(parts[1:], string(filepath.Separator))
 		targetPath := filepath.Join(stagingDir, relPath)
 
-		// Security: prevent Zip Slip / Tar Slip path traversal
-		if !strings.HasPrefix(filepath.Clean(targetPath), stagingDir+string(filepath.Separator)) {
-			slog.Warn("skipping malicious file in tarball", "path", header.Name)
-			continue
+		// Security: prevent Zip Slip / Tar Slip path traversal and reject malicious archives
+		cleanTarget := filepath.Clean(targetPath)
+		if !strings.HasPrefix(cleanTarget, stagingDir+string(filepath.Separator)) {
+			return fmt.Errorf("%w: path traversal attempt in %s", ErrGitHubMaliciousArchive, header.Name)
+		}
+
+		// Reject dangerous / unsupported file types
+		if header.Typeflag == tar.TypeSymlink || header.Typeflag == tar.TypeLink {
+			linkTarget := header.Linkname
+			if filepath.IsAbs(linkTarget) || strings.HasPrefix(filepath.ToSlash(linkTarget), "/") {
+				return fmt.Errorf("%w: absolute link rejected in %s", ErrGitHubMaliciousArchive, header.Name)
+			}
+			resolvedTarget := filepath.Join(filepath.Dir(targetPath), linkTarget)
+			if !strings.HasPrefix(filepath.Clean(resolvedTarget), stagingDir+string(filepath.Separator)) {
+				return fmt.Errorf("%w: escaping link rejected in %s", ErrGitHubMaliciousArchive, header.Name)
+			}
+			// Unsafe link: reject malicious archive
+			return fmt.Errorf("%w: symbolic or hard link rejected in %s", ErrGitHubMaliciousArchive, header.Name)
+		} else if header.Typeflag != tar.TypeDir && header.Typeflag != tar.TypeReg {
+			return fmt.Errorf("%w: unsupported entry type %v in %s", ErrGitHubMaliciousArchive, header.Typeflag, header.Name)
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(targetPath, 0755); err != nil {
+			if err := os.MkdirAll(targetPath, dirPerm); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(targetPath), dirPerm); err != nil {
 				return err
 			}
-			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, header.FileInfo().Mode())
+			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, filePerm)
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(outFile, tarReader); err != nil {
-				outFile.Close()
-				return err
-			}
+
+			// Enforce per-file and cumulative uncompressed size limits
+			remainingLimit := MaxGitHubSingleFileBytes + 1
+			written, copyErr := io.Copy(outFile, io.LimitReader(tarReader, remainingLimit))
 			outFile.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if written > MaxGitHubSingleFileBytes {
+				return ErrGitHubFileTooLarge
+			}
+			totalUncompressedBytes += written
+			if totalUncompressedBytes > MaxGitHubUncompressedBytes {
+				return ErrGitHubArchiveTooLarge
+			}
 		}
 	}
 
 	// Copy staging directory contents to final target directory
-	if err := copyDirectoryContents(stagingDir, destClean); err != nil {
+	if err := copyDirectoryContentsWithPerms(stagingDir, destClean, dirPerm, filePerm); err != nil {
 		return fmt.Errorf("failed to materialize extracted repository snapshot: %w", err)
 	}
 
-	// Populate disk cache for future reuse only when pinned to an immutable SHA and fully extracted
+	// Atomic cache creation: write to temporary staging directory, verify completeness, and rename
 	if cacheDir != "" {
-		_ = os.MkdirAll(cacheDir, 0755)
-		_ = copyDirectoryContents(stagingDir, cacheDir)
-		_ = os.WriteFile(filepath.Join(cacheDir, ".complete"), []byte(resolvedSHA), 0644)
+		tmpCacheDir := fmt.Sprintf("%s.tmp.%s", cacheDir, uuid.New().String())
+		_ = os.RemoveAll(tmpCacheDir)
+		if err := os.MkdirAll(tmpCacheDir, dirPerm); err == nil {
+			if copyErr := copyDirectoryContentsWithPerms(stagingDir, tmpCacheDir, dirPerm, filePerm); copyErr == nil {
+				if writeErr := os.WriteFile(filepath.Join(tmpCacheDir, ".complete"), []byte(resolvedSHA), filePerm); writeErr == nil {
+					_ = os.RemoveAll(cacheDir)
+					if renErr := os.Rename(tmpCacheDir, cacheDir); renErr != nil {
+						// On Windows rename may fail across certain boundaries or existing dirs, fallback copy
+						if copyErr2 := copyDirectoryContentsWithPerms(tmpCacheDir, cacheDir, dirPerm, filePerm); copyErr2 == nil {
+							_ = os.WriteFile(filepath.Join(cacheDir, ".complete"), []byte(resolvedSHA), filePerm)
+						}
+					}
+				}
+			}
+			_ = os.RemoveAll(tmpCacheDir)
+		}
 	}
 
+	extractionSuccess = true
 	return nil
 }

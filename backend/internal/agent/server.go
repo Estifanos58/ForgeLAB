@@ -645,6 +645,29 @@ func (s *AgentServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Check authentication to avoid leaking agent credentials or internal session counts
+	token := extractToken(r)
+	authenticated := false
+	if token != "" {
+		if _, err := s.validateToken(r.Context(), token); err == nil {
+			authenticated = true
+		}
+	}
+
+	if !authenticated {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":           "online",
+			"version":          s.version,
+			"commit":           s.commitSHA,
+			"os":               runtime.GOOS,
+			"arch":             runtime.GOARCH,
+			"docker_available": dockerAvailable,
+			"agent_id":         "",
+			"active_sessions":  0,
+		})
+		return
+	}
+
 	s.mu.RLock()
 	sessionCount := len(s.sessions)
 	s.mu.RUnlock()
