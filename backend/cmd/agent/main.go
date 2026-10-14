@@ -92,7 +92,12 @@ func main() {
 		fmt.Printf("   Connected backend: %s\n", *backendURL)
 		fmt.Printf("====================================================\n")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("agent server failed", "error", err)
+			errStr := strings.ToLower(err.Error())
+			if strings.Contains(errStr, "bind") || strings.Contains(errStr, "only one usage of each socket address") || strings.Contains(errStr, "address already in use") {
+				fmt.Fprintf(os.Stderr, "\n[ForgeLAB] Startup Error: Port %d is already in use by another process.\n  Action: Terminate the process using port %d or specify a different port via -port <number>.\n\n", *port, *port)
+			} else {
+				slog.Error("agent server failed", "error", err)
+			}
 			os.Exit(1)
 		}
 	}()

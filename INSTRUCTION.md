@@ -161,11 +161,14 @@ Deployment C is promoted to current ONLY after passing health check
 - Direct local-directory deployment (`source_type: "local_directory"`): directory validation (`POST /api/sources/local/validate`), zero-upload ingestion, direct filesystem build source
 - Streaming Docker build context (`io.Pipe()`) without in-memory archive buffering; bounded 64KB log lines
 - Local archive upload fallback (`source_type: "local_upload"`) via `/api/sources/upload` and isolated source workspaces with restricted 0700/0600 permissions
-- Authorized GitHub repository import (`source_type: "github"`) with hardened resource quotas, atomic cache creation, and pinned commit SHA resolution
+- Authorized GitHub repository import (`source_type: "github"`) with backend-owned OAuth code exchange / fine-grained PAT, hardened extraction quotas, atomic cache creation, and pinned commit SHA resolution
 - Local agent CLI (`cmd/agent`) with loopback `127.0.0.1` default binding and unauthenticated status protection
 - Docker SDK image builds, dynamic host port allocation (`10000–60000`)
 - Deployment state transitions (`QUEUED` → `CLONING` → `BUILDING` → `STARTING` → `HEALTH_CHECKING` → `RUNNING` / `FAILED`)
 - Deployment-time HTTP health check gating (10 attempts, 2-second interval)
+- Continuous runtime container health monitoring (`CheckContinuousRuntimeHealth` inspecting stopped/crashed containers and kernel OOM kills)
+- Container resource quotas (CPU `NanoCPUs`, Memory `Memory`, and PIDs `PidsLimit` enforced in Docker HostConfig)
+- Non-development environment validation hardening (rejecting weak secrets, default passwords, insecure cookies, unsafe source roots)
 - Application lifecycle controls: Stop, Start, Restart
 - Rollback creating a new release from prior known-good image
 - AES-256-GCM encrypted environment variables & streaming log secret redactor
@@ -173,12 +176,11 @@ Deployment C is promoted to current ONLY after passing health check
 - Next.js 16 frontend: Dashboard, project settings, secrets manager, live terminal viewer, and dual-mode computer import modal (Existing Directory + Upload Archive)
 
 ### Explicitly Deferred Future Scope (Do NOT Implement):
-- GitHub OAuth integration & repository browser (see [docs/15-github-integration.md](docs/15-github-integration.md))
 - Automated GitHub webhook deployments (`git push` triggers)
 - Caddy reverse proxy integration, custom domains, automated Let's Encrypt TLS
-- Continuous runtime health monitoring & automated self-healing crash recovery
+- Automated self-healing crash recovery & automatic rollback (continuous container health inspection is implemented)
 - Zero-downtime blue/green or rolling proxy updates
-- Container resource quotas (CPU/RAM caps in Docker HostConfig)
+- Ephemeral storage quotas (requires host filesystem quota support; rejected explicitly)
 - Multi-user organizations & Role-Based Access Control (RBAC)
 - ForgeLAB CLI (`forge deploy`, `forge logs`)
 - Multi-node distributed workers

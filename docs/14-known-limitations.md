@@ -34,10 +34,11 @@ These are deliberate scoping decisions for the current platform release. They ar
 4. **Single-Owner Tenant Model:**
    - Projects and deployments belong strictly to the creating user (`owner_id`).
    - There are no teams, organizations, or Role-Based Access Control (RBAC) permissions.
-5. **Deployment-Time Health Gating (Docker Restart Policy vs ForgeLAB Self-Healing):**
+5. **Deployment-Time Health Gating & Runtime Monitoring (Docker Restart Policy vs ForgeLAB Self-Healing):**
    - Health checks occur during deployment promotion (`HEALTH_CHECKING`) supporting `auto`, `http`, `tcp`, and `none`.
    - **Docker runtime restart behavior (`IMPLEMENTED`):** Deployed application containers are configured with `RestartPolicy: { Name: "unless-stopped" }` in [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go). The Docker daemon automatically restarts stopped or crashed containers at the container-engine layer.
-   - **ForgeLAB continuous health monitoring / self-healing (`NOT IMPLEMENTED`):** ForgeLAB does not implement continuous runtime health polling, crash diagnosis, automatic rollback, health-based remediation, crash-loop detection, or automated re-promotion. If an application enters a broken state or fails long after reaching `RUNNING`, ForgeLAB control plane takes no automated remedial action.
+   - **ForgeLAB continuous runtime health monitoring (`IMPLEMENTED`):** The background deployment reconciler periodically inspects running containers via `CheckContinuousRuntimeHealth` in [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go), detecting unexpected container exits and kernel OOM kills (`insp.State.OOMKilled`) and transitioning service records to `FAILED` with diagnostics.
+   - **ForgeLAB continuous self-healing / auto-rollback (`NOT IMPLEMENTED`):** ForgeLAB does not implement automatic rollback, automated crash-loop recovery, or automated re-promotion upon runtime failure. If an application enters a broken state or fails long after reaching `RUNNING`, ForgeLAB flags the service as failed and logs diagnostics, but takes no automated remedial rollback action.
 6. **No Zero-Downtime Rolling Traffic Shift:**
    - Promotion stops the old container and starts traffic on the new port. Because there is no proxy layer to gracefully drain connections or shift HTTP traffic, a brief connection gap can occur.
 7. **REST Pre-Fetch Required for Logs (No WebSocket Replay):**
@@ -160,9 +161,8 @@ These are identified codebase behaviors that require investigation and resolutio
 
 ## 3. Security Hardening Items (Deferred Backlog)
 
-1. **`localStorage` Token Storage:**
-   - Tokens stored in `localStorage` (`forgelab_token`) are vulnerable to cross-site scripting (XSS).
-   - Hardening: Transition client-side authentication to use `HttpOnly`, `Secure`, `SameSite=Lax` cookies exclusively.
+1. **`localStorage` Token Storage (`RESOLVED IN ARCHITECTURE`):**
+   - Authentication is backend-owned using `HttpOnly`, `Secure`, `SameSite=Lax` cookies (`forgelab_access_token` and `forgelab_refresh_token`). Client-side token storage in `localStorage` has been completely eliminated.
 2. **WebSocket Query String Token:**
    - The WebSocket hook passes the JWT via URL query parameter (`?token=...`).
    - Hardening: Authenticate WebSocket upgrades using the `forgelab_access_token` HttpOnly cookie or an initial authentication JSON frame after socket open.
@@ -172,9 +172,8 @@ These are identified codebase behaviors that require investigation and resolutio
 4. **Backend Docker Socket Trust:**
    - The Go backend mounts `/var/run/docker.sock` with root-equivalent Docker Engine control.
    - Hardening: Explore Docker rootless mode or a restricted daemon proxy to reduce blast radius.
-5. **Container Resource Limits:**
-   - Containers are created without memory or CPU caps (`container.HostConfig.Resources` is unconfigured).
-   - Hardening: Provide configurable memory (`Memory`) and CPU (`NanoCPUs`) quotas per project.
+5. **Container Resource Limits (`RESOLVED IN ARCHITECTURE`):**
+   - `ValidateAndBuildSecureHostConfig` enforces CPU (`NanoCPUs`), Memory (`Memory`), and PIDs (`PidsLimit`) quotas per service within `container.HostConfig.Resources`. Ephemeral storage quotas are explicitly rejected.
 
 ---
 
@@ -182,10 +181,9 @@ These are identified codebase behaviors that require investigation and resolutio
 
 Do not implement these capabilities during current MVP verification:
 
-- **GitHub OAuth Integration & Repository Selection:** Documented in [docs/15-github-integration.md](15-github-integration.md).
+- **Continuous Self-Healing / Auto-Rollback:** Automated crash-loop recovery and automatic rollback upon runtime failure (continuous health inspection is implemented).
 - **Automated Webhooks:** Push-to-deploy triggers from GitHub.
 - **Caddy Reverse Proxy:** Automatic subdomain routing (`<slug>.forgelab.local`) and Let's Encrypt TLS.
-- **Continuous Runtime Health Monitoring:** Background crash-loop detection and auto-recovery.
 - **Zero-Downtime Deployments:** Blue/green traffic switching.
 - **OpenTelemetry:** Distributed tracing and container metrics export.
 - **Role-Based Access Control (RBAC):** Organization-level user permissions.

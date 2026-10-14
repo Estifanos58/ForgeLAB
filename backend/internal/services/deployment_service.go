@@ -51,23 +51,29 @@ func (s *DeploymentService) SetGitHubService(gh *GitHubService) {
 }
 
 // resolveSourceRevision computes an immutable source revision:
-// - GitHub commit SHA if available, otherwise branch
-// - For local/agent/upload sources: deterministic source fingerprint from sources table or computed SHA
+// - GitHub commit SHA if available (pinned 40-character SHA), otherwise resolves via githubService
+// - For local directories: fresh content fingerprint from directory if accessible on disk (preventing stale plan revisions), otherwise plan SourceRevision
+// - For local/agent/upload sources: deterministic source fingerprint from sources table or plan SourceRevision
 func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *models.Project, commitSHA *string) *string {
-	// If project has an authoritative DeploymentPlan with SourceRevision, bind directly to it!
-	if project != nil && len(project.DeploymentPlan) > 0 && string(project.DeploymentPlan) != "{}" {
-		var plan struct {
-			SourceRevision string `json:"source_revision"`
-		}
-		if err := json.Unmarshal(project.DeploymentPlan, &plan); err == nil && strings.TrimSpace(plan.SourceRevision) != "" {
-			rev := strings.TrimSpace(plan.SourceRevision)
-			return &rev
-		}
+	if project == nil {
+		return nil
 	}
 
 	if project.SourceType == models.SourceTypeGitHub {
 		if commitSHA != nil && len(*commitSHA) == 40 {
 			return commitSHA
+		}
+		// Check if project has an authoritative DeploymentPlan with a pinned 40-character commit SHA
+		if len(project.DeploymentPlan) > 0 && string(project.DeploymentPlan) != "{}" {
+			var plan struct {
+				SourceRevision string `json:"source_revision"`
+			}
+			if err := json.Unmarshal(project.DeploymentPlan, &plan); err == nil {
+				rev := strings.TrimSpace(plan.SourceRevision)
+				if len(rev) == 40 {
+					return &rev
+				}
+			}
 		}
 		if s.githubService != nil {
 			repoRef := project.SourceReference
@@ -90,7 +96,38 @@ func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *
 		return nil
 	}
 
-	// For local_agent, local_upload, or local_directory: check if source has an immutable fingerprint
+	// For local directory: if the directory exists on disk, compute fresh content fingerprint
+	// to prevent stale plan revisions and metadata caching from identifying changed files as unchanged.
+	if (project.SourceType == models.SourceTypeLocalDirectory || project.SourceType == models.SourceTypeLocal) && project.RepositoryPath != "" {
+		if fi, err := os.Stat(project.RepositoryPath); err == nil && fi.IsDir() {
+			if fp, fpErr := discovery.ComputeDirectoryContentFingerprint(project.RepositoryPath); fpErr == nil && fp != "" {
+				// Synchronize project DeploymentPlan's source_revision if present so plan, deployment, build context, and cache keys match
+				if len(project.DeploymentPlan) > 0 && string(project.DeploymentPlan) != "{}" {
+					var planMap map[string]interface{}
+					if err := json.Unmarshal(project.DeploymentPlan, &planMap); err == nil {
+						planMap["source_revision"] = fp
+						if updatedBytes, err := json.Marshal(planMap); err == nil {
+							project.DeploymentPlan = updatedBytes
+						}
+					}
+				}
+				return &fp
+			}
+		}
+	}
+
+	// Check if project has an authoritative DeploymentPlan with SourceRevision (e.g. offline mock or pre-verified plan)
+	if len(project.DeploymentPlan) > 0 && string(project.DeploymentPlan) != "{}" {
+		var plan struct {
+			SourceRevision string `json:"source_revision"`
+		}
+		if err := json.Unmarshal(project.DeploymentPlan, &plan); err == nil && strings.TrimSpace(plan.SourceRevision) != "" {
+			rev := strings.TrimSpace(plan.SourceRevision)
+			return &rev
+		}
+	}
+
+	// For local_agent, local_upload, or local_directory: check if source has an immutable fingerprint in database
 	if s.db != nil {
 		var srcID uuid.UUID
 		if project.SourceID != nil && *project.SourceID != uuid.Nil {
@@ -114,15 +151,6 @@ func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *
 		ref = project.RepositoryPath
 	}
 	if ref != "" {
-		// If source is a local directory accessible on host, compute accurate revision from directory content/metadata so local changes produce accurate revisions
-		if (project.SourceType == models.SourceTypeLocalDirectory || project.SourceType == models.SourceTypeLocal) && project.RepositoryPath != "" {
-			if fi, err := os.Stat(project.RepositoryPath); err == nil && fi.IsDir() {
-				if fp, fpErr := discovery.ComputeLightweightDirectoryFingerprint(project.RepositoryPath); fpErr == nil && fp != "" {
-					return &fp
-				}
-			}
-		}
-
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%s", project.SourceType, ref)))
 		fp := fmt.Sprintf("fp_%s", hex.EncodeToString(h[:16]))
 		return &fp

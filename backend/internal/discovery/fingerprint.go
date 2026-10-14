@@ -8,28 +8,18 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 )
 
-type cachedFileHash struct {
-	size        int64
-	modTimeNano int64
-	hash        string
-}
-
-var contentHashCache sync.Map
-
-// ComputeLightweightDirectoryFingerprint computes a reliable directory fingerprint.
-// To guarantee reproducible deployments, metadata-only fingerprints are replaced
-// with reliable content-based fingerprints backed by metadata caching.
+// ComputeLightweightDirectoryFingerprint computes a reliable directory content fingerprint.
 func ComputeLightweightDirectoryFingerprint(dirPath string) (string, error) {
 	return ComputeDirectoryContentFingerprint(dirPath)
 }
 
 // ComputeDirectoryContentFingerprint walks a workspace directory and deterministically
-// hashes all non-pruned files to produce an immutable content fingerprint. It uses
-// metadata-based caching to avoid re-reading unchanged files repeatedly, and propagates
-// filesystem errors instead of silently skipping files.
+// hashes all non-pruned files to produce an immutable content fingerprint. It reads
+// and hashes actual file contents directly, preventing metadata-only cache collisions
+// from identifying changed files as unchanged, and propagates filesystem errors
+// instead of silently skipping files.
 func ComputeDirectoryContentFingerprint(dirPath string) (string, error) {
 	cleanDir := filepath.Clean(dirPath)
 	info, err := os.Stat(cleanDir)
@@ -70,28 +60,6 @@ func ComputeDirectoryContentFingerprint(dirPath string) (string, error) {
 			return nil
 		}
 
-		dInfo, infoErr := d.Info()
-		if infoErr != nil {
-			return fmt.Errorf("failed to stat %s: %w", path, infoErr)
-		}
-
-		sz := dInfo.Size()
-		modNano := dInfo.ModTime().UnixNano()
-
-		// Check metadata-keyed cache before reading file from disk
-		cacheKey := path
-		if cachedVal, ok := contentHashCache.Load(cacheKey); ok {
-			c := cachedVal.(cachedFileHash)
-			if c.size == sz && c.modTimeNano == modNano {
-				files = append(files, fileInfo{
-					relPath: slashRel,
-					size:    sz,
-					hash:    c.hash,
-				})
-				return nil
-			}
-		}
-
 		f, openErr := os.Open(path)
 		if openErr != nil {
 			return fmt.Errorf("failed to open file %s for fingerprinting: %w", path, openErr)
@@ -105,11 +73,6 @@ func ComputeDirectoryContentFingerprint(dirPath string) (string, error) {
 		}
 
 		fileHash := hex.EncodeToString(h.Sum(nil))
-		contentHashCache.Store(cacheKey, cachedFileHash{
-			size:        copiedSz,
-			modTimeNano: modNano,
-			hash:        fileHash,
-		})
 
 		files = append(files, fileInfo{
 			relPath: slashRel,

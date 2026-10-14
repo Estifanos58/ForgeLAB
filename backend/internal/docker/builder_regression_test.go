@@ -624,4 +624,3 @@ func TestRegression_BuildImage_BuildKitNoActiveSession_FallsBackToStandardBuilde
 	logs := strings.Join(logLines, "\n")
 	assert.Contains(t, logs, "BuildKit session unavailable on Docker daemon. Retrying with standard Docker builder...")
 }
-

@@ -145,7 +145,10 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 	}
 
 	// Fail closed: if containerRoot is configured, unmapped host/daemon paths must be rejected
-	return "", fmt.Errorf("%w: path %q cannot be mapped to container source root %q", ErrPathNotAllowed, candidatePath, containerRoot)
+	if hostRoot == "" {
+		return "", fmt.Errorf("%w: host path %q cannot be mapped to container source root %q because FORGELAB_HOST_SOURCE_ROOT is not configured. Set FORGELAB_HOST_SOURCE_ROOT to the host directory containing your projects and mount it to %s in docker-compose.yml", ErrPathNotAllowed, candidatePath, containerRoot, containerRoot)
+	}
+	return "", fmt.Errorf("%w: host path %q cannot be mapped to container source root %q because it is outside configured FORGELAB_HOST_SOURCE_ROOT %q. Ensure FORGELAB_HOST_SOURCE_ROOT contains the project directory and is mounted to %s in docker-compose.yml", ErrPathNotAllowed, candidatePath, containerRoot, hostRoot, containerRoot)
 }
 
 // HostSourceRoot returns the configured host source root directory.
@@ -254,7 +257,7 @@ func (v *PathValidator) TranslateContainerToHost(candidatePath string) (string, 
 	}
 
 	// Fail closed: if container mapping is configured, candidate must reside inside containerRoot
-	return "", fmt.Errorf("%w: container path %q cannot be mapped outside container source root %q", ErrPathNotAllowed, candidatePath, containerRoot)
+	return "", fmt.Errorf("%w: container path %q cannot be mapped outside container source root %q (FORGELAB_HOST_SOURCE_ROOT is %q). Ensure the directory resides within the configured source root", ErrPathNotAllowed, candidatePath, containerRoot, hostRoot)
 }
 
 // TranslateContainerToDaemon translates a container path to its Docker daemon mount source path.
@@ -304,7 +307,7 @@ func (v *PathValidator) TranslateContainerToDaemon(candidatePath string) (string
 	}
 
 	// Fail closed: if container mapping is configured, candidate must reside inside containerRoot
-	return "", fmt.Errorf("%w: container path %q cannot be mapped outside container source root %q", ErrPathNotAllowed, candidatePath, containerRoot)
+	return "", fmt.Errorf("%w: container path %q cannot be mapped outside container source root %q (daemon root is %q). Ensure the directory resides within the configured source root", ErrPathNotAllowed, candidatePath, containerRoot, daemonRoot)
 }
 
 func joinHostPath(base, rel string) string {

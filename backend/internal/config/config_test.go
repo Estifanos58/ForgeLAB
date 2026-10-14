@@ -119,3 +119,71 @@ func TestConfigBuildConcurrency(t *testing.T) {
 		t.Errorf("expected MaxConcurrentBuilds = 5, got %d", cfgOverride.Docker.MaxConcurrentBuilds)
 	}
 }
+
+func TestConfigLoadStagingRejectsWeakSecretsAndInsecureSettings(t *testing.T) {
+	os.Setenv("APP_ENV", "staging")
+	defer os.Unsetenv("APP_ENV")
+
+	// 1. Staging must reject short JWT_SECRET
+	os.Setenv("JWT_SECRET", "short-secret")
+	defer os.Unsetenv("JWT_SECRET")
+	_, err := Load()
+	if err == nil {
+		t.Errorf("expected error for short JWT_SECRET in staging mode, got nil")
+	}
+
+	// 2. Staging must reject default db password
+	os.Setenv("JWT_SECRET", "this-is-a-valid-production-jwt-secret-with-more-than-32-chars")
+	os.Setenv("FORGELAB_ENCRYPTION_KEY", "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=")
+	defer os.Unsetenv("FORGELAB_ENCRYPTION_KEY")
+	os.Setenv("DATABASE_URL", "postgres://forgelab:forgelab_dev_password@db:5432/forgelab")
+	defer os.Unsetenv("DATABASE_URL")
+	_, err = Load()
+	if err == nil {
+		t.Errorf("expected error for default db password in staging mode, got nil")
+	}
+
+	// 3. Staging must reject insecure cookies
+	os.Setenv("DATABASE_URL", "postgres://forgelab:staging_secure_pass_456@db:5432/forgelab")
+	os.Setenv("COOKIE_SECURE", "false")
+	defer os.Unsetenv("COOKIE_SECURE")
+	_, err = Load()
+	if err == nil {
+		t.Errorf("expected error for COOKIE_SECURE=false in staging mode, got nil")
+	}
+
+	// 4. Staging must reject unsafe source roots (e.g. root filesystem)
+	os.Setenv("COOKIE_SECURE", "true")
+	os.Setenv("RATE_LIMIT_TRUSTED_PROXIES", "10.0.0.1")
+	defer os.Unsetenv("RATE_LIMIT_TRUSTED_PROXIES")
+	os.Setenv("FORGELAB_ALLOWED_SOURCE_ROOTS", "/")
+	defer os.Unsetenv("FORGELAB_ALLOWED_SOURCE_ROOTS")
+	_, err = Load()
+	if err == nil {
+		t.Errorf("expected error for root filesystem in FORGELAB_ALLOWED_SOURCE_ROOTS in staging mode, got nil")
+	}
+
+	// 5. Staging must reject sensitive system directories
+	os.Setenv("FORGELAB_ALLOWED_SOURCE_ROOTS", "/etc")
+	_, err = Load()
+	if err == nil {
+		t.Errorf("expected error for /etc in FORGELAB_ALLOWED_SOURCE_ROOTS in staging mode, got nil")
+	}
+
+	// 6. Valid staging configuration succeeds and excludes loopback CORS origins by default
+	os.Setenv("FORGELAB_ALLOWED_SOURCE_ROOTS", "/opt/forgelab/sources")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("expected successful staging configuration load, got error: %v", err)
+	}
+	if cfg.App.Environment != "staging" {
+		t.Errorf("expected environment 'staging', got '%s'", cfg.App.Environment)
+	}
+
+	origins := cfg.App.AllowedOriginsList()
+	for _, o := range origins {
+		if o == "http://localhost:3000" || o == "http://127.0.0.1:3000" {
+			t.Errorf("staging configuration must not automatically include loopback origin %s", o)
+		}
+	}
+}

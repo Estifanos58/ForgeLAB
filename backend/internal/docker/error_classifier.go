@@ -86,6 +86,12 @@ func (e *Engine) formatDockerDiagnostic(ctx context.Context, origErr error, cat 
 		sb.WriteString("Check Docker Desktop health, available disk space, and containerd/image storage.\n\n")
 	case CategoryDaemonUnreachable:
 		sb.WriteString("Docker daemon is unreachable. Verify Docker Desktop or the Docker service is actively running.\n\n")
+	case CategoryApplicationBuild:
+		sb.WriteString("Application build failed inside Docker container (RUN instruction exited with non-zero status).\n")
+		sb.WriteString("Review compiler, bundler, or package manager output above for missing dependencies or syntax errors.\n\n")
+	case CategoryContextCancelled:
+		sb.WriteString("Docker build was cancelled or timed out before completion.\n")
+		sb.WriteString("Verify whether the deployment was cancelled by the user, superseded by a newer deployment, or exceeded maximum build duration.\n\n")
 	}
 
 	sb.WriteString(fmt.Sprintf("Original Docker error: %v\n", origErr))

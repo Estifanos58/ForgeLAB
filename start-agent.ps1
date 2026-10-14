@@ -33,16 +33,19 @@ if ($ForceRebuild) {
     $needsRebuild = $true
     $rebuildReason = "agent binary does not exist"
 } else {
-    # Check if any Go source file in backend is newer than the executable
+    # Check if any Go source file or dependency definition in backend is newer than the executable
     $exeTime = (Get-Item $agentExe).LastWriteTime
-    $newestSource = Get-ChildItem -Path $backendDir -Filter "*.go" -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch "[\\/](\.git|vendor)[\\/]" } |
+    $newestSource = Get-ChildItem -Path $backendDir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { 
+            ($_.Extension -eq ".go" -or $_.Name -eq "go.mod" -or $_.Name -eq "go.sum") -and 
+            ($_.FullName -notmatch "[\\/](\.git|vendor)[\\/]") 
+        } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
 
     if ($newestSource -and ($newestSource.LastWriteTime -gt $exeTime)) {
         $needsRebuild = $true
-        $rebuildReason = "source '$($newestSource.Name)' ($($newestSource.LastWriteTime)) is newer than binary ($exeTime)"
+        $rebuildReason = "source/dependency file '$($newestSource.Name)' ($($newestSource.LastWriteTime)) is newer than binary ($exeTime)"
     }
 }
 
@@ -82,6 +85,23 @@ if (-not (Test-Path $agentExe)) {
     exit 1
 }
 
+# Preflight check: verify port is not already bound
+try {
+    $activeTcp = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' }
+    if ($activeTcp) {
+        $conflictingPid = $activeTcp[0].OwningProcess
+        $procInfo = Get-Process -Id $conflictingPid -ErrorAction SilentlyContinue
+        $procName = if ($procInfo) { $procInfo.ProcessName } else { "Unknown" }
+        Write-Host "====================================================" -ForegroundColor Red
+        Write-Host "   [ForgeLAB] Startup Error: Port $Port is already in use!" -ForegroundColor Red
+        Write-Host "   Conflicting Process: $procName (PID: $conflictingPid)" -ForegroundColor Yellow
+        Write-Host "   Action: Terminate PID $conflictingPid or launch with another port:" -ForegroundColor Cyan
+        Write-Host "           .\start-agent.ps1 -Port $($Port + 1)" -ForegroundColor Cyan
+        Write-Host "====================================================" -ForegroundColor Red
+        exit 1
+    }
+} catch {}
+
 # Determine binary info for startup announcement
 $binaryInfo = ""
 try {
@@ -119,16 +139,24 @@ try {
     }
 } catch {}
 
+$exitCode = 0
 if ($canDirectRun) {
     & $agentExe @agentArgs
+    $exitCode = $LASTEXITCODE
 } else {
     Write-Host "[ForgeLAB] Notice: Direct binary execution was restricted by Windows Application Control." -ForegroundColor Yellow
     Write-Host "[ForgeLAB] Running agent using 'go run ./cmd/agent' from current source..." -ForegroundColor Cyan
     Push-Location $backendDir
     try {
         go run ./cmd/agent @agentArgs
+        $exitCode = $LASTEXITCODE
     } finally {
         Pop-Location
     }
+}
+
+if ($exitCode -ne 0) {
+    Write-Host "[ForgeLAB] Local agent process exited with status code $exitCode." -ForegroundColor Yellow
+    Write-Host "[ForgeLAB] If this was unexpected, verify that port $Port is free and backend at $Backend is reachable." -ForegroundColor Cyan
 }
 

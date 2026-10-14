@@ -168,7 +168,20 @@ All user application containers created by ForgeLAB enforce these constraints:
 | **No Host Root/Sensitive Mounts** | ENFORCED | User containers cannot mount `/proc`, `/sys`, `/dev`, `/etc`, `/root`, or host roots |
 | **Restart Policy (Docker Engine)** | ENFORCED | `RestartPolicy: unless-stopped` (Docker daemon restarts container on crash) |
 | **Resource Quotas (CPU/RAM/PIDs)** | ENFORCED | `ValidateAndBuildSecureHostConfig` clamps `NanoCPUs`, `Memory`, and `PidsLimit` in `HostConfig.Resources` |
-| **Continuous Self-Healing** | NOT IMPLEMENTED | Platform-level health polling, crash-loop detection, and auto-rollback deferred |
+| **Continuous Runtime Health Monitoring** | ENFORCED | Background reconciler (`CheckContinuousRuntimeHealth`) detects stopped/crashed containers and kernel OOM kills (`OOMKilled`), transitioning service records to `FAILED` with diagnostics |
+| **Continuous Self-Healing / Auto-Rollback** | NOT IMPLEMENTED | Automated remediation and auto-rollback deferred |
 | **Read-Only Root Filesystem** | DEFERRED | Future hardening option for stateless containers |
 
-> **Note on Self-Healing vs Docker Restart Policy:** User containers run with Docker's `unless-stopped` restart policy (`IMPLEMENTED`), allowing the Docker engine itself to restart crashed containers. However, ForgeLAB does **not** implement platform-level continuous health monitoring, crash diagnosis, crash-loop analysis, automated rollback, or re-promotion (`NOT IMPLEMENTED`). Docker's restart policy must not be confused with platform-level self-healing.
+> **Note on Health Monitoring vs Self-Healing vs Docker Restart Policy:** User containers run with Docker's `unless-stopped` restart policy (`IMPLEMENTED`), allowing the Docker engine itself to restart crashed containers. ForgeLAB also implements continuous runtime health monitoring (`CheckContinuousRuntimeHealth`) to detect stopped/crashed containers and kernel OOM kills, updating service records with actionable diagnostics. However, ForgeLAB does **not** implement automated self-healing, automated rollback, or automatic re-promotion upon runtime failure (`NOT IMPLEMENTED`).
+
+---
+
+## 6. Environment Configuration Hardening & Production-Grade Validation
+
+ForgeLAB enforces strict configuration validation across all non-development environments (`staging`, `production`, etc.):
+- **Secret & Key Strength:** Master encryption key (`FORGELAB_ENCRYPTION_KEY`) must be a valid 32-byte key rejecting default development placeholders and low-entropy keys. JWT secret must be at least 32 characters and cannot match known dev placeholders (`forgelab_dev_jwt_secret_change_me_in_production...`).
+- **Database Credentials:** Default dev passwords (`forgelab_dev_password`) are strictly rejected.
+- **Transport Security:** `COOKIE_SECURE=true` is unconditionally enforced in non-development environments.
+- **Source Root Constraints:** `FORGELAB_ALLOWED_SOURCE_ROOTS` must be explicitly configured and cannot be set to root (`/`), drive roots (`C:\`), or system directories (`/etc`, `/var`, `/usr`, `/var/run`, etc.).
+- **Boundary Restriction:** Development defaults (such as CORS and frontend URL defaulting to `http://localhost:3000`) are strictly confined to local development (`isDev`).
+

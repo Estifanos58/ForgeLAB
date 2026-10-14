@@ -127,9 +127,10 @@
 | R10.2 | Authorization: users can only view/deploy/manage their own projects | MVP |
 | R10.3 | Environment variables/secrets must not be stored as plaintext | MVP |
 | R10.4 | Secrets redacted from logs | MVP |
-| R10.5 | GitHub tokens encrypted at rest | Future |
-| R10.6 | Container resource limits | Future |
+| R10.5 | GitHub tokens encrypted at rest via AES-256-GCM | IMPLEMENTED |
+| R10.6 | Container resource limits (CPU, Memory, PIDs enforced via Docker HostConfig) | IMPLEMENTED |
 | R10.7 | Threat model documented before executing arbitrary user repos | MVP |
+| R10.8 | Non-development environment validation hardening (rejecting weak secrets, insecure cookies, unsafe roots) | IMPLEMENTED |
 
 ### R11. API-First
 
@@ -143,17 +144,15 @@
 
 ## Out of Scope for MVP (Explicitly)
 
-- GitHub OAuth integration
 - Automatic deployments from webhooks
 - Custom domains / DNS
-- HTTPS automation
+- HTTPS automation (Caddy reverse proxy routing)
 - Teams / RBAC / multi-user organizations
 - CLI tool
-- Self-healing / automatic recovery
+- Self-healing / automatic recovery (continuous health inspection is implemented; automated remediation/rollback is deferred)
 - Zero-downtime deployments
-- Multi-environment (dev/staging/prod)
 - Multi-node / worker separation
 - Audit logging (beyond basic)
 - Observability dashboards / OpenTelemetry metrics
 - PostgreSQL replication
-- Resource limits (CPU/memory caps)
+- Ephemeral storage quotas (requires host filesystem quota support; rejected explicitly)

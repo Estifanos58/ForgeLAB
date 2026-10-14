@@ -3,6 +3,8 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
@@ -68,4 +70,56 @@ func TestDeploymentService_ResolveSourceRevision_AuthoritativeDeploymentPlan(t *
 	fallbackRev := deploySvc.resolveSourceRevision(ctx, ghProjectNoPlan, &customSHA)
 	require.NotNil(t, fallbackRev)
 	assert.Equal(t, customSHA, *fallbackRev)
+}
+
+func TestDeploymentService_ResolveSourceRevision_LocalDirectoryUpdatedFiles(t *testing.T) {
+	ctx := context.Background()
+	deploySvc := NewDeploymentService(nil)
+
+	// Create real temporary directory on disk
+	tempDir, err := os.MkdirTemp("", "forgelab-deployplan-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	file1 := filepath.Join(tempDir, "main.go")
+	err = os.WriteFile(file1, []byte("package main\nfunc main() { /* v1 */ }\n"), 0644)
+	require.NoError(t, err)
+
+	fp1, err := discovery.ComputeDirectoryContentFingerprint(tempDir)
+	require.NoError(t, err)
+
+	// Set up project with stale deployment plan containing fp1
+	stalePlanBytes, _ := json.Marshal(discovery.DeploymentPlan{
+		SourceRevision: fp1,
+		SourceType:     models.SourceTypeLocalDirectory,
+	})
+	localProject := &models.Project{
+		ID:             uuid.New(),
+		OwnerID:        uuid.New(),
+		Name:           "Local-Live-App",
+		SourceType:     models.SourceTypeLocalDirectory,
+		RepositoryPath: tempDir,
+		DeploymentPlan: stalePlanBytes,
+	}
+
+	// Update file content on disk (simulating user edit)
+	err = os.WriteFile(file1, []byte("package main\nfunc main() { /* v2 updated */ }\n"), 0644)
+	require.NoError(t, err)
+
+	fp2, err := discovery.ComputeDirectoryContentFingerprint(tempDir)
+	require.NoError(t, err)
+	require.NotEqual(t, fp1, fp2, "content change must alter fingerprint")
+
+	// resolveSourceRevision must detect the updated content instead of returning stale fp1
+	liveRev := deploySvc.resolveSourceRevision(ctx, localProject, nil)
+	require.NotNil(t, liveRev)
+	assert.Equal(t, fp2, *liveRev, "resolveSourceRevision must return fresh content fingerprint from disk, not stale plan revision")
+
+	// DeploymentPlan on project must be synchronized
+	var updatedPlan struct {
+		SourceRevision string `json:"source_revision"`
+	}
+	err = json.Unmarshal(localProject.DeploymentPlan, &updatedPlan)
+	require.NoError(t, err)
+	assert.Equal(t, fp2, updatedPlan.SourceRevision, "DeploymentPlan source_revision must be synchronized with the fresh disk content revision")
 }

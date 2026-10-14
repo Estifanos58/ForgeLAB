@@ -898,8 +898,6 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				}
 			}
 
-
-
 			candidateBases := make([]string, 0, 8)
 			if baseURL != "" {
 				candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
@@ -1089,8 +1087,6 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 			}
 
-
-
 			archFile, archErr := tararchive.CreateCompletedArchiveFile(execCtx, e.workDir, tararchive.BuildContextOptions{
 				BuildContextDir: svcContextDir,
 				Matcher:         matcher,
@@ -1142,7 +1138,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			buildOpts = resolvedOpts
 		}
 
-		if err := e.buildImage(execCtx, tarArchive, buildOpts, func(msg string) {
+		buildCtx := WithBuildServiceName(execCtx, service.Name)
+		if err := e.buildImage(buildCtx, tarArchive, buildOpts, func(msg string) {
 			emitLog(models.LogPhaseBuild, models.LogStreamStdout, msg)
 		}); err != nil {
 			if sharedPromise != nil {
@@ -1152,12 +1149,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			}
 			reason := err.Error()
 			cat := ClassifyDockerBuildError(err)
-			if cat == CategoryStorageDaemon || cat == CategoryDaemonUnreachable || cat == CategoryBuildKitRequired {
-				diag := e.formatDockerDiagnostic(ctx, err, cat)
-				emitLog(models.LogPhaseBuild, models.LogStreamStderr, diag)
-			} else {
-				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-			}
+			diag := e.formatDockerDiagnostic(ctx, err, cat)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, diag)
 			emitStatus(models.DeployStatusFailed, nil, &reason)
 			return errors.New(reason)
 		}
@@ -2349,8 +2342,6 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				pkgManager = "npm"
 			}
 
-
-
 			candidateBases := make([]string, 0, 8)
 			if baseURL != "" {
 				candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
@@ -2497,8 +2488,6 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			if matcher == nil {
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 			}
-
-
 
 			archFile, archErr := tararchive.CreateCompletedArchiveFile(ctx, e.workDir, tararchive.BuildContextOptions{
 				BuildContextDir: buildContextDir,

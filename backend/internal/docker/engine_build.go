@@ -85,6 +85,13 @@ func (e *Engine) acquireBuildSlotWithInfo(
 	return e.getBuildSemaphore().AcquireWithInfo(ctx, info, onWait)
 }
 
+type buildServiceNameKey struct{}
+
+// WithBuildServiceName attaches the service name to the context for queue diagnostics.
+func WithBuildServiceName(ctx context.Context, serviceName string) context.Context {
+	return context.WithValue(ctx, buildServiceNameKey{}, serviceName)
+}
+
 // SetLocalBuildMode sets the local directory deployment mode ("direct" or "snapshot").
 func (e *Engine) SetLocalBuildMode(mode string) {
 	if mode != "" {
@@ -203,9 +210,13 @@ func (e *Engine) buildImage(
 		if onLogLine != nil {
 			onLogLine("Waiting for Docker build slot...")
 		}
+		svcName := "build_image"
+		if sn, ok := ctx.Value(buildServiceNameKey{}).(string); ok && sn != "" {
+			svcName = sn
+		}
 		slotInfo := SlotOwnerInfo{
 			ID:          uuid.New().String(),
-			ServiceName: "build_image",
+			ServiceName: svcName,
 			Phase:       "waiting_for_build_slot",
 		}
 		rel, err := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {

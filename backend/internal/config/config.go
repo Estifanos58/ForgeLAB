@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -60,7 +61,9 @@ func (a AppConfig) AllowedOriginsList() []string {
 		}
 	}
 	// Always include loopback origins in local development
-	if a.Environment != "production" {
+	envLower := strings.ToLower(a.Environment)
+	isDev := envLower == "development" || envLower == "dev" || envLower == "local" || envLower == "test" || envLower == ""
+	if isDev {
 		origins["http://localhost:3000"] = true
 		origins["http://127.0.0.1:3000"] = true
 		origins["http://localhost:8080"] = true
@@ -167,7 +170,7 @@ func Load() (*Config, error) {
 	}
 
 	envMode := strings.ToLower(getEnv("APP_ENV", getEnv("FORGELAB_ENV", getEnv("ENV", "development"))))
-	isProd := envMode == "production" || envMode == "prod"
+	isDev := envMode == "development" || envMode == "dev" || envMode == "local" || envMode == "test"
 
 	dbURL := getEnv("DATABASE_URL", "postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable")
 	encKey := getEnv("FORGELAB_ENCRYPTION_KEY", "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=")
@@ -177,32 +180,59 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid FORGELAB_ENCRYPTION_KEY: %w", err)
 	}
 
-	if isProd {
+	if !isDev {
+		if _, ok := os.LookupEnv("DATABASE_URL"); !ok || strings.Contains(dbURL, "forgelab_dev_password") {
+			return nil, fmt.Errorf("%s configuration error: default development database password (forgelab_dev_password) is not allowed in %s mode; DATABASE_URL must be explicitly configured", envMode, envMode)
+		}
+		if _, ok := os.LookupEnv("FORGELAB_ENCRYPTION_KEY"); !ok || encKey == "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=" {
+			return nil, fmt.Errorf("%s configuration error: default development encryption key is not allowed in %s mode; FORGELAB_ENCRYPTION_KEY must be explicitly configured", envMode, envMode)
+		}
 		if jwtSecret == "dev-jwt-secret-change-in-production" || jwtSecret == "your-super-secret-jwt-key" ||
 			jwtSecret == "example-jwt-secret" || len(jwtSecret) < 32 {
-			return nil, fmt.Errorf("production configuration error: JWT_SECRET must be a secure random secret of at least 32 characters in production mode")
+			return nil, fmt.Errorf("%s configuration error: JWT_SECRET must be a secure random secret of at least 32 characters in %s mode", envMode, envMode)
 		}
 		if err := crypto.ValidateProductionKey(encKey); err != nil {
-			return nil, fmt.Errorf("production configuration error: %w", err)
-		}
-		if strings.Contains(dbURL, "forgelab_dev_password") {
-			return nil, fmt.Errorf("production configuration error: default development database password (forgelab_dev_password) is not allowed in production mode")
+			return nil, fmt.Errorf("%s configuration error: %w", envMode, err)
 		}
 		if getEnv("COOKIE_SECURE", "false") != "true" {
-			return nil, fmt.Errorf("production configuration error: COOKIE_SECURE must be true in production mode to enforce secure HttpOnly cookies")
+			return nil, fmt.Errorf("%s configuration error: COOKIE_SECURE must be true in %s mode to enforce secure HttpOnly cookies", envMode, envMode)
 		}
 		logLevel := strings.ToLower(getEnv("LOG_LEVEL", "info"))
 		if logLevel == "debug" {
-			return nil, fmt.Errorf("production configuration error: LOG_LEVEL cannot be 'debug' in production mode to prevent sensitive data leakage")
+			return nil, fmt.Errorf("%s configuration error: LOG_LEVEL cannot be 'debug' in %s mode to prevent sensitive data leakage", envMode, envMode)
 		}
 		trustedProxies := parseStringSlice(getEnv("RATE_LIMIT_TRUSTED_PROXIES", ""))
 		if len(trustedProxies) == 0 {
-			return nil, fmt.Errorf("production configuration error: RATE_LIMIT_TRUSTED_PROXIES must be configured with at least one trusted reverse proxy IP/CIDR in production mode")
+			return nil, fmt.Errorf("%s configuration error: RATE_LIMIT_TRUSTED_PROXIES must be configured with at least one trusted reverse proxy IP/CIDR in %s mode", envMode, envMode)
 		}
 		allowedRoots := parseStringSlice(getEnv("FORGELAB_ALLOWED_SOURCE_ROOTS", ""))
 		if len(allowedRoots) == 0 {
-			return nil, fmt.Errorf("production configuration error: FORGELAB_ALLOWED_SOURCE_ROOTS must be configured with at least one explicit allowed source directory in production mode")
+			return nil, fmt.Errorf("%s configuration error: FORGELAB_ALLOWED_SOURCE_ROOTS must be configured with at least one explicit allowed source directory in %s mode", envMode, envMode)
 		}
+		for _, root := range allowedRoots {
+			cleanSlash := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
+			if cleanSlash == "/" || cleanSlash == "." || cleanSlash == ".." || strings.HasPrefix(cleanSlash, "../") {
+				return nil, fmt.Errorf("%s configuration error: unsafe source root %q in FORGELAB_ALLOWED_SOURCE_ROOTS (cannot allow entire root filesystem or relative path)", envMode, root)
+			}
+			if len(cleanSlash) <= 3 && strings.HasSuffix(cleanSlash, ":/") {
+				return nil, fmt.Errorf("%s configuration error: unsafe source root %q in FORGELAB_ALLOWED_SOURCE_ROOTS (cannot allow entire drive root)", envMode, root)
+			}
+			if cleanSlash == "/var" || strings.HasPrefix(cleanSlash, "/var/run") {
+				return nil, fmt.Errorf("%s configuration error: unsafe source root %q in FORGELAB_ALLOWED_SOURCE_ROOTS (system directory access forbidden)", envMode, root)
+			}
+			for _, sysDir := range []string{"/etc", "/usr", "/sys", "/proc", "/dev", "/boot", "/bin", "/sbin", "/root", "c:/windows", "c:/program files", "c:/program files (x86)", "c:/system volume information", "c:/recovery"} {
+				if cleanSlash == sysDir || strings.HasPrefix(cleanSlash, sysDir+"/") {
+					return nil, fmt.Errorf("%s configuration error: unsafe source root %q in FORGELAB_ALLOWED_SOURCE_ROOTS (system directory access forbidden)", envMode, root)
+				}
+			}
+		}
+	}
+
+	defaultFrontend := "http://localhost:3000"
+	defaultCORS := "http://localhost:3000"
+	if !isDev {
+		defaultFrontend = ""
+		defaultCORS = ""
 	}
 
 	cfg := &Config{
@@ -243,8 +273,8 @@ func Load() (*Config, error) {
 		},
 		App: AppConfig{
 			Environment:        envMode,
-			FrontendURL:        getEnv("FRONTEND_URL", "http://localhost:3000"),
-			CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
+			FrontendURL:        getEnv("FRONTEND_URL", defaultFrontend),
+			CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", defaultCORS),
 			CookieSecure:       getEnv("COOKIE_SECURE", "false") == "true",
 		},
 		Google: OAuthConfig{

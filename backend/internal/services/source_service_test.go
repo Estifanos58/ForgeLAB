@@ -823,4 +823,3 @@ func TestSourceService_NoHardcodedKeyFallback_FailsWhenUnavailable(t *testing.T)
 	_, err = svc.GetDecryptedAgentToken(context.Background(), uuid.New(), uuid.New())
 	require.Error(t, err)
 }
-
