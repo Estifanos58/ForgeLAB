@@ -66,7 +66,7 @@ func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *
 	}
 
 	if project.SourceType == models.SourceTypeGitHub {
-		if commitSHA != nil && *commitSHA != "" {
+		if commitSHA != nil && len(*commitSHA) == 40 {
 			return commitSHA
 		}
 		if s.githubService != nil {
@@ -81,15 +81,13 @@ func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *
 				if branch == "" {
 					branch = "main"
 				}
-				if resolvedSHA, err := s.githubService.ResolveCommitSHA(ctx, project.OwnerID, owner, repo, branch); err == nil && resolvedSHA != "" {
+				if resolvedSHA, err := s.githubService.ResolveCommitSHA(ctx, project.OwnerID, owner, repo, branch); err == nil && len(resolvedSHA) == 40 {
 					return &resolvedSHA
 				}
 			}
 		}
-		if project.Branch != "" {
-			b := project.Branch
-			return &b
-		}
+		// Do not return mutable branch strings for GitHub deployments to guarantee reproducibility
+		return nil
 	}
 
 	// For local_agent, local_upload, or local_directory: check if source has an immutable fingerprint
@@ -230,6 +228,9 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	}
 
 	sourceRevision := s.resolveSourceRevision(ctx, project, nil)
+	if project.SourceType == models.SourceTypeGitHub && (sourceRevision == nil || len(*sourceRevision) != 40) {
+		return nil, fmt.Errorf("failed to pin immutable 40-character commit SHA for GitHub deployment of project '%s'", project.Name)
+	}
 	deployment.SourceRevision = sourceRevision
 	if project.SourceType == models.SourceTypeGitHub && sourceRevision != nil && len(*sourceRevision) == 40 {
 		deployment.CommitSHA = sourceRevision
@@ -537,6 +538,9 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	}
 
 	sourceRevision := s.resolveSourceRevision(ctx, project, nil)
+	if project.SourceType == models.SourceTypeGitHub && (sourceRevision == nil || len(*sourceRevision) != 40) {
+		return nil, fmt.Errorf("failed to pin immutable 40-character commit SHA for GitHub service deployment of service '%s'", targetService.Name)
+	}
 
 	var envConfigHash *string
 	var envSnapshot []byte

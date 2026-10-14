@@ -798,3 +798,29 @@ func TestSourceService_SaveAndGetSource(t *testing.T) {
 	_, err = svc.GetSource(context.Background(), uuid.New(), ownerID)
 	assert.ErrorIs(t, err, services.ErrSourceDirNotFound)
 }
+
+func TestSourceService_NoHardcodedKeyFallback_FailsWhenUnavailable(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Strict initialization fails when encryptor is nil
+	_, err := services.NewSecureSourceService(nil, tempDir, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "encryption key is unavailable")
+
+	// 2. Clear encryption env vars
+	t.Setenv("ENCRYPTION_KEY", "")
+	t.Setenv("FORGELAB_ENCRYPTION_KEY", "")
+
+	// 3. NewSourceService with no encryptor should not use any fallback key
+	svc := services.NewSourceService(nil, tempDir)
+
+	// 4. Token encryption must fail rather than silently encrypting with a hardcoded key
+	_, err = svc.EncryptToken("agent-secret-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "encryption service not initialized")
+
+	// 5. Token decryption must fail
+	_, err = svc.GetDecryptedAgentToken(context.Background(), uuid.New(), uuid.New())
+	require.Error(t, err)
+}
+

@@ -1,8 +1,10 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	dockerimage "github.com/docker/docker/api/types/image"
 	dockernetwork "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/google/uuid"
@@ -63,6 +66,50 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	t.Log("Tier 3: backend")
 	t.Log("Tier 4: frontend")
 	t.Log("====================================================")
+
+	// Ensure required infrastructure and frontend images are locally available or pulled/built
+	ensureImageAvailable := func(img string) {
+		t.Logf("Checking image %s...", img)
+		_, _, inspectErr := cli.ImageInspectWithRaw(ctx, img)
+		if inspectErr == nil {
+			return
+		}
+		t.Logf("Pulling image %s...", img)
+		reader, pullErr := cli.ImagePull(ctx, img, dockerimage.PullOptions{})
+		if pullErr == nil && reader != nil {
+			_, _ = io.Copy(io.Discard, reader)
+			_ = reader.Close()
+			return
+		}
+		require.NoError(t, inspectErr, "image %s is not available locally and pull failed: %v", img, pullErr)
+	}
+
+	ensureFrontendImage := func() {
+		_, _, inspectErr := cli.ImageInspectWithRaw(ctx, "forgelab-frontend:latest")
+		if inspectErr == nil {
+			t.Log("Image forgelab-frontend:latest is already available.")
+			return
+		}
+		t.Log("Image forgelab-frontend:latest not found in local cache; creating reproducible test frontend image...")
+		ensureImageAvailable("alpine:3.19")
+		feTarData := createTarArchiveWithFiles(t, map[string][]byte{
+			"Dockerfile": []byte("FROM alpine:3.19\nEXPOSE 3000\nCMD [\"busybox\", \"httpd\", \"-f\", \"-p\", \"3000\", \"-h\", \"/var/www\"]\n"),
+		})
+		feOpts := types.ImageBuildOptions{
+			Tags:       []string{"forgelab-frontend:latest"},
+			Dockerfile: "Dockerfile",
+			Remove:     true,
+		}
+		feBuildErr := eng.buildImage(ctx, io.NopCloser(bytes.NewReader(feTarData)), feOpts, func(msg string) {
+			t.Logf("[frontend-build] %s", msg)
+		})
+		require.NoError(t, feBuildErr, "building forgelab-frontend test image must succeed")
+	}
+
+	t.Log("Ensuring dependencies for reproducible execution...")
+	ensureImageAvailable("postgres:16-alpine")
+	ensureImageAvailable("redis:7-alpine")
+	ensureFrontendImage()
 
 	// -------------------------------------------------------------------------
 	// TIER 1: postgres + redis

@@ -8,18 +8,63 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/tararchive"
 )
+
+type buildContextSizeKey struct{}
+
+type buildStreamRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (rt *buildStreamRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Path, "/build") {
+		if sz, ok := req.Context().Value(buildContextSizeKey{}).(int64); ok && sz > 0 {
+			req.ContentLength = sz
+			req.TransferEncoding = nil
+			req.Header.Del("Transfer-Encoding")
+		}
+	}
+	return rt.base.RoundTrip(req)
+}
+
+func (e *Engine) ensureStreamingTransport() {
+	if e.dockerClient == nil {
+		return
+	}
+	httpClient := e.dockerClient.HTTPClient()
+	if httpClient == nil {
+		return
+	}
+	if _, ok := httpClient.Transport.(*buildStreamRoundTripper); ok {
+		return
+	}
+	base := httpClient.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	httpClient.Transport = &buildStreamRoundTripper{base: base}
+	streamingCli, err := client.NewClientWithOpts(
+		client.WithHost(e.dockerClient.DaemonHost()),
+		client.WithVersion(e.dockerClient.ClientVersion()),
+		client.WithHTTPClient(httpClient),
+	)
+	if err == nil {
+		e.dockerClient = streamingCli
+	}
+}
 
 func (e *Engine) acquireBuildSlot(ctx context.Context) (func(), error) {
 	if ctx.Value(buildSlotContextKey) != nil {
@@ -71,9 +116,14 @@ func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Pro
 			return "", cleanupDir, errors.New("GitHub integration service is not available")
 		}
 		if len(ref) != 40 {
-			if sha, err := e.githubService.ResolveCommitSHA(ctx, project.OwnerID, parts[0], parts[1], ref); err == nil && len(sha) == 40 {
-				ref = sha
+			sha, err := e.githubService.ResolveCommitSHA(ctx, project.OwnerID, parts[0], parts[1], ref)
+			if err != nil {
+				return "", cleanupDir, fmt.Errorf("failed to pin immutable commit SHA for GitHub revision '%s': %w", ref, err)
 			}
+			if len(sha) != 40 {
+				return "", cleanupDir, fmt.Errorf("resolved GitHub revision '%s' is not an immutable 40-character commit SHA", sha)
+			}
+			ref = sha
 		}
 		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Acquiring GitHub repository archive for '%s' (revision: %s)...", project.SourceReference, ref))
 		if err := e.githubService.AcquireRepoTarball(ctx, project.OwnerID, parts[0], parts[1], ref, snapshotDir); err != nil {
@@ -259,22 +309,40 @@ func (e *Engine) buildImage(
 	if statErr != nil {
 		return fmt.Errorf("failed to stat build context file: %w", statErr)
 	}
+	validatedArchiveFilePath := validatedArchiveFile.Name()
 
-	var buildContextReader io.Reader
-	if stat.Size() <= 512*1024*1024 {
-		archiveBytes, readErr := io.ReadAll(validatedArchiveFile)
-		if readErr != nil {
-			return fmt.Errorf("failed buffering build context for Docker ImageBuild: %w", readErr)
-		}
-		buildContextReader = bytes.NewReader(archiveBytes)
-	} else {
-		buildContextReader = validatedArchiveFile
-	}
+	e.ensureStreamingTransport()
+	buildCtx = context.WithValue(buildCtx, buildContextSizeKey{}, stat.Size())
 
-	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, buildContextReader, options)
+	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, validatedArchiveFile, options)
 	if err != nil {
 		if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("Docker build timed out after %s: %w", buildTimeout.Round(time.Second), err)
+		}
+		if options.Version == types.BuilderBuildKit && (strings.Contains(strings.ToLower(err.Error()), "no active session") || strings.Contains(strings.ToLower(err.Error()), "no active sessions")) {
+			slog.Warn("buildkit returned session error on ImageBuild; retrying with standard builder", "error", err)
+			if onLogLine != nil {
+				onLogLine("BuildKit session unavailable on Docker daemon. Retrying with standard Docker builder...")
+			}
+			fallbackFile, openErr := os.Open(validatedArchiveFilePath)
+			if openErr == nil {
+				defer fallbackFile.Close()
+				fallbackOpts := options
+				fallbackOpts.Version = types.BuilderV1
+				retryCtx, retryCancel := context.WithTimeout(ctx, buildTimeout)
+				defer retryCancel()
+				retryCtx = context.WithValue(retryCtx, buildContextSizeKey{}, stat.Size())
+				retryResp, retryErr := e.dockerClient.ImageBuild(retryCtx, fallbackFile, fallbackOpts)
+				if retryErr == nil {
+					defer retryResp.Body.Close()
+					if retryParseErr := e.parseDockerStream(retryResp.Body, onLogLine); retryParseErr == nil {
+						slog.Info("docker image build completed using fallback standard builder", "tags", fallbackOpts.Tags)
+						return nil
+					} else {
+						return fmt.Errorf("Docker build error (fallback stream): %w", retryParseErr)
+					}
+				}
+			}
 		}
 		return fmt.Errorf("Docker build failed: %w", err)
 	}
@@ -285,12 +353,13 @@ func (e *Engine) buildImage(
 			diagDir := filepath.Join(e.workDir, "diagnostics", "failed-build-contexts")
 			_ = os.MkdirAll(diagDir, 0755)
 			diagPath := filepath.Join(diagDir, fmt.Sprintf("failed-build-%d.tar", time.Now().UnixNano()))
-			if _, rErr := validatedArchiveFile.Seek(0, io.SeekStart); rErr == nil {
+			if diagFile, oErr := os.Open(validatedArchiveFilePath); oErr == nil {
 				if df, cErr := os.Create(diagPath); cErr == nil {
-					_, _ = io.Copy(df, validatedArchiveFile)
+					_, _ = io.Copy(df, diagFile)
 					_ = df.Close()
 					slog.Info("preserved failed build context for diagnostics", "path", diagPath, "size", stat.Size())
 				}
+				_ = diagFile.Close()
 			}
 		}
 
@@ -298,33 +367,41 @@ func (e *Engine) buildImage(
 			return fmt.Errorf("Docker build timed out after %s: %w", buildTimeout.Round(time.Second), parseErr)
 		}
 
-		// If BuildKit was used and rejected the tar header, attempt fallback only if Dockerfile does NOT require BuildKit
-		if options.Version == types.BuilderBuildKit && strings.Contains(parseErr.Error(), "archive/tar: invalid tar header") && !requiresBuildKit {
-			slog.Warn("buildkit rejected tar build context; retrying with standard builder", "error", parseErr)
+		// If BuildKit was used and failed with session error or rejected the tar header, attempt fallback
+		isSessionErr := strings.Contains(strings.ToLower(parseErr.Error()), "no active session") || strings.Contains(strings.ToLower(parseErr.Error()), "no active sessions")
+		isTarHeaderErr := strings.Contains(parseErr.Error(), "archive/tar: invalid tar header")
+		if options.Version == types.BuilderBuildKit && (isSessionErr || (isTarHeaderErr && !requiresBuildKit)) {
+			slog.Warn("buildkit rejected build context or session unavailable; retrying with standard builder", "error", parseErr)
 			if onLogLine != nil {
-				onLogLine("BuildKit rejected tar build context header. Retrying with standard Docker builder...")
+				if isSessionErr {
+					onLogLine("BuildKit session unavailable on Docker daemon. Retrying with standard Docker builder...")
+				} else {
+					onLogLine("BuildKit rejected tar build context header. Retrying with standard Docker builder...")
+				}
 			}
-			if _, seekErr := validatedArchiveFile.Seek(0, io.SeekStart); seekErr == nil {
+			fallbackFile, openErr := os.Open(validatedArchiveFilePath)
+			if openErr == nil {
+				defer fallbackFile.Close()
 				fallbackOpts := options
 				fallbackOpts.Version = types.BuilderV1
 				retryCtx, retryCancel := context.WithTimeout(ctx, buildTimeout)
 				defer retryCancel()
-				var retryReader io.Reader = validatedArchiveFile
-				if stat.Size() <= 512*1024*1024 {
-					if rBytes, err := io.ReadAll(validatedArchiveFile); err == nil {
-						retryReader = bytes.NewReader(rBytes)
-					}
-				}
-				retryResp, retryErr := e.dockerClient.ImageBuild(retryCtx, retryReader, fallbackOpts)
+				retryCtx = context.WithValue(retryCtx, buildContextSizeKey{}, stat.Size())
+				retryResp, retryErr := e.dockerClient.ImageBuild(retryCtx, fallbackFile, fallbackOpts)
 				if retryErr == nil {
 					defer retryResp.Body.Close()
 					if retryParseErr := e.parseDockerStream(retryResp.Body, onLogLine); retryParseErr == nil {
 						slog.Info("docker image build completed using fallback standard builder", "tags", fallbackOpts.Tags)
 						return nil
 					} else {
-						return fmt.Errorf("Docker build error: %w", retryParseErr)
+						return fmt.Errorf("Docker build error (fallback stream): %w", retryParseErr)
 					}
+				} else {
+					slog.Error("docker fallback ImageBuild failed", "error", retryErr)
+					return fmt.Errorf("Docker build fallback ImageBuild failed: %w", retryErr)
 				}
+			} else {
+				slog.Error("failed to reopen archive for fallback", "error", openErr)
 			}
 		}
 		return fmt.Errorf("Docker build error: %w", parseErr)

@@ -128,13 +128,33 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Location:** [`backend/cmd/agent/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/agent/main.go), [`backend/internal/agent/server.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/server.go), [`start-agent.ps1`](file:///c:/Users/estif/Desktop/ForgeLAB/start-agent.ps1)
 - **Resolution:** Local agent defaults strictly to loopback `127.0.0.1` binding to prevent unauthorized LAN exposure. The `/api/agent/status` endpoint scrubs internal `agent_id` and active session counts for unauthenticated requests, preventing credential discovery and enumeration while returning online status and system architecture.
 
-### 20. Direct Build Context Streaming & Bounded Log Lines (`RESOLVED IN ARCHITECTURE`)
+### 20. Direct Disk Build Context Streaming & Zero-Memory Buffering (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go)
-- **Resolution:** In `parseDockerStream`, bounded buffer growth and line length to 64KB, preventing uncontrolled memory consumption or CPU starvation on malformed or exceptionally long build log lines without newlines. Retained the Windows named pipe invariant for BuildKit context submission (`bytes.NewReader(archiveBytes)` for contexts <= 512MB) to ensure `Content-Length` is explicitly populated by Go's `net/http` client, preventing chunked transfer encoding corruptions (`failed to read dockerfile: archive/tar: invalid tar header`) over `//./pipe/docker_engine`.
+- **Resolution:** Removed unnecessary `io.ReadAll` buffering of build contexts up to 512 MB. Validated archives stream directly from disk to the Docker daemon. To preserve required HTTP semantics and prevent chunked transfer encoding issues over Windows named pipes (`//./pipe/docker_engine`), a custom `buildStreamRoundTripper` sets `req.ContentLength` from the context archive file size and removes `Transfer-Encoding: chunked`. Log streaming lines in `parseDockerStream` remain bounded to 64KB.
 
 ### 21. Container Network Namespace Isolation (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/docker/trust_boundary.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/trust_boundary.go), [`backend/internal/discovery/compose.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/compose.go)
 - **Resolution:** `ValidateAndBuildSecureHostConfig` actively rejects `container:` network namespace sharing (`ErrContainerNetworkSharingRejected`), preventing inter-container cross-boundary tampering or network interception. Compose parsing emits an explicit security warning and maps services to isolated bridge networks.
+
+### 22. Local Agent Filesystem Path Leak Resolution (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/agent/server.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/server.go)
+- **Resolution:** Eliminated exposure of internal host filesystem paths (`source_path: session.CanonicalPath`) from local agent session responses (`renderSessionResponse`). Responses now expose only safe public session metadata, preserving path privacy.
+
+### 23. SharedBuildCoordinator Concurrency & Retry Safety (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/shared_build_coordinator.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/shared_build_coordinator.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:** Thread-safe singleton access for `SharedBuildCoordinator` via engine mutex. `GetOrInit` evicts previously failed build promises so subsequent deployment retries attempt a fresh build rather than immediately re-failing on stale cached errors. `SharedBuildPromise` access uses synchronized `Complete()` and `Result()` methods to prevent concurrent map/field race conditions.
+
+### 24. BuildKit Session Fallback & Concurrency Separation (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:** If BuildKit fails due to missing or unsupported client gRPC sessions (`no active session`), `buildImage` automatically falls back to the standard daemon builder (`types.BuilderV1`) by reopening the staged archive from disk. Context preparation (agent transfers, tar archive creation) runs concurrently without acquiring the Docker build slot; build slots are acquired only when Docker image building begins.
+
+### 25. Immutable GitHub Revision Pinning & Error-Propagating Fingerprints (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/deployment_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/deployment_service.go), [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/discovery/fingerprint.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/fingerprint.go)
+- **Resolution:** GitHub deployments strictly resolve to immutable 40-character commit SHAs; deployment creation and release execution fail closed if the SHA cannot be acquired, prohibiting fallback to mutable branch names. Replaced metadata-only directory fingerprints with reliable content-based fingerprints backed by metadata caching, and propagated filesystem errors instead of silently skipping files.
+
+### 26. Configuration Hardening & Secret Protection (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml), [`backend/internal/services/source_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/source_service.go)
+- **Resolution:** Docker Compose explicitly passes `APP_ENV: ${APP_ENV:-development}` to the backend service, activating production security validations in production mode. Removed the hard-coded default encryption key fallback in `SourceService`, failing closed if encryption is unavailable. External port exposures in Docker Compose default to loopback `127.0.0.1` (`${BACKEND_PORT_BINDING:-127.0.0.1:8080}:8080`, `${FRONTEND_PORT_BINDING:-127.0.0.1:3000}:3000`).
 
 ---
 

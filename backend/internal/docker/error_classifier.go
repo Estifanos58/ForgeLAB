@@ -35,7 +35,8 @@ func ClassifyDockerBuildError(err error) DockerErrorCategory {
 	// BuildKit required failures
 	if strings.Contains(msg, "the --mount option requires buildkit") ||
 		strings.Contains(msg, "requires buildkit") ||
-		strings.Contains(msg, "buildkit is required") {
+		strings.Contains(msg, "buildkit is required") ||
+		strings.Contains(msg, "no active session") {
 		return CategoryBuildKitRequired
 	}
 

@@ -41,6 +41,7 @@ services:
     restart: "no"
     command: ["./forgelab-migrate", "up"]
     environment:
+      APP_ENV: ${APP_ENV:-development}
       DATABASE_URL: postgres://${POSTGRES_USER:-forgelab}:${POSTGRES_PASSWORD:-forgelab_dev_password}@postgres:5432/${POSTGRES_DB:-forgelab}?sslmode=disable
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -58,10 +59,11 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "8080:8080"
+      - "${BACKEND_PORT_BINDING:-127.0.0.1:8080}:8080"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      APP_ENV: ${APP_ENV:-development}
       SERVER_PORT: 8080
       SERVER_HOST: 0.0.0.0
       DATABASE_URL: postgres://${POSTGRES_USER:-forgelab}:${POSTGRES_PASSWORD:-forgelab_dev_password}@postgres:5432/${POSTGRES_DB:-forgelab}?sslmode=disable
@@ -115,7 +117,7 @@ services:
     container_name: forgelab-frontend
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT_BINDING:-127.0.0.1:3000}:3000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

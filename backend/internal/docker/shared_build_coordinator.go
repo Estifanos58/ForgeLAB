@@ -136,7 +136,14 @@ func (c *SharedBuildCoordinator) GetOrInit(key string, ownerServiceID string) (*
 	defer c.mu.Unlock()
 
 	if p, exists := c.promises[key]; exists {
-		return p, true
+		p.mu.RLock()
+		failed := p.err != nil
+		p.mu.RUnlock()
+		if !failed {
+			return p, true
+		}
+		// Discard previously failed promise so retry attempts can proceed cleanly
+		delete(c.promises, key)
 	}
 
 	p := NewSharedBuildPromise(ownerServiceID)

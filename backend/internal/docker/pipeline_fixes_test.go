@@ -332,14 +332,14 @@ func TestSharedBuildArtifact_Coordination(t *testing.T) {
 				// This worker won the build race
 				atomic.AddInt32(&buildExecutions, 1)
 				time.Sleep(50 * time.Millisecond) // simulate build time
-				promise.imageTag = "forgelab/test-proj/worker:1"
-				promise.digest = "sha256:abc123456789"
-				close(promise.done)
-				results[idx] = promise.imageTag
+				promise.Complete("forgelab/test-proj/worker:1", "sha256:abc123456789")
+				tag, _, _ := promise.Result()
+				results[idx] = tag
 			} else {
 				// Waiting worker
-				<-promise.done
-				results[idx] = promise.imageTag
+				<-promise.Done()
+				tag, _, _ := promise.Result()
+				results[idx] = tag
 			}
 		}(i)
 	}

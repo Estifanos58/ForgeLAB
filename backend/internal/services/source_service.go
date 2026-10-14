@@ -110,11 +110,14 @@ func NewSourceService(db *pgxpool.Pool, sourcesDir string, encryptor ...*crypto.
 	var enc *crypto.Encryptor
 	if len(encryptor) > 0 && encryptor[0] != nil {
 		enc = encryptor[0]
+	} else if key := os.Getenv("FORGELAB_ENCRYPTION_KEY"); key != "" {
+		if e, err := crypto.NewEncryptor(key); err == nil {
+			enc = e
+		}
 	} else if key := os.Getenv("ENCRYPTION_KEY"); key != "" {
-		enc, _ = crypto.NewEncryptor(key)
-	}
-	if enc == nil {
-		enc, _ = crypto.NewEncryptor("default-forgelab-encryption-key!")
+		if e, err := crypto.NewEncryptor(key); err == nil {
+			enc = e
+		}
 	}
 
 	return &SourceService{
@@ -122,6 +125,14 @@ func NewSourceService(db *pgxpool.Pool, sourcesDir string, encryptor ...*crypto.
 		sourcesDir: sourcesDir,
 		encryptor:  enc,
 	}
+}
+
+// NewSecureSourceService initializes a SourceService and returns an error if encryption is unavailable.
+func NewSecureSourceService(db *pgxpool.Pool, sourcesDir string, encryptor *crypto.Encryptor) (*SourceService, error) {
+	if encryptor == nil {
+		return nil, errors.New("cannot initialize SourceService: encryption key is unavailable")
+	}
+	return NewSourceService(db, sourcesDir, encryptor), nil
 }
 
 // SetEncryptor configures or overrides the encryptor.

@@ -63,6 +63,7 @@ type Engine struct {
 	activeCancels        sync.Map                // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
 	activeContainers     sync.Map                // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
 	sharedBuildArtifacts sync.Map                // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
+	sharedCoordMu        sync.Mutex              // protects initialization and mutation of sharedCoordinator
 	sharedCoordinator    *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
 	cachedBuilderVer     atomic.Value            // stores types.BuilderVersion advertised by Docker daemon
 }
@@ -165,11 +166,18 @@ func (e *Engine) GetMaxConcurrentBuilds() int {
 	return e.maxConcurrentBuilds
 }
 
-func (e *Engine) getOrInitSharedBuild(key string) (*sharedBuildPromise, bool) {
+func (e *Engine) getSharedCoordinator() *SharedBuildCoordinator {
+	e.sharedCoordMu.Lock()
+	defer e.sharedCoordMu.Unlock()
 	if e.sharedCoordinator == nil {
 		e.sharedCoordinator = NewSharedBuildCoordinator()
 	}
-	p, loaded := e.sharedCoordinator.GetOrInit(key, "")
+	return e.sharedCoordinator
+}
+
+func (e *Engine) getOrInitSharedBuild(key string) (*sharedBuildPromise, bool) {
+	coord := e.getSharedCoordinator()
+	p, loaded := coord.GetOrInit(key, "")
 	e.sharedBuildArtifacts.Store(key, p)
 	return p, loaded
 }
@@ -247,18 +255,12 @@ func (e *Engine) GetBuildDiagnostics() SemaphoreDiagnostics {
 
 // GetSharedBuildDiagnostics returns a diagnostic snapshot of in-flight and completed shared build artifacts.
 func (e *Engine) GetSharedBuildDiagnostics() SharedBuildDiagnostics {
-	if e.sharedCoordinator == nil {
-		return SharedBuildDiagnostics{}
-	}
-	return e.sharedCoordinator.GetDiagnostics()
+	return e.getSharedCoordinator().GetDiagnostics()
 }
 
 // CleanupDeploymentSharedBuilds cleans up completed shared build entries for a project.
 func (e *Engine) CleanupDeploymentSharedBuilds(projectID string) int {
-	if e.sharedCoordinator == nil {
-		return 0
-	}
-	return e.sharedCoordinator.CleanupDeployment(projectID)
+	return e.getSharedCoordinator().CleanupDeployment(projectID)
 }
 
 // RegisterActiveCancel registers a cancellation function for an active deployment execution.
@@ -779,9 +781,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 						failErr = errors.New("shared image build aborted or cancelled before completion")
 					}
 					sharedPromise.Fail(failErr)
-					if e.sharedCoordinator != nil {
-						e.sharedCoordinator.Remove(sharedKey)
-					}
+					e.getSharedCoordinator().Remove(sharedKey)
 					e.sharedBuildArtifacts.Delete(sharedKey)
 				}
 			}()
@@ -898,35 +898,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				}
 			}
 
-			slotID := uuid.NewString()
-			deployIDStr := ""
-			if serviceDeploy.DeploymentID != nil {
-				deployIDStr = serviceDeploy.DeploymentID.String()
-			}
-			slotInfo := SlotOwnerInfo{
-				ID:                  slotID,
-				DeploymentID:        deployIDStr,
-				ServiceDeploymentID: serviceDeploy.ID.String(),
-				ServiceName:         service.Name,
-				Phase:               "waiting_for_build_slot",
-			}
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Service '%s' waiting for Docker build slot...", service.Name))
-			acquiredSlot, slotErr := e.acquireBuildSlotWithInfo(execCtx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
-				var ownerDesc string
-				if len(actSlots) > 0 {
-					ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
-				}
-				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
-			})
-			if slotErr != nil {
-				reason := fmt.Sprintf("Docker build queue wait cancelled: %v", slotErr)
-				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-				emitStatus(models.DeployStatusFailed, nil, &reason)
-				return errors.New(reason)
-			}
-			releaseSlot = acquiredSlot
-			e.buildSem.UpdatePhase(slotID, "context_transfer")
-			execCtx = context.WithValue(execCtx, buildSlotContextKey, slotID)
+
 
 			candidateBases := make([]string, 0, 8)
 			if baseURL != "" {
@@ -1117,37 +1089,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 			}
 
-			if execCtx.Value(buildSlotContextKey) == nil {
-				slotID := uuid.NewString()
-				deployIDStr := ""
-				if serviceDeploy.DeploymentID != nil {
-					deployIDStr = serviceDeploy.DeploymentID.String()
-				}
-				slotInfo := SlotOwnerInfo{
-					ID:                  slotID,
-					DeploymentID:        deployIDStr,
-					ServiceDeploymentID: serviceDeploy.ID.String(),
-					ServiceName:         service.Name,
-					Phase:               "waiting_for_build_slot",
-				}
-				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Service '%s' waiting for Docker build slot...", service.Name))
-				acquiredSlot, slotErr := e.acquireBuildSlotWithInfo(execCtx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
-					var ownerDesc string
-					if len(actSlots) > 0 {
-						ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
-					}
-					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
-				})
-				if slotErr != nil {
-					reason := fmt.Sprintf("Docker build queue wait cancelled: %v", slotErr)
-					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-					emitStatus(models.DeployStatusFailed, nil, &reason)
-					return errors.New(reason)
-				}
-				releaseSlot = acquiredSlot
-				e.buildSem.UpdatePhase(slotID, "archive_generation")
-				execCtx = context.WithValue(execCtx, buildSlotContextKey, slotID)
-			}
+
 
 			archFile, archErr := tararchive.CreateCompletedArchiveFile(execCtx, e.workDir, tararchive.BuildContextOptions{
 				BuildContextDir: svcContextDir,
@@ -1205,9 +1147,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}); err != nil {
 			if sharedPromise != nil {
 				sharedPromise.Fail(err)
-				if e.sharedCoordinator != nil {
-					e.sharedCoordinator.Remove(sharedKey)
-				}
+				e.getSharedCoordinator().Remove(sharedKey)
 				e.sharedBuildArtifacts.Delete(sharedKey)
 			}
 			reason := err.Error()
@@ -2409,30 +2349,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				pkgManager = "npm"
 			}
 
-			slotID := uuid.NewString()
-			slotInfo := SlotOwnerInfo{
-				ID:           slotID,
-				DeploymentID: deployment.ID.String(),
-				ServiceName:  project.Name,
-				Phase:        "waiting_for_build_slot",
-			}
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Waiting for Docker build slot...")
-			acquiredSlot, slotErr := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
-				var ownerDesc string
-				if len(actSlots) > 0 {
-					ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
-				}
-				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
-			})
-			if slotErr != nil {
-				reason := fmt.Sprintf("Docker build slot wait cancelled: %v", slotErr)
-				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-				updateStatus(models.DeployStatusFailed, &reason)
-				return errors.New(reason)
-			}
-			releaseSlot = acquiredSlot
-			e.buildSem.UpdatePhase(slotID, "context_transfer")
-			ctx = context.WithValue(ctx, buildSlotContextKey, slotID)
+
 
 			candidateBases := make([]string, 0, 8)
 			if baseURL != "" {
@@ -2581,32 +2498,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				matcher = NewDockerignoreMatcher(DefaultIgnorePatterns)
 			}
 
-			if ctx.Value(buildSlotContextKey) == nil {
-				slotID := uuid.NewString()
-				slotInfo := SlotOwnerInfo{
-					ID:           slotID,
-					DeploymentID: deployment.ID.String(),
-					ServiceName:  project.Name,
-					Phase:        "waiting_for_build_slot",
-				}
-				emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Waiting for Docker build slot...")
-				acquiredSlot, slotErr := e.acquireBuildSlotWithInfo(ctx, slotInfo, func(pos int, waitDur time.Duration, actSlots []SlotOwnerInfo) {
-					var ownerDesc string
-					if len(actSlots) > 0 {
-						ownerDesc = fmt.Sprintf(" (currently held by service '%s' in phase '%s')", actSlots[0].ServiceName, actSlots[0].Phase)
-					}
-					emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Queued for Docker build slot: position %d, elapsed %s%s", pos, waitDur.Round(time.Second), ownerDesc))
-				})
-				if slotErr != nil {
-					reason := fmt.Sprintf("Docker build queue wait cancelled: %v", slotErr)
-					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
-					updateStatus(models.DeployStatusFailed, &reason)
-					return errors.New(reason)
-				}
-				releaseSlot = acquiredSlot
-				e.buildSem.UpdatePhase(slotID, "archive_generation")
-				ctx = context.WithValue(ctx, buildSlotContextKey, slotID)
-			}
+
 
 			archFile, archErr := tararchive.CreateCompletedArchiveFile(ctx, e.workDir, tararchive.BuildContextOptions{
 				BuildContextDir: buildContextDir,

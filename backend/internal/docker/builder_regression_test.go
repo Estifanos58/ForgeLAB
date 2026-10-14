@@ -393,16 +393,15 @@ func TestRegression_SharedBuildArtifact_Coordination(t *testing.T) {
 	// Simulate first service finishing the build
 	expectedImageTag := "forgelab/" + projectID.String() + "/backend:1"
 	expectedDigest := "sha256:1234567890abcdef"
-	p1.imageTag = expectedImageTag
-	p1.digest = expectedDigest
-	close(p1.done)
+	p1.Complete(expectedImageTag, expectedDigest)
 
 	// Verify second service sees the completed artifact
 	select {
-	case <-p2.done:
-		assert.Equal(t, expectedImageTag, p2.imageTag)
-		assert.Equal(t, expectedDigest, p2.digest)
-		assert.NoError(t, p2.err)
+	case <-p2.Done():
+		tag, dig, err := p2.Result()
+		assert.Equal(t, expectedImageTag, tag)
+		assert.Equal(t, expectedDigest, dig)
+		assert.NoError(t, err)
 	default:
 		t.Fatal("shared promise done channel must be closed")
 	}
@@ -560,3 +559,69 @@ func TestRegression_BuildImage_SetsContentLengthAndDisablesChunkedEncoding(t *te
 	assert.Equal(t, int64(len(tarData)), receivedContentLength, "HTTP Content-Length must match exact archive size")
 	assert.False(t, isChunked, "HTTP request must not use chunked transfer encoding over named pipes")
 }
+
+func TestRegression_BuildImage_BuildKitNoActiveSession_FallsBackToStandardBuilder(t *testing.T) {
+	var buildAttempts int
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_ping", "/v1.41/_ping":
+			w.Header().Set("API-Version", "1.41")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+		case "/build", "/v1.41/build":
+			buildAttempts++
+			w.Header().Set("Content-Type", "application/json")
+			// If version=2 (BuildKit) requested on first attempt, return "no active session" stream error
+			if r.URL.Query().Get("version") == "2" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("{\"errorDetail\":{\"message\":\"failed to solve: no active session for session 12345\"},\"error\":\"failed to solve: no active session for session 12345\"}\n"))
+				return
+			}
+			// Fallback (standard builder / version=1) succeeds
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{\"stream\":\"Successfully built fallback123\\n\"}\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockServer.Close()
+
+	cli, err := client.NewClientWithOpts(
+		client.WithHost(mockServer.URL),
+		client.WithHTTPClient(mockServer.Client()),
+		client.WithVersion("1.41"),
+	)
+	require.NoError(t, err)
+	defer cli.Close()
+
+	eng := &Engine{dockerClient: cli, workDir: t.TempDir()}
+
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test-build-*.tar")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	tarData := createTarArchiveWithFiles(t, map[string][]byte{
+		"Dockerfile": []byte("FROM alpine\nRUN echo hi\n"),
+	})
+	_, err = tmpFile.Write(tarData)
+	require.NoError(t, err)
+	_, err = tmpFile.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+
+	var logLines []string
+	opts := types.ImageBuildOptions{
+		Tags:       []string{"forgelab/test-fallback:latest"},
+		Dockerfile: "Dockerfile",
+		Version:    types.BuilderBuildKit,
+	}
+
+	buildErr := eng.buildImage(context.Background(), tmpFile, opts, func(msg string) {
+		logLines = append(logLines, msg)
+	})
+	require.NoError(t, buildErr, "buildImage must succeed via fallback when BuildKit has no active session")
+	assert.GreaterOrEqual(t, buildAttempts, 2, "buildImage should have retried with standard builder")
+
+	logs := strings.Join(logLines, "\n")
+	assert.Contains(t, logs, "BuildKit session unavailable on Docker daemon. Retrying with standard Docker builder...")
+}
+

@@ -79,6 +79,9 @@ Configuration is managed via `.env` with fallback defaults in `.env.example`:
 
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
+| `APP_ENV` | `development` | Application environment (`development` or `production`; enforces strict validation when `production`) |
+| `BACKEND_PORT_BINDING` | `127.0.0.1:8080` | Host port/IP binding for backend Docker Compose service (defaults to loopback) |
+| `FRONTEND_PORT_BINDING` | `127.0.0.1:3000` | Host port/IP binding for frontend Docker Compose service (defaults to loopback) |
 | `SERVER_HOST` | `0.0.0.0` | Bind address for Go API server |
 | `SERVER_PORT` | `8080` | Bind port for Go API server |
 | `DATABASE_URL` | `postgres://forgelab:forgelab_dev_password@postgres:5432/forgelab?sslmode=disable` | PostgreSQL connection DSN |
