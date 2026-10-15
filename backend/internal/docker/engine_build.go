@@ -56,12 +56,16 @@ func (e *Engine) ensureStreamingTransport() {
 		base = http.DefaultTransport
 	}
 	httpClient.Transport = &buildStreamRoundTripper{base: base}
-	streamingCli, err := client.NewClientWithOpts(
+	opts := []client.Opt{
 		client.WithHost(e.dockerClient.DaemonHost()),
-		client.WithVersion(e.dockerClient.ClientVersion()),
 		client.WithHTTPClient(httpClient),
-	)
+		client.WithAPIVersionNegotiation(),
+	}
+	streamingCli, err := client.NewClientWithOpts(opts...)
 	if err == nil {
+		negotiateCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		streamingCli.NegotiateAPIVersion(negotiateCtx)
+		cancel()
 		e.dockerClient = streamingCli
 	}
 }
@@ -330,7 +334,7 @@ func (e *Engine) buildImage(
 		if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("Docker build timed out after %s: %w", buildTimeout.Round(time.Second), err)
 		}
-		if options.Version == types.BuilderBuildKit && (strings.Contains(strings.ToLower(err.Error()), "no active session") || strings.Contains(strings.ToLower(err.Error()), "no active sessions")) {
+		if !requiresBuildKit && options.Version == types.BuilderBuildKit && (strings.Contains(strings.ToLower(err.Error()), "no active session") || strings.Contains(strings.ToLower(err.Error()), "no active sessions")) {
 			slog.Warn("buildkit returned session error on ImageBuild; retrying with standard builder", "error", err)
 			if onLogLine != nil {
 				onLogLine("BuildKit session unavailable on Docker daemon. Retrying with standard Docker builder...")
@@ -381,7 +385,7 @@ func (e *Engine) buildImage(
 		// If BuildKit was used and failed with session error or rejected the tar header, attempt fallback
 		isSessionErr := strings.Contains(strings.ToLower(parseErr.Error()), "no active session") || strings.Contains(strings.ToLower(parseErr.Error()), "no active sessions")
 		isTarHeaderErr := strings.Contains(parseErr.Error(), "archive/tar: invalid tar header")
-		if options.Version == types.BuilderBuildKit && (isSessionErr || (isTarHeaderErr && !requiresBuildKit)) {
+		if !requiresBuildKit && options.Version == types.BuilderBuildKit && (isSessionErr || isTarHeaderErr) {
 			slog.Warn("buildkit rejected build context or session unavailable; retrying with standard builder", "error", parseErr)
 			if onLogLine != nil {
 				if isSessionErr {

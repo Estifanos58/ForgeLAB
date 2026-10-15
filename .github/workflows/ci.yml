@@ -7,8 +7,8 @@ on:
     branches: [ main ]
 
 jobs:
-  backend:
-    name: Backend CI
+  backend-unit:
+    name: Backend Unit Tests & Linters
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -36,10 +36,98 @@ jobs:
           cd backend
           go vet ./...
 
-      - name: Run Backend Tests
+      - name: Run Backend Unit Tests
+        env:
+          SKIP_DOCKER_LIVE_TEST: "1"
         run: |
           cd backend
           go test -v -race ./...
+
+  backend-integration:
+    name: Backend Integration Tests (PostgreSQL & Redis)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: forgelab
+          POSTGRES_PASSWORD: forgelab_dev_password
+          POSTGRES_DB: forgelab
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Install PostgreSQL Client
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Wait for Services Readiness
+        run: |
+          timeout 60 bash -c 'until pg_isready -h localhost -p 5432 -U forgelab -d forgelab; do sleep 2; done'
+
+      - name: Run Database Migrations
+        env:
+          DATABASE_URL: postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable
+        run: |
+          cd backend
+          go run ./cmd/migrate up
+
+      - name: Run Backend Integration Tests
+        env:
+          DATABASE_URL: postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable
+          REDIS_URL: redis://localhost:6379/0
+          REQUIRE_INTEGRATION_DB: "1"
+          SKIP_DOCKER_LIVE_TEST: "1"
+        run: |
+          cd backend
+          go test -v -race ./internal/database/... ./internal/services/...
+
+  docker-live:
+    name: Docker Engine Live Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Pre-pull Base Images
+        run: |
+          docker pull golang:alpine
+          docker pull alpine:3.19
+
+      - name: Run Live Docker Tests
+        run: |
+          cd backend
+          go test -v -race -timeout 20m -run 'TestLive|TestDocker|TestRegression_Build' ./internal/docker/...
 
   frontend:
     name: Frontend CI

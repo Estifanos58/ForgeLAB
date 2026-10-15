@@ -1,6 +1,7 @@
 package discovery_test
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -295,6 +296,86 @@ func TestComputeDirectoryContentFingerprint_Deterministic(t *testing.T) {
 	fp4, err := discovery.ComputeDirectoryContentFingerprint(tempDir)
 	require.NoError(t, err)
 	assert.NotEqual(t, fp1, fp4, "Content changes must alter fingerprint")
+}
+
+func TestComputeDirectoryContentFingerprint_RejectsExternalSymlinkEscape(t *testing.T) {
+	outsideDir, err := os.MkdirTemp("", "forgelab-outside-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(outsideDir)
+
+	outsideSecret := filepath.Join(outsideDir, "secret.txt")
+	err = os.WriteFile(outsideSecret, []byte("super-secret-outside-content"), 0600)
+	require.NoError(t, err)
+
+	sourceDir, err := os.MkdirTemp("", "forgelab-source-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(sourceDir)
+
+	err = os.WriteFile(filepath.Join(sourceDir, "app.js"), []byte("console.log('hello');"), 0644)
+	require.NoError(t, err)
+
+	// Create external symlink pointing outside sourceDir
+	linkPath := filepath.Join(sourceDir, "external_link")
+	err = os.Symlink(outsideSecret, linkPath)
+	if err != nil {
+		t.Skipf("Symlink creation not supported in current environment: %v", err)
+	}
+
+	_, fpErr := discovery.ComputeDirectoryContentFingerprint(sourceDir)
+	require.Error(t, fpErr, "Fingerprinting must fail when external symlink points outside source root")
+	assert.Contains(t, fpErr.Error(), "security violation")
+}
+
+func TestComputeDirectoryContentFingerprint_InternalSymlinkAllowed(t *testing.T) {
+	sourceDir, err := os.MkdirTemp("", "forgelab-source-internal-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(sourceDir)
+
+	targetFile := filepath.Join(sourceDir, "target.txt")
+	err = os.WriteFile(targetFile, []byte("internal content"), 0644)
+	require.NoError(t, err)
+
+	linkPath := filepath.Join(sourceDir, "internal_link")
+	err = os.Symlink("target.txt", linkPath)
+	if err != nil {
+		t.Skipf("Symlink creation not supported in current environment: %v", err)
+	}
+
+	fp, err := discovery.ComputeDirectoryContentFingerprint(sourceDir)
+	require.NoError(t, err, "Fingerprinting must succeed for internal symlinks")
+	assert.Contains(t, fp, "fp_")
+}
+
+func TestComputeDirectoryContentFingerprint_LimitsAndCancellation(t *testing.T) {
+	sourceDir, err := os.MkdirTemp("", "forgelab-source-limits-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(sourceDir)
+
+	err = os.WriteFile(filepath.Join(sourceDir, "file1.txt"), []byte("1234567890"), 0644)
+	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(sourceDir, "file2.txt"), []byte("1234567890"), 0644)
+	require.NoError(t, err)
+
+	// Test MaxFiles limit
+	_, fileErr := discovery.ComputeDirectoryContentFingerprintWithContext(context.Background(), sourceDir, discovery.FingerprintOptions{
+		MaxFiles: 1,
+	})
+	require.Error(t, fileErr)
+	assert.Contains(t, fileErr.Error(), "maximum file count limit")
+
+	// Test MaxFileSize limit
+	_, sizeErr := discovery.ComputeDirectoryContentFingerprintWithContext(context.Background(), sourceDir, discovery.FingerprintOptions{
+		MaxFileSize: 5,
+	})
+	require.Error(t, sizeErr)
+	assert.Contains(t, sizeErr.Error(), "exceeds maximum file size limit")
+
+	// Test context cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, ctxErr := discovery.ComputeDirectoryContentFingerprintWithContext(ctx, sourceDir)
+	require.Error(t, ctxErr)
+	assert.ErrorIs(t, ctxErr, context.Canceled)
 }
 
 func TestCompose_EnvFileParsingAndOverride(t *testing.T) {

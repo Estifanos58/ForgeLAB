@@ -40,6 +40,9 @@ func connectTestDB(t *testing.T) (*pgxpool.Pool, string) {
 
 	pool, err := database.Connect(ctx, dbURL)
 	if err != nil {
+		if os.Getenv("REQUIRE_INTEGRATION_DB") != "" {
+			t.Fatalf("Required database connection failed for integration test: %v", err)
+		}
 		t.Skipf("Skipping integration test; cannot connect to database at %s: %v", dbURL, err)
 		return nil, ""
 	}

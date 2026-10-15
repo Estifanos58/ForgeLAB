@@ -112,22 +112,25 @@ Verify user registration, login, authenticated requests, cookie/token handling, 
 1. Navigate to `http://localhost:3000/register`.
 2. Register a new user with email `test-user-1@example.com` and password `Password123!`.
 3. Confirm redirection to `http://localhost:3000/dashboard`.
-4. Open Browser DevTools → Application → Local Storage; verify `forgelab_token` is present.
-5. In DevTools → Network, inspect request to `/api/auth/me`; verify status is `200 OK` and returns user object.
-6. Click the "Logout" button on the dashboard.
-7. Verify redirection to `http://localhost:3000/login`, and verify `forgelab_token` is removed from Local Storage.
-8. Attempt to navigate directly to `http://localhost:3000/dashboard`; verify client immediately redirects to `/login`.
-9. In `/login`, attempt login with wrong password `WrongPassword!`; verify error banner displays "invalid email or password".
-10. Log in with correct password `Password123!`; verify dashboard loads successfully.
+4. Open Browser DevTools → Application → Cookies (`http://localhost:3000`); verify `forgelab_access_token` and `forgelab_refresh_token` are set as `HttpOnly`, `SameSite=Lax` cookies. Verify that no tokens are stored in `localStorage` or `sessionStorage`.
+5. In DevTools → Network, inspect request to `/api/auth/me`; verify status is `200 OK` and returns user object (browser automatically includes cookies with requests).
+6. **Refresh Token Rotation Check:** Send `POST /api/auth/refresh` via DevTools console or API client; verify status is `200 OK`, a new access token and rotated refresh token are set in cookies, and replaying the old refresh token fails with `401 Unauthorized`.
+7. Click the "Logout" button on the dashboard.
+8. Verify redirection to `http://localhost:3000/login`, and verify `forgelab_access_token` and `forgelab_refresh_token` cookies are cleared (expired).
+9. Attempt to navigate directly to `http://localhost:3000/dashboard`; verify client immediately redirects to `/login`.
+10. In `/login`, attempt login with wrong password `WrongPassword!`; verify error banner displays "invalid email or password".
+11. Log in with correct password `Password123!`; verify dashboard loads successfully.
 
 #### Expected Result
 - Clean registration and login transitions.
-- Auth token stored in localStorage and sent via Bearer headers.
+- Auth tokens strictly managed via secure HttpOnly cookies (`forgelab_access_token`, `forgelab_refresh_token`), zero tokens in localStorage/sessionStorage.
+- Atomic, single-use refresh token rotation with replay detection.
 - Direct protected page access redirects unauthenticated users to `/login`.
 
 #### Failure Conditions
-- Registration returns 500 or fails to set token.
+- Registration returns 500 or fails to set HttpOnly cookies.
 - Invalid credentials log user in.
+- Tokens stored in client-accessible localStorage/sessionStorage.
 - Protected routes allow unauthenticated rendering.
 
 #### What to Inspect if it Fails
@@ -253,17 +256,18 @@ Verify that users can import projects from both their local computer (direct fil
 2. Click "Validate Directory".
 3. Verify an error alert is displayed explaining that the path is restricted or outside configured roots.
 4. Verify project creation is blocked.
-1. Prepare a test zip archive containing an entry with relative traversal (e.g. `../../etc/evil.txt`).
-2. Make a direct API upload request:
+5. Prepare a test zip archive containing an entry with relative traversal (e.g. `../../etc/evil.txt`).
+6. Make a direct API upload request:
    ```bash
+   # Session cookies from browser or explicit auth header:
    curl -i -X POST http://localhost:8080/api/sources/upload \
-     -H "Authorization: Bearer <user1-token>" \
+     -b "forgelab_access_token=<access-token>" \
      -F "archive=@traversal-test.zip"
    ```
-3. Verify response status: `422 Unprocessable Entity` or `400 Bad Request` with message `path traversal detected in source archive`.
-4. Inspect `data/sources/` on the server to verify the directory was purged immediately.
+7. Verify response status: `422 Unprocessable Entity` or `400 Bad Request` with message `path traversal detected in source archive`.
+8. Inspect `data/sources/` on the server to verify the directory was purged immediately.
 
-#### Test Procedure — Part C: GitHub Repository Authorization & Import
+#### Test Procedure — Part D: GitHub Repository Authorization & Import
 1. In ForgeLAB, click "+ Create Project" and select the **"Import from GitHub"** tab.
 2. If GitHub repository permissions have not yet been granted:
    - Verify an informative banner explains repository permission requirements.
@@ -282,7 +286,37 @@ Verify that users can import projects from both their local computer (direct fil
 9. Click **"Create & Deploy Project"**.
 10. Verify project is created in PostgreSQL with `source_type: "github"` and `source_reference: "<owner>/<repo>"`.
 
-#### Test Procedure — Part D: Cross-User Ownership Isolation
+#### Test Procedure — Part E: Local Agent Mode Connector
+1. Select the **"Local Agent"** import option.
+2. Verify pairing token is generated and encrypted at rest using AES-256-GCM.
+3. Start the local agent CLI (`forgelab-agent connect --token <token>`).
+4. Verify mutual TLS or token authentication establishes the streaming reverse tunnel.
+5. Verify source discovery and deployment build stream directly from the agent without persisting plain credentials.
+
+#### Test Procedure — Part F: Immutable Source Snapshot & Plan Invalidation Verification
+1. Create a project and perform source discovery to generate a reviewed deployment plan:
+   - Verify `GET /api/projects/:id/discovery` returns the service topology, detected commands, and authoritative `content_fingerprint`.
+   - Verify the deployment plan's `source_revision` matches this fingerprint.
+2. **Modify Source After Review:** Before triggering deployment, modify or add a file in the project's source directory (e.g. edit `package.json` or add `test.txt`).
+3. Trigger deployment: `POST /api/deployments` with `{ "project_id": "<id>" }`.
+4. Observe the response:
+   - Backend calculates the new content fingerprint, detects mismatch (`fp != plan.SourceRevision`).
+   - Backend clears the stale plan (`deployment_plan = '{}'::jsonb`).
+   - Backend rejects the deployment with HTTP 409 Conflict: `source files have changed since deployment plan was reviewed; please re-run discovery and review the updated deployment plan`.
+5. Verify that deployment cannot build content different from the reviewed revision.
+6. Re-run discovery, review the updated plan, and trigger deployment: verify deployment succeeds.
+
+#### Test Procedure — Part G: Hardened Fingerprinting & External Symlink Protection
+1. Inside an approved local repository, create a symlink pointing outside the source boundary:
+   ```bash
+   ln -s /etc/passwd ./leak.txt    # Linux/macOS
+   # On Windows: mklink leak.txt C:\Windows\System32\drivers\etc\hosts
+   ```
+2. Trigger directory validation or fingerprint calculation (`POST /api/sources/local/validate` or discovery).
+3. Verify that ForgeLAB rejects the symlink or canonicalizes the path, detects that it resolves outside the root, and returns an error without following or reading external files.
+4. Verify directory traversal and size limits safely abort processing on maliciously nested directories or symlink loops.
+
+#### Test Procedure — Part H: Cross-User Ownership Isolation
 1. Copy the project UUID created by User 1.
 2. In User 2's Incognito browser, log in and verify User 1's project is not shown on the dashboard.
 3. Attempt to fetch User 1's project: `GET /api/projects/<user-1-project-uuid>`.
@@ -291,9 +325,10 @@ Verify that users can import projects from both their local computer (direct fil
 6. Verify User 2 does NOT see User 1's GitHub repositories or credentials.
 
 #### Expected Result
-- Local computer uploads extract cleanly to isolated workspaces without host-path dependencies.
+- All source import types (`local_directory`, `local_upload`, `github`, `local_agent`) function reliably with isolated boundaries.
+- Stale or tampered deployment plans are invalidated immediately upon content modification.
+- External symlinks cannot escape the approved source root or leak host files.
 - Path traversal and Zip Slip attacks are blocked.
-- GitHub integration allows seamless repo/branch selection without manual URL pasting.
 - User data and repository grants remain strictly isolated per user.
 
 #### Verification Record
@@ -533,11 +568,14 @@ Verify that WebSocket channels are strictly isolated by UUID and that logs or st
 3. Observe Window 2: Verify that **zero** log lines, status changes, or deployment events from Project A appear in Window 2's terminal.
 4. Trigger a deployment on Project B in Window 2.
 5. Verify Window 2 receives Project B logs and Window 1 receives no cross-project noise.
-6. In Window 1's browser DevTools Console, execute an unauthorized subscription:
+6. In Window 1's browser DevTools Console, execute an unauthorized subscription (cookies are automatically passed via the same-origin Next.js WebSocket proxy, or using a standalone WebSocket client with query parameter token fallback):
    ```javascript
-   const ws = new WebSocket(`ws://localhost:8080/api/ws?token=${localStorage.getItem('forgelab_token')}`);
+   // In browser console on http://localhost:3000 (authenticated session cookies forwarded):
+   const ws = new WebSocket('ws://localhost:3000/api/ws');
+   // For direct backend port testing:
+   // const ws = new WebSocket('ws://localhost:8080/api/ws?token=<accessToken>');
    ws.onopen = () => ws.send(JSON.stringify({ type: 'subscribe', channel: 'project:00000000-0000-0000-0000-000000000000' }));
-   ws.onmessage = (e) => console.log('WS msg:', e.data);
+   ws.onmessage = (e) => console.log('WS msg:', JSON.parse(e.data));
    ```
 7. Verify the server returns:
    ```json

@@ -133,9 +133,8 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 		workspaceDir = canonicalPath
 		fp, fpErr := discovery.ComputeLightweightDirectoryFingerprint(canonicalPath)
 		if fpErr != nil {
-			slog.Warn("failed to compute deterministic directory fingerprint", "path", canonicalPath, "error", fpErr)
-			hash := sha256.Sum256([]byte(fmt.Sprintf("dir:%s", canonicalPath)))
-			fp = fmt.Sprintf("fp_%s", hex.EncodeToString(hash[:16]))
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to compute source directory fingerprint: %v", fpErr))
+			return
 		}
 		sourceRevision = fp
 
@@ -161,9 +160,8 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 		workspaceDir = p
 		fp, fpErr := discovery.ComputeDirectoryContentFingerprint(p)
 		if fpErr != nil {
-			slog.Warn("failed to compute deterministic upload fingerprint", "path", p, "error", fpErr)
-			hash := sha256.Sum256([]byte(fmt.Sprintf("upload:%s", sourceUUID.String())))
-			fp = fmt.Sprintf("fp_%s", hex.EncodeToString(hash[:16]))
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to compute uploaded source fingerprint: %v", fpErr))
+			return
 		}
 		sourceRevision = fp
 

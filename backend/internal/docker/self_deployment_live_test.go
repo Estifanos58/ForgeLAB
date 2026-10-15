@@ -109,6 +109,8 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	t.Log("Ensuring dependencies for reproducible execution...")
 	ensureImageAvailable("postgres:16-alpine")
 	ensureImageAvailable("redis:7-alpine")
+	ensureImageAvailable("golang:alpine")
+	ensureImageAvailable("alpine:3.19")
 	ensureFrontendImage()
 
 	// -------------------------------------------------------------------------

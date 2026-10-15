@@ -795,6 +795,9 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 // ListBranches retrieves branches for a specific repository.
 func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owner, repo string) ([]GitHubBranch, error) {
 	token, tokenErr := s.getDecryptedToken(ctx, userID)
+	if tokenErr != nil {
+		return nil, tokenErr
+	}
 
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/branches?per_page=100", url.PathEscape(owner), url.PathEscape(repo))
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
@@ -860,6 +863,9 @@ func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owne
 // DetectRepo queries file indicators on GitHub and performs runtime detection.
 func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner, repo, branch, rootDir string) (*detector.DetectionResult, error) {
 	token, tokenErr := s.getDecryptedToken(ctx, userID)
+	if tokenErr != nil {
+		return nil, tokenErr
+	}
 
 	if branch == "" {
 		branch = "main"
@@ -948,6 +954,9 @@ func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner,
 // ResolveCommitSHA resolves a branch/ref to the exact 40-character commit SHA.
 func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, owner, repo, ref string) (string, error) {
 	token, tokenErr := s.getDecryptedToken(ctx, userID)
+	if tokenErr != nil {
+		return "", tokenErr
+	}
 	if ref == "" {
 		ref = "main"
 	}

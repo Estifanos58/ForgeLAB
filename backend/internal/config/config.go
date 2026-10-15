@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -165,31 +167,56 @@ func Load() (*Config, error) {
 	}
 
 	jwtSecret := getEnv("JWT_SECRET", "")
-	if jwtSecret == "" {
-		return nil, fmt.Errorf("JWT_SECRET is required")
-	}
-
 	envMode := strings.ToLower(getEnv("APP_ENV", getEnv("FORGELAB_ENV", getEnv("ENV", "development"))))
 	isDev := envMode == "development" || envMode == "dev" || envMode == "local" || envMode == "test"
 
-	dbURL := getEnv("DATABASE_URL", "postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable")
-	encKey := getEnv("FORGELAB_ENCRYPTION_KEY", "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=")
+	// 1. Validate JWT Secret
+	if err := validateJWTSecret(jwtSecret, isDev, envMode); err != nil {
+		return nil, err
+	}
 
-	// Validate encryption key length in all environments
+	// 2. Validate Database URL & credentials
+	if !isDev {
+		if _, ok := os.LookupEnv("DATABASE_URL"); !ok {
+			return nil, fmt.Errorf("%s configuration error: default development database password (forgelab_dev_password) is not allowed in %s mode; DATABASE_URL must be explicitly configured", envMode, envMode)
+		}
+	}
+	dbURL := getEnv("DATABASE_URL", "postgres://forgelab:forgelab_dev_password@localhost:5432/forgelab?sslmode=disable")
+	if err := validateDatabaseURL(dbURL, isDev, envMode); err != nil {
+		return nil, err
+	}
+
+	// 3. Validate Redis URL if configured
+	redisURL := getEnv("REDIS_URL", "redis://localhost:6379/0")
+	if err := validateRedisURL(redisURL); err != nil {
+		return nil, err
+	}
+
+	// 4. Validate Encryption Key
+	encKey := getEnv("FORGELAB_ENCRYPTION_KEY", "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=")
 	if _, err := crypto.ParseKey(encKey); err != nil {
 		return nil, fmt.Errorf("invalid FORGELAB_ENCRYPTION_KEY: %w", err)
 	}
 
+	// 5. Validate Trusted Proxies
+	trustedProxies := parseStringSlice(getEnv("RATE_LIMIT_TRUSTED_PROXIES", ""))
+	if err := validateTrustedProxies(trustedProxies, isDev, envMode); err != nil {
+		return nil, err
+	}
+
+	defaultFrontend := "http://localhost:3000"
+	defaultCORS := "http://localhost:3000"
 	if !isDev {
-		if _, ok := os.LookupEnv("DATABASE_URL"); !ok || strings.Contains(dbURL, "forgelab_dev_password") {
-			return nil, fmt.Errorf("%s configuration error: default development database password (forgelab_dev_password) is not allowed in %s mode; DATABASE_URL must be explicitly configured", envMode, envMode)
-		}
+		defaultFrontend = ""
+		defaultCORS = ""
+	}
+
+	frontendURL := getEnv("FRONTEND_URL", defaultFrontend)
+	corsOrigins := getEnv("CORS_ALLOWED_ORIGINS", defaultCORS)
+
+	if !isDev {
 		if _, ok := os.LookupEnv("FORGELAB_ENCRYPTION_KEY"); !ok || encKey == "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=" {
 			return nil, fmt.Errorf("%s configuration error: default development encryption key is not allowed in %s mode; FORGELAB_ENCRYPTION_KEY must be explicitly configured", envMode, envMode)
-		}
-		if jwtSecret == "dev-jwt-secret-change-in-production" || jwtSecret == "your-super-secret-jwt-key" ||
-			jwtSecret == "example-jwt-secret" || len(jwtSecret) < 32 {
-			return nil, fmt.Errorf("%s configuration error: JWT_SECRET must be a secure random secret of at least 32 characters in %s mode", envMode, envMode)
 		}
 		if err := crypto.ValidateProductionKey(encKey); err != nil {
 			return nil, fmt.Errorf("%s configuration error: %w", envMode, err)
@@ -201,9 +228,8 @@ func Load() (*Config, error) {
 		if logLevel == "debug" {
 			return nil, fmt.Errorf("%s configuration error: LOG_LEVEL cannot be 'debug' in %s mode to prevent sensitive data leakage", envMode, envMode)
 		}
-		trustedProxies := parseStringSlice(getEnv("RATE_LIMIT_TRUSTED_PROXIES", ""))
-		if len(trustedProxies) == 0 {
-			return nil, fmt.Errorf("%s configuration error: RATE_LIMIT_TRUSTED_PROXIES must be configured with at least one trusted reverse proxy IP/CIDR in %s mode", envMode, envMode)
+		if err := validateFrontendAndCORS(frontendURL, corsOrigins, envMode); err != nil {
+			return nil, err
 		}
 		allowedRoots := parseStringSlice(getEnv("FORGELAB_ALLOWED_SOURCE_ROOTS", ""))
 		if len(allowedRoots) == 0 {
@@ -226,13 +252,6 @@ func Load() (*Config, error) {
 				}
 			}
 		}
-	}
-
-	defaultFrontend := "http://localhost:3000"
-	defaultCORS := "http://localhost:3000"
-	if !isDev {
-		defaultFrontend = ""
-		defaultCORS = ""
 	}
 
 	cfg := &Config{
@@ -273,8 +292,8 @@ func Load() (*Config, error) {
 		},
 		App: AppConfig{
 			Environment:        envMode,
-			FrontendURL:        getEnv("FRONTEND_URL", defaultFrontend),
-			CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", defaultCORS),
+			FrontendURL:        frontendURL,
+			CORSAllowedOrigins: corsOrigins,
 			CookieSecure:       getEnv("COOKIE_SECURE", "false") == "true",
 		},
 		Google: OAuthConfig{
@@ -359,4 +378,168 @@ func defaultMaxConcurrentBuilds() int {
 		return 4
 	}
 	return n
+}
+
+func validateDatabaseURL(rawURL string, isDev bool, envMode string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return fmt.Errorf("DATABASE_URL is required")
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid DATABASE_URL: %w", err)
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "postgres" && scheme != "postgresql" {
+		return fmt.Errorf("invalid DATABASE_URL scheme %q (must be postgres:// or postgresql://)", u.Scheme)
+	}
+
+	if u.Host == "" {
+		return fmt.Errorf("invalid DATABASE_URL: host and port must be specified")
+	}
+
+	if !isDev {
+		if u.User == nil || u.User.Username() == "" {
+			return fmt.Errorf("%s configuration error: DATABASE_URL must specify a database username in %s mode", envMode, envMode)
+		}
+		pass, hasPass := u.User.Password()
+		if !hasPass || pass == "" {
+			return fmt.Errorf("%s configuration error: DATABASE_URL must specify a password in %s mode", envMode, envMode)
+		}
+		lowerPass := strings.ToLower(pass)
+		if strings.Contains(rawURL, "forgelab_dev_password") ||
+			lowerPass == "password" || lowerPass == "postgres" ||
+			lowerPass == "admin" || lowerPass == "root" ||
+			lowerPass == "123456" || lowerPass == "test" {
+			return fmt.Errorf("%s configuration error: default development database password (forgelab_dev_password) is not allowed in %s mode; DATABASE_URL must be explicitly configured", envMode, envMode)
+		}
+	}
+	return nil
+}
+
+func validateRedisURL(rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid REDIS_URL: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "redis" && scheme != "rediss" {
+		return fmt.Errorf("invalid REDIS_URL scheme %q (must be redis:// or rediss://)", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid REDIS_URL: host must be specified")
+	}
+	return nil
+}
+
+func validateJWTSecret(secret string, isDev bool, envMode string) error {
+	if strings.TrimSpace(secret) == "" {
+		return fmt.Errorf("JWT_SECRET is required")
+	}
+	if !isDev {
+		if len(secret) < 32 {
+			return fmt.Errorf("%s configuration error: JWT_SECRET must be a secure random secret of at least 32 characters in %s mode", envMode, envMode)
+		}
+		lower := strings.ToLower(secret)
+		if secret == "dev-jwt-secret-change-in-production" ||
+			secret == "your-super-secret-jwt-key" ||
+			secret == "example-jwt-secret" ||
+			strings.Contains(lower, "change-in-prod") ||
+			strings.Contains(lower, "changeme") ||
+			strings.Contains(lower, "default-jwt") ||
+			strings.Contains(lower, "example-jwt") ||
+			strings.Contains(lower, "super-secret") ||
+			strings.Contains(lower, "password") ||
+			strings.Contains(lower, "forgelab") ||
+			strings.Contains(lower, "123456") ||
+			strings.Contains(lower, "1234567890") ||
+			strings.Contains(lower, "abcdefgh") ||
+			strings.Contains(lower, "qwerty") ||
+			strings.Contains(lower, "admin") {
+			return fmt.Errorf("%s configuration error: JWT_SECRET must be a secure random secret of at least 32 characters in %s mode", envMode, envMode)
+		}
+		uniqueChars := make(map[rune]struct{})
+		for _, r := range secret {
+			uniqueChars[r] = struct{}{}
+		}
+		if len(uniqueChars) < 8 {
+			return fmt.Errorf("%s configuration error: JWT_SECRET has insufficient entropy (must contain at least 8 unique characters) in %s mode", envMode, envMode)
+		}
+	}
+	return nil
+}
+
+func validateTrustedProxies(proxies []string, isDev bool, envMode string) error {
+	if !isDev && len(proxies) == 0 {
+		return fmt.Errorf("%s configuration error: RATE_LIMIT_TRUSTED_PROXIES must be configured with at least one trusted reverse proxy IP/CIDR in %s mode", envMode, envMode)
+	}
+	for _, p := range proxies {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		if net.ParseIP(trimmed) == nil {
+			if _, _, err := net.ParseCIDR(trimmed); err != nil {
+				if !isDev {
+					return fmt.Errorf("%s configuration error: invalid trusted proxy IP address or CIDR %q", envMode, trimmed)
+				}
+				return fmt.Errorf("invalid trusted proxy IP address or CIDR %q in RATE_LIMIT_TRUSTED_PROXIES", trimmed)
+			}
+		}
+	}
+	return nil
+}
+
+func validateFrontendAndCORS(frontendURL, corsAllowed, envMode string) error {
+	trimmedFE := strings.TrimSpace(frontendURL)
+	if trimmedFE == "" {
+		return fmt.Errorf("%s configuration error: FRONTEND_URL must be explicitly configured in %s mode", envMode, envMode)
+	}
+	if strings.HasSuffix(trimmedFE, "/") {
+		return fmt.Errorf("%s configuration error: FRONTEND_URL %q must not contain a trailing slash", envMode, trimmedFE)
+	}
+	u, err := url.Parse(trimmedFE)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("%s configuration error: FRONTEND_URL %q is not a valid absolute http/https URL", envMode, trimmedFE)
+	}
+	if (envMode == "production" || envMode == "staging") && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1") {
+		return fmt.Errorf("%s configuration error: FRONTEND_URL %q cannot use loopback/localhost in %s mode", envMode, trimmedFE, envMode)
+	}
+
+	trimmedCORS := strings.TrimSpace(corsAllowed)
+	if trimmedCORS == "" {
+		return fmt.Errorf("%s configuration error: CORS_ALLOWED_ORIGINS must be explicitly configured in %s mode", envMode, envMode)
+	}
+	origins := strings.Split(trimmedCORS, ",")
+	validCount := 0
+	for _, o := range origins {
+		oTrimmed := strings.TrimSpace(o)
+		if oTrimmed == "" {
+			continue
+		}
+		validCount++
+		if oTrimmed == "*" {
+			return fmt.Errorf("%s configuration error: wildcard origin '*' is not allowed in CORS_ALLOWED_ORIGINS in %s mode", envMode, envMode)
+		}
+		if strings.HasSuffix(oTrimmed, "/") {
+			return fmt.Errorf("%s configuration error: CORS origin %q must not contain trailing slash", envMode, oTrimmed)
+		}
+		oURL, err := url.Parse(oTrimmed)
+		if err != nil || oURL.Host == "" || (oURL.Scheme != "http" && oURL.Scheme != "https") {
+			return fmt.Errorf("%s configuration error: invalid browser origin %q in CORS_ALLOWED_ORIGINS", envMode, oTrimmed)
+		}
+		if (envMode == "production" || envMode == "staging") && (oURL.Hostname() == "localhost" || oURL.Hostname() == "127.0.0.1" || oURL.Hostname() == "::1") {
+			return fmt.Errorf("%s configuration error: CORS origin %q cannot use loopback/localhost in %s mode", envMode, oTrimmed, envMode)
+		}
+	}
+	if validCount == 0 {
+		return fmt.Errorf("%s configuration error: CORS_ALLOWED_ORIGINS must contain at least one valid origin in %s mode", envMode, envMode)
+	}
+	return nil
 }

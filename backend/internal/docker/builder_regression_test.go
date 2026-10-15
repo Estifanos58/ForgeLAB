@@ -624,3 +624,90 @@ func TestRegression_BuildImage_BuildKitNoActiveSession_FallsBackToStandardBuilde
 	logs := strings.Join(logLines, "\n")
 	assert.Contains(t, logs, "BuildKit session unavailable on Docker daemon. Retrying with standard Docker builder...")
 }
+
+func TestRegression_BuildImage_BuildKitRequiresBuildKit_NeverFallsBackToStandardBuilder(t *testing.T) {
+	var buildAttempts int
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_ping", "/v1.41/_ping":
+			w.Header().Set("API-Version", "1.41")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+		case "/build", "/v1.41/build":
+			buildAttempts++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			// Returns "no active session" error
+			_, _ = w.Write([]byte("{\"errorDetail\":{\"message\":\"failed to solve: no active session for session 12345\"},\"error\":\"failed to solve: no active session for session 12345\"}\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockServer.Close()
+
+	cli, err := client.NewClientWithOpts(
+		client.WithHost(mockServer.URL),
+		client.WithHTTPClient(mockServer.Client()),
+		client.WithVersion("1.41"),
+	)
+	require.NoError(t, err)
+	defer cli.Close()
+
+	eng := &Engine{dockerClient: cli, workDir: t.TempDir()}
+
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test-build-*.tar")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	// Dockerfile uses BuildKit-only feature: RUN --mount=type=cache
+	tarData := createTarArchiveWithFiles(t, map[string][]byte{
+		"Dockerfile": []byte("FROM alpine\nRUN --mount=type=cache,target=/root/.cache echo hi\n"),
+	})
+	_, err = tmpFile.Write(tarData)
+	require.NoError(t, err)
+	_, err = tmpFile.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+
+	opts := types.ImageBuildOptions{
+		Tags:       []string{"forgelab/test-no-fallback:latest"},
+		Dockerfile: "Dockerfile",
+		Version:    types.BuilderBuildKit,
+	}
+
+	buildErr := eng.buildImage(context.Background(), tmpFile, opts, nil)
+	require.Error(t, buildErr, "buildImage must return an error when BuildKit fails and BuildKit is required")
+	assert.Contains(t, buildErr.Error(), "no active session")
+	assert.Equal(t, 1, buildAttempts, "must not attempt fallback with standard builder when BuildKit instructions are required")
+}
+
+func TestRegression_EnsureStreamingTransport_NegotiatesAPIVersion(t *testing.T) {
+	var pingCalled bool
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/_ping"):
+			pingCalled = true
+			w.Header().Set("API-Version", "1.42")
+			w.Header().Set("Builder-Version", "2")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer mockServer.Close()
+
+	cli, err := client.NewClientWithOpts(
+		client.WithHost(mockServer.URL),
+		client.WithHTTPClient(mockServer.Client()),
+		client.WithAPIVersionNegotiation(),
+	)
+	require.NoError(t, err)
+	defer cli.Close()
+
+	eng := &Engine{dockerClient: cli, workDir: t.TempDir()}
+	eng.ensureStreamingTransport()
+
+	require.NotNil(t, eng.dockerClient)
+	assert.True(t, pingCalled, "ensureStreamingTransport must trigger API-version negotiation against daemon")
+	assert.Equal(t, "1.42", eng.dockerClient.ClientVersion(), "ClientVersion must be negotiated to daemon version")
+}
