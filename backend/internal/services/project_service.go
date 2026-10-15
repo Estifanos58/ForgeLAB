@@ -43,6 +43,7 @@ type ProjectService struct {
 	githubService  *GitHubService
 	serviceService *ServiceService
 	secretService  *SecretService
+	deploymentService *DeploymentService
 }
 
 // NewProjectService creates a new ProjectService.
@@ -74,6 +75,10 @@ func (s *ProjectService) SetServiceService(ss *ServiceService) {
 
 func (s *ProjectService) SetSecretService(sec *SecretService) {
 	s.secretService = sec
+}
+
+func (s *ProjectService) SetDeploymentService(ds *DeploymentService) {
+	s.deploymentService = ds
 }
 
 type CreateServiceInput struct {
@@ -768,6 +773,13 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID, pa
 			}
 		}
 		p.Services = svcs
+		if len(svcs) > 0 {
+			derivedStatus := CalculateProjectStatus(svcs)
+			if p.Status != models.ProjectStatusDeploying && p.Status != models.ProjectStatusDeleting && p.Status != derivedStatus {
+				p.Status = derivedStatus
+				_ = s.UpdateProjectStatus(ctx, p.ID, derivedStatus)
+			}
+		}
 		s.populateProjectPreviewURL(p)
 	}
 
@@ -931,16 +943,53 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 }
 
 // DeleteProject deletes a project and its associated resources.
-func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID uuid.UUID, cleanupFunc func(ctx context.Context, projectID uuid.UUID)) error {
+// It is idempotent and error-aware: if cleanup fails, it does NOT permanently delete
+// the database records, but leaves the project in a retryable failed state.
+func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID uuid.UUID, cleanupFunc func(ctx context.Context, projectID uuid.UUID) error) error {
 	project, err := s.GetProject(ctx, projectID, ownerID)
 	if err != nil {
 		return err
 	}
 
-	if cleanupFunc != nil {
-		cleanupFunc(ctx, project.ID)
+	// 1. Mark project as deleting in DB so no deployments can be created or queued
+	_, _ = s.db.Exec(ctx, "UPDATE projects SET status = $1, updated_at = NOW() WHERE id = $2", models.ProjectStatusDeleting, project.ID)
+
+	// 2. Drain / cancel active or queued deployments
+	if s.deploymentService != nil {
+		_ = s.deploymentService.CancelAllProjectDeployments(ctx, project.ID)
+	} else if s.db != nil {
+		now := time.Now()
+		reason := "Project deletion in progress"
+		_, _ = s.db.Exec(ctx,
+			`UPDATE deployments SET
+			 status = $1, failure_reason = $2, finished_at = $3
+			 WHERE project_id = $4 AND status IN ($5, $6, $7, $8, $9)`,
+			models.DeployStatusFailed, reason, now, project.ID,
+			models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
+			models.DeployStatusStarting, models.DeployStatusHealthChecking,
+		)
+		_, _ = s.db.Exec(ctx,
+			`UPDATE service_deployments SET
+			 status = $1, failure_reason = $2, finished_at = $3
+			 WHERE service_id IN (SELECT id FROM services WHERE project_id = $4)
+			   AND status IN ($5, $6, $7, $8, $9)`,
+			models.DeployStatusFailed, reason, now, project.ID,
+			models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
+			models.DeployStatusStarting, models.DeployStatusHealthChecking,
+		)
 	}
 
+	// 3. Error-aware resource cleanup
+	if cleanupFunc != nil {
+		if err := cleanupFunc(ctx, project.ID); err != nil {
+			slog.Error("resource cleanup failed during project deletion", "project_id", project.ID, "error", err)
+			// Do not permanently delete project records when cleanup fails; provide a retryable cleanup path.
+			_, _ = s.db.Exec(ctx, "UPDATE projects SET status = $1, updated_at = NOW() WHERE id = $2", models.ProjectStatusFailed, project.ID)
+			return fmt.Errorf("cleanup failed: %w (project preserved for retry)", err)
+		}
+	}
+
+	// 4. Cleanup succeeded: permanently remove project records
 	_, err = s.db.Exec(ctx, "DELETE FROM projects WHERE id = $1", project.ID)
 	if err != nil {
 		return fmt.Errorf("failed to delete project: %w", err)
@@ -1003,6 +1052,13 @@ func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, pro
 			}
 		}
 		p.Services = svcs
+		if len(svcs) > 0 {
+			derivedStatus := CalculateProjectStatus(svcs)
+			if p.Status != models.ProjectStatusDeploying && p.Status != models.ProjectStatusDeleting && p.Status != derivedStatus {
+				p.Status = derivedStatus
+				_ = s.UpdateProjectStatus(ctx, p.ID, derivedStatus)
+			}
+		}
 	}
 	s.populateProjectPreviewURL(p)
 	return p, nil
@@ -1044,7 +1100,7 @@ func (s *ProjectService) resolveAuthoritativeHost() string {
 	return "localhost"
 }
 
-func (s *ProjectService) populateProjectPreviewURL(p *models.Project) {
+func (s *ProjectService) PopulateProjectPreviewURL(p *models.Project) {
 	if p == nil {
 		return
 	}
@@ -1054,7 +1110,8 @@ func (s *ProjectService) populateProjectPreviewURL(p *models.Project) {
 	var frontendSvcURL *string
 
 	for _, svc := range p.Services {
-		if svc.HostPort != nil && *svc.HostPort > 0 && svc.PublicExposed {
+		// Only running public services have an active live preview URL
+		if svc.Status == models.ServiceStatusRunning && svc.HostPort != nil && *svc.HostPort > 0 && svc.PublicExposed {
 			urlStr := fmt.Sprintf("http://%s:%d", publicHost, *svc.HostPort)
 			svc.PreviewURL = &urlStr
 
@@ -1063,6 +1120,8 @@ func (s *ProjectService) populateProjectPreviewURL(p *models.Project) {
 			} else if primarySvcURL == nil {
 				primarySvcURL = &urlStr
 			}
+		} else {
+			svc.PreviewURL = nil
 		}
 	}
 
@@ -1070,10 +1129,16 @@ func (s *ProjectService) populateProjectPreviewURL(p *models.Project) {
 		p.PreviewURL = frontendSvcURL
 	} else if primarySvcURL != nil {
 		p.PreviewURL = primarySvcURL
-	} else if p.Port != nil && *p.Port > 0 {
+	} else if p.Status == models.ProjectStatusRunning && p.Port != nil && *p.Port > 0 {
 		urlStr := fmt.Sprintf("http://%s:%d", publicHost, *p.Port)
 		p.PreviewURL = &urlStr
+	} else {
+		p.PreviewURL = nil
 	}
+}
+
+func (s *ProjectService) populateProjectPreviewURL(p *models.Project) {
+	s.PopulateProjectPreviewURL(p)
 }
 
 func generateSlug(name string) string {

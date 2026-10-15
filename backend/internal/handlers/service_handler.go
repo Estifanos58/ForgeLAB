@@ -215,6 +215,10 @@ func (h *ServiceHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "a deployment is already in progress for this service")
 			return
 		}
+		if errors.Is(err, services.ErrProjectDeleting) {
+			writeError(w, http.StatusConflict, "project deletion is in progress")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to create service deployment: "+err.Error())
 		return
 	}

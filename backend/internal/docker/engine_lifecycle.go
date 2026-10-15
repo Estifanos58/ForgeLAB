@@ -95,7 +95,7 @@ func (e *Engine) getProjectByID(ctx context.Context, projectID uuid.UUID) (*mode
 	return e.projectService.GetProjectByIDWithoutOwnership(ctx, projectID)
 }
 
-// StopApp stops the currently running container for a project.
+// StopApp stops the currently running containers for a project.
 func (e *Engine) StopApp(ctx context.Context, projectID, ownerID uuid.UUID) error {
 	project, err := e.projectService.GetProject(ctx, projectID, ownerID)
 	if err != nil {
@@ -106,26 +106,37 @@ func (e *Engine) StopApp(ctx context.Context, projectID, ownerID uuid.UUID) erro
 		return errors.New("project has no active deployment to stop")
 	}
 
+	// 1. Stop legacy deployment container if present
 	deployment, err := e.deploymentService.GetDeployment(ctx, *project.CurrentDeploymentID)
-	if err != nil {
-		return err
-	}
-
-	if deployment.ContainerID != nil && *deployment.ContainerID != "" {
+	if err == nil && deployment.ContainerID != nil && *deployment.ContainerID != "" {
 		if err := e.dockerClient.ContainerStop(ctx, *deployment.ContainerID, container.StopOptions{}); err != nil {
 			slog.Error("failed to stop container", "container_id", *deployment.ContainerID, "error", err)
 		}
+		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusStopped, nil)
 	}
 
-	_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusStopped, nil)
-	_, _ = e.projectService.UpdateProject(ctx, projectID, ownerID, services.UpdateProjectInput{})
-	_ = e.deploymentService.SetCurrentDeployment(ctx, projectID, deployment.ID, models.ProjectStatusStopped)
+	// 2. Stop all service containers for multi-service configurations
+	if e.serviceService != nil {
+		svcs, _ := e.serviceService.ListServices(ctx, projectID)
+		for _, svc := range svcs {
+			if svc.CurrentServiceDeploymentID != nil {
+				e.StopLogCollector(*svc.CurrentServiceDeploymentID)
+			}
+			if svc.ContainerID != nil && *svc.ContainerID != "" {
+				_ = e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{})
+			}
+			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil)
+		}
+	}
+
+	_, _ = e.recalculateAndUpdateProjectStatus(ctx, projectID)
+	_ = e.deploymentService.SetCurrentDeployment(ctx, projectID, *project.CurrentDeploymentID, models.ProjectStatusStopped)
 
 	slog.Info("project app stopped", "project_id", projectID)
 	return nil
 }
 
-// StartApp starts the stopped container for a project.
+// StartApp starts the stopped containers for a project.
 func (e *Engine) StartApp(ctx context.Context, projectID, ownerID uuid.UUID) error {
 	project, err := e.projectService.GetProject(ctx, projectID, ownerID)
 	if err != nil {
@@ -136,19 +147,30 @@ func (e *Engine) StartApp(ctx context.Context, projectID, ownerID uuid.UUID) err
 		return errors.New("project has no active deployment to start")
 	}
 
+	// 1. Start legacy deployment container if present
 	deployment, err := e.deploymentService.GetDeployment(ctx, *project.CurrentDeploymentID)
-	if err != nil {
-		return err
-	}
-
-	if deployment.ContainerID != nil && *deployment.ContainerID != "" {
+	if err == nil && deployment.ContainerID != nil && *deployment.ContainerID != "" {
 		if err := e.dockerClient.ContainerStart(ctx, *deployment.ContainerID, container.StartOptions{}); err != nil {
 			return fmt.Errorf("failed to start container: %w", err)
 		}
+		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusRunning, nil)
 	}
 
-	_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusRunning, nil)
-	_ = e.deploymentService.SetCurrentDeployment(ctx, projectID, deployment.ID, models.ProjectStatusRunning)
+	// 2. Start all service containers for multi-service configurations
+	if e.serviceService != nil {
+		svcs, _ := e.serviceService.ListServices(ctx, projectID)
+		for _, svc := range svcs {
+			if svc.ContainerID != nil && *svc.ContainerID != "" {
+				if err := e.dockerClient.ContainerStart(ctx, *svc.ContainerID, container.StartOptions{}); err != nil {
+					slog.Warn("failed to start service container", "service_id", svc.ID, "error", err)
+				}
+			}
+			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusRunning, nil, nil, nil)
+		}
+	}
+
+	_, _ = e.recalculateAndUpdateProjectStatus(ctx, projectID)
+	_ = e.deploymentService.SetCurrentDeployment(ctx, projectID, *project.CurrentDeploymentID, models.ProjectStatusRunning)
 
 	slog.Info("project app started", "project_id", projectID)
 	return nil
@@ -241,49 +263,160 @@ func (e *Engine) RestartService(ctx context.Context, projectID, serviceID, owner
 	return e.StartService(ctx, projectID, serviceID, ownerID)
 }
 
-// CleanUpProjectContainers stops and removes all containers associated with a project before deletion.
+// CleanUpProjectContainers is a backward-compatible wrapper calling CleanUpProjectResources.
 func (e *Engine) CleanUpProjectContainers(ctx context.Context, projectID uuid.UUID) {
+	_ = e.CleanUpProjectResources(ctx, projectID)
+}
+
+// CleanUpProjectResources stops and removes all containers, images, and networks owned by a project.
+// It is idempotent, error-aware, and safely ignores already-removed resources.
+// It never touches Compose infrastructure containers, persistent volumes, or unrelated images.
+func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUID) error {
 	if e.dockerClient == nil {
-		return
+		return nil
 	}
 
-	// 1. Clean up legacy single-container deployment containers
+	var cleanupErrs []error
+	projIDStr := projectID.String()
+
+	// 1. Gather all containers owned by this project (including orphaned containers)
+	knownContainerIDs := make(map[string]bool)
 	if e.deploymentService != nil {
-		deployments, err := e.deploymentService.ListDeployments(ctx, projectID)
-		if err == nil {
+		if deployments, err := e.deploymentService.ListDeployments(ctx, projectID); err == nil {
 			for _, d := range deployments {
 				if d.ContainerID != nil && *d.ContainerID != "" {
-					_ = e.dockerClient.ContainerStop(ctx, *d.ContainerID, container.StopOptions{})
-					_ = e.dockerClient.ContainerRemove(ctx, *d.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+					knownContainerIDs[*d.ContainerID] = true
+				}
+			}
+		}
+	}
+	if e.serviceService != nil {
+		if svcs, err := e.serviceService.ListServices(ctx, projectID); err == nil {
+			for _, svc := range svcs {
+				if svc.CurrentServiceDeploymentID != nil {
+					e.StopLogCollector(*svc.CurrentServiceDeploymentID)
+				}
+				if svc.ContainerID != nil && *svc.ContainerID != "" {
+					knownContainerIDs[*svc.ContainerID] = true
 				}
 			}
 		}
 	}
 
-	// 2. Clean up multi-service containers
-	if e.serviceService != nil {
-		svcs, _ := e.serviceService.ListServices(ctx, projectID)
-		for _, svc := range svcs {
-			if svc.ContainerID != nil && *svc.ContainerID != "" {
-				_ = e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{})
-				_ = e.dockerClient.ContainerRemove(ctx, *svc.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+	containers, err := e.dockerClient.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return fmt.Errorf("failed to list containers for project cleanup: %w", err)
+	}
+
+	stopTimeout := 5
+	for _, c := range containers {
+		// NEVER touch Docker Compose infrastructure containers
+		if _, isCompose := c.Labels["com.docker.compose.project"]; isCompose {
+			continue
+		}
+		if _, isComposeService := c.Labels["com.docker.compose.service"]; isComposeService {
+			continue
+		}
+
+		isOwned := false
+		if c.Labels != nil && c.Labels["forgelab.project_id"] == projIDStr {
+			isOwned = true
+		} else if knownContainerIDs[c.ID] || (len(c.ID) > 12 && knownContainerIDs[c.ID[:12]]) {
+			isOwned = true
+		}
+
+		if isOwned {
+			// Stop container (ignore not found or already stopped)
+			_ = e.dockerClient.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &stopTimeout})
+
+			// Remove container with RemoveVolumes: false (Never remove persistent volumes!)
+			remErr := e.dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: false})
+			if remErr != nil && !client.IsErrNotFound(remErr) {
+				slog.Error("failed to remove project container", "container_id", c.ID, "project_id", projIDStr, "error", remErr)
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to remove container %s: %w", c.ID, remErr))
+			} else {
+				slog.Info("removed project container", "container_id", c.ID, "project_id", projIDStr)
 			}
 		}
 	}
 
-	// 3. Clean up project networks
+	// 2. Remove project networks
 	nets, netListErr := e.dockerClient.NetworkList(ctx, dockernetwork.ListOptions{})
-	if netListErr == nil {
-		projPrefix := fmt.Sprintf("forgelab-net-%s", projectID.String())
-		projShortPrefix := fmt.Sprintf("forgelab-net-%s", projectID.String()[:8])
+	if netListErr != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to list networks: %w", netListErr))
+	} else {
+		projPrefix := fmt.Sprintf("forgelab-net-%s", projIDStr)
+		projShortPrefix := fmt.Sprintf("forgelab-net-%s", projIDStr[:8])
 		for _, n := range nets {
-			if (n.Labels != nil && n.Labels["forgelab.project_id"] == projectID.String()) ||
+			isProjectNet := (n.Labels != nil && n.Labels["forgelab.project_id"] == projIDStr) ||
 				strings.HasPrefix(n.Name, projPrefix) ||
-				strings.HasPrefix(n.Name, projShortPrefix) {
-				_ = e.dockerClient.NetworkRemove(ctx, n.ID)
+				strings.HasPrefix(n.Name, projShortPrefix)
+
+			if isProjectNet {
+				remErr := e.dockerClient.NetworkRemove(ctx, n.ID)
+				if remErr != nil && !client.IsErrNotFound(remErr) {
+					slog.Error("failed to remove project network", "network_id", n.ID, "name", n.Name, "error", remErr)
+					cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to remove network %s: %w", n.Name, remErr))
+				} else {
+					slog.Info("removed project network", "network_id", n.ID, "name", n.Name)
+				}
 			}
 		}
 	}
+
+	// 3. Remove project-owned images (including retained rollback images)
+	// Never use global image prune! Remove only images owned by this project.
+	images, imgListErr := e.dockerClient.ImageList(ctx, dockerimage.ListOptions{All: true})
+	if imgListErr != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to list images: %w", imgListErr))
+	} else {
+		projTagPrefix := fmt.Sprintf("forgelab/%s", projIDStr)
+		for _, img := range images {
+			isProjectImage := false
+			if img.Labels != nil && img.Labels["forgelab.project_id"] == projIDStr {
+				isProjectImage = true
+			} else {
+				for _, tag := range img.RepoTags {
+					if strings.HasPrefix(tag, projTagPrefix) {
+						isProjectImage = true
+						break
+					}
+				}
+			}
+
+			if isProjectImage {
+				_, remErr := e.dockerClient.ImageRemove(ctx, img.ID, dockerimage.RemoveOptions{Force: true, PruneChildren: true})
+				if remErr != nil && !client.IsErrNotFound(remErr) {
+					slog.Warn("failed to remove project image", "image_id", img.ID, "error", remErr)
+					cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to remove image %s: %w", img.ID, remErr))
+				} else {
+					slog.Info("removed project image", "image_id", img.ID, "project_id", projIDStr)
+				}
+			}
+		}
+	}
+
+	// 4. Release in-memory port allocations
+	if e.portManager != nil {
+		if activeContainers, err := e.dockerClient.ContainerList(ctx, container.ListOptions{}); err == nil {
+			var runningPorts []int
+			for _, ac := range activeContainers {
+				if ac.State == "running" {
+					for _, p := range ac.Ports {
+						if p.PublicPort > 0 {
+							runningPorts = append(runningPorts, int(p.PublicPort))
+						}
+					}
+				}
+			}
+			e.portManager.ReconcileUsedPorts(runningPorts)
+		}
+	}
+
+	if len(cleanupErrs) > 0 {
+		return errors.Join(cleanupErrs...)
+	}
+	return nil
 }
 
 // ReconcileDaemonContainers reconciles DB container state against Docker daemon state on startup:
@@ -334,7 +467,9 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 		if err != nil {
 			slog.Warn("reconciliation: failed to list active services", "error", err)
 		} else {
+			touchedProjects := make(map[uuid.UUID]bool)
 			for _, svc := range services {
+				touchedProjects[svc.ProjectID] = true
 				if svc.ContainerID == nil || *svc.ContainerID == "" {
 					if svc.Status == models.ServiceStatusRunning {
 						_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil)
@@ -373,6 +508,22 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 					legitimateContainers[dockCont.ID] = true
 					if len(dockCont.ID) > 12 {
 						legitimateContainers[dockCont.ID[:12]] = true
+					}
+				}
+			}
+
+			// Recalculate parent project status for all projects with inspected services
+			for projID := range touchedProjects {
+				_, _ = e.recalculateAndUpdateProjectStatus(ctx, projID)
+			}
+
+			// Also reconcile any project currently marked active in DB whose services may have ceased
+			if e.projectService != nil {
+				if activeProjects, err := e.projectService.ListActiveProjects(ctx); err == nil {
+					for _, p := range activeProjects {
+						if !touchedProjects[p.ID] {
+							_, _ = e.recalculateAndUpdateProjectStatus(ctx, p.ID)
+						}
 					}
 				}
 			}
@@ -757,6 +908,7 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 		return err
 	}
 
+	touchedProjects := make(map[uuid.UUID]bool)
 	for _, svc := range services {
 		if svc.ContainerID == nil || *svc.ContainerID == "" {
 			continue
@@ -770,6 +922,7 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 					_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, "Runtime container terminated or disappeared from Docker daemon")
 				}
 				slog.Warn("continuous health: container not found, marked service failed", "service_id", svc.ID, "container_id", *svc.ContainerID)
+				touchedProjects[svc.ProjectID] = true
 			}
 			continue
 		}
@@ -785,14 +938,27 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 				_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, reason)
 			}
 			slog.Warn("continuous health: container OOM killed", "service_id", svc.ID, "container_id", *svc.ContainerID)
-		} else if !insp.State.Running && insp.State.Status == "exited" && insp.State.ExitCode != 0 {
-			reason := fmt.Sprintf("Container crashed with non-zero exit code (%d)", insp.State.ExitCode)
-			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
-			if svc.CurrentServiceDeploymentID != nil && e.deploymentService != nil {
-				_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, reason)
+			touchedProjects[svc.ProjectID] = true
+		} else if !insp.State.Running {
+			if insp.State.ExitCode != 0 {
+				reason := fmt.Sprintf("Container crashed with non-zero exit code (%d)", insp.State.ExitCode)
+				_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+				if svc.CurrentServiceDeploymentID != nil && e.deploymentService != nil {
+					_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, reason)
+				}
+				slog.Warn("continuous health: container exited with failure", "service_id", svc.ID, "exit_code", insp.State.ExitCode)
+				touchedProjects[svc.ProjectID] = true
+			} else if svc.Status != models.ServiceStatusStopped {
+				// Clean exit code 0 when service was not marked stopped: record intentional/clean stop
+				_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil)
+				slog.Info("continuous health: container exited cleanly (code 0), marked stopped", "service_id", svc.ID)
+				touchedProjects[svc.ProjectID] = true
 			}
-			slog.Warn("continuous health: container exited with failure", "service_id", svc.ID, "exit_code", insp.State.ExitCode)
 		}
+	}
+
+	for projID := range touchedProjects {
+		_, _ = e.recalculateAndUpdateProjectStatus(ctx, projID)
 	}
 
 	return nil

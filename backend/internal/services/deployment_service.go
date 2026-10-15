@@ -26,6 +26,7 @@ var (
 	ErrNoDeploymentToRollback        = errors.New("no previous deployment to rollback to")
 	ErrCannotCancelRunningDeployment = errors.New("cannot cancel a deployment that is already running")
 	ErrDeploymentAlreadyTerminal     = errors.New("deployment is already in a terminal state")
+	ErrProjectDeleting               = errors.New("cannot perform deployment: project deletion is in progress")
 )
 
 // DeploymentService handles deployment-related business logic.
@@ -219,9 +220,13 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 
 	// Lock the project row FOR UPDATE to prevent concurrent creation for the same project
 	var lockedProjectID uuid.UUID
-	err = tx.QueryRow(ctx, "SELECT id FROM projects WHERE id = $1 FOR UPDATE", project.ID).Scan(&lockedProjectID)
+	var currentProjectStatus string
+	err = tx.QueryRow(ctx, "SELECT id, status FROM projects WHERE id = $1 FOR UPDATE", project.ID).Scan(&lockedProjectID, &currentProjectStatus)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lock project row: %w", err)
+	}
+	if currentProjectStatus == models.ProjectStatusDeleting {
+		return nil, ErrProjectDeleting
 	}
 
 	// Check for existing active deployment
@@ -495,6 +500,16 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	// Check if parent project is currently being deleted
+	var parentProjStatus string
+	err = tx.QueryRow(ctx, "SELECT status FROM projects WHERE id = $1", project.ID).Scan(&parentProjStatus)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check project status: %w", err)
+	}
+	if parentProjStatus == models.ProjectStatusDeleting {
+		return nil, ErrProjectDeleting
+	}
 
 	// Lock only the target service row FOR UPDATE to prevent concurrent creation for the exact same service
 	var lockedServiceID uuid.UUID
@@ -2887,4 +2902,41 @@ func (s *DeploymentService) CancelDeployment(ctx context.Context, projectID, dep
 	)
 
 	return tx.Commit(ctx)
+}
+
+// CancelAllProjectDeployments cancels all queued or in-progress parent and service deployments for a project.
+func (s *DeploymentService) CancelAllProjectDeployments(ctx context.Context, projectID uuid.UUID) error {
+	now := time.Now()
+	reason := "Project deletion in progress"
+
+	// Mark queued/active project deployments as failed
+	_, err := s.db.Exec(ctx,
+		`UPDATE deployments SET
+		 status = $1, failure_reason = $2, finished_at = $3,
+		 duration_ms = EXTRACT(EPOCH FROM ($3 - COALESCE(started_at, created_at))) * 1000
+		 WHERE project_id = $4 AND status IN ($5, $6, $7, $8, $9)`,
+		models.DeployStatusFailed, reason, now, projectID,
+		models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
+		models.DeployStatusStarting, models.DeployStatusHealthChecking,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to cancel project deployments: %w", err)
+	}
+
+	// Mark queued/active service deployments as failed
+	_, err = s.db.Exec(ctx,
+		`UPDATE service_deployments SET
+		 status = $1, failure_reason = $2, finished_at = $3,
+		 duration_ms = EXTRACT(EPOCH FROM ($3 - COALESCE(started_at, created_at))) * 1000
+		 WHERE service_id IN (SELECT id FROM services WHERE project_id = $4)
+		   AND status IN ($5, $6, $7, $8, $9)`,
+		models.DeployStatusFailed, reason, now, projectID,
+		models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
+		models.DeployStatusStarting, models.DeployStatusHealthChecking,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to cancel service deployments: %w", err)
+	}
+
+	return nil
 }

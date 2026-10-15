@@ -12,6 +12,7 @@ import {
   FileCode,
   HeartPulse,
   Rocket,
+  RotateCcw,
   Globe,
   Server,
   Cpu,
@@ -78,10 +79,20 @@ export function ServicesSection({
                 loading={isDeployingAll}
                 disabled={isDeployingAll}
                 className="h-8 text-xs px-3 shadow-sm bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500"
-                icon={<Rocket className="w-3.5 h-3.5" />}
+                icon={
+                  (project.current_deployment_id || project.status === 'stopped' || project.status === 'failed') && project.status !== 'running' ? (
+                    <RotateCcw className="w-3.5 h-3.5" />
+                  ) : (
+                    <Rocket className="w-3.5 h-3.5" />
+                  )
+                }
                 title="Trigger a full project release deploying all services"
               >
-                {isDeployingAll ? 'Deploying Release...' : 'Deploy All Services'}
+                {isDeployingAll
+                  ? 'Deploying Release...'
+                  : (project.current_deployment_id || project.status === 'stopped' || project.status === 'failed') && project.status !== 'running'
+                  ? 'Redeploy All Services'
+                  : 'Deploy All Services'}
               </Button>
             </div>
           )}

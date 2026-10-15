@@ -196,9 +196,9 @@ func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var cleanup func(ctx context.Context, id uuid.UUID)
+	var cleanup func(ctx context.Context, id uuid.UUID) error
 	if h.dockerEngine != nil {
-		cleanup = h.dockerEngine.CleanUpProjectContainers
+		cleanup = h.dockerEngine.CleanUpProjectResources
 	}
 
 	err = h.projectService.DeleteProject(r.Context(), projectID, userID, cleanup)
@@ -211,7 +211,7 @@ func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "access denied")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to delete project")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -251,6 +251,10 @@ func (h *ProjectHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, services.ErrActiveDeployment) {
 			writeError(w, http.StatusConflict, "a deployment is already in progress")
+			return
+		}
+		if errors.Is(err, services.ErrProjectDeleting) {
+			writeError(w, http.StatusConflict, "project deletion is in progress")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to create deployment")

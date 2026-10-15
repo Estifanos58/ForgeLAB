@@ -2,13 +2,27 @@ import React from 'react';
 import Link from 'next/link';
 import { Project } from '@/lib/api/types';
 import { Badge } from '@/components/ui/badge';
-import { ExternalLink, GitBranch } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { ExternalLink, GitBranch, Play, RotateCcw } from 'lucide-react';
 
 interface ProjectCardProps {
   project: Project;
+  onRedeploy?: (projectId: string) => void;
+  onStart?: (projectId: string) => void;
+  actionLoading?: string | null;
 }
 
-export function ProjectCard({ project }: ProjectCardProps) {
+export function ProjectCard({
+  project,
+  onRedeploy,
+  onStart,
+  actionLoading,
+}: ProjectCardProps) {
+  const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(project.status);
+  const isRunning = project.status === 'running';
+  const isStopped = project.status === 'stopped';
+  const wasDeployed = Boolean(project.current_deployment_id || project.status === 'stopped' || project.status === 'failed');
+
   return (
     <div className="p-4 rounded-md border border-surface-border bg-surface hover:border-neutral-700 transition-colors flex flex-col justify-between gap-3 text-xs">
       <div>
@@ -37,33 +51,68 @@ export function ProjectCard({ project }: ProjectCardProps) {
         </div>
       </div>
 
-      <div className="pt-2.5 border-t border-surface-border flex items-center justify-between font-mono text-[11px]">
-        <div>
-          {project.status === 'running' && (project.preview_url || project.port) ? (
-            <a
-              href={
-                project.preview_url ||
-                `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`
-              }
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 text-emerald-400 hover:underline"
-            >
-              <span>{project.port ? `:${project.port}` : 'preview'}</span>
-              <ExternalLink className="w-3 h-3" />
-            </a>
-          ) : (
-            <span className="text-neutral-500">—</span>
-          )}
+      <div className="pt-2.5 border-t border-surface-border flex flex-col gap-2 font-mono text-[11px]">
+        <div className="flex items-center justify-between">
+          <div>
+            {project.status === 'running' && (project.preview_url || project.port) ? (
+              <a
+                href={
+                  project.preview_url ||
+                  `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`
+                }
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-emerald-400 hover:underline"
+              >
+                <span>{project.port ? `:${project.port}` : 'preview'}</span>
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            ) : (
+              <span className="text-neutral-500">—</span>
+            )}
+          </div>
+
+          <Link
+            href={`/projects/${project.id}`}
+            className="text-neutral-300 hover:text-white font-medium"
+          >
+            Manage →
+          </Link>
         </div>
 
-        <Link
-          href={`/projects/${project.id}`}
-          className="text-neutral-300 hover:text-white font-medium"
-        >
-          Manage →
-        </Link>
+        {/* Quick Lifecycle Controls on Mobile */}
+        {(isStopped || (wasDeployed && !isRunning)) && (
+          <div className="flex items-center gap-2 pt-1.5 border-t border-surface-border/40 font-sans">
+            {isStopped && onStart && (
+              <Button
+                size="sm"
+                variant="secondary"
+                className="h-7 text-xs px-2 flex-1"
+                loading={actionLoading === 'start'}
+                disabled={actionLoading !== null || isDeploying}
+                onClick={() => onStart(project.id)}
+                icon={<Play className="w-2.5 h-2.5" />}
+              >
+                Start
+              </Button>
+            )}
+            {wasDeployed && !isRunning && onRedeploy && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs px-2 flex-1"
+                loading={actionLoading === 'redeploy'}
+                disabled={actionLoading !== null || isDeploying}
+                onClick={() => onRedeploy(project.id)}
+                icon={<RotateCcw className="w-2.5 h-2.5" />}
+              >
+                Redeploy
+              </Button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 }
+

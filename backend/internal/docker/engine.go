@@ -319,6 +319,17 @@ func (e *Engine) recalculateAndUpdateProjectStatus(ctx context.Context, projectI
 	}
 	newStatus := services.CalculateProjectStatus(svcs)
 	_ = e.projectService.UpdateProjectStatus(ctx, projectID, newStatus)
+	if e.wsHub != nil {
+		projectChannel := fmt.Sprintf("project:%s", projectID.String())
+		_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
+			Type:    "project_status",
+			Channel: projectChannel,
+			Data: map[string]interface{}{
+				"project_id": projectID.String(),
+				"status":     newStatus,
+			},
+		})
+	}
 	return newStatus, nil
 }
 
@@ -385,6 +396,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	project, err := e.getProjectByID(execCtx, service.ProjectID)
 	if err != nil {
 		return fmt.Errorf("failed to get project %s: %w", service.ProjectID, err)
+	}
+
+	if project.Status == models.ProjectStatusDeleting {
+		return errors.New("deployment aborted: project deletion is in progress")
 	}
 
 	// Capture previous service state for safe rollback if health checks or promotion fail
@@ -1117,9 +1132,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 
 		buildLabels := map[string]string{
-			"forgelab.managed":      "true",
-			"forgelab.project_id":   project.ID.String(),
-			"forgelab.service_name": service.Name,
+			"forgelab.managed":               "true",
+			"forgelab.project_id":            project.ID.String(),
+			"forgelab.service_id":            service.ID.String(),
+			"forgelab.service_name":          service.Name,
+			"forgelab.service_deployment_id": serviceDeploy.ID.String(),
 		}
 		if serviceDeploy.DeploymentID != nil {
 			buildLabels["forgelab.deployment_id"] = serviceDeploy.DeploymentID.String()
@@ -1841,6 +1858,10 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	project, err := e.getProjectByID(execCtx, deployment.ProjectID)
 	if err != nil {
 		return fmt.Errorf("failed to get project %s: %w", deployment.ProjectID, err)
+	}
+
+	if project.Status == models.ProjectStatusDeleting {
+		return errors.New("deployment aborted: project deletion is in progress")
 	}
 
 	redactor := logging.NewLogRedactor()

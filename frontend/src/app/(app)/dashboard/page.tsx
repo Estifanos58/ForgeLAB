@@ -12,13 +12,14 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Alert } from '@/components/ui/alert';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Plus, RefreshCw, ExternalLink, GitBranch, FolderGit2 } from 'lucide-react';
+import { Plus, RefreshCw, ExternalLink, GitBranch, FolderGit2, Play, RotateCcw } from 'lucide-react';
 
 export default function DashboardPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [actionLoading, setActionLoading] = useState<Record<string, string | null>>({});
 
   const loadProjects = useCallback(async () => {
     try {
@@ -31,6 +32,30 @@ export default function DashboardPage() {
       setLoading(false);
     }
   }, []);
+
+  const handleRedeploy = async (projectId: string) => {
+    setActionLoading((prev) => ({ ...prev, [projectId]: 'redeploy' }));
+    try {
+      await api.projects.deploy(projectId);
+      await loadProjects();
+    } catch (err: any) {
+      setError(err.message || 'Failed to redeploy project');
+    } finally {
+      setActionLoading((prev) => ({ ...prev, [projectId]: null }));
+    }
+  };
+
+  const handleStart = async (projectId: string) => {
+    setActionLoading((prev) => ({ ...prev, [projectId]: 'start' }));
+    try {
+      await api.projects.start(projectId);
+      await loadProjects();
+    } catch (err: any) {
+      setError(err.message || 'Failed to start project');
+    } finally {
+      setActionLoading((prev) => ({ ...prev, [projectId]: null }));
+    }
+  };
 
   useEffect(() => {
     loadProjects();
@@ -180,11 +205,51 @@ export default function DashboardPage() {
                           {new Date(p.created_at).toLocaleDateString()}
                         </td>
                         <td className="py-3 px-4 whitespace-nowrap text-right">
-                          <Link href={`/projects/${p.id}`}>
-                            <Button size="sm" variant="outline" className="h-7 text-xs">
-                              Manage
-                            </Button>
-                          </Link>
+                          {(() => {
+                            const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(p.status);
+                            const isRunning = p.status === 'running';
+                            const isStopped = p.status === 'stopped';
+                            const wasDeployed = Boolean(p.current_deployment_id || p.status === 'stopped' || p.status === 'failed');
+                            const loadingState = actionLoading[p.id] || null;
+
+                            return (
+                              <div className="flex items-center justify-end gap-1.5">
+                                {isStopped && (
+                                  <Button
+                                    size="sm"
+                                    variant="secondary"
+                                    className="h-7 text-xs px-2"
+                                    loading={loadingState === 'start'}
+                                    disabled={loadingState !== null || isDeploying}
+                                    onClick={() => handleStart(p.id)}
+                                    icon={<Play className="w-2.5 h-2.5" />}
+                                    title="Start stopped containers"
+                                  >
+                                    Start
+                                  </Button>
+                                )}
+                                {wasDeployed && !isRunning && (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-7 text-xs px-2"
+                                    loading={loadingState === 'redeploy'}
+                                    disabled={loadingState !== null || isDeploying}
+                                    onClick={() => handleRedeploy(p.id)}
+                                    icon={<RotateCcw className="w-2.5 h-2.5" />}
+                                    title="Redeploy project"
+                                  >
+                                    Redeploy
+                                  </Button>
+                                )}
+                                <Link href={`/projects/${p.id}`}>
+                                  <Button size="sm" variant="outline" className="h-7 text-xs">
+                                    Manage
+                                  </Button>
+                                </Link>
+                              </div>
+                            );
+                          })()}
                         </td>
                       </tr>
                     ))}
@@ -195,9 +260,16 @@ export default function DashboardPage() {
               {/* Mobile Stacked List View */}
               <div className="sm:hidden space-y-3">
                 {projects.map((p) => (
-                  <ProjectCard key={p.id} project={p} />
+                  <ProjectCard
+                    key={p.id}
+                    project={p}
+                    onRedeploy={handleRedeploy}
+                    onStart={handleStart}
+                    actionLoading={actionLoading[p.id] || null}
+                  />
                 ))}
               </div>
+
             </div>
           )}
         </div>

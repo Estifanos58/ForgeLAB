@@ -427,6 +427,7 @@ const (
 	ProjectStatusPartiallyRunning = "partially_running"
 	ProjectStatusStopped          = "stopped"
 	ProjectStatusFailed           = "failed"
+	ProjectStatusDeleting         = "deleting"
 )
 
 // ServiceStatus constants (coarse service-level states)

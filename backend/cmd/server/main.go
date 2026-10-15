@@ -168,6 +168,7 @@ func main() {
 	deploymentService.SetSecretService(secretService)
 	deploymentService.SetGitHubService(githubService)
 	projectService.SetSecretService(secretService)
+	projectService.SetDeploymentService(deploymentService)
 
 	// Initialize WebSocket Hub
 	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient, cfg.App.AllowedOriginsList()...)
@@ -269,10 +270,21 @@ func main() {
 		}
 	}
 
-	// Launch reconciliation in background so HTTP server begins listening immediately
-	go func() {
-		reconcileFn()
+	// Run initial startup reconciliation synchronously before accepting HTTP traffic
+	// to fix the startup race where dashboard requests could see stale running states.
+	slog.Info("running initial container and runtime status reconciliation...")
+	startupReconcileCtx, startupCancel := context.WithTimeout(ctx, 15*time.Second)
+	if err := dockerEngine.ReconcileDaemonContainers(startupReconcileCtx); err != nil {
+		slog.Warn("initial daemon container reconciliation failed", "error", err)
+	}
+	if err := dockerEngine.CheckContinuousRuntimeHealth(startupReconcileCtx); err != nil {
+		slog.Warn("initial runtime container health check failed", "error", err)
+	}
+	startupCancel()
+	slog.Info("initial container and runtime status reconciliation complete")
 
+	// Launch periodic background reconciliation for continuous health inspection
+	go func() {
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
 		for {

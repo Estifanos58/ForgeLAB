@@ -21,16 +21,13 @@ export function ProjectHeader({
 }: ProjectHeaderProps) {
   const services = project.services || [];
 
-  // Determine the primary preview URL across running services
-  // 1. Authoritative backend project preview URL
-  // 2. Running frontend service with a preview URL or host port
-  // 3. Any running public service with a preview URL or host port
-  // 4. Fallback: project.port if project is running
-  let primaryPreviewUrl: string | null = project.preview_url || null;
-  if (!primaryPreviewUrl) {
-    const runningServices = services.filter((s) => s.status === 'running');
+  // Determine the primary preview URL across running services.
+  // Preview is ONLY displayed when the corresponding public service is confirmed running.
+  let primaryPreviewUrl: string | null = null;
+  const runningServices = services.filter((s) => s.status === 'running');
+  if (services.length > 0) {
     const frontendSvc = runningServices.find(
-      (s) => s.role === 'frontend' && (s.preview_url || (s.public_exposed && s.host_port))
+      (s) => s.role === 'frontend' && s.public_exposed && (s.preview_url || s.host_port)
     );
 
     if (frontendSvc) {
@@ -39,16 +36,18 @@ export function ProjectHeader({
         `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${frontendSvc.host_port}`;
     } else {
       const anyPublicSvc = runningServices.find(
-        (s) => s.preview_url || (s.public_exposed && s.host_port)
+        (s) => s.public_exposed && (s.preview_url || s.host_port)
       );
       if (anyPublicSvc) {
         primaryPreviewUrl =
           anyPublicSvc.preview_url ||
           `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${anyPublicSvc.host_port}`;
-      } else if (project.status === 'running' && project.port) {
-        primaryPreviewUrl = `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`;
       }
     }
+  } else if (project.status === 'running' && (project.preview_url || project.port)) {
+    primaryPreviewUrl =
+      project.preview_url ||
+      `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`;
   }
 
   const getSourceIcon = () => {

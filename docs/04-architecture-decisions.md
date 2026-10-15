@@ -520,4 +520,32 @@ Container configuration is validated through authoritative unified boundaries in
 - **Docker Build Context Isolation:** `.env` and `.env.*` are strictly excluded from Docker build context archives via `dockerignore.DefaultIgnorePatterns`. Environment variables are injected only at container runtime or via explicit BuildKit secret mounts, never baked into Docker images.
 - **Parser Security Limits:** The `.env` parser enforces strict limits (maximum 512KB file size, 500 variables, 256 char key length, 8192 char value length) and literal parsing without executing shell expressions or subshells.
 
+### 9. Idempotent Project Deletion Cleanup & Image Ownership
+- **Two-Phase Error-Aware Deletion:** Project deletion is an error-aware, transactional, and retryable lifecycle operation rather than a best-effort blind deletion:
+  1. **Deletion State Transition & Deployment Drain:** The project is locked and its status transitioned to `models.ProjectStatusDeleting` (`"deleting"`). Any active or queued deployments are immediately cancelled with reason `"Project deletion in progress"`.
+  2. **Concurrency Invariant:** Both `CreateDeployment` and `CreateServiceDeployment` check the parent project's status under `FOR UPDATE` transaction locks. If the project is `deleting`, requests are rejected with `ErrProjectDeleting` (HTTP 409 Conflict), preventing new deployment pipelines from recreating containers or images during cleanup.
+  3. **Docker Resource Cleanup (`CleanUpProjectResources`):**
+     - Collects all containers owned by the project via Docker label `forgelab.project_id=<id>` as well as database deployment/service records. Orphaned containers not tracked in PostgreSQL are discovered and stopped/removed safely.
+     - Handles already-removed resources safely (treating Docker `NotFound` / 404 as non-fatal).
+     - Protects persistent volumes: Container removal specifies `RemoveVolumes: false` to guarantee persistent volumes are never wiped during project deletion.
+     - Removes project bridge networks (`forgelab-net-<id>`).
+     - Removes only project-owned images tagged with `forgelab.project_id=<id>` label or matching repo tag prefix `forgelab/<id>`, including rollback snapshots, without invoking global `ImagesPrune`. Never touches base images or other projects' images.
+     - Clears host port bindings in `PortManager`.
+  4. **Failure Atomicity & Retryability:** If any Docker cleanup step encounters an unrecoverable failure, the project record is NOT deleted from PostgreSQL. Its status is updated to `models.ProjectStatusFailed` and the error is returned to the client. The user can retry the deletion operation at any time. The database record is permanently removed (`DELETE FROM projects`) only after Docker cleanup completes with zero errors.
+
+### 10. Startup & Continuous Runtime State Reconciliation
+- **Synchronous Startup Initialization:** To fix the startup race condition where the frontend dashboard displays stale `running` states before background reconciliation completes, the control plane executes `ReconcileDaemonContainers` and `CheckContinuousRuntimeHealth` synchronously with a 15-second budget BEFORE starting the HTTP server listener.
+- **Continuous Runtime Health & Exit Classification:**
+  - Background ticker monitors container state continuously via Docker daemon inspection.
+  - Distinguishes intentional stops (exit code 0 -> `models.ServiceStatusStopped`) from crashes (exit code != 0 or OOMKilled -> `models.ServiceStatusFailed`).
+  - Missing containers are marked as `models.ServiceStatusFailed` with diagnostic reason `"container missing or removed from Docker daemon"`.
+- **Automatic Parent Status Recalculation:** Whenever individual service containers exit, crash, or are removed, the engine immediately derives the parent project status using `CalculateProjectStatus` and broadcasts `project_status` WebSocket events on channel `project:<id>` so browser dashboards update in real time without requiring manual page reloads.
+
+### 11. Redeploy vs. Start Semantics & Preview URL Consistency
+- **Strict Preview URL Gating:** Preview URLs are strictly suppressed unless the corresponding service or project container is confirmed running (`status === 'running'`). Stopped, deploying, and failed services display their allocated port or `—`, but never an active preview link.
+- **Redeploy vs. Start:**
+  - If a container is stopped and its container definition remains intact on the Docker daemon, the user can use `Start` to resume execution without rebuilding.
+  - If a service or project was previously deployed and is currently inactive (e.g. stopped, crashed, failed), the dashboard and service cards expose a prominent **Redeploy** action that triggers the deployment pipeline.
+  - Previous successful deployment history (`current_deployment_id`, `image_digest`, historical configurations) is preserved, ensuring rollback guarantees are retained.
+
 

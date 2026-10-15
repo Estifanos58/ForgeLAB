@@ -92,12 +92,20 @@ export function ServiceCard({
     }
   };
 
-  // Construct browser-accessible preview URL if public
+  // Construct browser-accessible preview URL strictly when confirmed running and public
   const previewUrl =
-    service.preview_url ||
-    (service.public_exposed && service.host_port
-      ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${service.host_port}`
-      : null);
+    isRunning
+      ? service.preview_url ||
+        (service.public_exposed && service.host_port
+          ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${service.host_port}`
+          : null)
+      : null;
+
+  const wasServiceDeployed = Boolean(
+    service.current_service_deployment_id ||
+      service.status === 'stopped' ||
+      service.status === 'failed'
+  );
 
   const internalEndpoint = `${service.name}:${service.internal_port}`;
 
@@ -262,7 +270,7 @@ export function ServiceCard({
       {/* Bottom Actions Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-surface-border/60">
         <div className="flex items-center gap-1.5 flex-wrap">
-          {/* Independent Service Deploy Button - Never blocked by other services */}
+          {/* Independent Service Deploy / Redeploy Button - Never blocked by other services */}
           <Button
             variant="primary"
             size="sm"
@@ -270,10 +278,14 @@ export function ServiceCard({
             loading={isDeployPending}
             disabled={isDeployPending || isServiceDeploying}
             className="h-7 text-xs px-2.5"
-            icon={<Rocket className="w-3 h-3" />}
-            title="Deploy only this service concurrently"
+            icon={wasServiceDeployed && !isRunning ? <RotateCcw className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
+            title={wasServiceDeployed && !isRunning ? 'Redeploy this service' : 'Deploy only this service concurrently'}
           >
-            {isServiceDeploying ? getDeployingLabel() : 'Deploy Service'}
+            {isServiceDeploying
+              ? getDeployingLabel()
+              : wasServiceDeployed && !isRunning
+              ? 'Redeploy'
+              : 'Deploy Service'}
           </Button>
 
           {/* Service-Specific Rollback */}
@@ -318,7 +330,7 @@ export function ServiceCard({
                 Restart
               </Button>
             </>
-          ) : (
+          ) : service.status === 'stopped' && service.container_id ? (
             <Button
               variant="secondary"
               size="sm"
@@ -327,10 +339,11 @@ export function ServiceCard({
               disabled={actionLoading !== null || isServiceDeploying}
               className="h-7 text-xs px-2.5"
               icon={<Play className="w-2.5 h-2.5" />}
+              title="Start existing stopped container"
             >
               Start
             </Button>
-          )}
+          ) : null}
         </div>
 
         {/* View Logs & History Buttons */}

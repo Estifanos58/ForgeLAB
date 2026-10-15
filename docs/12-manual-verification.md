@@ -1058,5 +1058,122 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Environment:** —
 - **Notes:** —
 
+---
 
+### 17. Project Deletion Cleanup & Image Scoping
 
+#### Test Procedure 17.1 — Idempotent Project Deletion & Orphan Container Cleanup
+1. In the ForgeLab UI, deploy a project with multiple services (e.g. `web` and `api`).
+2. After deployment reaches `running`, open a terminal and inspect running containers:
+   ```bash
+   docker ps --filter "label=forgelab.project_id=<project_id>"
+   ```
+3. Manually spawn an untracked/orphan container on the Docker host carrying the project's ownership label:
+   ```bash
+   docker run -d --label "forgelab.project_id=<project_id>" --name orphan-test-container alpine sleep 3600
+   ```
+4. Click **Delete Project** in the ForgeLAB UI.
+5. Expected behavior:
+   - Project transitions to `deleting` status.
+   - Any in-progress or queued deployments are immediately cancelled.
+   - New deployment attempts during deletion are rejected with HTTP 409 Conflict (`project is currently being deleted`).
+   - All containers labeled `forgelab.project_id=<project_id>` (including the manual orphan container) are stopped and removed.
+   - Project bridge network (`forgelab-net-<project_id>`) is removed.
+   - Only images tagged with label `forgelab.project_id=<project_id>` or repo prefix `forgelab/<project_id>` are removed.
+   - Persistent volumes (`com.docker.compose.project` or named volumes) are preserved intact (`RemoveVolumes: false`).
+   - Unrelated images (base images, other projects' images) remain completely untouched.
+   - Once cleanup succeeds, the project is removed from PostgreSQL and the user is redirected to the dashboard.
+
+#### Test Procedure 17.2 — Failure Atomicity & Deletion Retryability
+1. Simulate a Docker daemon failure or unremovable resource during cleanup.
+2. Trigger project deletion.
+3. Expected behavior:
+   - The deletion operation returns an explicit error to the client.
+   - The project record is NOT deleted from PostgreSQL.
+   - Project status transitions to `failed` (`models.ProjectStatusFailed`).
+   - The project remains visible and manageable on the dashboard.
+4. Resolve the Docker daemon issue and click **Delete Project** again.
+5. Expected behavior:
+   - Cleanup proceeds idempotently, safely skipping already-deleted resources.
+   - Upon completion, the project record is successfully deleted from PostgreSQL.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 18. Startup & Continuous Runtime State Reconciliation
+
+#### Test Procedure 18.1 — Continuous Health Check & Exit Code Discrimination
+1. Deploy a multi-service project (e.g. `frontend` on `:3000` and `backend` on `:8080`).
+2. Simulate an intentional container stop on the backend:
+   ```bash
+   docker stop <backend_container_id>
+   ```
+3. Observe ForgeLab dashboard:
+   - Backend service transitions to `stopped` (`models.ServiceStatusStopped`) within the health check loop.
+   - Parent project status transitions to `partially_running`.
+   - Backend preview URL is hidden / marked `(stopped)`.
+4. Now simulate a container crash or OOM kill:
+   ```bash
+   docker kill --signal=SIGKILL <backend_container_id>
+   ```
+5. Observe ForgeLab dashboard:
+   - Reconciler reads non-zero exit code or OOM flag and marks service status as `failed` (`models.ServiceStatusFailed`).
+   - Parent project status reflects failure.
+   - Real-time updates arrive via WebSocket `project_status` without needing page reload.
+
+#### Test Procedure 18.2 — Synchronous Startup Reconciliation
+1. With containers in stopped/failed state from Test 18.1, stop the ForgeLab control plane server.
+2. Restart the ForgeLab server (`./server` or `go run ./cmd/server/main.go`).
+3. Simultaneously open the dashboard in a browser.
+4. Expected behavior:
+   - Control plane performs `ReconcileDaemonContainers` and `CheckContinuousRuntimeHealth` synchronously before accepting HTTP requests.
+   - Dashboard immediately reflects `stopped` or `partially_running` status, never displaying stale `running` states.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 19. Redeploy vs. Start UI & Preview URL Consistency
+
+#### Test Procedure 19.1 — Redeploy Button Behavior on Inactive Projects
+1. Navigate to the Projects dashboard table and mobile view.
+2. For an intentionally stopped project whose container is intact:
+   - Verify both **Start** and **Redeploy** buttons are available.
+   - Clicking **Start** resumes the existing stopped container without rebuilding.
+3. For a project whose container crashed or failed:
+   - Verify **Redeploy** button is prominently displayed with the `RotateCcw` icon.
+   - Verify Preview link is hidden and displays `—`.
+4. Click **Redeploy**:
+   - Verify button shows a loading spinner during API dispatch.
+   - Deployment starts and project status updates to `queued` / `deploying`.
+   - Once healthy, project status transitions to `running`.
+   - Preview link reappears with direct clickable link.
+
+#### Test Procedure 19.2 — Service Card Redeploy & Preview Visibility
+1. Open the project detail page.
+2. Inspect individual service cards:
+   - Stopped service: displays **Start** and **Redeploy** buttons; preview banner is hidden; meta grid shows `:<port> (stopped)`.
+   - Failed service: displays **Redeploy** button; preview banner is hidden.
+   - Running public service: displays prominent green preview banner with pulsing live indicator and direct preview link; meta grid shows clickable link with external icon.
+3. Click **Redeploy** on a single service:
+   - Only that service enters deployment (`Building...`, `Starting...`, `Health Checking...`).
+   - Other services continue running unaffected.
+   - Historical deployments in the History drawer retain snapshot metadata (`image_digest`, `env_config_hash`, source revision).
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
