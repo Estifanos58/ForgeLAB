@@ -1501,14 +1501,14 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                         </div>
 
                         <div className="space-y-1.5 font-mono text-[11px]">
-                          <div className="text-[10px] text-neutral-400 font-sans">PowerShell (Project Root):</div>
+                          <div className="text-[10px] text-neutral-400 font-sans">Linux / macOS (Bash):</div>
                           <div className="bg-black/50 px-3 py-1.5 rounded border border-surface-border text-emerald-400 select-all">
-                            .\start-agent.ps1
+                            ./start-agent.sh
                           </div>
 
-                          <div className="text-[10px] text-neutral-400 font-sans pt-1">Or run binary directly:</div>
+                          <div className="text-[10px] text-neutral-400 font-sans pt-1">Windows (PowerShell):</div>
                           <div className="bg-black/50 px-3 py-1.5 rounded border border-surface-border text-emerald-400 select-all">
-                            .\backend\forgelab-agent.exe
+                            .\start-agent.ps1
                           </div>
                         </div>
 

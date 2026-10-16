@@ -14,6 +14,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 
+	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/models"
 )
 
@@ -352,13 +353,24 @@ func (e *Engine) verifyServiceHealth(
 			}
 		}
 
+		isContainer := false
+		if _, err := os.Stat("/.dockerenv"); err == nil {
+			isContainer = true
+		}
+		if os.Getenv("FORGELAB_IN_DOCKER") != "" || os.Getenv("DOCKER_CONTAINER") != "" {
+			isContainer = true
+		}
+
 		if hostPort != nil && *hostPort > 0 {
 			targets = append(targets, fmt.Sprintf("127.0.0.1:%d", *hostPort))
 			targets = append(targets, fmt.Sprintf("localhost:%d", *hostPort))
-			if os.Getenv("FORGELAB_IN_DOCKER") != "" || os.Getenv("DOCKER_CONTAINER") != "" {
+			if isContainer {
 				targets = append(targets, fmt.Sprintf("host.docker.internal:%d", *hostPort))
 				if cJSON.NetworkSettings != nil && cJSON.NetworkSettings.Gateway != "" {
 					targets = append(targets, fmt.Sprintf("%s:%d", cJSON.NetworkSettings.Gateway, *hostPort))
+				}
+				if gw := agent.GetDefaultGateway(); gw != "" {
+					targets = append(targets, fmt.Sprintf("%s:%d", gw, *hostPort))
 				}
 			}
 		}
@@ -393,24 +405,24 @@ func (e *Engine) verifyServiceHealth(
 			}
 		}
 
-		// Internal service without public port and NO native health check
-		if hostPort == nil && cJSON.State.Running && !cJSON.State.Restarting && cJSON.State.Health == nil {
+		// 6. Socket-level verification fallback: if external HTTP/TCP connection attempts failed (e.g. due to Docker network namespace isolation between backend container and target container), check whether the internal port is listening inside the container via docker exec
+		if cJSON.State.Running && !cJSON.State.Restarting && cJSON.State.Health == nil {
 			if internalPort > 0 {
 				listening, supported := e.isInternalPortListening(ctx, containerID, internalPort)
 				if listening {
-					logFn(fmt.Sprintf("Internal service port %d verified listening inside container (attempt %d).", internalPort, attempt))
+					logFn(fmt.Sprintf("Service port %d verified listening inside container (attempt %d).", internalPort, attempt))
 					return true, "healthy"
 				}
 				if supported {
 					if attempt == 1 || attempt%5 == 0 {
-						logFn(fmt.Sprintf("Internal service port %d not yet listening inside container (attempt %d)... waiting", internalPort, attempt))
+						logFn(fmt.Sprintf("Service port %d not yet listening inside container (attempt %d)... waiting", internalPort, attempt))
 					}
 				} else if attempt >= 8 && cJSON.RestartCount == 0 {
-					logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
+					logFn(fmt.Sprintf("Service verified running stably (attempt %d).", attempt))
 					return true, "healthy"
 				}
 			} else if attempt >= 6 && cJSON.RestartCount == 0 {
-				logFn(fmt.Sprintf("Internal service verified running stably (attempt %d).", attempt))
+				logFn(fmt.Sprintf("Service verified running stably (attempt %d).", attempt))
 				return true, "healthy"
 			}
 		}

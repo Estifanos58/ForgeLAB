@@ -43,6 +43,11 @@ func getDefaultGateway() string {
 	return ""
 }
 
+// GetDefaultGateway extracts the IPv4 default gateway from /proc/net/route in containerized Linux environments.
+func GetDefaultGateway() string {
+	return getDefaultGateway()
+}
+
 // ResolveCandidateBaseURLs returns prioritized candidate base URLs for reaching the local agent.
 func ResolveCandidateBaseURLs() []string {
 	var candidates []string
@@ -69,20 +74,20 @@ func ResolveCandidateBaseURLs() []string {
 		add(h)
 	}
 
-	// 1. Docker Desktop for Windows / macOS host gateway IP (accessible from Linux containers)
-	add("http://192.168.65.254:4142")
-	add("http://192.168.65.2:4142")
-
-	// 2. Container network default gateway from /proc/net/route
+	// 1. Container network default gateway from /proc/net/route (works on Linux containers)
 	if gw := getDefaultGateway(); gw != "" {
 		add(fmt.Sprintf("http://%s:4142", gw))
 	}
 
-	// 3. host.docker.internal (works if extra_hosts: host.docker.internal:host-gateway is set)
+	// 2. host.docker.internal (works on Docker Desktop & Linux when extra_hosts is configured)
 	add("http://host.docker.internal:4142")
 
-	// 4. Default bridge gateway
+	// 3. Default bridge gateway
 	add("http://172.17.0.1:4142")
+
+	// 4. Docker Desktop for Windows / macOS host gateway IP (accessible from Linux containers)
+	add("http://192.168.65.254:4142")
+	add("http://192.168.65.2:4142")
 
 	// 5. Direct localhost (for non-docker backend setups)
 	add("http://127.0.0.1:4142")
@@ -132,6 +137,9 @@ func ResolveBaseURL() string {
 	if isContainer {
 		if ips, err := net.LookupHost("host.docker.internal"); err == nil && len(ips) > 0 {
 			return "http://host.docker.internal:4142"
+		}
+		if gw := getDefaultGateway(); gw != "" {
+			return fmt.Sprintf("http://%s:4142", gw)
 		}
 		return "http://192.168.65.254:4142"
 	}

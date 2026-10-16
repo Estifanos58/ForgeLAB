@@ -28,6 +28,8 @@ backend/tmp/
 backend/scratch/
 *.exe
 forgelab-agent.exe
+forgelab-agent
+backend/forgelab-agent
 *~
 *.bak
 

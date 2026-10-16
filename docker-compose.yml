@@ -91,6 +91,8 @@ services:
       GITHUB_REDIRECT_URL: ${GITHUB_REDIRECT_URL:-http://localhost:3000/api/auth/github/callback}
       GITHUB_REPO_REDIRECT_URL: ${GITHUB_REPO_REDIRECT_URL:-http://localhost:3000/api/integrations/github/callback}
       LOG_LEVEL: ${LOG_LEVEL:-debug}
+      FORGELAB_IN_DOCKER: "true"
+      FORGELAB_AGENT_URL: ${FORGELAB_AGENT_URL:-http://host.docker.internal:4142}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - forgelab_builds:/app/data/builds
@@ -128,6 +130,12 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
 volumes:
   forgelab_pgdata:

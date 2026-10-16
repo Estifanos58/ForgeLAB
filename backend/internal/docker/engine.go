@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -932,6 +933,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 			var resp *http.Response
 			var httpErr error
+			agentStreamClient := &http.Client{
+				Transport: &http.Transport{
+					DialContext: (&net.Dialer{
+						Timeout:   2 * time.Second,
+						KeepAlive: 30 * time.Second,
+					}).DialContext,
+					TLSHandshakeTimeout:   5 * time.Second,
+					ResponseHeaderTimeout: 15 * time.Second,
+				},
+			}
 			for _, candBase := range candidateBases {
 				agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?%s",
 					candBase,
@@ -944,7 +955,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				}
 				req.Header.Set("Authorization", "Bearer "+agentToken)
 				req.Header.Set("X-Agent-Session-Token", agentToken)
-				r, err := http.DefaultClient.Do(req)
+				r, err := agentStreamClient.Do(req)
 				if err == nil {
 					resp = r
 					httpErr = nil
@@ -2382,6 +2393,16 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 
 			var resp *http.Response
 			var httpErr error
+			agentStreamClient := &http.Client{
+				Transport: &http.Transport{
+					DialContext: (&net.Dialer{
+						Timeout:   2 * time.Second,
+						KeepAlive: 30 * time.Second,
+					}).DialContext,
+					TLSHandshakeTimeout:   5 * time.Second,
+					ResponseHeaderTimeout: 15 * time.Second,
+				},
+			}
 			for _, candBase := range candidateBases {
 				agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s&package_manager=%s",
 					candBase,
@@ -2398,7 +2419,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				}
 				req.Header.Set("Authorization", "Bearer "+agentToken)
 				req.Header.Set("X-Agent-Session-Token", agentToken)
-				r, err := http.DefaultClient.Do(req)
+				r, err := agentStreamClient.Do(req)
 				if err == nil {
 					resp = r
 					httpErr = nil
