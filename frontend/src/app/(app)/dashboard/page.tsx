@@ -16,7 +16,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Plus, RefreshCw, ExternalLink, GitBranch, FolderGit2, Play, RotateCcw, Info } from 'lucide-react';
 
 export default function DashboardPage() {
-  const { user } = useAuth();
+  const { user, allowGuestMode, loading: authLoading } = useAuth();
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -61,13 +61,15 @@ export default function DashboardPage() {
 
   useEffect(() => {
     loadProjects();
-    if (typeof window !== 'undefined') {
+    if (typeof window !== 'undefined' && !authLoading) {
       const params = new URLSearchParams(window.location.search);
       if (params.get('deploy') === 'true' || params.get('create') === 'true') {
-        setIsModalOpen(true);
+        if (user || allowGuestMode) {
+          setIsModalOpen(true);
+        }
       }
     }
-  }, [loadProjects]);
+  }, [loadProjects, user, allowGuestMode, authLoading]);
 
   return (
     <div className="min-h-screen flex flex-col bg-background">
@@ -111,8 +113,8 @@ export default function DashboardPage() {
           </Alert>
         )}
 
-        {/* Guest Workspace Banner */}
-        {!user && !loading && (
+        {/* Guest or Auth Status Banner */}
+        {!user && !authLoading && allowGuestMode && (
           <div className="p-3.5 rounded-lg border border-amber-500/20 bg-amber-500/5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-neutral-300">
             <div className="flex items-center gap-2.5">
               <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" />
@@ -124,6 +126,29 @@ export default function DashboardPage() {
               <Link href="/register">
                 <Button size="sm" variant="outline" className="h-7 text-xs border-amber-500/30 text-amber-200 hover:bg-amber-500/10">
                   Register for GitHub
+                </Button>
+              </Link>
+            </div>
+          </div>
+        )}
+
+        {!user && !authLoading && !allowGuestMode && (
+          <div className="p-3.5 rounded-lg border border-neutral-700 bg-surface flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-neutral-300">
+            <div className="flex items-center gap-2.5">
+              <Info className="w-4 h-4 text-neutral-400 shrink-0" />
+              <span>
+                <strong className="text-white">Authentication Required:</strong> Guest deployments are disabled on this installation. Please sign in or create an account to deploy and manage projects.
+              </span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <Link href="/login">
+                <Button size="sm" variant="ghost" className="h-7 text-xs text-neutral-300 hover:text-white">
+                  Sign In
+                </Button>
+              </Link>
+              <Link href="/register">
+                <Button size="sm" variant="primary" className="h-7 text-xs">
+                  Create Account
                 </Button>
               </Link>
             </div>

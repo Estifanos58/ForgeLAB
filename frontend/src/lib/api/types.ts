@@ -17,6 +17,12 @@ export interface AuthResponse {
   expires_in: number;
 }
 
+export interface AuthModeResponse {
+  allow_guest_mode: boolean;
+  guest_mode_enabled: boolean;
+  guest_user_id: string;
+}
+
 export type ProjectStatus = 'inactive' | 'deploying' | 'running' | 'partially_running' | 'stopped' | 'failed';
 
 export type ServiceRole = 'frontend' | 'backend' | 'worker' | 'other';

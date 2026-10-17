@@ -448,6 +448,13 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Strictly reject anonymous WebSocket connections with an untrusted origin
+		if !h.CheckOrigin(r) {
+			slog.Warn("ws anonymous connection rejected: untrusted origin", "origin", r.Header.Get("Origin"), "remote_addr", r.RemoteAddr)
+			http.Error(w, "forbidden: untrusted origin", http.StatusForbidden)
+			return
+		}
+
 		userID = models.GuestUserID
 		userEmail = models.GuestUserEmail
 	}

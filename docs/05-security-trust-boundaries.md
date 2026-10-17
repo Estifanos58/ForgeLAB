@@ -245,4 +245,13 @@ ForgeLAB supports registration-free local deployments for self-hosted and single
    - Deleting a guest project stops active workers, drains pending jobs, and prunes containers and images.
    - The shared guest identity record persists across application restarts and project deletions; it is never removed when projects are deleted.
 
+8. **Migration Rollback & Operator Cleanup Procedure:**
+   - Migration `000017_add_guest_identity.down.sql` protects against orphaned Docker containers and resource leaks by refusing to delete the guest user identity while any guest-owned projects or sources exist in PostgreSQL.
+   - If an operator attempts to run `migrate down` while guest projects exist, PostgreSQL raises an exception:
+     `Cannot rollback migration 000017_add_guest_identity: X guest project(s) and Y guest source(s) exist. Operators must delete all guest-owned projects and clean up runtime resources via ForgeLAB before rolling back the guest identity.`
+   - **Operator Procedure to decommission guest mode:**
+     1. With the ForgeLAB server running, delete all guest projects via the ForgeLAB UI or API (`DELETE /api/projects/{id}`). This triggers the engine's clean shutdown, container removal, port deallocation, and volume pruning.
+     2. Verify no guest projects remain: `SELECT COUNT(*) FROM projects WHERE owner_id = '00000000-0000-0000-0000-000000000001';`
+     3. Apply database migration rollback: `migrate -path backend/migrations -database "$DATABASE_URL" down 1`.
+
 

@@ -63,7 +63,7 @@ func (a AppConfig) AllowedOriginsList() []string {
 			}
 		}
 	}
-	// Always include loopback origins in local development
+	// Always include loopback origins and local agent in local development
 	envLower := strings.ToLower(a.Environment)
 	isDev := envLower == "development" || envLower == "dev" || envLower == "local" || envLower == "test" || envLower == ""
 	if isDev {
@@ -71,6 +71,8 @@ func (a AppConfig) AllowedOriginsList() []string {
 		origins["http://127.0.0.1:3000"] = true
 		origins["http://localhost:8080"] = true
 		origins["http://127.0.0.1:8080"] = true
+		origins["http://localhost:4142"] = true
+		origins["http://127.0.0.1:4142"] = true
 	}
 
 	result := make([]string, 0, len(origins))

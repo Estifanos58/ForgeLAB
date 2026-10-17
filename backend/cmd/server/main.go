@@ -160,8 +160,12 @@ func main() {
 	sourceService := services.NewSourceService(pool, cfg.Docker.SourcesDir, encryptor)
 	githubService := services.NewGitHubService(pool, encryptor, cfg.GitHub, redisClient)
 	userService := services.NewUserService(pool, jwtManager)
-	if err := userService.EnsureGuestUser(ctx); err != nil {
-		slog.Warn("failed to ensure guest user during startup", "error", err)
+	if cfg.App.AllowGuestMode {
+		if err := userService.EnsureGuestUser(ctx); err != nil {
+			slog.Error("failed to ensure guest user identity during startup", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("ensured shared guest user identity in database", "guest_user_id", models.GuestUserID)
 	}
 	serviceService := services.NewServiceService(pool)
 	projectService := services.NewProjectService(pool, pathValidator, sourceService, githubService)
@@ -352,7 +356,7 @@ func main() {
 	r.Use(chimiddleware.RealIP)
 	r.Use(middleware.RequestLogger)
 	r.Use(middleware.MaxBodySize(10*1024*1024, 105*1024*1024))
-	r.Use(middleware.CORS(cfg.App.CORSAllowedOrigins))
+	r.Use(middleware.CORS(cfg.App.AllowedOriginsList()...))
 	r.Use(chimiddleware.Recoverer)
 
 	// Health and readiness checks (unauthenticated)
@@ -425,7 +429,7 @@ func main() {
 
 		// Protected or Guest routes (Local Deployments)
 		r.Group(func(r chi.Router) {
-			r.Use(middleware.AuthOrGuestMiddleware(jwtManager, cfg.App.AllowGuestMode))
+			r.Use(middleware.AuthOrGuestMiddleware(jwtManager, cfg.App.AllowGuestMode, cfg.App.AllowedOriginsList()...))
 
 			// Source Management & Uploads
 			r.Route("/sources", func(r chi.Router) {

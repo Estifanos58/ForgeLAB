@@ -126,3 +126,175 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 		t.Errorf("missing or incorrect Content-Security-Policy")
 	}
 }
+
+func TestCORSMiddleware(t *testing.T) {
+	allowedOrigins := []string{"http://localhost:3000", "http://127.0.0.1:3000"}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mw := middleware.CORS(allowedOrigins...)(handler)
+
+	t.Run("AllowedOrigin_PreflightOPTIONS", func(t *testing.T) {
+		req := httptest.NewRequest("OPTIONS", "/api/projects", nil)
+		req.Header.Set("Origin", "http://localhost:3000")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if rec.Header().Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
+			t.Fatalf("expected Access-Control-Allow-Origin to be http://localhost:3000, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+		}
+		if rec.Header().Get("Access-Control-Allow-Credentials") != "true" {
+			t.Fatalf("expected Access-Control-Allow-Credentials: true")
+		}
+	})
+
+	t.Run("DisallowedOrigin_PreflightOPTIONS_RejectedWith403", func(t *testing.T) {
+		req := httptest.NewRequest("OPTIONS", "/api/projects", nil)
+		req.Header.Set("Origin", "https://evil.com")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for disallowed origin preflight, got %d", rec.Code)
+		}
+		if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Fatalf("expected NO Access-Control-Allow-Origin header for disallowed origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+		}
+	})
+
+	t.Run("DisallowedOrigin_StandardGET_NoAllowOriginHeader", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/projects", nil)
+		req.Header.Set("Origin", "https://evil.com")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Fatalf("expected NO Access-Control-Allow-Origin header for disallowed origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+		}
+	})
+}
+
+func TestAuthOrGuestMiddleware_OriginSecurity(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-32-chars-long!", 15*time.Minute, 7*24*time.Hour)
+	allowedOrigins := []string{"http://localhost:3000", "http://127.0.0.1:3000"}
+
+	mutationExecuted := false
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mutationExecuted = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("mutated"))
+	})
+
+	mw := middleware.AuthOrGuestMiddleware(jwtManager, true, allowedOrigins...)(handler)
+
+	t.Run("Guest_AllowedOrigin_POST_Accepted", func(t *testing.T) {
+		mutationExecuted = false
+		req := httptest.NewRequest("POST", "/api/projects", strings.NewReader(`{"name":"test"}`))
+		req.Header.Set("Origin", "http://localhost:3000")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if !mutationExecuted {
+			t.Fatalf("expected handler to execute")
+		}
+	})
+
+	t.Run("Guest_DisallowedOrigin_POST_RejectedBeforeMutation", func(t *testing.T) {
+		mutationExecuted = false
+		req := httptest.NewRequest("POST", "/api/projects", strings.NewReader(`{"name":"test"}`))
+		req.Header.Set("Origin", "https://evil.com")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for untrusted origin, got %d", rec.Code)
+		}
+		if mutationExecuted {
+			t.Fatalf("handler MUST NOT execute when origin is untrusted")
+		}
+	})
+
+	t.Run("Guest_DisallowedReferer_POST_RejectedBeforeMutation", func(t *testing.T) {
+		mutationExecuted = false
+		req := httptest.NewRequest("POST", "/api/projects", strings.NewReader(`{"name":"test"}`))
+		req.Header.Set("Referer", "https://evil.com/attack-page")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for untrusted referer, got %d", rec.Code)
+		}
+		if mutationExecuted {
+			t.Fatalf("handler MUST NOT execute when referer is untrusted")
+		}
+	})
+
+	t.Run("Guest_CrossSiteSecFetch_POST_RejectedBeforeMutation", func(t *testing.T) {
+		mutationExecuted = false
+		req := httptest.NewRequest("POST", "/api/projects", strings.NewReader(`{"name":"test"}`))
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for Sec-Fetch-Site: cross-site, got %d", rec.Code)
+		}
+		if mutationExecuted {
+			t.Fatalf("handler MUST NOT execute for cross-site fetch")
+		}
+	})
+
+	t.Run("Guest_DirectLocalCLI_POST_Accepted", func(t *testing.T) {
+		mutationExecuted = false
+		// Direct curl/agent CLI without Origin or Referer
+		req := httptest.NewRequest("POST", "/api/projects", strings.NewReader(`{"name":"test"}`))
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if !mutationExecuted {
+			t.Fatalf("expected handler to execute for direct local CLI")
+		}
+	})
+
+	t.Run("RegisteredUser_ValidJWT_POST_AlwaysAccepted", func(t *testing.T) {
+		mutationExecuted = false
+		userUUID := uuid.New()
+		token, err := jwtManager.GenerateAccessToken(userUUID, "reg@user.com")
+		if err != nil {
+			t.Fatalf("failed to generate token: %v", err)
+		}
+
+		req := httptest.NewRequest("POST", "/api/projects", strings.NewReader(`{"name":"test"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		// Even if from another origin or no origin, authenticated registered user requests work
+		req.Header.Set("Origin", "http://another-client.internal")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 for registered user, got %d", rec.Code)
+		}
+		if !mutationExecuted {
+			t.Fatalf("expected handler to execute for registered user")
+		}
+	})
+}

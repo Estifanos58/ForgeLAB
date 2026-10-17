@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -93,9 +95,27 @@ func AuthMiddleware(jwtManager *auth.JWTManager) func(http.Handler) http.Handler
 	}
 }
 
+// IsAllowedOrigin checks whether a given origin is in the allowed origins list.
+func IsAllowedOrigin(origin string, allowedOrigins []string) bool {
+	if origin == "" {
+		return false
+	}
+	normOrigin := strings.TrimRight(strings.ToLower(strings.TrimSpace(origin)), "/")
+	for _, o := range allowedOrigins {
+		normAllowed := strings.TrimRight(strings.ToLower(strings.TrimSpace(o)), "/")
+		if normAllowed == "*" || normAllowed == normOrigin {
+			return true
+		}
+	}
+	return false
+}
+
 // AuthOrGuestMiddleware validates JWT tokens for registered users or assigns the
 // shared guest identity if unauthenticated and guest mode is enabled.
-func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool) func(http.Handler) http.Handler {
+// For guest state-changing requests (POST, PUT, PATCH, DELETE), incoming browser
+// Origin and Referer headers are validated against allowedOrigins to prevent
+// unauthorized cross-origin mutations.
+func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool, allowedOrigins ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tokenString := ""
@@ -136,6 +156,57 @@ func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool) fun
 			if !allowGuestMode {
 				http.Error(w, `{"error": "authentication required: guest mode disabled on this installation"}`, http.StatusUnauthorized)
 				return
+			}
+
+			// Validate Origin at the request boundary for state-changing guest requests
+			isStateChanging := r.Method == http.MethodPost || r.Method == http.MethodPut ||
+				r.Method == http.MethodPatch || r.Method == http.MethodDelete
+
+			if isStateChanging {
+				origin := r.Header.Get("Origin")
+				if origin != "" {
+					if !IsAllowedOrigin(origin, allowedOrigins) {
+						slog.Warn("untrusted origin rejected for guest mutation",
+							"origin", origin,
+							"method", r.Method,
+							"path", r.URL.Path,
+							"remote_addr", r.RemoteAddr,
+						)
+						http.Error(w, `{"error": "untrusted origin: cross-origin guest operations are forbidden"}`, http.StatusForbidden)
+						return
+					}
+				} else {
+					// Check Referer header if Origin is absent
+					referer := r.Header.Get("Referer")
+					if referer != "" {
+						u, err := url.Parse(referer)
+						if err == nil && u.Host != "" {
+							refOrigin := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+							if !IsAllowedOrigin(refOrigin, allowedOrigins) {
+								slog.Warn("untrusted referer rejected for guest mutation",
+									"referer", referer,
+									"method", r.Method,
+									"path", r.URL.Path,
+									"remote_addr", r.RemoteAddr,
+								)
+								http.Error(w, `{"error": "untrusted origin: cross-origin guest operations are forbidden"}`, http.StatusForbidden)
+								return
+							}
+						}
+					}
+
+					// Check Sec-Fetch-Site: reject cross-site browser fetches
+					secFetchSite := strings.ToLower(r.Header.Get("Sec-Fetch-Site"))
+					if secFetchSite == "cross-site" {
+						slog.Warn("cross-site fetch rejected for guest mutation",
+							"method", r.Method,
+							"path", r.URL.Path,
+							"remote_addr", r.RemoteAddr,
+						)
+						http.Error(w, `{"error": "untrusted origin: cross-origin guest operations are forbidden"}`, http.StatusForbidden)
+						return
+					}
+				}
 			}
 
 			// Assign the single shared guest identity
@@ -202,12 +273,16 @@ func RequestLogger(next http.Handler) http.Handler {
 }
 
 // CORS creates a CORS middleware that permits requests from configured origins.
-func CORS(allowedOriginsStr string) func(http.Handler) http.Handler {
+// Preflight OPTIONS requests and standard requests from disallowed origins are strictly
+// forbidden from receiving Access-Control-Allow-Origin headers.
+func CORS(allowedOriginsInputs ...string) func(http.Handler) http.Handler {
 	allowedOrigins := make(map[string]bool)
-	for _, o := range strings.Split(allowedOriginsStr, ",") {
-		o = strings.TrimSpace(o)
-		if o != "" {
-			allowedOrigins[o] = true
+	for _, input := range allowedOriginsInputs {
+		for _, o := range strings.Split(input, ",") {
+			trimmed := strings.TrimRight(strings.ToLower(strings.TrimSpace(o)), "/")
+			if trimmed != "" {
+				allowedOrigins[trimmed] = true
+			}
 		}
 	}
 	if len(allowedOrigins) == 0 {
@@ -217,17 +292,30 @@ func CORS(allowedOriginsStr string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			origin := r.Header.Get("Origin")
-			if origin != "" && (allowedOrigins[origin] || allowedOrigins["*"]) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-			} else {
-				w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
-			}
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Cookie")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			if origin != "" {
+				normOrigin := strings.TrimRight(strings.ToLower(strings.TrimSpace(origin)), "/")
+				if allowedOrigins[normOrigin] || allowedOrigins["*"] {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+					w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Cookie, X-Requested-With")
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+					w.Header().Set("Vary", "Origin")
 
-			if r.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusOK)
+					if r.Method == http.MethodOptions {
+						w.WriteHeader(http.StatusOK)
+						return
+					}
+				} else {
+					// Origin is present but disallowed: do NOT set Access-Control-Allow-Origin!
+					// Strictly reject preflight requests from disallowed origins
+					if r.Method == http.MethodOptions {
+						http.Error(w, `{"error": "forbidden origin"}`, http.StatusForbidden)
+						return
+					}
+				}
+			} else if r.Method == http.MethodOptions {
+				// Non-browser OPTIONS request without Origin header
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 

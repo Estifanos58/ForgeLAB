@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,7 +74,9 @@ func setupGuestTestRouter(
 	sourceHandler := handlers.NewSourceHandler(sourceService, nil)
 	discoveryHandler := handlers.NewDiscoveryHandler(nil, sourceService, nil, secretService)
 
+	allowedOrigins := []string{"http://localhost:3000", "http://127.0.0.1:3000"}
 	r := chi.NewRouter()
+	r.Use(middleware.CORS(allowedOrigins...))
 	r.Use(middleware.ContentTypeJSON)
 
 	r.Route("/api", func(r chi.Router) {
@@ -93,7 +96,7 @@ func setupGuestTestRouter(
 
 		// Protected or Guest routes (Local Deployments)
 		r.Group(func(r chi.Router) {
-			r.Use(middleware.AuthOrGuestMiddleware(jwtManager, allowGuestMode))
+			r.Use(middleware.AuthOrGuestMiddleware(jwtManager, allowGuestMode, allowedOrigins...))
 
 			r.Route("/sources", func(r chi.Router) {
 				r.Post("/upload", sourceHandler.Upload)
@@ -572,28 +575,490 @@ func TestGuestMode_DisabledByConfig(t *testing.T) {
 	assert.Equal(t, false, modeResp["allow_guest_mode"])
 }
 
-// 8. Guest project abuse limit
-func TestGuestMode_AbuseLimit(t *testing.T) {
-	_, _, projectService, _, _, _ := setupGuestTestRouter(t, true)
+// 8. Untrusted origin guest mutations are rejected before state change occurs
+func TestGuestMode_UntrustedOriginRejected(t *testing.T) {
+	r, jwtManager, projectService, _, _, _ := setupGuestTestRouter(t, true)
 	ctx := context.Background()
 
-	// Verify project count limit logic
-	pool, _ := connectTestDB(t)
-
-	// Count existing guest projects
-	var existingCount int
-	err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM projects WHERE owner_id = $1", models.GuestUserID).Scan(&existingCount)
-	require.NoError(t, err)
-
-	abuseDir := createTestDir(t)
+	// Pre-create a guest project for testing mutation endpoints
+	tempDir := createTestDir(t)
 	proj, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
-		Name:           "Guest Project Limit Test " + uuid.New().String()[:8],
+		Name:           "Origin Protection Test " + uuid.New().String()[:8],
 		SourceType:     models.SourceTypeLocalDirectory,
-		RepositoryPath: abuseDir,
+		RepositoryPath: tempDir,
 		Services: []services.CreateServiceInput{
 			{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
 		},
 	})
 	require.NoError(t, err)
-	defer projectService.DeleteProject(ctx, proj.ID, models.GuestUserID, nil)
+	t.Cleanup(func() {
+		_ = projectService.DeleteProject(ctx, proj.ID, models.GuestUserID, nil)
+	})
+
+	evilOrigin := "https://malicious-attacker.evil"
+
+	// 1. CORS Preflight OPTIONS from untrusted origin is rejected with 403 Forbidden
+	reqPreflight := httptest.NewRequest("OPTIONS", "/api/projects", nil)
+	reqPreflight.Header.Set("Origin", evilOrigin)
+	reqPreflight.Header.Set("Access-Control-Request-Method", "POST")
+	recPreflight := httptest.NewRecorder()
+	r.ServeHTTP(recPreflight, reqPreflight)
+	assert.Equal(t, http.StatusForbidden, recPreflight.Code)
+	assert.Empty(t, recPreflight.Header().Get("Access-Control-Allow-Origin"))
+
+	// 2. POST /api/projects with untrusted Origin is rejected before project creation
+	pool, _ := connectTestDB(t)
+	var countBefore int
+	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM projects WHERE owner_id = $1", models.GuestUserID).Scan(&countBefore)
+	require.NoError(t, err)
+
+	createProjBody, _ := json.Marshal(map[string]interface{}{
+		"name":        "Evil Injected Project",
+		"source_type": models.SourceTypeLocalDirectory,
+	})
+	reqCreate := httptest.NewRequest("POST", "/api/projects", bytes.NewReader(createProjBody))
+	reqCreate.Header.Set("Content-Type", "application/json")
+	reqCreate.Header.Set("Origin", evilOrigin)
+	recCreate := httptest.NewRecorder()
+	r.ServeHTTP(recCreate, reqCreate)
+	assert.Equal(t, http.StatusForbidden, recCreate.Code)
+	assert.Contains(t, recCreate.Body.String(), "untrusted origin")
+
+	var countAfter int
+	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM projects WHERE owner_id = $1", models.GuestUserID).Scan(&countAfter)
+	require.NoError(t, err)
+	assert.Equal(t, countBefore, countAfter, "no project should have been created in database")
+
+	// 3. POST /api/sources/upload with untrusted Origin
+	reqUpload := httptest.NewRequest("POST", "/api/sources/upload", bytes.NewReader([]byte("dummy content")))
+	reqUpload.Header.Set("Content-Type", "multipart/form-data; boundary=boundary")
+	reqUpload.Header.Set("Origin", evilOrigin)
+	recUpload := httptest.NewRecorder()
+	r.ServeHTTP(recUpload, reqUpload)
+	assert.Equal(t, http.StatusForbidden, recUpload.Code)
+
+	// 4. POST /api/sources/agent/session with untrusted Origin
+	reqAgentSess := httptest.NewRequest("POST", "/api/sources/agent/session", bytes.NewReader([]byte(`{"agent_id":"evil-agent"}`)))
+	reqAgentSess.Header.Set("Content-Type", "application/json")
+	reqAgentSess.Header.Set("Origin", evilOrigin)
+	recAgentSess := httptest.NewRecorder()
+	r.ServeHTTP(recAgentSess, reqAgentSess)
+	assert.Equal(t, http.StatusForbidden, recAgentSess.Code)
+
+	// 5. POST /api/projects/:id/env with untrusted Origin
+	envBody, _ := json.Marshal(map[string]string{"key": "EVIL_VAR", "value": "pwned"})
+	reqEnv := httptest.NewRequest("POST", fmt.Sprintf("/api/projects/%s/env", proj.ID), bytes.NewReader(envBody))
+	reqEnv.Header.Set("Content-Type", "application/json")
+	reqEnv.Header.Set("Origin", evilOrigin)
+	recEnv := httptest.NewRecorder()
+	r.ServeHTTP(recEnv, reqEnv)
+	assert.Equal(t, http.StatusForbidden, recEnv.Code)
+
+	// Verify env var was not written
+	var envCount int
+	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM environment_variables WHERE project_id = $1 AND key = 'EVIL_VAR'", proj.ID).Scan(&envCount)
+	require.NoError(t, err)
+	assert.Equal(t, 0, envCount)
+
+	// 6. DELETE /api/projects/:id with untrusted Origin
+	reqDel := httptest.NewRequest("DELETE", fmt.Sprintf("/api/projects/%s", proj.ID), nil)
+	reqDel.Header.Set("Origin", evilOrigin)
+	recDel := httptest.NewRecorder()
+	r.ServeHTTP(recDel, reqDel)
+	assert.Equal(t, http.StatusForbidden, recDel.Code)
+
+	// Verify project still exists
+	var projExists bool
+	err = pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)", proj.ID).Scan(&projExists)
+	require.NoError(t, err)
+	assert.True(t, projExists, "project must not be deleted by untrusted origin request")
+
+	// 7. Request with Sec-Fetch-Site: cross-site
+	reqCrossSite := httptest.NewRequest("POST", fmt.Sprintf("/api/projects/%s/stop", proj.ID), nil)
+	reqCrossSite.Header.Set("Sec-Fetch-Site", "cross-site")
+	recCrossSite := httptest.NewRecorder()
+	r.ServeHTTP(recCrossSite, reqCrossSite)
+	assert.Equal(t, http.StatusForbidden, recCrossSite.Code)
+
+	// 8. Request with untrusted Referer
+	reqReferer := httptest.NewRequest("POST", fmt.Sprintf("/api/projects/%s/stop", proj.ID), nil)
+	reqReferer.Header.Set("Referer", "https://untrusted-referer.com/dashboard")
+	recReferer := httptest.NewRecorder()
+	r.ServeHTTP(recReferer, reqReferer)
+	assert.Equal(t, http.StatusForbidden, recReferer.Code)
+
+	// 9. Legitimate authenticated registered user with JWT is allowed
+	regUserID := uuid.New()
+	regToken, err := jwtManager.GenerateAccessToken(regUserID, "registered@user.com")
+	require.NoError(t, err)
+
+	regReq := httptest.NewRequest("GET", "/api/projects", nil)
+	regReq.Header.Set("Authorization", "Bearer "+regToken)
+	regReq.Header.Set("Origin", "http://localhost:3000")
+	recReg := httptest.NewRecorder()
+	r.ServeHTTP(recReg, regReq)
+	assert.Equal(t, http.StatusOK, recReg.Code)
+}
+
+// 9. Allowed-origin guest requests succeed
+func TestGuestMode_AllowedOriginSucceeds(t *testing.T) {
+	r, _, _, _, _, _ := setupGuestTestRouter(t, true)
+
+	allowedOrigin := "http://localhost:3000"
+
+	// Preflight OPTIONS for allowed origin
+	reqPreflight := httptest.NewRequest("OPTIONS", "/api/projects", nil)
+	reqPreflight.Header.Set("Origin", allowedOrigin)
+	reqPreflight.Header.Set("Access-Control-Request-Method", "POST")
+	recPreflight := httptest.NewRecorder()
+	r.ServeHTTP(recPreflight, reqPreflight)
+	assert.Equal(t, http.StatusOK, recPreflight.Code)
+	assert.Equal(t, allowedOrigin, recPreflight.Header().Get("Access-Control-Allow-Origin"))
+
+	// Create session with allowed origin
+	sessReqBody := []byte(`{"agent_id":"agent-allowed-test"}`)
+	reqSess := httptest.NewRequest("POST", "/api/sources/agent/session", bytes.NewReader(sessReqBody))
+	reqSess.Header.Set("Content-Type", "application/json")
+	reqSess.Header.Set("Origin", allowedOrigin)
+	recSess := httptest.NewRecorder()
+	r.ServeHTTP(recSess, reqSess)
+	assert.Equal(t, http.StatusCreated, recSess.Code)
+	assert.Equal(t, allowedOrigin, recSess.Header().Get("Access-Control-Allow-Origin"))
+}
+
+// 10. Fail safely if guest owner cannot be initialized
+func TestGuestMode_GuestIdentityInitializationFailure(t *testing.T) {
+	pool, _ := connectTestDB(t)
+	jwtManager := auth.NewJWTManager("test-secret-key-32-bytes-long!!!", 15*time.Minute, 7*24*time.Hour)
+	userService := services.NewUserService(pool, jwtManager)
+
+	// A cancelled context simulates a database connection/execution failure during startup
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	err := userService.EnsureGuestUser(ctx)
+	assert.Error(t, err, "EnsureGuestUser must return error and fail-closed when database execution fails")
+}
+
+// 11. Guest project quota boundary: exactly 20 allowed, 21st rejected
+func TestGuestMode_20ProjectLimitAnd21stRejected(t *testing.T) {
+	_, _, projectService, _, _, _ := setupGuestTestRouter(t, true)
+	pool, _ := connectTestDB(t)
+	ctx := context.Background()
+
+	// Clean up any existing guest projects
+	_, err := pool.Exec(ctx, "DELETE FROM projects WHERE owner_id = $1", models.GuestUserID)
+	require.NoError(t, err)
+
+	createdProjectIDs := make([]uuid.UUID, 0, 25)
+	t.Cleanup(func() {
+		for _, id := range createdProjectIDs {
+			_ = projectService.DeleteProject(ctx, id, models.GuestUserID, nil)
+		}
+	})
+
+	// Create 20 projects sequentially
+	for i := 1; i <= 20; i++ {
+		tempDir := createTestDir(t)
+		proj, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+			Name:           fmt.Sprintf("Guest Quota Project %02d", i),
+			SourceType:     models.SourceTypeLocalDirectory,
+			RepositoryPath: tempDir,
+			Services: []services.CreateServiceInput{
+				{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+			},
+		})
+		require.NoError(t, err, "creating project %d of 20 should succeed", i)
+		createdProjectIDs = append(createdProjectIDs, proj.ID)
+	}
+
+	// Verify DB has exactly 20 projects
+	var count int
+	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM projects WHERE owner_id = $1", models.GuestUserID).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 20, count)
+
+	// Attempt to create the 21st project: MUST be rejected with quota error
+	tempDir21 := createTestDir(t)
+	proj21, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+		Name:           "Guest Quota Project 21 - Over Limit",
+		SourceType:     models.SourceTypeLocalDirectory,
+		RepositoryPath: tempDir21,
+		Services: []services.CreateServiceInput{
+			{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+		},
+	})
+	assert.Error(t, err, "21st project creation must be rejected")
+	assert.Nil(t, proj21)
+	assert.Contains(t, err.Error(), "guest deployment limit reached")
+
+	// Delete 1 project -> count is 19
+	err = projectService.DeleteProject(ctx, createdProjectIDs[0], models.GuestUserID, nil)
+	require.NoError(t, err)
+	createdProjectIDs = createdProjectIDs[1:]
+
+	// Creating project again should succeed -> count is 20 again
+	tempDirReplacement := createTestDir(t)
+	projReplacement, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+		Name:           "Guest Quota Replacement Project",
+		SourceType:     models.SourceTypeLocalDirectory,
+		RepositoryPath: tempDirReplacement,
+		Services: []services.CreateServiceInput{
+			{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+		},
+	})
+	require.NoError(t, err, "creating replacement project up to quota 20 should succeed")
+	createdProjectIDs = append(createdProjectIDs, projReplacement.ID)
+
+	// Verify 21st is rejected again
+	_, err = projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+		Name:           "Guest Quota Project 21 - Second Attempt",
+		SourceType:     models.SourceTypeLocalDirectory,
+		RepositoryPath: tempDir21,
+		Services: []services.CreateServiceInput{
+			{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+		},
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "guest deployment limit reached")
+}
+
+// 12. Concurrent guest project creation race test
+func TestGuestMode_ConcurrentProjectCreationQuota(t *testing.T) {
+	_, _, projectService, _, _, _ := setupGuestTestRouter(t, true)
+	pool, _ := connectTestDB(t)
+	ctx := context.Background()
+
+	// Clean up any existing guest projects
+	_, err := pool.Exec(ctx, "DELETE FROM projects WHERE owner_id = $1", models.GuestUserID)
+	require.NoError(t, err)
+
+	// Pre-create 15 projects
+	createdProjectIDs := make([]uuid.UUID, 0, 25)
+	var mu sync.Mutex
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, id := range createdProjectIDs {
+			_ = projectService.DeleteProject(ctx, id, models.GuestUserID, nil)
+		}
+	})
+
+	for i := 1; i <= 15; i++ {
+		tempDir := createTestDir(t)
+		proj, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+			Name:           fmt.Sprintf("Base Quota Project %02d", i),
+			SourceType:     models.SourceTypeLocalDirectory,
+			RepositoryPath: tempDir,
+			Services: []services.CreateServiceInput{
+				{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+			},
+		})
+		require.NoError(t, err)
+		createdProjectIDs = append(createdProjectIDs, proj.ID)
+	}
+
+	// Now launch 10 simultaneous goroutines attempting to create projects (15 + 10 = 25 attempts, limit 20)
+	concurrency := 10
+	var wg sync.WaitGroup
+	var successCount, failureCount int
+	var countMu sync.Mutex
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			tempDir := createTestDir(t)
+			proj, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+				Name:           fmt.Sprintf("Concurrent Guest Project %02d", workerID),
+				SourceType:     models.SourceTypeLocalDirectory,
+				RepositoryPath: tempDir,
+				Services: []services.CreateServiceInput{
+					{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+				},
+			})
+			countMu.Lock()
+			defer countMu.Unlock()
+			if err == nil {
+				successCount++
+				mu.Lock()
+				createdProjectIDs = append(createdProjectIDs, proj.ID)
+				mu.Unlock()
+			} else {
+				failureCount++
+				assert.Contains(t, err.Error(), "guest deployment limit reached")
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Exactly 5 should have succeeded (reaching limit of 20) and 5 should have failed
+	assert.Equal(t, 5, successCount, "exactly 5 concurrent creations should succeed to reach quota 20")
+	assert.Equal(t, 5, failureCount, "remaining 5 concurrent creations must fail")
+
+	// Final verification in PostgreSQL
+	var totalProjects int
+	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM projects WHERE owner_id = $1", models.GuestUserID).Scan(&totalProjects)
+	require.NoError(t, err)
+	assert.Equal(t, 20, totalProjects, "database must have exactly 20 projects, never more")
+}
+
+// 13. Active guest deployment concurrency limit (maximum 5 active deployments)
+func TestGuestMode_ActiveDeploymentLimit(t *testing.T) {
+	_, _, projectService, _, _, _ := setupGuestTestRouter(t, true)
+	pool, _ := connectTestDB(t)
+	ctx := context.Background()
+
+	deploymentService := services.NewDeploymentService(pool)
+
+	projects := make([]*models.Project, 0, 6)
+	t.Cleanup(func() {
+		for _, p := range projects {
+			_ = projectService.DeleteProject(ctx, p.ID, models.GuestUserID, nil)
+		}
+	})
+
+	// Create 5 projects, each with 1 active in-flight deployment
+	insertedDeployIDs := make([]uuid.UUID, 0, 5)
+	for i := 1; i <= 5; i++ {
+		tempDir := createTestDir(t)
+		p, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+			Name:           fmt.Sprintf("Guest Concurrency Test %d", i),
+			SourceType:     models.SourceTypeLocalDirectory,
+			RepositoryPath: tempDir,
+			Services: []services.CreateServiceInput{
+				{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+			},
+		})
+		require.NoError(t, err)
+		projects = append(projects, p)
+
+		deployID := uuid.New()
+		_, err = pool.Exec(ctx,
+			`INSERT INTO deployments (id, project_id, deploy_number, status, commit_sha, created_at)
+			 VALUES ($1, $2, $3, $4, $5, NOW())`,
+			deployID, p.ID, 1, models.DeployStatusBuilding, "abcd1234",
+		)
+		require.NoError(t, err)
+		insertedDeployIDs = append(insertedDeployIDs, deployID)
+	}
+
+	// Create 6th project
+	tempDir6 := createTestDir(t)
+	p6, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+		Name:           "Guest Concurrency Test 6",
+		SourceType:     models.SourceTypeLocalDirectory,
+		RepositoryPath: tempDir6,
+		Services: []services.CreateServiceInput{
+			{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+		},
+	})
+	require.NoError(t, err)
+	projects = append(projects, p6)
+
+	// Attempting deployment on 6th project must fail due to guest concurrency quota (5 active)
+	_, err = deploymentService.CreateDeployment(ctx, p6)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "guest deployment concurrency limit reached")
+
+	// Mark 1 deployment on first project as running -> now only 4 active in-flight
+	_, err = pool.Exec(ctx, "UPDATE deployments SET status = $1 WHERE id = $2", models.DeployStatusRunning, insertedDeployIDs[0])
+	require.NoError(t, err)
+
+	// Now CreateDeployment on 6th project succeeds
+	d6, err := deploymentService.CreateDeployment(ctx, p6)
+	require.NoError(t, err)
+	assert.NotNil(t, d6)
+}
+
+// 14. Migration rollback refuses to delete owner when guest resources exist
+func TestGuestMode_MigrationRollbackSafety(t *testing.T) {
+	_, _, projectService, _, _, userService := setupGuestTestRouter(t, true)
+	pool, _ := connectTestDB(t)
+	ctx := context.Background()
+
+	// Ensure guest user exists
+	require.NoError(t, userService.EnsureGuestUser(ctx))
+
+	// Create a project owned by guest
+	tempDir := createTestDir(t)
+	proj, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+		Name:           "Rollback Safety Project " + uuid.New().String()[:8],
+		SourceType:     models.SourceTypeLocalDirectory,
+		RepositoryPath: tempDir,
+		Services: []services.CreateServiceInput{
+			{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 8080},
+		},
+	})
+	require.NoError(t, err)
+
+	// Read and execute down migration SQL
+	candidates := []string{
+		"../../migrations/000017_add_guest_identity.down.sql",
+		"../migrations/000017_add_guest_identity.down.sql",
+		"migrations/000017_add_guest_identity.down.sql",
+	}
+	var downSQL []byte
+	for _, c := range candidates {
+		if data, err := os.ReadFile(c); err == nil {
+			downSQL = data
+			break
+		}
+	}
+	require.NotEmpty(t, downSQL, "must find 000017_add_guest_identity.down.sql")
+
+	// Executing down migration MUST fail because guest project exists
+	_, err = pool.Exec(ctx, string(downSQL))
+	assert.Error(t, err, "down migration must fail when guest project exists")
+	assert.Contains(t, err.Error(), "Cannot rollback migration 000017_add_guest_identity")
+
+	// Verify guest user still exists in database
+	var guestExists bool
+	err = pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", models.GuestUserID).Scan(&guestExists)
+	require.NoError(t, err)
+	assert.True(t, guestExists, "guest user must NOT be deleted while projects exist")
+
+	// Now clean up the guest project
+	err = projectService.DeleteProject(ctx, proj.ID, models.GuestUserID, nil)
+	require.NoError(t, err)
+
+	// Also clean up any lingering guest sources if any
+	_, err = pool.Exec(ctx, "DELETE FROM sources WHERE owner_id = $1", models.GuestUserID)
+	require.NoError(t, err)
+
+	// Down migration should now succeed!
+	_, err = pool.Exec(ctx, string(downSQL))
+	require.NoError(t, err, "down migration should succeed when no guest resources remain")
+
+	// Verify guest user was deleted
+	err = pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", models.GuestUserID).Scan(&guestExists)
+	require.NoError(t, err)
+	assert.False(t, guestExists, "guest user should be removed after clean down migration")
+
+	// Re-run up migration to restore guest user for subsequent tests
+	var upSQL []byte
+	for _, c := range []string{
+		"../../migrations/000017_add_guest_identity.up.sql",
+		"../migrations/000017_add_guest_identity.up.sql",
+		"migrations/000017_add_guest_identity.up.sql",
+	} {
+		if data, err := os.ReadFile(c); err == nil {
+			upSQL = data
+			break
+		}
+	}
+	require.NotEmpty(t, upSQL, "must find 000017_add_guest_identity.up.sql")
+
+	_, err = pool.Exec(ctx, string(upSQL))
+	require.NoError(t, err, "up migration should succeed")
+
+	// Verify idempotency of up migration
+	_, err = pool.Exec(ctx, string(upSQL))
+	require.NoError(t, err, "up migration must be idempotent")
+
+	// Ensure guest is restored
+	err = pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", models.GuestUserID).Scan(&guestExists)
+	require.NoError(t, err)
+	assert.True(t, guestExists, "guest user must be restored")
 }

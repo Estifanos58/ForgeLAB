@@ -331,3 +331,107 @@ func TestConfigValidation_FrontendAndCORS(t *testing.T) {
 		t.Errorf("expected valid frontend and CORS origins to pass in production, got: %v", err)
 	}
 }
+
+func TestConfigGuestModeDefaults(t *testing.T) {
+	// Helper to set standard prod vars to allow config.Load to pass
+	setupProdEnv := func() {
+		os.Setenv("APP_ENV", "production")
+		os.Setenv("COOKIE_SECURE", "true")
+		os.Setenv("RATE_LIMIT_TRUSTED_PROXIES", "127.0.0.1")
+		os.Setenv("JWT_SECRET", "this-is-a-valid-production-jwt-secret-with-more-than-32-chars")
+		os.Setenv("FORGELAB_ENCRYPTION_KEY", "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=")
+		os.Setenv("DATABASE_URL", "postgres://forgelab:strong_prod_pass_123@db:5432/forgelab")
+		os.Setenv("FORGELAB_ALLOWED_SOURCE_ROOTS", "/var/forgelab/sources")
+		os.Setenv("FRONTEND_URL", "https://app.forgelab.com")
+		os.Setenv("CORS_ALLOWED_ORIGINS", "https://app.forgelab.com")
+	}
+
+	cleanupEnv := func() {
+		os.Unsetenv("APP_ENV")
+		os.Unsetenv("COOKIE_SECURE")
+		os.Unsetenv("RATE_LIMIT_TRUSTED_PROXIES")
+		os.Unsetenv("JWT_SECRET")
+		os.Unsetenv("FORGELAB_ENCRYPTION_KEY")
+		os.Unsetenv("DATABASE_URL")
+		os.Unsetenv("FORGELAB_ALLOWED_SOURCE_ROOTS")
+		os.Unsetenv("FRONTEND_URL")
+		os.Unsetenv("CORS_ALLOWED_ORIGINS")
+		os.Unsetenv("FORGELAB_ALLOW_GUEST_MODE")
+		os.Unsetenv("ALLOW_GUEST_MODE")
+	}
+
+	t.Run("development defaults to enabled", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		os.Setenv("APP_ENV", "development")
+		os.Setenv("JWT_SECRET", "dev-secret-that-is-short")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.App.AllowGuestMode {
+			t.Errorf("expected AllowGuestMode to be true in development by default")
+		}
+	})
+
+	t.Run("production defaults to disabled", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.App.AllowGuestMode {
+			t.Errorf("expected AllowGuestMode to be false in production by default")
+		}
+	})
+
+	t.Run("staging defaults to disabled", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("APP_ENV", "staging")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.App.AllowGuestMode {
+			t.Errorf("expected AllowGuestMode to be false in staging by default")
+		}
+	})
+
+	t.Run("production explicitly enabled", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("FORGELAB_ALLOW_GUEST_MODE", "true")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.App.AllowGuestMode {
+			t.Errorf("expected AllowGuestMode to be true when explicitly configured")
+		}
+	})
+
+	t.Run("development explicitly disabled", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		os.Setenv("APP_ENV", "development")
+		os.Setenv("JWT_SECRET", "dev-secret-that-is-short")
+		os.Setenv("FORGELAB_ALLOW_GUEST_MODE", "false")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.App.AllowGuestMode {
+			t.Errorf("expected AllowGuestMode to be false when explicitly disabled in dev")
+		}
+	})
+}

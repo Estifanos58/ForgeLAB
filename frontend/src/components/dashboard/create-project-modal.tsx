@@ -175,7 +175,7 @@ function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): Confi
 
 export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProjectModalProps) {
   const router = useRouter();
-  const { user } = useAuth();
+  const { user, allowGuestMode } = useAuth();
 
   // Step state
   const [step, setStep] = useState<Step>('source');
@@ -1384,6 +1384,31 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       )}
 
       {step === 'source' && (
+        !user && !allowGuestMode ? (
+          <div className="p-8 rounded-lg border border-surface-border bg-surface-elevated/40 text-center space-y-4">
+            <div className="w-12 h-12 rounded-full bg-surface border border-surface-border flex items-center justify-center mx-auto text-neutral-400">
+              <Lock className="w-6 h-6 text-neutral-300" />
+            </div>
+            <div className="max-w-md mx-auto space-y-1.5">
+              <h3 className="text-sm font-semibold text-white">Sign In Required</h3>
+              <p className="text-xs text-neutral-400">
+                Guest deployments are disabled on this installation. You must sign in or register an account before deploying applications.
+              </p>
+            </div>
+            <div className="flex items-center justify-center gap-3 pt-2">
+              <Link href="/login">
+                <Button variant="outline" size="sm" className="text-xs">
+                  Sign In
+                </Button>
+              </Link>
+              <Link href="/register">
+                <Button variant="primary" size="sm" className="text-xs">
+                  Create Account
+                </Button>
+              </Link>
+            </div>
+          </div>
+        ) : (
         <div className="space-y-4">
           {/* Source Selector Tabs */}
           <div className="grid grid-cols-2 p-1 rounded-md bg-surface-elevated border border-surface-border text-xs">
@@ -2080,9 +2105,11 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                     </Button>
                   </Link>
                 </div>
-                <div className="pt-2 text-[11px] text-neutral-500">
-                  Tip: You can deploy local projects immediately from your machine without creating an account!
-                </div>
+                {allowGuestMode && (
+                  <div className="pt-2 text-[11px] text-neutral-500">
+                    Tip: You can deploy local projects immediately from your machine without creating an account!
+                  </div>
+                )}
               </div>
             ) : (
             <div className="space-y-4">
@@ -2517,6 +2544,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             )}
           </div>
         </div>
+        )
       )}
 
       {/* STEP 2: CONFIGURATION & REVIEW */}

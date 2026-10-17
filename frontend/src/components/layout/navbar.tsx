@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Terminal } from 'lucide-react';
 
 export function Navbar() {
-  const { user, loading } = useAuth();
+  const { user, allowGuestMode, loading } = useAuth();
 
   return (
     <header className="sticky top-0 z-40 w-full border-b border-surface-border bg-background/95">
@@ -55,11 +55,13 @@ export function Navbar() {
             </Link>
           ) : (
             <>
-              <Link href="/dashboard?deploy=true">
-                <Button size="sm" variant="outline" className="border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10 text-xs">
-                  Deploy Local
-                </Button>
-              </Link>
+              {allowGuestMode && (
+                <Link href="/dashboard?deploy=true">
+                  <Button size="sm" variant="outline" className="border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10 text-xs">
+                    Deploy Local
+                  </Button>
+                </Link>
+              )}
               <Link href="/login">
                 <Button size="sm" variant="ghost">
                   Sign In

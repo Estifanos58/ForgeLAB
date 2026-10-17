@@ -157,10 +157,13 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 	}
 
 	if models.IsGuest(ownerID) {
-		var guestCount int
 		if s.db != nil {
+			var guestCount int
 			err := s.db.QueryRow(ctx, "SELECT COUNT(*) FROM projects WHERE owner_id = $1", ownerID).Scan(&guestCount)
-			if err == nil && guestCount >= 20 {
+			if err != nil {
+				return nil, fmt.Errorf("failed to verify guest project quota: %w", err)
+			}
+			if guestCount >= 20 {
 				return nil, fmt.Errorf("%w: guest deployment limit reached (maximum 20 projects)", ErrValidationFailed)
 			}
 		}
@@ -579,6 +582,29 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	// For guest project creation, serialize access and atomically verify quota using row lock on guest user
+	if models.IsGuest(ownerID) {
+		var lockedID uuid.UUID
+		err = tx.QueryRow(ctx, "SELECT id FROM users WHERE id = $1 FOR UPDATE", ownerID).Scan(&lockedID)
+		if err != nil {
+			slog.Error("failed to acquire guest quota lock", "owner_id", ownerID, "error", err)
+			return nil, fmt.Errorf("failed to acquire guest quota lock: %w", err)
+		}
+
+		var currentGuestCount int
+		err = tx.QueryRow(ctx, "SELECT COUNT(*) FROM projects WHERE owner_id = $1", ownerID).Scan(&currentGuestCount)
+		if err != nil {
+			slog.Error("failed to count guest projects within transaction", "owner_id", ownerID, "error", err)
+			return nil, fmt.Errorf("failed to check guest project quota: %w", err)
+		}
+		if currentGuestCount >= 20 {
+			return nil, fmt.Errorf("%w: guest deployment limit reached (maximum 20 projects)", ErrValidationFailed)
+		}
+		if len(servicesToCreate) > 10 {
+			return nil, fmt.Errorf("%w: guest projects can have at most 10 services", ErrValidationFailed)
+		}
+	}
 
 	// 1. Insert or update source record
 	_, err = tx.Exec(ctx,

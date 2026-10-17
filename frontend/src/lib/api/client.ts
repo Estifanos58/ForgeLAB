@@ -1,6 +1,7 @@
 import {
   AgentSourceSession,
   AgentStatus,
+  AuthModeResponse,
   AuthResponse,
   CreateProjectInput,
   Deployment,
@@ -210,6 +211,12 @@ export const api = {
     async refresh(): Promise<{ expires_in: number }> {
       return apiFetch<{ expires_in: number }>('/api/auth/refresh', {
         method: 'POST',
+      });
+    },
+
+    async getMode(): Promise<AuthModeResponse> {
+      return apiFetch<AuthModeResponse>('/api/auth/mode', {
+        method: 'GET',
       });
     },
   },

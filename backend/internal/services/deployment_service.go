@@ -229,6 +229,28 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		return nil, ErrProjectDeleting
 	}
 
+	// Limit active in-flight guest deployments to prevent resource exhaustion
+	if models.IsGuest(project.OwnerID) {
+		var activeGuestDeployments int
+		err = tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM deployments d
+			 JOIN projects p ON d.project_id = p.id
+			 WHERE p.owner_id = $1 AND d.status IN ($2, $3, $4, $5, $6)`,
+			project.OwnerID,
+			models.DeployStatusQueued,
+			models.DeployStatusCloning,
+			models.DeployStatusBuilding,
+			models.DeployStatusStarting,
+			models.DeployStatusHealthChecking,
+		).Scan(&activeGuestDeployments)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check guest active deployment quota: %w", err)
+		}
+		if activeGuestDeployments >= 5 {
+			return nil, fmt.Errorf("%w: guest deployment concurrency limit reached (maximum 5 active deployments in progress)", ErrValidationFailed)
+		}
+	}
+
 	// Check for existing active deployment
 	// If an existing deployment is still in 'queued' state, the newer deployment supersedes it.
 	var activeID *uuid.UUID
@@ -509,6 +531,29 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	}
 	if parentProjStatus == models.ProjectStatusDeleting {
 		return nil, ErrProjectDeleting
+	}
+
+	// Limit active in-flight guest service deployments to prevent resource exhaustion
+	if models.IsGuest(project.OwnerID) {
+		var activeGuestDeployments int
+		err = tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM service_deployments sd
+			 JOIN services s ON sd.service_id = s.id
+			 JOIN projects p ON s.project_id = p.id
+			 WHERE p.owner_id = $1 AND sd.status IN ($2, $3, $4, $5, $6)`,
+			project.OwnerID,
+			models.DeployStatusQueued,
+			models.DeployStatusCloning,
+			models.DeployStatusBuilding,
+			models.DeployStatusStarting,
+			models.DeployStatusHealthChecking,
+		).Scan(&activeGuestDeployments)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check guest active service deployment quota: %w", err)
+		}
+		if activeGuestDeployments >= 5 {
+			return nil, fmt.Errorf("%w: guest deployment concurrency limit reached (maximum 5 active deployments in progress)", ErrValidationFailed)
+		}
 	}
 
 	// Lock only the target service row FOR UPDATE to prevent concurrent creation for the exact same service

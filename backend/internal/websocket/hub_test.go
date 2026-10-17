@@ -828,6 +828,112 @@ func TestWebSocketOriginAllowlist(t *testing.T) {
 	}
 }
 
+// 12b. Anonymous guest WebSocket origin and access policy
+func TestWebSocketGuestOriginSecurity(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	regUserID := uuid.New()
+	regProjectID := uuid.New()
+	regDeployID := uuid.New()
+
+	guestProjectID := uuid.New()
+	guestDeployID := uuid.New()
+
+	mockProjectSvc := &mockProjectAuthorizer{
+		getProjectFn: func(ctx context.Context, id, ownerID uuid.UUID) (*models.Project, error) {
+			if id == regProjectID && ownerID == regUserID {
+				return &models.Project{ID: regProjectID, OwnerID: regUserID}, nil
+			}
+			if id == guestProjectID && ownerID == models.GuestUserID {
+				return &models.Project{ID: guestProjectID, OwnerID: models.GuestUserID}, nil
+			}
+			return nil, errors.New("project access denied")
+		},
+	}
+
+	mockDeploySvc := &mockDeploymentResolver{
+		getDeploymentFn: func(ctx context.Context, id uuid.UUID) (*models.Deployment, error) {
+			if id == regDeployID {
+				return &models.Deployment{ID: regDeployID, ProjectID: regProjectID}, nil
+			}
+			if id == guestDeployID {
+				return &models.Deployment{ID: guestDeployID, ProjectID: guestProjectID}, nil
+			}
+			return nil, errors.New("deployment not found")
+		},
+	}
+
+	hub := NewHub(jwtManager, mockProjectSvc, mockDeploySvc, nil, "http://localhost:3000")
+	defer hub.cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeWS))
+	defer server.Close()
+
+	wsBaseURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	// Case 1: Anonymous guest connection with disallowed origin is rejected with 403 Forbidden
+	headerDisallowed := http.Header{"Origin": []string{"http://evil-attacker-site.com"}}
+	_, respDisallowed, err := websocket.DefaultDialer.Dial(wsBaseURL, headerDisallowed)
+	if err == nil {
+		t.Fatalf("expected dial to fail for anonymous connection with disallowed origin")
+	}
+	if respDisallowed == nil || respDisallowed.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for disallowed anonymous origin, got %+v", respDisallowed)
+	}
+
+	// Case 2: Anonymous guest connection with allowed origin succeeds (101 Switching Protocols)
+	headerAllowed := http.Header{"Origin": []string{"http://localhost:3000"}}
+	guestConn, respAllowed, err := websocket.DefaultDialer.Dial(wsBaseURL, headerAllowed)
+	if err != nil {
+		t.Fatalf("expected allowed anonymous connection to succeed, got: %v", err)
+	}
+	defer guestConn.Close()
+	if respAllowed.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("expected 101 Switching Protocols, got %d", respAllowed.StatusCode)
+	}
+
+	// Case 3: Guest connection can subscribe to guest deployment
+	subGuest := ClientMessage{
+		Type:    "subscribe",
+		Channel: "deployment:" + guestDeployID.String(),
+	}
+	if err := guestConn.WriteJSON(subGuest); err != nil {
+		t.Fatalf("failed to send subscribe to guest deployment: %v", err)
+	}
+	var ackGuest EventMessage
+	if err := guestConn.ReadJSON(&ackGuest); err != nil {
+		t.Fatalf("failed to read ack for guest deployment subscription: %v", err)
+	}
+	if ackGuest.Type != "subscribed" {
+		t.Fatalf("expected subscribed event for guest deployment, got: %+v", ackGuest)
+	}
+
+	// Case 4: Guest connection attempting to subscribe to registered-user deployment is rejected
+	subReg := ClientMessage{
+		Type:    "subscribe",
+		Channel: "deployment:" + regDeployID.String(),
+	}
+	if err := guestConn.WriteJSON(subReg); err != nil {
+		t.Fatalf("failed to send subscribe to registered deployment: %v", err)
+	}
+	var errReg EventMessage
+	if err := guestConn.ReadJSON(&errReg); err != nil {
+		t.Fatalf("failed to read error response: %v", err)
+	}
+	if errReg.Type != "error" || errReg.Code != "UNAUTHORIZED" {
+		t.Fatalf("expected unauthorized error for subscription to registered user deployment, got: %+v", errReg)
+	}
+
+	// Case 5: When guest mode is disabled on hub, anonymous connection is rejected with 401 Unauthorized
+	hub.SetAllowGuestMode(false)
+	_, respDisabled, err := websocket.DefaultDialer.Dial(wsBaseURL, headerAllowed)
+	if err == nil {
+		t.Fatalf("expected dial to fail when guest mode is disabled")
+	}
+	if respDisabled == nil || respDisabled.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when guest mode is disabled, got %+v", respDisabled)
+	}
+}
+
 // 13. Reconnect replay of missed log events
 func TestWebSocketReconnectReplay(t *testing.T) {
 	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)

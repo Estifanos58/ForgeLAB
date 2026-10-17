@@ -12,7 +12,7 @@ interface AppHeaderProps {
 }
 
 export function AppHeader({ breadcrumbs }: AppHeaderProps) {
-  const { user, logout } = useAuth();
+  const { user, allowGuestMode, logout } = useAuth();
 
   return (
     <header className="sticky top-0 z-40 w-full border-b border-surface-border bg-background">
@@ -82,10 +82,12 @@ export function AppHeader({ breadcrumbs }: AppHeaderProps) {
             </>
           ) : (
             <>
-              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded border border-amber-500/30 bg-amber-500/10 text-[11px] text-amber-300">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-                <span className="font-medium">Guest Mode</span>
-              </div>
+              {allowGuestMode && (
+                <div className="flex items-center gap-1.5 px-2 py-0.5 rounded border border-amber-500/30 bg-amber-500/10 text-[11px] text-amber-300">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  <span className="font-medium">Guest Mode</span>
+                </div>
+              )}
               <Link href="/login">
                 <Button size="sm" variant="ghost" className="h-7 text-xs text-neutral-300 hover:text-white">
                   Sign In

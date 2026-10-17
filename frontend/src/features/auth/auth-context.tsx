@@ -8,6 +8,8 @@ import { User } from '@/lib/api/types';
 interface AuthContextType {
   user: User | null;
   loading: boolean;
+  allowGuestMode: boolean;
+  isGuest: boolean;
   error: string | null;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string, displayName?: string) => Promise<void>;
@@ -20,6 +22,7 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
+  const [allowGuestMode, setAllowGuestMode] = useState<boolean>(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const router = useRouter();
@@ -28,11 +31,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const refreshUser = useCallback(async () => {
     try {
-      const currentUser = await api.auth.me();
-      setUser(currentUser);
-      setError(null);
+      const [authModeResult, userResult] = await Promise.allSettled([
+        api.auth.getMode(),
+        api.auth.me(),
+      ]);
+
+      if (authModeResult.status === 'fulfilled') {
+        const mode = authModeResult.value;
+        setAllowGuestMode(Boolean(mode.allow_guest_mode ?? mode.guest_mode_enabled));
+      } else {
+        // Fail-closed: if configuration endpoint fails or is unreachable, do not enable guest mode
+        setAllowGuestMode(false);
+      }
+
+      if (userResult.status === 'fulfilled') {
+        setUser(userResult.value);
+        setError(null);
+      } else {
+        setUser(null);
+      }
     } catch {
       setUser(null);
+      setAllowGuestMode(false);
     } finally {
       setLoading(false);
     }
@@ -83,11 +103,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  const isGuest = !loading && user === null && allowGuestMode;
+
   return (
     <AuthContext.Provider
       value={{
         user,
         loading,
+        allowGuestMode,
+        isGuest,
         error,
         login,
         register,
