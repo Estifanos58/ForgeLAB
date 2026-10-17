@@ -107,6 +107,8 @@ export interface ConfigurableService {
   dockerfile_path: string;
   health_strategy: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path: string;
+  public_exposed?: boolean;
+  host_port?: number;
   expanded?: boolean;
 }
 
@@ -134,6 +136,10 @@ function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): Confi
   const pkgManager = def.package_manager || def.build_system || 'generic';
   const strategy = (def.build_strategy as any) || (def.selected_build_strategy as any) || (defaultCandidate?.strategy === 'dockerfile' ? 'dockerfile' : 'auto');
 
+  const isFrontend = def.role === 'frontend' || (def.name && def.name.toLowerCase().includes('frontend'));
+  const isApplication = !def.classification || def.classification === 'application';
+  const defaultPublicExposed = def.public_exposed !== undefined ? def.public_exposed : (isFrontend || isApplication);
+
   return {
     id: def.id || `svc-${idx}-${Date.now()}`,
     name: def.name || (def.role === 'frontend' ? 'frontend' : def.role === 'backend' ? 'backend' : `service-${idx + 1}`),
@@ -156,6 +162,8 @@ function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): Confi
     build_command: def.build_command || defaultCandidate?.build_command || '',
     start_command: def.start_command || defaultCandidate?.start_command || '',
     internal_port: def.internal_port || defaultCandidate?.suggested_port || 8080,
+    host_port: def.host_port || defaultCandidate?.suggested_port,
+    public_exposed: defaultPublicExposed,
     dockerfile_path: def.dockerfile_path || defaultCandidate?.dockerfile_path || (strategy === 'dockerfile' ? 'Dockerfile' : ''),
     health_strategy: (def.health_strategy as any) || (defaultCandidate?.health_strategy as any) || 'auto',
     health_check_path: def.health_check_path || defaultCandidate?.health_check_path || '/health',
@@ -1208,6 +1216,10 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
       const servicesPayload: any[] = configuredServices.map((svc) => {
         const planned = deploymentPlan?.services.find((ps) => ps.name === svc.name);
+        const isFrontend = svc.role === 'frontend' || (svc.name && svc.name.toLowerCase().includes('frontend'));
+        const isApp = !svc.classification || svc.classification === 'application';
+        const isPublic = planned?.public_exposed ?? svc.public_exposed ?? (isFrontend || isApp);
+
         return {
           name: svc.name.trim(),
           role: svc.role,
@@ -1230,6 +1242,8 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
           start_command: svc.start_command,
           dockerfile_path: planned?.dockerfile_path !== undefined ? planned.dockerfile_path : svc.dockerfile_path,
           internal_port: Number(svc.internal_port) || 8080,
+          host_port: planned?.host_port || svc.host_port,
+          public_exposed: isPublic,
           health_strategy: svc.health_strategy,
           health_check_path: svc.health_check_path,
         };

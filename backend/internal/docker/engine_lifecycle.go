@@ -481,6 +481,10 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 				cID := *svc.ContainerID
 				dockCont, exists := containerMap[cID]
 				if !exists {
+					if svc.Classification == models.ClassificationJob || svc.Status == models.ServiceStatusStopped {
+						slog.Info("reconciliation: stopped/job service container missing (cleaned up), keeping status", "service_id", svc.ID)
+						continue
+					}
 					// Container disappeared while offline
 					_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
 					if svc.CurrentServiceDeploymentID != nil {
@@ -488,8 +492,8 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 					}
 					slog.Warn("reconciliation: service container missing, marked failed", "service_id", svc.ID, "container_id", cID)
 				} else if dockCont.State != "running" {
-					if svc.Status == models.ServiceStatusStopped {
-						// Service was intentionally stopped; preserve its stopped container
+					if svc.Status == models.ServiceStatusStopped || svc.Classification == models.ClassificationJob {
+						// Service was intentionally stopped or is a completed job; preserve its stopped container
 						legitimateContainers[dockCont.ID] = true
 						if len(dockCont.ID) > 12 {
 							legitimateContainers[dockCont.ID[:12]] = true
@@ -917,6 +921,9 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 		insp, err := e.dockerClient.ContainerInspect(ctx, *svc.ContainerID)
 		if err != nil {
 			if client.IsErrNotFound(err) {
+				if svc.Classification == models.ClassificationJob || svc.Status == models.ServiceStatusStopped {
+					continue
+				}
 				_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
 				if svc.CurrentServiceDeploymentID != nil && e.deploymentService != nil {
 					_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, "Runtime container terminated or disappeared from Docker daemon")

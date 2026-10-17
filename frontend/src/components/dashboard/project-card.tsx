@@ -54,7 +54,7 @@ export function ProjectCard({
       <div className="pt-2.5 border-t border-surface-border flex flex-col gap-2 font-mono text-[11px]">
         <div className="flex items-center justify-between">
           <div>
-            {project.status === 'running' && (project.preview_url || project.port) ? (
+            {(project.status === 'running' || project.status === 'partially_running') && (project.preview_url || project.port) ? (
               <a
                 href={
                   project.preview_url ||

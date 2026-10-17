@@ -5,6 +5,7 @@ import { Deployment, DeploymentLog, LogTarget, Service } from '@/lib/api/types';
 import { TerminalViewer } from '@/features/deployments/terminal-viewer';
 import { WSConnectionState } from '@/lib/websocket/use-deployment-ws';
 import { cn } from '@/lib/utils/cn';
+import { Radio, ExternalLink } from 'lucide-react';
 
 interface LogsSectionProps {
   deployments: Deployment[];
@@ -18,6 +19,7 @@ interface LogsSectionProps {
   connected: boolean;
   connectionState: WSConnectionState;
   onClearLogs?: () => void;
+  primaryPreviewUrl?: string | null;
 }
 
 export function LogsSection({
@@ -32,6 +34,7 @@ export function LogsSection({
   connected,
   connectionState,
   onClearLogs,
+  primaryPreviewUrl,
 }: LogsSectionProps) {
   // If target is a service deployment, show all its logs directly.
   // Otherwise filter release logs client-side if a specific service scope is selected.
@@ -117,59 +120,75 @@ export function LogsSection({
           </div>
         )}
 
-        {/* Service Scope Tabs */}
-        {services.length > 0 && (
-          <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono sm:ml-auto overflow-x-auto max-w-full min-w-0 shrink-0">
-            <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold shrink-0">
-              Scope:
-            </span>
-            <button
-              type="button"
-              onClick={() => onSelectServiceScope(null)}
-              className={cn(
-                'px-2.5 py-1 rounded transition-colors text-xs font-medium shrink-0 whitespace-nowrap',
-                selectedLogTarget?.type === 'release' && selectedServiceId === null
-                  ? 'bg-white text-black font-semibold shadow-sm'
-                  : 'text-neutral-400 hover:text-white'
-              )}
+        <div className="flex items-center gap-2 sm:ml-auto flex-wrap">
+          {primaryPreviewUrl && (
+            <a
+              href={primaryPreviewUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-semibold shadow-sm transition-colors shrink-0 font-sans"
+              title="Open application preview in new tab"
             >
-              All Services
-            </button>
-            {services.map((svc) => {
-              const isServiceActive =
-                (selectedLogTarget?.type === 'service' && selectedLogTarget.serviceDeployment.service_id === svc.id) ||
-                (selectedLogTarget?.type === 'release' && selectedServiceId === svc.id);
-              return (
-                <button
-                  key={svc.id}
-                  type="button"
-                  onClick={() => onSelectServiceScope(svc.id)}
-                  className={cn(
-                    'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5 shrink-0 whitespace-nowrap',
-                    isServiceActive
-                      ? 'bg-white text-black font-semibold shadow-sm'
-                      : 'text-neutral-400 hover:text-white'
-                  )}
-                >
-                  <span
+              <Radio className="w-3 h-3 text-black animate-pulse" />
+              <span>Preview</span>
+              <ExternalLink className="w-3 h-3" />
+            </a>
+          )}
+
+          {/* Service Scope Tabs */}
+          {services.length > 0 && (
+            <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono overflow-x-auto max-w-full min-w-0 shrink-0">
+              <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold shrink-0">
+                Scope:
+              </span>
+              <button
+                type="button"
+                onClick={() => onSelectServiceScope(null)}
+                className={cn(
+                  'px-2.5 py-1 rounded transition-colors text-xs font-medium shrink-0 whitespace-nowrap',
+                  selectedLogTarget?.type === 'release' && selectedServiceId === null
+                    ? 'bg-white text-black font-semibold shadow-sm'
+                    : 'text-neutral-400 hover:text-white'
+                )}
+              >
+                All Services
+              </button>
+              {services.map((svc) => {
+                const isServiceActive =
+                  (selectedLogTarget?.type === 'service' && selectedLogTarget.serviceDeployment.service_id === svc.id) ||
+                  (selectedLogTarget?.type === 'release' && selectedServiceId === svc.id);
+                return (
+                  <button
+                    key={svc.id}
+                    type="button"
+                    onClick={() => onSelectServiceScope(svc.id)}
                     className={cn(
-                      'w-1.5 h-1.5 rounded-full shrink-0',
-                      svc.status === 'running'
-                        ? 'bg-emerald-500'
-                        : svc.status === 'failed'
-                        ? 'bg-rose-500'
-                        : svc.status === 'deploying' || svc.status === 'building' || svc.status === 'starting'
-                        ? 'bg-amber-400 animate-pulse'
-                        : 'bg-neutral-500'
+                      'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5 shrink-0 whitespace-nowrap',
+                      isServiceActive
+                        ? 'bg-white text-black font-semibold shadow-sm'
+                        : 'text-neutral-400 hover:text-white'
                     )}
-                  />
-                  <span>{svc.name}</span>
-                  <span className="text-[10px] opacity-70 uppercase font-sans">({svc.role})</span>
-                </button>
-              );
-            })}
-          </div>
-        )}
+                  >
+                    <span
+                      className={cn(
+                        'w-1.5 h-1.5 rounded-full shrink-0',
+                        svc.status === 'running'
+                          ? 'bg-emerald-500'
+                          : svc.status === 'failed'
+                          ? 'bg-rose-500'
+                          : svc.status === 'deploying' || svc.status === 'building' || svc.status === 'starting'
+                          ? 'bg-amber-400 animate-pulse'
+                          : 'bg-neutral-500'
+                      )}
+                    />
+                    <span>{svc.name}</span>
+                    <span className="text-[10px] opacity-70 uppercase font-sans">({svc.role})</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Terminal Logs Output */}

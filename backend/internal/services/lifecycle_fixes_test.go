@@ -72,6 +72,15 @@ func TestLifecycle_CalculateProjectStatus(t *testing.T) {
 		status := services.CalculateProjectStatus(svcs)
 		assert.Equal(t, models.ProjectStatusFailed, status)
 	})
+
+	t.Run("running services with completed jobs returns running", func(t *testing.T) {
+		svcs := []*models.Service{
+			{Status: models.ServiceStatusRunning, Classification: models.ClassificationApplication},
+			{Status: models.ServiceStatusStopped, Classification: models.ClassificationJob},
+		}
+		status := services.CalculateProjectStatus(svcs)
+		assert.Equal(t, models.ProjectStatusRunning, status)
+	})
 }
 
 // TestLifecycle_PopulatePreviewURLRules verifies that preview URLs are strictly suppressed
@@ -134,6 +143,37 @@ func TestLifecycle_PopulatePreviewURLRules(t *testing.T) {
 		projectSvc.PopulateProjectPreviewURL(proj)
 		assert.Empty(t, proj.PreviewURL, "stopped legacy project must NOT have preview URL")
 	})
+
+	t.Run("running frontend service populates preview URL even when public_exposed is unset", func(t *testing.T) {
+		svc := &models.Service{
+			Status:        models.ServiceStatusRunning,
+			Role:          models.RoleFrontend,
+			PublicExposed: false,
+			HostPort:      &hostPort,
+		}
+		proj := &models.Project{
+			Status:   models.ServiceStatusRunning,
+			Services: []*models.Service{svc},
+		}
+		projectSvc.PopulateProjectPreviewURL(proj)
+		assert.NotEmpty(t, svc.PreviewURL, "running frontend service must have preview URL")
+		assert.NotEmpty(t, proj.PreviewURL, "running project must have preview URL")
+	})
+
+	t.Run("partially_running project with running frontend service populates preview URL", func(t *testing.T) {
+		svc := &models.Service{
+			Status:        models.ServiceStatusRunning,
+			Role:          models.RoleFrontend,
+			PublicExposed: true,
+			HostPort:      &hostPort,
+		}
+		proj := &models.Project{
+			Status:   models.ProjectStatusPartiallyRunning,
+			Services: []*models.Service{svc},
+		}
+		projectSvc.PopulateProjectPreviewURL(proj)
+		assert.NotEmpty(t, proj.PreviewURL, "partially_running project with running frontend must have preview URL")
+	})
 }
 
 // TestLifecycle_DeleteProject_IdempotentErrorPath tests that DeleteProject does NOT delete DB records
@@ -185,7 +225,7 @@ func TestLifecycle_DeleteProject_IdempotentErrorPath(t *testing.T) {
 		return cleanupErr
 	}
 
-	err = projectSvc.DeleteProject(ctx, userID, projectID, failedCleanupFunc)
+	err = projectSvc.DeleteProject(ctx, projectID, userID, failedCleanupFunc)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "simulated docker daemon timeout")
 
@@ -200,7 +240,7 @@ func TestLifecycle_DeleteProject_IdempotentErrorPath(t *testing.T) {
 		return nil
 	}
 
-	err = projectSvc.DeleteProject(ctx, userID, projectID, successfulCleanupFunc)
+	err = projectSvc.DeleteProject(ctx, projectID, userID, successfulCleanupFunc)
 	require.NoError(t, err, "retryable cleanup must succeed")
 
 	// Verify project is now deleted from DB

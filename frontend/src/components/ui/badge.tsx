@@ -18,6 +18,7 @@ export function Badge({ status, variant, className, children, showDot = true }: 
   if (!variant && status) {
     switch (normStatus) {
       case 'running':
+      case 'completed':
         computedVariant = 'success';
         break;
       case 'partially_running':

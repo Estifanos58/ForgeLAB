@@ -63,6 +63,7 @@ export function ServiceCard({
 
   const isFrontend = service.role === 'frontend';
   const isBackend = service.role === 'backend';
+  const isJob = service.classification === 'job';
   const isRunning = service.status === 'running';
 
   const isServiceDeploying = [
@@ -93,10 +94,13 @@ export function ServiceCard({
   };
 
   // Construct browser-accessible preview URL strictly when confirmed running and public
+  const isPublicOrExposed = Boolean(
+    service.public_exposed || service.role === 'frontend' || service.preview_url
+  );
   const previewUrl =
     isRunning
       ? service.preview_url ||
-        (service.public_exposed && service.host_port
+        (isPublicOrExposed && service.host_port
           ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${service.host_port}`
           : null)
       : null;
@@ -151,7 +155,13 @@ export function ServiceCard({
           </span>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <Badge status={service.status} />
+          {service.classification === 'job' && service.status === 'stopped' ? (
+            <Badge status="completed" variant="success">
+              Completed
+            </Badge>
+          ) : (
+            <Badge status={service.status} />
+          )}
         </div>
       </div>
 
@@ -180,9 +190,9 @@ export function ServiceCard({
 
         <div>
           <span className="text-[10px] text-neutral-500 block uppercase tracking-wider">
-            {service.public_exposed ? 'Public Endpoint' : 'Internal Mesh Endpoint'}
+            {isPublicOrExposed ? 'Public Endpoint' : 'Internal Mesh Endpoint'}
           </span>
-          {service.public_exposed ? (
+          {isPublicOrExposed ? (
             isRunning && previewUrl ? (
               <a
                 href={previewUrl}
@@ -246,7 +256,7 @@ export function ServiceCard({
       </div>
 
       {/* Prominent Preview Banner for Running Public Services */}
-      {service.public_exposed && isRunning && previewUrl && (
+      {isPublicOrExposed && isRunning && previewUrl && (
         <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-emerald-500/10 border border-emerald-500/20 text-xs">
           <div className="flex items-center gap-2 min-w-0">
             <Radio className="w-3.5 h-3.5 text-emerald-400 shrink-0 animate-pulse" />
@@ -279,10 +289,14 @@ export function ServiceCard({
             disabled={isDeployPending || isServiceDeploying}
             className="h-7 text-xs px-2.5"
             icon={wasServiceDeployed && !isRunning ? <RotateCcw className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
-            title={wasServiceDeployed && !isRunning ? 'Redeploy this service' : 'Deploy only this service concurrently'}
+            title={isJob ? (wasServiceDeployed ? 'Re-run this job' : 'Run this job') : wasServiceDeployed && !isRunning ? 'Redeploy this service' : 'Deploy only this service concurrently'}
           >
             {isServiceDeploying
               ? getDeployingLabel()
+              : isJob
+              ? wasServiceDeployed
+                ? 'Re-run Job'
+                : 'Run Job'
               : wasServiceDeployed && !isRunning
               ? 'Redeploy'
               : 'Deploy Service'}

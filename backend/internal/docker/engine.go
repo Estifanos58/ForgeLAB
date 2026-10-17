@@ -481,7 +481,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	emitStatus := func(newStatus string, hostPort *int, failureReason *string) {
-		_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, newStatus, failureReason)
+		if err := e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, newStatus, failureReason); err != nil {
+			slog.Warn("failed to update service deployment status in db", "service_deployment_id", serviceDeploy.ID, "status", newStatus, "error", err)
+		}
 		coarseStatus := toCoarseServiceStatus(newStatus, hasPreviousHealthy)
 		_ = e.serviceService.UpdateServiceStatus(ctx, service.ID, coarseStatus, nil, nil, nil)
 		newProjStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
@@ -1734,8 +1736,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			return fmt.Errorf("failed to promote job service deployment: %w", err)
 		}
 		_ = e.deploymentService.UpdateServiceDeploymentContainer(ctx, serviceDeploy.ID, containerID, nil)
-		_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, models.DeployStatusRunning, nil)
-		emitStatus(models.DeployStatusRunning, nil, nil)
+		_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, models.DeployStatusStopped, nil)
+		_ = e.serviceService.UpdateServiceStatus(ctx, service.ID, models.ServiceStatusStopped, &containerID, &runImage, nil)
+		emitStatus(models.DeployStatusStopped, nil, nil)
 		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Job service '%s' deployment #%d completed successfully!", service.Name, serviceDeploy.DeployNumber))
 		return nil
 	}
@@ -1908,7 +1911,9 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	}
 
 	updateReleaseStatus := func(newStatus string, failureReason *string) {
-		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason)
+		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason); err != nil {
+			slog.Warn("failed to update release deployment status in db", "deployment_id", deployment.ID, "status", newStatus, "error", err)
+		}
 		if e.wsHub != nil {
 			channel := "deployment:" + deployment.ID.String()
 			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
@@ -2154,14 +2159,14 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	newProjectStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
 
 	if allHealthy && anyHealthy {
-		updateReleaseStatus(models.DeployStatusRunning, nil)
 		_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
+		updateReleaseStatus(models.DeployStatusRunning, nil)
 		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d successfully deployed all services!", deployment.DeployNumber))
 		return nil
 	} else if anyHealthy {
 		// Valid state transition: deployment status is Running (not partially_running!), while project status reflects partially_running
-		updateReleaseStatus(models.DeployStatusRunning, nil)
 		_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
+		updateReleaseStatus(models.DeployStatusRunning, nil)
 		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d finished with partial success (%s).", deployment.DeployNumber, strings.Join(errList, "; ")))
 		return nil
 	} else {
@@ -2201,7 +2206,9 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 
 	updateStatus := func(newStatus string, failureReason *string) {
 		prevStatus := deployment.Status
-		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason)
+		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason); err != nil {
+			slog.Warn("failed to update deployment status in db", "deployment_id", deployment.ID, "status", newStatus, "error", err)
+		}
 		deployment.Status = newStatus
 		if e.wsHub != nil {
 			channel := "deployment:" + deployment.ID.String()

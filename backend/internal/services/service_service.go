@@ -209,7 +209,8 @@ func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Serv
 		        build_strategy, build_candidates, build_command, start_command, dockerfile_path, build_context,
 		        internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
 		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
-		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb
+		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
+		        COALESCE(classification, 'application')
 		 FROM services WHERE status IN ('running', 'deploying', 'starting', 'health_checking', 'stopped') ORDER BY created_at ASC`,
 	)
 	if err != nil {
@@ -230,6 +231,7 @@ func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Serv
 			&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
 			&svc.CreatedAt, &svc.UpdatedAt,
 			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
+			&svc.Classification,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan active service: %w", err)
@@ -592,8 +594,17 @@ func CalculateProjectStatus(services []*models.Service) string {
 	}
 
 	var runningCount, failedCount, stoppedCount, deployingCount, inactiveCount int
+	var nonJobCount, nonJobRunningCount int
 
 	for _, svc := range services {
+		isJob := svc.Classification == models.ClassificationJob
+		if !isJob {
+			nonJobCount++
+			if svc.Status == models.ServiceStatusRunning {
+				nonJobRunningCount++
+			}
+		}
+
 		switch svc.Status {
 		case models.ServiceStatusRunning:
 			runningCount++
@@ -615,27 +626,35 @@ func CalculateProjectStatus(services []*models.Service) string {
 		return models.ProjectStatusDeploying
 	}
 
-	// 2. All running -> running
+	// 2. Any failed service makes the project failed or partially_running
+	if failedCount > 0 {
+		if runningCount > 0 {
+			return models.ProjectStatusPartiallyRunning
+		}
+		return models.ProjectStatusFailed
+	}
+
+	// 3. All non-job services running (and any jobs completed/stopped or no non-jobs) -> running
+	if nonJobCount > 0 && nonJobRunningCount == nonJobCount {
+		return models.ProjectStatusRunning
+	}
+
+	// 4. All running -> running (for cases with only jobs or uniform services)
 	if runningCount == len(services) {
 		return models.ProjectStatusRunning
 	}
 
-	// 3. Partial running (some running, others stopped or failed)
+	// 5. Partial running (some running, others stopped)
 	if runningCount > 0 {
 		return models.ProjectStatusPartiallyRunning
 	}
 
-	// 4. Any failed and none running -> failed
-	if failedCount > 0 {
-		return models.ProjectStatusFailed
-	}
-
-	// 5. All stopped -> stopped
+	// 6. All stopped -> stopped
 	if stoppedCount == len(services) {
 		return models.ProjectStatusStopped
 	}
 
-	// 6. Inactive default
+	// 7. Inactive default
 	return models.ProjectStatusInactive
 }
 

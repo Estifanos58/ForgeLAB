@@ -22,29 +22,43 @@ export function ProjectHeader({
   const services = project.services || [];
 
   // Determine the primary preview URL across running services.
-  // Preview is ONLY displayed when the corresponding public service is confirmed running.
+  // Preview is ONLY displayed when the corresponding public service or project is confirmed running.
   let primaryPreviewUrl: string | null = null;
   const runningServices = services.filter((s) => s.status === 'running');
   if (services.length > 0) {
     const frontendSvc = runningServices.find(
-      (s) => s.role === 'frontend' && s.public_exposed && (s.preview_url || s.host_port)
+      (s) =>
+        (s.role === 'frontend' || s.name.toLowerCase() === 'frontend') &&
+        (s.public_exposed || s.preview_url || s.host_port)
     );
 
     if (frontendSvc) {
       primaryPreviewUrl =
         frontendSvc.preview_url ||
-        `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${frontendSvc.host_port}`;
+        (frontendSvc.host_port
+          ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${frontendSvc.host_port}`
+          : null);
     } else {
       const anyPublicSvc = runningServices.find(
-        (s) => s.public_exposed && (s.preview_url || s.host_port)
+        (s) => (s.public_exposed || s.role === 'frontend') && (s.preview_url || s.host_port)
       );
       if (anyPublicSvc) {
         primaryPreviewUrl =
           anyPublicSvc.preview_url ||
-          `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${anyPublicSvc.host_port}`;
+          (anyPublicSvc.host_port
+            ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${anyPublicSvc.host_port}`
+            : null);
       }
     }
-  } else if (project.status === 'running' && (project.preview_url || project.port)) {
+  }
+
+  // Fallback if not resolved from individual services: check project-level preview_url or port
+  // strictly when project is confirmed running or partially_running
+  if (
+    !primaryPreviewUrl &&
+    (project.status === 'running' || project.status === 'partially_running') &&
+    (project.preview_url || project.port)
+  ) {
     primaryPreviewUrl =
       project.preview_url ||
       `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`;

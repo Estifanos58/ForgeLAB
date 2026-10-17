@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 // Helper functions mirroring dashboard & service-card logic
 
 function getProjectPreviewUrl(project, windowHost = 'localhost') {
-  if (project.status === 'running' && (project.preview_url || project.port)) {
+  const isRunning = project.status === 'running' || project.status === 'partially_running';
+  if (isRunning && (project.preview_url || project.port)) {
     return project.preview_url || `http://${windowHost}:${project.port}`;
   }
   return null;
@@ -18,7 +19,8 @@ function getServicePreviewUrl(service, windowHost = 'localhost') {
   if (service.preview_url) {
     return service.preview_url;
   }
-  if (service.public_exposed && service.host_port) {
+  const isPublicOrExposed = Boolean(service.public_exposed || service.role === 'frontend');
+  if (isPublicOrExposed && service.host_port) {
     return `http://${windowHost}:${service.host_port}`;
   }
   return null;
@@ -85,6 +87,9 @@ test('Preview URL — only displayed when project is confirmed running', () => {
   const runningProj = { status: 'running', port: 8080 };
   assert.equal(getProjectPreviewUrl(runningProj), 'http://localhost:8080');
 
+  const partiallyRunningProj = { status: 'partially_running', port: 8080 };
+  assert.equal(getProjectPreviewUrl(partiallyRunningProj), 'http://localhost:8080');
+
   const stoppedProj = { status: 'stopped', port: 8080 };
   assert.equal(getProjectPreviewUrl(stoppedProj), null);
 
@@ -98,6 +103,9 @@ test('Preview URL — only displayed when project is confirmed running', () => {
 test('Preview URL — only displayed when service is confirmed running and public', () => {
   const runningSvc = { status: 'running', public_exposed: true, host_port: 3001 };
   assert.equal(getServicePreviewUrl(runningSvc), 'http://localhost:3001');
+
+  const runningFrontendSvc = { status: 'running', role: 'frontend', public_exposed: false, host_port: 3001 };
+  assert.equal(getServicePreviewUrl(runningFrontendSvc), 'http://localhost:3001');
 
   const stoppedSvc = { status: 'stopped', public_exposed: true, host_port: 3001 };
   assert.equal(getServicePreviewUrl(stoppedSvc), null);

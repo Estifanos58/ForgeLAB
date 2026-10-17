@@ -1,7 +1,8 @@
 'use client';
 
-import React, { useEffect, useState, useCallback, useRef, use } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import Link from 'next/link';
+import { useParams } from 'next/navigation';
 import { api } from '@/lib/api/client';
 import { Project, Deployment, DeploymentLog, Service, ServiceDeployment, LogTarget } from '@/lib/api/types';
 import { AppHeader } from '@/components/layout/app-header';
@@ -23,14 +24,60 @@ import {
 import { cn } from '@/lib/utils/cn';
 
 interface ProjectPageProps {
-  params: Promise<{ id: string }>;
+  params?: Promise<{ id: string }> | { id?: string };
+}
+
+function derivePrimaryPreviewUrl(project: Project | null): string | null {
+  if (!project) return null;
+  const services = project.services || [];
+  const runningServices = services.filter((s) => s.status === 'running');
+  if (services.length > 0) {
+    const frontendSvc = runningServices.find(
+      (s) =>
+        (s.role === 'frontend' || s.name.toLowerCase() === 'frontend') &&
+        (s.public_exposed || s.preview_url || s.host_port)
+    );
+    if (frontendSvc) {
+      return (
+        frontendSvc.preview_url ||
+        (frontendSvc.host_port
+          ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${frontendSvc.host_port}`
+          : null)
+      );
+    }
+    const anyPublicSvc = runningServices.find(
+      (s) => (s.public_exposed || s.role === 'frontend') && (s.preview_url || s.host_port)
+    );
+    if (anyPublicSvc) {
+      return (
+        anyPublicSvc.preview_url ||
+        (anyPublicSvc.host_port
+          ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${anyPublicSvc.host_port}`
+          : null)
+      );
+    }
+  }
+
+  if (
+    (project.status === 'running' || project.status === 'partially_running') &&
+    (project.preview_url || project.port)
+  ) {
+    return (
+      project.preview_url ||
+      `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`
+    );
+  }
+  return null;
 }
 
 type TabType = 'overview' | 'deployments' | 'logs' | 'env';
 
 export default function ProjectPage({ params }: ProjectPageProps) {
-  const resolvedParams = use(params);
-  const projectId = resolvedParams.id;
+  const routeParams = useParams();
+  const rawId =
+    (routeParams?.id as string | string[] | undefined) ||
+    (params && typeof (params as any).id === 'string' ? (params as any).id : '');
+  const projectId = typeof rawId === 'string' ? rawId : Array.isArray(rawId) ? rawId[0] : '';
 
   const [project, setProject] = useState<Project | null>(null);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
@@ -61,6 +108,12 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
   // Load project and deployments
   const loadData = useCallback(async () => {
+    if (!projectId || projectId === 'undefined' || projectId === 'null') {
+      setLoading(false);
+      setError('Invalid project ID');
+      return;
+    }
+
     try {
       const [projData, deployList] = await Promise.all([
         api.projects.get(projectId),
@@ -184,6 +237,11 @@ export default function ProjectPage({ params }: ProjectPageProps) {
           },
         };
       });
+
+      const isTerminal = ['running', 'failed', 'stopped', 'partially_running'].includes(data.new_status);
+      if (isTerminal) {
+        loadData();
+      }
       return;
     }
 
@@ -238,6 +296,24 @@ export default function ProjectPage({ params }: ProjectPageProps) {
     }, 2500);
     return () => clearTimeout(timer);
   }, [targetKey, connectionState, fetchHistoricalLogs]);
+
+  // Check if any deployment is actively in flight across project or services
+  const isAnyDeploying =
+    Boolean(
+      project &&
+        ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(
+          project.status
+        )
+    ) || Object.values(deployingServices).some(Boolean);
+
+  // Targeted polling while deployment is in flight to guarantee status & preview URL reconciliation
+  useEffect(() => {
+    if (!isAnyDeploying) return;
+    const interval = setInterval(() => {
+      loadData();
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [isAnyDeploying, loadData]);
 
   // Handle immediate deployment creation from lifecycle controls
   const handleDeploymentCreated = useCallback((newDeployment: Deployment) => {
@@ -462,7 +538,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
         <div className="flex-1 max-w-md mx-auto p-8 text-center flex flex-col items-center justify-center">
           <h2 className="text-base font-semibold text-white mb-1">Project Not Found</h2>
           <p className="text-xs text-neutral-400 mb-4">
-            The project does not exist or you do not have permission to view it.
+            {error || 'The project does not exist or you do not have permission to view it.'}
           </p>
           <Link
             href="/dashboard"
@@ -477,9 +553,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   }
 
   const services = project.services || [];
-  const isAnyDeploying =
-    ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(project.status) ||
-    Object.values(deployingServices).some(Boolean);
+  const primaryPreviewUrl = derivePrimaryPreviewUrl(project);
 
   return (
     <div className="h-screen max-h-screen flex flex-col bg-background overflow-hidden">
@@ -625,6 +699,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
                 connected={connected}
                 connectionState={connectionState}
                 onClearLogs={clearLogs}
+                primaryPreviewUrl={primaryPreviewUrl}
               />
             </div>
           </div>
@@ -658,6 +733,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
                 connected={connected}
                 connectionState={connectionState}
                 onClearLogs={clearLogs}
+                primaryPreviewUrl={primaryPreviewUrl}
               />
             </div>
           </div>
@@ -678,6 +754,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
               connected={connected}
               connectionState={connectionState}
               onClearLogs={clearLogs}
+              primaryPreviewUrl={primaryPreviewUrl}
             />
           </div>
         )}

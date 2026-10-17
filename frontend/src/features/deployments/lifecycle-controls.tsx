@@ -75,7 +75,7 @@ export function LifecycleControls({ project, onActionComplete, onError, onDeploy
   };
 
   const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(project.status);
-  const isRunning = project.status === 'running';
+  const isRunning = project.status === 'running' || project.status === 'partially_running';
   const isStopped = project.status === 'stopped';
   const wasDeployed = Boolean(project.current_deployment_id || project.status === 'stopped' || project.status === 'failed');
 

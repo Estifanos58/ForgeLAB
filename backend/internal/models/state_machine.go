@@ -12,24 +12,35 @@ var (
 // AllowedTransitions maps each deployment status to its allowed next statuses.
 var AllowedTransitions = map[string]map[string]bool{
 	DeployStatusQueued: {
-		DeployStatusCloning: true,
-		DeployStatusFailed:  true,
-		DeployStatusSkipped: true,
+		DeployStatusCloning:  true,
+		DeployStatusBuilding: true, // For release deployments or builds skipping clone
+		DeployStatusStarting: true, // For infrastructure / pre-built images skipping clone and build
+		DeployStatusRunning:  true, // For cached or direct promotions
+		DeployStatusFailed:   true,
+		DeployStatusSkipped:  true,
 	},
 	DeployStatusCloning: {
 		DeployStatusBuilding: true,
+		DeployStatusStarting: true, // For repos with pre-built artifacts
 		DeployStatusFailed:   true,
+		DeployStatusSkipped:  true,
 	},
 	DeployStatusBuilding: {
 		DeployStatusStarting: true,
+		DeployStatusRunning:  true, // For release deployments after all services have completed
+		DeployStatusStopped:  true, // For build-only or compile jobs
 		DeployStatusFailed:   true,
+		DeployStatusSkipped:  true,
 	},
 	DeployStatusStarting: {
 		DeployStatusHealthChecking: true,
+		DeployStatusRunning:        true, // For services without health checks
+		DeployStatusStopped:        true, // For one-shot jobs (e.g. database migrations) that exit cleanly
 		DeployStatusFailed:         true,
 	},
 	DeployStatusHealthChecking: {
 		DeployStatusRunning: true,
+		DeployStatusStopped: true, // If service is stopped during health check
 		DeployStatusFailed:  true,
 	},
 	DeployStatusRunning: {
@@ -38,12 +49,14 @@ var AllowedTransitions = map[string]map[string]bool{
 		DeployStatusFailed:  true,
 	},
 	DeployStatusStopped: {
-		DeployStatusRunning: true,
-		DeployStatusFailed:  true,
+		DeployStatusStarting: true,
+		DeployStatusRunning:  true,
+		DeployStatusFailed:   true,
 	},
 	DeployStatusCrashed: {
-		DeployStatusRunning: true,
-		DeployStatusFailed:  true,
+		DeployStatusStarting: true,
+		DeployStatusRunning:  true,
+		DeployStatusFailed:   true,
 	},
 	DeployStatusFailed:  {}, // Terminal
 	DeployStatusSkipped: {}, // Terminal

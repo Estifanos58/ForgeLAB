@@ -153,6 +153,8 @@ export interface ServiceDefinition {
   dockerfile_path?: string;
   build_context?: string;
   internal_port?: number;
+  host_port?: number;
+  public_exposed?: boolean;
   health_strategy?: string;
   health_check_path?: string;
   classification?: string;

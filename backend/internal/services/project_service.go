@@ -475,6 +475,11 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				svcClassification = models.ClassificationApplication
 			}
 
+			isPublic := svcIn.PublicExposed
+			if !isPublic && (svcRole == models.RoleFrontend || strings.Contains(strings.ToLower(svcRole), "web") || strings.Contains(strings.ToLower(svcName), "frontend") || (len(input.Services) == 1 && svcClassification == models.ClassificationApplication)) {
+				isPublic = true
+			}
+
 			svc := &models.Service{
 				ID:                  uuid.New(),
 				ProjectID:           project.ID,
@@ -500,7 +505,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				BuildContext:        bCtx,
 				InternalPort:        svcPort,
 				HostPort:            svcIn.HostPort,
-				PublicExposed:       svcIn.PublicExposed,
+				PublicExposed:       isPublic,
 				HealthStrategy:      svcHealthStrat,
 				HealthCheckPath:     &svcHealthPath,
 				HealthCheckEnabled:  true,
@@ -1111,11 +1116,13 @@ func (s *ProjectService) PopulateProjectPreviewURL(p *models.Project) {
 
 	for _, svc := range p.Services {
 		// Only running public services have an active live preview URL
-		if svc.Status == models.ServiceStatusRunning && svc.HostPort != nil && *svc.HostPort > 0 && svc.PublicExposed {
+		isFrontend := svc.Role == models.RoleFrontend || strings.Contains(strings.ToLower(svc.Name), "frontend")
+		isPublic := svc.PublicExposed || isFrontend
+		if svc.Status == models.ServiceStatusRunning && svc.HostPort != nil && *svc.HostPort > 0 && isPublic {
 			urlStr := fmt.Sprintf("http://%s:%d", publicHost, *svc.HostPort)
 			svc.PreviewURL = &urlStr
 
-			if svc.Role == models.RoleFrontend && frontendSvcURL == nil {
+			if isFrontend && frontendSvcURL == nil {
 				frontendSvcURL = &urlStr
 			} else if primarySvcURL == nil {
 				primarySvcURL = &urlStr
@@ -1129,7 +1136,7 @@ func (s *ProjectService) PopulateProjectPreviewURL(p *models.Project) {
 		p.PreviewURL = frontendSvcURL
 	} else if primarySvcURL != nil {
 		p.PreviewURL = primarySvcURL
-	} else if p.Status == models.ProjectStatusRunning && p.Port != nil && *p.Port > 0 {
+	} else if (p.Status == models.ProjectStatusRunning || p.Status == models.ProjectStatusPartiallyRunning) && p.Port != nil && *p.Port > 0 {
 		urlStr := fmt.Sprintf("http://%s:%d", publicHost, *p.Port)
 		p.PreviewURL = &urlStr
 	} else {

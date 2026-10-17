@@ -17,6 +17,16 @@ export function proxy(request: NextRequest) {
   // Authentication entry routes
   const isAuthRoute = pathname === '/login' || pathname === '/register';
 
+  // Redirect /projects directly to /dashboard
+  if (pathname === '/projects' || pathname === '/projects/') {
+    if (!hasSession) {
+      const loginUrl = new URL('/login', request.url);
+      loginUrl.searchParams.set('from', '/dashboard');
+      return NextResponse.redirect(loginUrl);
+    }
+    return NextResponse.redirect(new URL('/dashboard', request.url));
+  }
+
   if (isProtectedRoute && !hasSession) {
     const loginUrl = new URL('/login', request.url);
     loginUrl.searchParams.set('from', pathname);

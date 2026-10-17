@@ -172,6 +172,11 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 
 	user, err := h.userService.GetUserByID(r.Context(), userID)
 	if err != nil {
+		if errors.Is(err, services.ErrUserNotFound) {
+			h.clearAuthCookies(w)
+			writeError(w, http.StatusUnauthorized, "authenticated user account no longer exists")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to get user")
 		return
 	}

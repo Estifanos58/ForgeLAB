@@ -612,6 +612,12 @@ func (h *SourceHandler) CreateAgentSession(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if h.sourceService != nil && !h.sourceService.UserExists(r.Context(), userID) {
+		ClearAuthCookies(w)
+		writeError(w, http.StatusUnauthorized, "authenticated user account no longer exists; please sign in again")
+		return
+	}
+
 	var req struct {
 		AgentID string `json:"agent_id"`
 	}
@@ -731,6 +737,12 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 	userID, ok := getUserIDFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if h.sourceService != nil && !h.sourceService.UserExists(r.Context(), userID) {
+		ClearAuthCookies(w)
+		writeError(w, http.StatusUnauthorized, "authenticated user account no longer exists; please sign in again")
 		return
 	}
 
@@ -876,6 +888,11 @@ func (h *SourceHandler) RegisterAgentSource(w http.ResponseWriter, r *http.Reque
 
 	if h.sourceService != nil {
 		if err := h.sourceService.SaveSource(r.Context(), sourceRecord); err != nil {
+			if errors.Is(err, services.ErrUserNotFound) || strings.Contains(err.Error(), "sources_owner_id_fkey") || strings.Contains(err.Error(), "23503") {
+				ClearAuthCookies(w)
+				writeError(w, http.StatusUnauthorized, "authenticated user account no longer exists; please sign in again")
+				return
+			}
 			slog.Error("failed to save agent source in database", "source_id", verifiedSourceID, "error", err)
 			writeError(w, http.StatusInternalServerError, "failed to register agent source: "+err.Error())
 			return

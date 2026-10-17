@@ -27,3 +27,24 @@ func writeError(w http.ResponseWriter, status int, message string) {
 func getUserIDFromContext(r *http.Request) (uuid.UUID, bool) {
 	return middleware.GetUserID(r.Context())
 }
+
+// ClearAuthCookies removes authenticated access and refresh cookies from the response.
+func ClearAuthCookies(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_access_token",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "forgelab_refresh_token",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+

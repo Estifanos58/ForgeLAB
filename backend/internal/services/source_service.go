@@ -1589,6 +1589,9 @@ func (s *SourceService) SaveSource(ctx context.Context, src *models.Source) erro
 		    updated_at = NOW()`,
 		src.ID, src.OwnerID, src.SourceType, src.SourceReference, src.AgentID, src.Fingerprint, metaJSON, src.EncryptedSessionToken, src.CreatedAt, src.UpdatedAt,
 	)
+	if err != nil && (strings.Contains(err.Error(), "sources_owner_id_fkey") || strings.Contains(err.Error(), "23503")) {
+		return fmt.Errorf("%w: %v", ErrUserNotFound, err)
+	}
 	return err
 }
 
@@ -1669,3 +1672,14 @@ func (s *SourceService) UpdateSourceMetadataField(ctx context.Context, sourceID 
 	src.Metadata[key] = value
 	return s.SaveSource(ctx, src)
 }
+
+// UserExists checks whether a user ID exists in the database.
+func (s *SourceService) UserExists(ctx context.Context, userID uuid.UUID) bool {
+	if s.db == nil {
+		return true // In-memory/test fallback
+	}
+	var exists bool
+	err := s.db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", userID).Scan(&exists)
+	return err == nil && exists
+}
+

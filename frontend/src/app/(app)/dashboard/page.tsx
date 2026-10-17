@@ -184,7 +184,7 @@ export default function DashboardPage() {
                           </span>
                         </td>
                         <td className="py-3 px-4 whitespace-nowrap">
-                          {p.status === 'running' && (p.preview_url || p.port) ? (
+                          {(p.status === 'running' || p.status === 'partially_running') && (p.preview_url || p.port) ? (
                             <a
                               href={
                                 p.preview_url ||
