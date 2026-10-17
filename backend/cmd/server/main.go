@@ -160,6 +160,9 @@ func main() {
 	sourceService := services.NewSourceService(pool, cfg.Docker.SourcesDir, encryptor)
 	githubService := services.NewGitHubService(pool, encryptor, cfg.GitHub, redisClient)
 	userService := services.NewUserService(pool, jwtManager)
+	if err := userService.EnsureGuestUser(ctx); err != nil {
+		slog.Warn("failed to ensure guest user during startup", "error", err)
+	}
 	serviceService := services.NewServiceService(pool)
 	projectService := services.NewProjectService(pool, pathValidator, sourceService, githubService)
 	projectService.SetServiceService(serviceService)
@@ -174,6 +177,7 @@ func main() {
 	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient, cfg.App.AllowedOriginsList()...)
 	wsHub.SetServiceDeploymentResolver(deploymentService)
 	wsHub.SetServiceResolver(serviceService)
+	wsHub.SetAllowGuestMode(cfg.App.AllowGuestMode)
 
 	// Initialize Docker Engine
 	dockerEngine := docker.NewEngine(
@@ -329,6 +333,7 @@ func main() {
 	// Initialize handlers
 	oauthService := services.NewOAuthService(cfg.Google, cfg.GitHub, redisClient)
 	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
+	authHandler.SetAllowGuestMode(cfg.App.AllowGuestMode)
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
 	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, deploymentService, dockerEngine, deployQueue)
 	envHandler := handlers.NewEnvHandler(secretService, projectService)
@@ -377,6 +382,7 @@ func main() {
 
 		// Auth routes (public)
 		r.Route("/auth", func(r chi.Router) {
+			r.Get("/mode", authHandler.Mode)
 			r.With(authThrottle).Post("/register", authHandler.Register)
 			r.With(authThrottle).Post("/login", authHandler.Login)
 			r.With(authThrottle).Post("/refresh", authHandler.Refresh)
@@ -395,25 +401,9 @@ func main() {
 			})
 		})
 
-		// Protected routes
+		// Registered-only integrations (GitHub)
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.AuthMiddleware(jwtManager))
-
-			// Source Management & Uploads
-			r.Route("/sources", func(r chi.Router) {
-				r.With(sourceThrottle).Post("/upload", sourceHandler.Upload)
-				r.Post("/agent/session", sourceHandler.CreateAgentSession)
-				r.Post("/agent/register", sourceHandler.RegisterAgentSource)
-				r.With(sourceThrottle).Post("/local/validate", sourceHandler.ValidateLocalPath)
-				r.Get("/local/validate/{sessionId}", sourceHandler.GetLocalValidationStatus)
-				r.Get("/{id}", sourceHandler.GetStatus)
-				r.Delete("/{id}", sourceHandler.Delete)
-			})
-
-			// Discovery & Deployment Plan
-			r.Route("/discovery", func(r chi.Router) {
-				r.With(sourceThrottle).Post("/plan", discoveryHandler.GeneratePlan)
-			})
 
 			// Integrations (GitHub Repository Access)
 			r.Route("/integrations", func(r chi.Router) {
@@ -430,6 +420,27 @@ func main() {
 					r.Get("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
 					r.Post("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
 				})
+			})
+		})
+
+		// Protected or Guest routes (Local Deployments)
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.AuthOrGuestMiddleware(jwtManager, cfg.App.AllowGuestMode))
+
+			// Source Management & Uploads
+			r.Route("/sources", func(r chi.Router) {
+				r.With(sourceThrottle).Post("/upload", sourceHandler.Upload)
+				r.Post("/agent/session", sourceHandler.CreateAgentSession)
+				r.Post("/agent/register", sourceHandler.RegisterAgentSource)
+				r.With(sourceThrottle).Post("/local/validate", sourceHandler.ValidateLocalPath)
+				r.Get("/local/validate/{sessionId}", sourceHandler.GetLocalValidationStatus)
+				r.Get("/{id}", sourceHandler.GetStatus)
+				r.Delete("/{id}", sourceHandler.Delete)
+			})
+
+			// Discovery & Deployment Plan
+			r.Route("/discovery", func(r chi.Router) {
+				r.With(sourceThrottle).Post("/plan", discoveryHandler.GeneratePlan)
 			})
 
 			// Projects

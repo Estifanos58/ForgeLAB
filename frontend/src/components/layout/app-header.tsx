@@ -59,26 +59,45 @@ export function AppHeader({ breadcrumbs }: AppHeaderProps) {
           </nav>
         </div>
 
-        {/* Right: Authenticated User + Logout */}
+        {/* Right: Authenticated User + Logout OR Guest Mode */}
         <div className="flex items-center gap-2">
-          {user && (
-            <div className="hidden sm:flex items-center gap-1.5 px-2 py-1 rounded border border-surface-border bg-surface text-[11px] text-neutral-400">
-              <UserIcon className="w-3 h-3 text-neutral-500" />
-              <span className="font-mono text-neutral-200">
-                {user.display_name || user.email.split('@')[0]}
-              </span>
-            </div>
+          {user ? (
+            <>
+              <div className="hidden sm:flex items-center gap-1.5 px-2 py-1 rounded border border-surface-border bg-surface text-[11px] text-neutral-400">
+                <UserIcon className="w-3 h-3 text-neutral-500" />
+                <span className="font-mono text-neutral-200">
+                  {user.display_name || user.email.split('@')[0]}
+                </span>
+              </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={logout}
+                className="h-7 text-xs text-neutral-400 hover:text-white"
+                title="Sign out of ForgeLAB"
+              >
+                <LogOut className="w-3.5 h-3.5 mr-1" />
+                <span>Sign Out</span>
+              </Button>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded border border-amber-500/30 bg-amber-500/10 text-[11px] text-amber-300">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                <span className="font-medium">Guest Mode</span>
+              </div>
+              <Link href="/login">
+                <Button size="sm" variant="ghost" className="h-7 text-xs text-neutral-300 hover:text-white">
+                  Sign In
+                </Button>
+              </Link>
+              <Link href="/register">
+                <Button size="sm" variant="primary" className="h-7 text-xs">
+                  Register
+                </Button>
+              </Link>
+            </>
           )}
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={logout}
-            className="h-7 text-xs text-neutral-400 hover:text-white"
-            title="Sign out of ForgeLAB"
-          >
-            <LogOut className="w-3.5 h-3.5 mr-1" />
-            <span>Sign Out</span>
-          </Button>
         </div>
       </div>
     </header>

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/forgelab/backend/internal/middleware"
+	"github.com/forgelab/backend/internal/models"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -220,9 +221,10 @@ func Middleware(l *Limiter, category string, limit int, window time.Duration) fu
 				return
 			}
 
-			// Prioritize authenticated user ID, fall back to client IP (evaluating trusted proxies)
+			// Prioritize authenticated user ID, fall back to client IP (evaluating trusted proxies).
+			// For guest requests, rate limit per client IP so one anonymous user doesn't exhaust limits for others.
 			var identifier string
-			if userID, ok := middleware.GetUserID(r.Context()); ok {
+			if userID, ok := middleware.GetUserID(r.Context()); ok && !models.IsGuest(userID) {
 				identifier = "user:" + userID.String()
 			} else {
 				identifier = "ip:" + ExtractClientIP(r, l.TrustedProxies())

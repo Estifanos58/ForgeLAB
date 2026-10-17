@@ -59,9 +59,28 @@ type AuthTokens struct {
 	ExpiresIn    int    `json:"expires_in"` // seconds
 }
 
+// EnsureGuestUser ensures the single shared guest user record exists in the database.
+func (s *UserService) EnsureGuestUser(ctx context.Context) error {
+	if s.db == nil {
+		return nil
+	}
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO users (id, email, password_hash, display_name, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, NOW(), NOW())
+		ON CONFLICT (id) DO UPDATE SET updated_at = NOW()
+	`, models.GuestUserID, models.GuestUserEmail, "$2a$12$disabled.guest.account.cannot.login.directly.hash", "Guest")
+	if err != nil {
+		return fmt.Errorf("failed to ensure guest user identity: %w", err)
+	}
+	return nil
+}
+
 // Register creates a new user account.
 func (s *UserService) Register(ctx context.Context, input RegisterInput) (*models.User, *AuthTokens, error) {
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+	if input.Email == models.GuestUserEmail {
+		return nil, nil, ErrUserExists
+	}
 
 	// Check if user already exists
 	var exists bool
@@ -114,6 +133,9 @@ func (s *UserService) Register(ctx context.Context, input RegisterInput) (*model
 // Login authenticates a user and returns tokens.
 func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User, *AuthTokens, error) {
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+	if input.Email == models.GuestUserEmail {
+		return nil, nil, ErrInvalidPassword
+	}
 
 	// Find user by email
 	user := &models.User{}
@@ -128,6 +150,10 @@ func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User
 			return nil, nil, ErrInvalidPassword
 		}
 		return nil, nil, fmt.Errorf("failed to find user: %w", err)
+	}
+
+	if models.IsGuest(user.ID) {
+		return nil, nil, ErrInvalidPassword
 	}
 
 	if passwordHash == nil || *passwordHash == "" {

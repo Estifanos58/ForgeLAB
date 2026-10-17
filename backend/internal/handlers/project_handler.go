@@ -288,6 +288,11 @@ func (h *ProjectHandler) Stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.dockerEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "docker engine is not available")
+		return
+	}
+
 	if err := h.dockerEngine.StopApp(r.Context(), projectID, userID); err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -318,6 +323,11 @@ func (h *ProjectHandler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.dockerEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "docker engine is not available")
+		return
+	}
+
 	if err := h.dockerEngine.StartApp(r.Context(), projectID, userID); err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -345,6 +355,11 @@ func (h *ProjectHandler) Restart(w http.ResponseWriter, r *http.Request) {
 	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	if h.dockerEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "docker engine is not available")
 		return
 	}
 

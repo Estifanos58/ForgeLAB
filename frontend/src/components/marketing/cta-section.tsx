@@ -1,6 +1,6 @@
 import React from 'react';
 import Link from 'next/link';
-import { ArrowRight } from 'lucide-react';
+import { ArrowRight, Play } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 export function CtaSection() {
@@ -12,13 +12,19 @@ export function CtaSection() {
             Run ForgeLAB on your local machine
           </h2>
           <p className="text-xs sm:text-sm text-neutral-400 max-w-lg mx-auto leading-relaxed">
-            Zero cloud configuration, zero unexpected bills. Deploy with Docker Compose in seconds.
+            Zero cloud configuration, zero unexpected bills. Deploy local code without registration, or create an account for GitHub repository sync.
           </p>
 
           <div className="pt-2 flex flex-wrap items-center justify-center gap-3">
+            <Link href="/dashboard?deploy=true">
+              <Button size="md" variant="primary" className="bg-emerald-600 hover:bg-emerald-500 text-white font-medium">
+                <Play className="w-3.5 h-3.5 mr-1.5 fill-white" />
+                Deploy Without Account
+              </Button>
+            </Link>
             <Link href="/register">
-              <Button size="md" variant="primary">
-                Get Started
+              <Button size="md" variant="secondary">
+                Register
                 <ArrowRight className="w-3.5 h-3.5 ml-1" />
               </Button>
             </Link>
@@ -27,7 +33,7 @@ export function CtaSection() {
               target="_blank"
               rel="noreferrer"
             >
-              <Button size="md" variant="secondary">
+              <Button size="md" variant="ghost" className="text-neutral-400 hover:text-white">
                 View Repository
               </Button>
             </a>

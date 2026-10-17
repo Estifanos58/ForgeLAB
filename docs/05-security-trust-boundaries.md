@@ -203,4 +203,46 @@ ForgeLAB strictly validates project ownership and cross-project isolation across
 - **Startup Reconciliation:** Initial Docker daemon container and runtime state reconciliation executes synchronously on server startup before deployment queue workers are launched, eliminating races between queue job processing and daemon state synchronization.
 - **State Machine & WebSocket Consistency:** Deployment status transitions are broadcast over WebSocket only when database persistence succeeds. The state machine strictly prevents direct invalid jumps from `queued` to `running`.
 
+---
+
+## 9. Registration-Free Local Deployments & Shared Guest Workspace
+
+ForgeLAB supports registration-free local deployments for self-hosted and single-user installations while preserving strict security boundaries for registered users and GitHub integrations:
+
+1. **Single Installation-Level Guest Identity:**
+   - Unauthenticated local deployments belong to a single, installation-level internal guest owner record (`models.GuestUserID = uuid.MustParse("00000000-0000-0000-0000-000000000001")`, email `guest@forgelab.local`).
+   - The record is ensured in PostgreSQL during database migration (`000017_add_guest_identity.up.sql`) and verified idempotently during server startup (`userService.EnsureGuestUser`).
+   - No per-visitor guest accounts, guest sessions, guest JWT tokens, or guest cookies are created or stored.
+   - User registration and login explicitly reject `guest@forgelab.local` and `models.IsGuest(userID)`.
+
+2. **Zero-Token Identity Resolution & Middleware:**
+   - Endpoints supporting local deployment (`/api/sources/*`, `/api/discovery/plan`, `/api/projects/*`, and `/api/ws`) use `middleware.AuthOrGuestMiddleware`.
+   - If an authenticated JWT token is present, the registered user's ID is injected into the request context.
+   - If unauthenticated and `FORGELAB_ALLOW_GUEST_MODE=true` (or running in local development `isDev`), `models.GuestUserID` and `IsGuestKey=true` are injected into context.
+   - If unauthenticated and guest mode is disabled, the middleware rejects the request with `401 Unauthorized`.
+
+3. **Tenant Isolation:**
+   - Multi-tenant isolation is maintained through existing `owner_id` constraints across `projects`, `services`, `deployments`, `sources`, and `environment_variables`.
+   - Guest requests can never view, mutate, deploy, or delete resources owned by registered users.
+   - Registered users cannot view or mutate guest-owned projects.
+
+4. **GitHub Features are Registration-Only:**
+   - All GitHub OAuth, repository listing, branch inspection, detection, and personal access token endpoints (`/api/integrations/github/*`) remain strictly behind `middleware.AuthMiddleware` requiring valid user JWT tokens.
+   - `GeneratePlan` and `CreateProject` strictly reject `source_type: "github"` when requested by guests with HTTP `403 Forbidden` (`registration required for GitHub deployments`).
+   - Frontend tabs indicate account requirement for GitHub and prompt visitors to sign in or create an account.
+
+5. **Deployment Scope & Public Exposure Restriction:**
+   - ForgeLAB is a self-hosted platform. Guest mode is enabled by default for single-user local development installations (`isDev`).
+   - For remote or publicly accessible production installations, guest mode is disabled by default unless explicitly configured via `FORGELAB_ALLOW_GUEST_MODE=true`. This ensures shared guest access is never unintentionally exposed to untrusted public networks.
+
+6. **Abuse Protection & Rate Limiting:**
+   - Rate limiting for guest requests is enforced per client IP (`ip:<client_ip>:<resource>`) rather than using a single shared user counter, preventing one visitor from exhausting the global guest rate limit.
+   - Guest workspace enforces a maximum project limit (20 projects) to prevent resource exhaustion.
+   - Source upload body size limits (`100MB`) and strict timeout/decompression guards apply equally to guest uploads.
+
+7. **Lifecycle & Docker Cleanliness:**
+   - Guest projects use the identical lifecycle engine, worker draining, and Docker container/image cleanup routines.
+   - Deleting a guest project stops active workers, drains pending jobs, and prunes containers and images.
+   - The shared guest identity record persists across application restarts and project deletions; it is never removed when projects are deleted.
+
 

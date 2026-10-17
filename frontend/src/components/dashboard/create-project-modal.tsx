@@ -1,7 +1,9 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import { useAuth } from '@/features/auth/use-auth';
 import { api, UploadProgress } from '@/lib/api/client';
 import {
   formatBytes,
@@ -173,6 +175,7 @@ function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): Confi
 
 export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProjectModalProps) {
   const router = useRouter();
+  const { user } = useAuth();
 
   // Step state
   const [step, setStep] = useState<Step>('source');
@@ -279,12 +282,14 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   useEffect(() => {
     if (isOpen) {
       if (sourceTab === 'github') {
-        checkGitHubStatus();
+        if (user) {
+          checkGitHubStatus();
+        }
       } else if (sourceTab === 'local' && localMode === 'agent') {
         checkAgentStatus();
       }
     }
-  }, [isOpen, sourceTab, localMode]);
+  }, [isOpen, sourceTab, localMode, user]);
 
   // Cancel in-flight upload, stop agent polling, and reset local-agent state when modal closes
   useEffect(() => {
@@ -1415,6 +1420,11 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             >
               <Github className="w-4 h-4" />
               <span>Import from GitHub</span>
+              {!user && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-normal">
+                  Account Required
+                </span>
+              )}
             </button>
           </div>
 
@@ -2047,6 +2057,34 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
           {/* TAB 2: GITHUB REPOSITORIES (REBUILT: Vercel / Render / Google AI Studio Style) */}
           {sourceTab === 'github' && (
+            !user ? (
+              <div className="p-8 rounded-lg border border-surface-border bg-surface-elevated/40 text-center space-y-4">
+                <div className="w-12 h-12 rounded-full bg-surface border border-surface-border flex items-center justify-center mx-auto text-neutral-400">
+                  <Github className="w-6 h-6" />
+                </div>
+                <div className="max-w-md mx-auto space-y-1.5">
+                  <h3 className="text-sm font-semibold text-white">Registration Required for GitHub</h3>
+                  <p className="text-xs text-neutral-400">
+                    Deploying directly from GitHub repositories requires an authenticated account to manage repository access, webhooks, and private credentials.
+                  </p>
+                </div>
+                <div className="flex items-center justify-center gap-3 pt-2">
+                  <Link href="/login">
+                    <Button variant="outline" size="sm" className="text-xs">
+                      Sign In
+                    </Button>
+                  </Link>
+                  <Link href="/register">
+                    <Button variant="primary" size="sm" className="text-xs">
+                      Create Account
+                    </Button>
+                  </Link>
+                </div>
+                <div className="pt-2 text-[11px] text-neutral-500">
+                  Tip: You can deploy local projects immediately from your machine without creating an account!
+                </div>
+              </div>
+            ) : (
             <div className="space-y-4">
               {/* Quick Git Repository URL Import (Vercel Style) */}
               <div className="p-3.5 rounded-lg border border-surface-border bg-surface-elevated/40 space-y-2.5">
@@ -2435,6 +2473,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 </div>
               )}
             </div>
+            )
           )}
 
           {/* Action Bar */}

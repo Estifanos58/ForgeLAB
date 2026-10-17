@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -92,6 +93,7 @@ type Hub struct {
 	allowedOrigins           []string
 	rateLimiter              *ratelimit.Limiter
 	subscriptionLimit        int
+	allowGuestMode           bool
 	ctx                      context.Context
 	cancel                   context.CancelFunc
 }
@@ -109,6 +111,7 @@ func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deplo
 		deploymentService: deploymentService,
 		redisClient:       redisClient,
 		allowedOrigins:    allowedOrigins,
+		allowGuestMode:    true,
 		ctx:               ctx,
 		cancel:            cancel,
 	}
@@ -118,6 +121,13 @@ func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deplo
 		go h.listenRedisPubSub()
 	}
 	return h
+}
+
+// SetAllowGuestMode sets whether anonymous connections can connect to WebSocket as guest.
+func (h *Hub) SetAllowGuestMode(allow bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.allowGuestMode = allow
 }
 
 // SetRateLimiter configures rate limiting for subscription messages.
@@ -413,20 +423,36 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		tokenString = r.URL.Query().Get("token")
 	}
 
-	if tokenString == "" {
-		slog.Warn("ws authentication failure", "remote_addr", r.RemoteAddr, "reason", "token required")
-		http.Error(w, "unauthorized: token required", http.StatusUnauthorized)
-		return
+	var (
+		userID    uuid.UUID
+		userEmail string
+	)
+
+	if tokenString != "" {
+		claims, err := h.jwtManager.ValidateAccessToken(tokenString)
+		if err != nil {
+			slog.Warn("ws authentication failure", "remote_addr", r.RemoteAddr, "error", err, "reason", "invalid token")
+			http.Error(w, "unauthorized: invalid token", http.StatusUnauthorized)
+			return
+		}
+		userID = claims.UserID
+		userEmail = claims.Email
+	} else {
+		h.mu.RLock()
+		allowGuest := h.allowGuestMode
+		h.mu.RUnlock()
+
+		if !allowGuest {
+			slog.Warn("ws authentication failure", "remote_addr", r.RemoteAddr, "reason", "token required")
+			http.Error(w, "unauthorized: token required", http.StatusUnauthorized)
+			return
+		}
+
+		userID = models.GuestUserID
+		userEmail = models.GuestUserEmail
 	}
 
-	claims, err := h.jwtManager.ValidateAccessToken(tokenString)
-	if err != nil {
-		slog.Warn("ws authentication failure", "remote_addr", r.RemoteAddr, "error", err, "reason", "invalid token")
-		http.Error(w, "unauthorized: invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	slog.Info("ws authentication success", "user_id", claims.UserID)
+	slog.Info("ws authentication success", "user_id", userID)
 
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -443,8 +469,8 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	client := &Client{
 		hub:           h,
 		conn:          conn,
-		userID:        claims.UserID,
-		userEmail:     claims.Email,
+		userID:        userID,
+		userEmail:     userEmail,
 		subscriptions: make(map[string]bool),
 		send:          make(chan []byte, 256),
 		pending:       make([][]byte, 0, 32),
@@ -564,7 +590,16 @@ func (c *Client) handleSubscribe(channel string, lastSequence ...int64) {
 
 	// Enforce subscription rate limit
 	if c.hub.rateLimiter != nil && c.hub.subscriptionLimit > 0 {
-		allowed, retryAfter, _ := c.hub.rateLimiter.Allow(context.Background(), "ws_sub", "user:"+c.userID.String(), c.hub.subscriptionLimit, 1*time.Minute)
+		rateLimitKey := "user:" + c.userID.String()
+		if models.IsGuest(c.userID) && c.conn != nil {
+			host, _, err := net.SplitHostPort(c.conn.RemoteAddr().String())
+			if err == nil {
+				rateLimitKey = "ip:" + host
+			} else {
+				rateLimitKey = "ip:" + c.conn.RemoteAddr().String()
+			}
+		}
+		allowed, retryAfter, _ := c.hub.rateLimiter.Allow(context.Background(), "ws_sub", rateLimitKey, c.hub.subscriptionLimit, 1*time.Minute)
 		if !allowed {
 			slog.Warn("ws subscription rate limited", "user_id", c.userID, "channel", channel, "retry_after", retryAfter)
 			retrySec := int(retryAfter.Seconds())

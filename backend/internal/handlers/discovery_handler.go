@@ -84,6 +84,10 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 
 	switch req.SourceType {
 	case models.SourceTypeGitHub:
+		if models.IsGuest(userID) {
+			writeError(w, http.StatusForbidden, "registration required for GitHub deployments")
+			return
+		}
 		parts := strings.Split(req.SourceReference, "/")
 		if len(parts) != 2 {
 			writeError(w, http.StatusBadRequest, "invalid GitHub repository reference. Expected 'owner/repo'")

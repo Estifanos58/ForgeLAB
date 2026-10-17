@@ -8,15 +8,17 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/services"
 )
 
 // AuthHandler handles authentication-related HTTP requests.
 type AuthHandler struct {
-	userService  *services.UserService
-	oauthService *services.OAuthService
-	frontendURL  string
-	cookieSecure bool
+	userService    *services.UserService
+	oauthService   *services.OAuthService
+	frontendURL    string
+	cookieSecure   bool
+	allowGuestMode bool
 }
 
 // NewAuthHandler creates a new AuthHandler.
@@ -27,11 +29,26 @@ func NewAuthHandler(
 	cookieSecure bool,
 ) *AuthHandler {
 	return &AuthHandler{
-		userService:  userService,
-		oauthService: oauthService,
-		frontendURL:  frontendURL,
-		cookieSecure: cookieSecure,
+		userService:    userService,
+		oauthService:   oauthService,
+		frontendURL:    frontendURL,
+		cookieSecure:   cookieSecure,
+		allowGuestMode: true,
 	}
+}
+
+// SetAllowGuestMode configures whether guest mode is enabled.
+func (h *AuthHandler) SetAllowGuestMode(allow bool) {
+	h.allowGuestMode = allow
+}
+
+// Mode handles GET /api/auth/mode
+func (h *AuthHandler) Mode(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"guest_mode_enabled": h.allowGuestMode,
+		"allow_guest_mode":   h.allowGuestMode,
+		"guest_user_id":      models.GuestUserID.String(),
+	})
 }
 
 // Register handles POST /api/auth/register

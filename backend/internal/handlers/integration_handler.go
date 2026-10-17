@@ -10,7 +10,9 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/services"
 )
 
@@ -32,11 +34,23 @@ func NewIntegrationHandler(githubService *services.GitHubService, frontendURL st
 	}
 }
 
-// GetGitHubStatus handles GET /api/integrations/github
-func (h *IntegrationHandler) GetGitHubStatus(w http.ResponseWriter, r *http.Request) {
+func (h *IntegrationHandler) getRegisteredUserID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	userID, ok := getUserIDFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return uuid.Nil, false
+	}
+	if models.IsGuest(userID) {
+		writeError(w, http.StatusForbidden, "registration required for GitHub integration")
+		return uuid.Nil, false
+	}
+	return userID, true
+}
+
+// GetGitHubStatus handles GET /api/integrations/github
+func (h *IntegrationHandler) GetGitHubStatus(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getRegisteredUserID(w, r)
+	if !ok {
 		return
 	}
 
@@ -51,9 +65,8 @@ func (h *IntegrationHandler) GetGitHubStatus(w http.ResponseWriter, r *http.Requ
 
 // ConnectGitHub handles POST and GET /api/integrations/github/connect
 func (h *IntegrationHandler) ConnectGitHub(w http.ResponseWriter, r *http.Request) {
-	userID, ok := getUserIDFromContext(r)
+	userID, ok := h.getRegisteredUserID(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -81,9 +94,8 @@ func (h *IntegrationHandler) ConnectGitHub(w http.ResponseWriter, r *http.Reques
 
 // ConnectGitHubPAT handles POST /api/integrations/github/token
 func (h *IntegrationHandler) ConnectGitHubPAT(w http.ResponseWriter, r *http.Request) {
-	userID, ok := getUserIDFromContext(r)
+	userID, ok := h.getRegisteredUserID(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -106,9 +118,8 @@ func (h *IntegrationHandler) ConnectGitHubPAT(w http.ResponseWriter, r *http.Req
 
 // ListOrganizations handles GET /api/integrations/github/orgs
 func (h *IntegrationHandler) ListOrganizations(w http.ResponseWriter, r *http.Request) {
-	userID, ok := getUserIDFromContext(r)
+	userID, ok := h.getRegisteredUserID(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -180,9 +191,8 @@ func (h *IntegrationHandler) getAndClearOAuthNonceCookie(w http.ResponseWriter, 
 
 // DisconnectGitHub handles POST /api/integrations/github/disconnect
 func (h *IntegrationHandler) DisconnectGitHub(w http.ResponseWriter, r *http.Request) {
-	userID, ok := getUserIDFromContext(r)
+	userID, ok := h.getRegisteredUserID(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -239,9 +249,8 @@ func (h *IntegrationHandler) handleGitHubError(w http.ResponseWriter, err error,
 
 // GetRepository handles GET /api/integrations/github/repositories/{owner}/{repo}
 func (h *IntegrationHandler) GetRepository(w http.ResponseWriter, r *http.Request) {
-	userID, ok := getUserIDFromContext(r)
+	userID, ok := h.getRegisteredUserID(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -263,9 +272,8 @@ func (h *IntegrationHandler) GetRepository(w http.ResponseWriter, r *http.Reques
 
 // ListRepositories handles GET /api/integrations/github/repositories
 func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Request) {
-	userID, ok := getUserIDFromContext(r)
+	userID, ok := h.getRegisteredUserID(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -295,9 +303,8 @@ func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Req
 
 // ListBranches handles GET /api/integrations/github/repositories/{owner}/{repo}/branches
 func (h *IntegrationHandler) ListBranches(w http.ResponseWriter, r *http.Request) {
-	userID, ok := getUserIDFromContext(r)
+	userID, ok := h.getRegisteredUserID(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -321,9 +328,8 @@ func (h *IntegrationHandler) ListBranches(w http.ResponseWriter, r *http.Request
 
 // DetectRepository handles GET /api/integrations/github/repositories/{owner}/{repo}/detect
 func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Request) {
-	userID, ok := getUserIDFromContext(r)
+	userID, ok := h.getRegisteredUserID(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 

@@ -46,6 +46,7 @@ type AppConfig struct {
 	FrontendURL        string
 	CORSAllowedOrigins string
 	CookieSecure       bool
+	AllowGuestMode     bool
 }
 
 // AllowedOriginsList returns a slice of allowed origins parsed from CORSAllowedOrigins and FrontendURL.
@@ -295,6 +296,14 @@ func Load() (*Config, error) {
 			FrontendURL:        frontendURL,
 			CORSAllowedOrigins: corsOrigins,
 			CookieSecure:       getEnv("COOKIE_SECURE", "false") == "true",
+			AllowGuestMode: func() bool {
+				if guestEnv, ok := os.LookupEnv("FORGELAB_ALLOW_GUEST_MODE"); ok {
+					guestEnvLower := strings.ToLower(strings.TrimSpace(guestEnv))
+					return guestEnvLower == "true" || guestEnvLower == "1" || guestEnvLower == "yes"
+				}
+				// Default: enabled for local/single-user development, restricted for public/remote installations
+				return isDev
+			}(),
 		},
 		Google: OAuthConfig{
 			ClientID:     getEnv("GOOGLE_CLIENT_ID", ""),

@@ -10,6 +10,17 @@ import (
 	"github.com/google/uuid"
 )
 
+// Shared Guest Identity constants
+var (
+	GuestUserID    = uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	GuestUserEmail = "guest@forgelab.local"
+)
+
+// IsGuest checks if the given user ID matches the shared guest identity.
+func IsGuest(userID uuid.UUID) bool {
+	return userID == GuestUserID
+}
+
 // User represents a ForgeLab user account.
 // This is completely separate from users of applications deployed onto ForgeLab.
 type User struct {

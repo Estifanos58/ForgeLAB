@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
+import { useAuth } from '@/features/auth/use-auth';
 import { api } from '@/lib/api/client';
 import { Project } from '@/lib/api/types';
 import { AppHeader } from '@/components/layout/app-header';
@@ -12,9 +13,10 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Alert } from '@/components/ui/alert';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Plus, RefreshCw, ExternalLink, GitBranch, FolderGit2, Play, RotateCcw } from 'lucide-react';
+import { Plus, RefreshCw, ExternalLink, GitBranch, FolderGit2, Play, RotateCcw, Info } from 'lucide-react';
 
 export default function DashboardPage() {
+  const { user } = useAuth();
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -59,6 +61,12 @@ export default function DashboardPage() {
 
   useEffect(() => {
     loadProjects();
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('deploy') === 'true' || params.get('create') === 'true') {
+        setIsModalOpen(true);
+      }
+    }
   }, [loadProjects]);
 
   return (
@@ -101,6 +109,25 @@ export default function DashboardPage() {
           <Alert variant="error" onClose={() => setError(null)}>
             {error}
           </Alert>
+        )}
+
+        {/* Guest Workspace Banner */}
+        {!user && !loading && (
+          <div className="p-3.5 rounded-lg border border-amber-500/20 bg-amber-500/5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-neutral-300">
+            <div className="flex items-center gap-2.5">
+              <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" />
+              <span>
+                <strong className="text-amber-200">Shared Guest Workspace:</strong> You are deploying local code without registration. Projects persist on this installation. Register or Sign In to deploy from GitHub repositories.
+              </span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <Link href="/register">
+                <Button size="sm" variant="outline" className="h-7 text-xs border-amber-500/30 text-amber-200 hover:bg-amber-500/10">
+                  Register for GitHub
+                </Button>
+              </Link>
+            </div>
+          </div>
         )}
 
         {/* Compact Statistics Row */}

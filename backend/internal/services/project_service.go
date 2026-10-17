@@ -156,6 +156,16 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		return nil, fmt.Errorf("%w: project name is required", ErrValidationFailed)
 	}
 
+	if models.IsGuest(ownerID) {
+		var guestCount int
+		if s.db != nil {
+			err := s.db.QueryRow(ctx, "SELECT COUNT(*) FROM projects WHERE owner_id = $1", ownerID).Scan(&guestCount)
+			if err == nil && guestCount >= 20 {
+				return nil, fmt.Errorf("%w: guest deployment limit reached (maximum 20 projects)", ErrValidationFailed)
+			}
+		}
+	}
+
 	sourceType := strings.ToLower(strings.TrimSpace(input.SourceType))
 	if sourceType == "" {
 		if strings.TrimSpace(input.RepositoryPath) != "" {
@@ -172,6 +182,9 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 
 	switch sourceType {
 	case models.SourceTypeGitHub:
+		if models.IsGuest(ownerID) {
+			return nil, fmt.Errorf("%w: registration required for github deployments", ErrValidationFailed)
+		}
 		if sourceRef == "" {
 			return nil, fmt.Errorf("%w: github repository (owner/name) is required", ErrValidationFailed)
 		}

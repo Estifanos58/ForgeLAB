@@ -55,6 +55,11 @@ export function Navbar() {
             </Link>
           ) : (
             <>
+              <Link href="/dashboard?deploy=true">
+                <Button size="sm" variant="outline" className="border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10 text-xs">
+                  Deploy Local
+                </Button>
+              </Link>
               <Link href="/login">
                 <Button size="sm" variant="ghost">
                   Sign In

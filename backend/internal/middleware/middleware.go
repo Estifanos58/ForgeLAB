@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/auth"
+	"github.com/forgelab/backend/internal/models"
 )
 
 // contextKey is a custom type for context keys to avoid collisions.
@@ -23,6 +24,8 @@ const (
 	UserIDKey contextKey = "user_id"
 	// UserEmailKey is the context key for the authenticated user's email.
 	UserEmailKey contextKey = "user_email"
+	// IsGuestKey is the context key indicating whether the request is authenticated as guest.
+	IsGuestKey contextKey = "is_guest"
 )
 
 // GetUserID extracts the authenticated user's ID from the request context.
@@ -35,6 +38,12 @@ func GetUserID(ctx context.Context) (uuid.UUID, bool) {
 func GetUserEmail(ctx context.Context) (string, bool) {
 	email, ok := ctx.Value(UserEmailKey).(string)
 	return email, ok
+}
+
+// IsGuestRequest extracts whether the request in context is resolved as a guest.
+func IsGuestRequest(ctx context.Context) bool {
+	val, ok := ctx.Value(IsGuestKey).(bool)
+	return ok && val
 }
 
 // AuthMiddleware validates JWT tokens and adds user info to the request context.
@@ -77,6 +86,62 @@ func AuthMiddleware(jwtManager *auth.JWTManager) func(http.Handler) http.Handler
 			// Add user info to context
 			ctx := context.WithValue(r.Context(), UserIDKey, claims.UserID)
 			ctx = context.WithValue(ctx, UserEmailKey, claims.Email)
+			ctx = context.WithValue(ctx, IsGuestKey, false)
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// AuthOrGuestMiddleware validates JWT tokens for registered users or assigns the
+// shared guest identity if unauthenticated and guest mode is enabled.
+func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tokenString := ""
+
+			// 1. Try Authorization header
+			authHeader := r.Header.Get("Authorization")
+			if authHeader != "" {
+				parts := strings.SplitN(authHeader, " ", 2)
+				if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+					tokenString = parts[1]
+				}
+			}
+
+			// 2. Try cookie
+			if tokenString == "" {
+				if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
+					tokenString = cookie.Value
+				}
+			}
+
+			// If a token was provided, validate it strictly
+			if tokenString != "" {
+				claims, err := jwtManager.ValidateAccessToken(tokenString)
+				if err != nil {
+					slog.Debug("token validation failed", "error", err)
+					http.Error(w, `{"error": "invalid or expired token"}`, http.StatusUnauthorized)
+					return
+				}
+
+				ctx := context.WithValue(r.Context(), UserIDKey, claims.UserID)
+				ctx = context.WithValue(ctx, UserEmailKey, claims.Email)
+				ctx = context.WithValue(ctx, IsGuestKey, false)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
+			// No token provided: check if guest mode is permitted on this installation
+			if !allowGuestMode {
+				http.Error(w, `{"error": "authentication required: guest mode disabled on this installation"}`, http.StatusUnauthorized)
+				return
+			}
+
+			// Assign the single shared guest identity
+			ctx := context.WithValue(r.Context(), UserIDKey, models.GuestUserID)
+			ctx = context.WithValue(ctx, UserEmailKey, models.GuestUserEmail)
+			ctx = context.WithValue(ctx, IsGuestKey, true)
 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

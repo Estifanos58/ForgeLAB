@@ -32,6 +32,12 @@
 - Access tokens expire after 15 minutes (`JWT_ACCESS_TOKEN_EXPIRY`).
 - Refresh tokens expire after 7 days (`JWT_REFRESH_TOKEN_EXPIRY`) and use atomic single-use rotation.
 
+### Registration-Free Guest Workspace (Local Deployments)
+- When `FORGELAB_ALLOW_GUEST_MODE=true` (or in local development `isDev`), unauthenticated requests to local deployment endpoints (`/api/sources/*`, `/api/discovery/plan`, `/api/projects/*`, and `/api/ws`) use `middleware.AuthOrGuestMiddleware` and resolve to the single internal guest identity `00000000-0000-0000-0000-000000000001` (`guest@forgelab.local`).
+- No guest tokens, cookies, or sessions are issued to anonymous visitors.
+- All GitHub integrations (`/api/integrations/github/*`) and `source_type: "github"` strictly require registered accounts and reject guest requests with `401 Unauthorized` or `403 Forbidden`.
+- `GET /api/auth/mode` returns installation guest mode configuration (`allow_guest_mode`, `guest_user_id`).
+
 ### Server-Side Ownership Enforcement
 - ForgeLAB enforces strict multi-tenant data isolation at the backend service layer:
   - A user can **only** inspect, modify, deploy, or delete projects they own (`projects.owner_id == user.id`).
