@@ -227,12 +227,6 @@ func main() {
 			}
 			return false, nil
 		})
-		deployQueue.StartJobWorker(ctx, func(workerCtx context.Context, job queue.Job) error {
-			if job.Type == queue.JobTypeServiceDeployment {
-				return dockerEngine.ExecuteServiceDeployment(workerCtx, job.ID)
-			}
-			return dockerEngine.ExecuteDeployment(workerCtx, job.ID)
-		})
 		defer deployQueue.Stop()
 	}
 
@@ -270,8 +264,8 @@ func main() {
 		}
 	}
 
-	// Run initial startup reconciliation synchronously before accepting HTTP traffic
-	// to fix the startup race where dashboard requests could see stale running states.
+	// Run initial startup reconciliation synchronously before accepting HTTP traffic and starting queue workers
+	// to fix startup races where workers or dashboard requests could see stale states.
 	slog.Info("running initial container and runtime status reconciliation...")
 	startupReconcileCtx, startupCancel := context.WithTimeout(ctx, 15*time.Second)
 	if err := dockerEngine.ReconcileDaemonContainers(startupReconcileCtx); err != nil {
@@ -282,6 +276,16 @@ func main() {
 	}
 	startupCancel()
 	slog.Info("initial container and runtime status reconciliation complete")
+
+	// Start deployment queue workers AFTER initial Docker and runtime reconciliation completes
+	if deployQueue != nil {
+		deployQueue.StartJobWorker(ctx, func(workerCtx context.Context, job queue.Job) error {
+			if job.Type == queue.JobTypeServiceDeployment {
+				return dockerEngine.ExecuteServiceDeployment(workerCtx, job.ID)
+			}
+			return dockerEngine.ExecuteDeployment(workerCtx, job.ID)
+		})
+	}
 
 	// Launch periodic background reconciliation for continuous health inspection
 	go func() {

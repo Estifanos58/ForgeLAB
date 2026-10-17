@@ -15,7 +15,6 @@ var AllowedTransitions = map[string]map[string]bool{
 		DeployStatusCloning:  true,
 		DeployStatusBuilding: true, // For release deployments or builds skipping clone
 		DeployStatusStarting: true, // For infrastructure / pre-built images skipping clone and build
-		DeployStatusRunning:  true, // For cached or direct promotions
 		DeployStatusFailed:   true,
 		DeployStatusSkipped:  true,
 	},

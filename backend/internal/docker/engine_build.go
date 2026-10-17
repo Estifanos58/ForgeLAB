@@ -40,22 +40,26 @@ func (rt *buildStreamRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	return rt.base.RoundTrip(req)
 }
 
-func (e *Engine) ensureStreamingTransport() {
+func (e *Engine) ensureStreamingTransport() *client.Client {
+	e.clientMu.Lock()
+	defer e.clientMu.Unlock()
+
 	if e.dockerClient == nil {
-		return
+		return nil
 	}
 	httpClient := e.dockerClient.HTTPClient()
 	if httpClient == nil {
-		return
+		return e.dockerClient
 	}
 	if _, ok := httpClient.Transport.(*buildStreamRoundTripper); ok {
-		return
+		return e.dockerClient
 	}
 	base := httpClient.Transport
 	if base == nil {
 		base = http.DefaultTransport
 	}
 	httpClient.Transport = &buildStreamRoundTripper{base: base}
+	origVersion := e.dockerClient.ClientVersion()
 	opts := []client.Opt{
 		client.WithHost(e.dockerClient.DaemonHost()),
 		client.WithHTTPClient(httpClient),
@@ -66,8 +70,15 @@ func (e *Engine) ensureStreamingTransport() {
 		negotiateCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		streamingCli.NegotiateAPIVersion(negotiateCtx)
 		cancel()
+
+		// Protect against downgrade below Docker minimum for image prune (1.25)
+		// if mock daemon didn't supply an API-Version header (which defaults to fallbackAPIVersion 1.24)
+		if streamingCli.ClientVersion() == "1.24" && origVersion != "" && origVersion != "1.24" {
+			_ = client.WithVersion(origVersion)(streamingCli)
+		}
 		e.dockerClient = streamingCli
 	}
+	return e.dockerClient
 }
 
 func (e *Engine) acquireBuildSlot(ctx context.Context) (func(), error) {
@@ -326,10 +337,13 @@ func (e *Engine) buildImage(
 	}
 	validatedArchiveFilePath := validatedArchiveFile.Name()
 
-	e.ensureStreamingTransport()
+	buildCli := e.ensureStreamingTransport()
+	if buildCli == nil {
+		buildCli = e.dockerClient
+	}
 	buildCtx = context.WithValue(buildCtx, buildContextSizeKey{}, stat.Size())
 
-	buildResponse, err := e.dockerClient.ImageBuild(buildCtx, validatedArchiveFile, options)
+	buildResponse, err := buildCli.ImageBuild(buildCtx, validatedArchiveFile, options)
 	if err != nil {
 		if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("Docker build timed out after %s: %w", buildTimeout.Round(time.Second), err)
@@ -347,7 +361,7 @@ func (e *Engine) buildImage(
 				retryCtx, retryCancel := context.WithTimeout(ctx, buildTimeout)
 				defer retryCancel()
 				retryCtx = context.WithValue(retryCtx, buildContextSizeKey{}, stat.Size())
-				retryResp, retryErr := e.dockerClient.ImageBuild(retryCtx, fallbackFile, fallbackOpts)
+				retryResp, retryErr := buildCli.ImageBuild(retryCtx, fallbackFile, fallbackOpts)
 				if retryErr == nil {
 					defer retryResp.Body.Close()
 					if retryParseErr := e.parseDockerStream(retryResp.Body, onLogLine); retryParseErr == nil {
@@ -402,7 +416,7 @@ func (e *Engine) buildImage(
 				retryCtx, retryCancel := context.WithTimeout(ctx, buildTimeout)
 				defer retryCancel()
 				retryCtx = context.WithValue(retryCtx, buildContextSizeKey{}, stat.Size())
-				retryResp, retryErr := e.dockerClient.ImageBuild(retryCtx, fallbackFile, fallbackOpts)
+				retryResp, retryErr := buildCli.ImageBuild(retryCtx, fallbackFile, fallbackOpts)
 				if retryErr == nil {
 					defer retryResp.Body.Close()
 					if retryParseErr := e.parseDockerStream(retryResp.Body, onLogLine); retryParseErr == nil {

@@ -12,7 +12,6 @@ func TestStateTransitions(t *testing.T) {
 		{models.DeployStatusQueued, models.DeployStatusCloning},
 		{models.DeployStatusQueued, models.DeployStatusBuilding},
 		{models.DeployStatusQueued, models.DeployStatusStarting},
-		{models.DeployStatusQueued, models.DeployStatusRunning},
 		{models.DeployStatusCloning, models.DeployStatusBuilding},
 		{models.DeployStatusBuilding, models.DeployStatusStarting},
 		{models.DeployStatusBuilding, models.DeployStatusRunning},
@@ -33,6 +32,7 @@ func TestStateTransitions(t *testing.T) {
 
 	// Invalid transitions
 	invalidPairs := [][2]string{
+		{models.DeployStatusQueued, models.DeployStatusRunning},
 		{models.DeployStatusCloning, models.DeployStatusRunning},
 		{models.DeployStatusFailed, models.DeployStatusRunning},
 		{models.DeployStatusFailed, models.DeployStatusBuilding},

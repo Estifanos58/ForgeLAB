@@ -407,6 +407,10 @@ func (h *ProjectHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "a deployment is already in progress")
 			return
 		}
+		if errors.Is(err, services.ErrProjectDeleting) {
+			writeError(w, http.StatusConflict, "project deletion is in progress")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to create rollback deployment: "+err.Error())
 		return
 	}
@@ -568,9 +572,21 @@ func (h *ProjectHandler) GetDeploymentLogs(w http.ResponseWriter, r *http.Reques
 
 	var serviceUUIDPtr *uuid.UUID
 	if serviceIDStr := r.URL.Query().Get("service_id"); serviceIDStr != "" {
-		if serviceUUID, parseErr := uuid.Parse(serviceIDStr); parseErr == nil {
-			serviceUUIDPtr = &serviceUUID
+		serviceUUID, parseErr := uuid.Parse(serviceIDStr)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid service_id")
+			return
 		}
+		belongs, err := h.deploymentService.VerifyServiceBelongsToProject(r.Context(), serviceUUID, projectID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to verify service access")
+			return
+		}
+		if !belongs {
+			writeError(w, http.StatusBadRequest, "service does not belong to project")
+			return
+		}
+		serviceUUIDPtr = &serviceUUID
 	}
 
 	limit := 1000
@@ -637,6 +653,21 @@ func (h *ProjectHandler) ListServiceDeployments(w http.ResponseWriter, r *http.R
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to verify project access")
+		return
+	}
+
+	// Verify deployment belongs to the project
+	deployment, err := h.deploymentService.GetDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, services.ErrDeploymentNotFound) {
+			writeError(w, http.StatusNotFound, "deployment not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get deployment")
+		return
+	}
+	if deployment.ProjectID != projectID {
+		writeError(w, http.StatusNotFound, "deployment not found")
 		return
 	}
 

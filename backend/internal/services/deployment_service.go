@@ -1073,6 +1073,16 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 	}
 	defer tx.Rollback(ctx)
 
+	// Lock parent project row and check if project deletion is in progress
+	var parentProjectStatus string
+	err = tx.QueryRow(ctx, "SELECT status FROM projects WHERE id = $1 FOR UPDATE", project.ID).Scan(&parentProjectStatus)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lock parent project row: %w", err)
+	}
+	if parentProjectStatus == models.ProjectStatusDeleting {
+		return nil, ErrProjectDeleting
+	}
+
 	// Lock the target service row
 	var lockedServiceID uuid.UUID
 	err = tx.QueryRow(ctx, "SELECT id FROM services WHERE id = $1 FOR UPDATE", targetService.ID).Scan(&lockedServiceID)
@@ -1317,9 +1327,13 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 
 	// Lock the project row FOR UPDATE
 	var lockedProjectID uuid.UUID
-	err = tx.QueryRow(ctx, "SELECT id FROM projects WHERE id = $1 FOR UPDATE", project.ID).Scan(&lockedProjectID)
+	var projectStatus string
+	err = tx.QueryRow(ctx, "SELECT id, status FROM projects WHERE id = $1 FOR UPDATE", project.ID).Scan(&lockedProjectID, &projectStatus)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lock project row: %w", err)
+	}
+	if projectStatus == models.ProjectStatusDeleting {
+		return nil, ErrProjectDeleting
 	}
 
 	// Verify no active deployments exist for this project
@@ -1927,6 +1941,19 @@ func (s *DeploymentService) GetServiceLogs(ctx context.Context, deploymentID, se
 	}
 
 	return logs, nil
+}
+
+// VerifyServiceBelongsToProject verifies whether a serviceID belongs to the given projectID.
+func (s *DeploymentService) VerifyServiceBelongsToProject(ctx context.Context, serviceID, projectID uuid.UUID) (bool, error) {
+	if s.db == nil {
+		return false, nil
+	}
+	var count int
+	err := s.db.QueryRow(ctx, "SELECT COUNT(*) FROM services WHERE id = $1 AND project_id = $2", serviceID, projectID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to verify service project association: %w", err)
+	}
+	return count > 0, nil
 }
 
 // GetServiceDeploymentLogs retrieves logs scoped strictly to an individual service deployment record.

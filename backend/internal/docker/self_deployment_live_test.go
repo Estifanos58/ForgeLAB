@@ -93,7 +93,7 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 		t.Log("Image forgelab-frontend:latest not found in local cache; creating reproducible test frontend image...")
 		ensureImageAvailable("alpine:3.19")
 		feTarData := createTarArchiveWithFiles(t, map[string][]byte{
-			"Dockerfile": []byte("FROM alpine:3.19\nEXPOSE 3000\nCMD [\"busybox\", \"httpd\", \"-f\", \"-p\", \"3000\", \"-h\", \"/var/www\"]\n"),
+			"Dockerfile": []byte("FROM alpine:3.19\nRUN apk add --no-cache busybox-extras && mkdir -p /var/www && echo 'ok' > /var/www/index.html\nEXPOSE 3000\nCMD [\"httpd\", \"-f\", \"-p\", \"3000\", \"-h\", \"/var/www\"]\n"),
 		})
 		feOpts := types.ImageBuildOptions{
 			Tags:       []string{"forgelab-frontend:latest"},

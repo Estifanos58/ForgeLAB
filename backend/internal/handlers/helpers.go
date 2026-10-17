@@ -47,4 +47,3 @@ func ClearAuthCookies(w http.ResponseWriter) {
 		MaxAge:   -1,
 	})
 }
-

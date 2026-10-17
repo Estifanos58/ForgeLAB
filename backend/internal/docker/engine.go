@@ -42,7 +42,15 @@ import (
 
 type sharedBuildPromise = SharedBuildPromise
 
+type activeExecEntry struct {
+	id        uuid.UUID
+	projectID uuid.UUID
+	cancel    context.CancelFunc
+	done      chan struct{}
+}
+
 type Engine struct {
+	clientMu             sync.Mutex // synchronizes streaming transport wrapping and client updates
 	dockerClient         *client.Client
 	projectService       *services.ProjectService
 	deploymentService    *services.DeploymentService
@@ -58,10 +66,12 @@ type Engine struct {
 	maxConcurrentBuilds  int
 	buildSem             *BuildSemaphore
 	semMu                sync.Mutex
-	buildMaintenanceMu   sync.RWMutex            // synchronizes Docker image builds vs image pruning/maintenance
-	pruneFilterLabel     string                  // optional label filter for scoped image pruning
-	activeLogCollectors  sync.Map                // map[string]context.CancelFunc — tracks running log collector goroutines
-	activeCancels        sync.Map                // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	buildMaintenanceMu   sync.RWMutex // synchronizes Docker image builds vs image pruning/maintenance
+	pruneFilterLabel     string       // optional label filter for scoped image pruning
+	activeLogCollectors  sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
+	activeCancels        sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	activeExecMu         sync.Mutex   // protects activeExecs map
+	activeExecs          map[uuid.UUID]*activeExecEntry
 	activeContainers     sync.Map                // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
 	sharedBuildArtifacts sync.Map                // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
 	sharedCoordMu        sync.Mutex              // protects initialization and mutation of sharedCoordinator
@@ -138,6 +148,7 @@ func NewEngine(
 		maxConcurrentBuilds: DefaultMaxConcurrentBuilds(),
 		buildSem:            NewBuildSemaphore(DefaultMaxConcurrentBuilds()),
 		sharedCoordinator:   NewSharedBuildCoordinator(),
+		activeExecs:         make(map[uuid.UUID]*activeExecEntry),
 	}
 }
 
@@ -264,6 +275,30 @@ func (e *Engine) CleanupDeploymentSharedBuilds(projectID string) int {
 	return e.getSharedCoordinator().CleanupDeployment(projectID)
 }
 
+func (e *Engine) registerActiveExec(id, projectID uuid.UUID, cancel context.CancelFunc) chan struct{} {
+	e.activeExecMu.Lock()
+	defer e.activeExecMu.Unlock()
+	done := make(chan struct{})
+	e.activeExecs[id] = &activeExecEntry{
+		id:        id,
+		projectID: projectID,
+		cancel:    cancel,
+		done:      done,
+	}
+	e.activeCancels.Store(id, cancel)
+	return done
+}
+
+func (e *Engine) unregisterActiveExec(id uuid.UUID) {
+	e.activeExecMu.Lock()
+	if entry, ok := e.activeExecs[id]; ok {
+		delete(e.activeExecs, id)
+		close(entry.done)
+	}
+	e.activeExecMu.Unlock()
+	e.activeCancels.Delete(id)
+}
+
 // RegisterActiveCancel registers a cancellation function for an active deployment execution.
 func (e *Engine) RegisterActiveCancel(deploymentID uuid.UUID, cancel context.CancelFunc) {
 	e.activeCancels.Store(deploymentID, cancel)
@@ -276,6 +311,13 @@ func (e *Engine) UnregisterActiveCancel(deploymentID uuid.UUID) {
 
 // CancelActiveDeployment cancels the context of an actively executing deployment if present.
 func (e *Engine) CancelActiveDeployment(deploymentID uuid.UUID) bool {
+	e.activeExecMu.Lock()
+	entry, ok := e.activeExecs[deploymentID]
+	e.activeExecMu.Unlock()
+	if ok && entry.cancel != nil {
+		entry.cancel()
+		return true
+	}
 	if val, ok := e.activeCancels.Load(deploymentID); ok {
 		if cancel, isFunc := val.(context.CancelFunc); isFunc {
 			cancel()
@@ -283,6 +325,31 @@ func (e *Engine) CancelActiveDeployment(deploymentID uuid.UUID) bool {
 		}
 	}
 	return false
+}
+
+// CancelAndDrainProjectDeployments cancels all active deployment contexts for the given project
+// and synchronously waits for their worker goroutines to exit before returning.
+func (e *Engine) CancelAndDrainProjectDeployments(ctx context.Context, projectID uuid.UUID) error {
+	e.activeExecMu.Lock()
+	var toDrain []chan struct{}
+	for _, entry := range e.activeExecs {
+		if entry.projectID == projectID {
+			if entry.cancel != nil {
+				entry.cancel()
+			}
+			toDrain = append(toDrain, entry.done)
+		}
+	}
+	e.activeExecMu.Unlock()
+
+	for _, done := range toDrain {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 type buildSlotContextKeyType struct{}
@@ -319,7 +386,9 @@ func (e *Engine) recalculateAndUpdateProjectStatus(ctx context.Context, projectI
 		return models.ProjectStatusInactive, nil
 	}
 	newStatus := services.CalculateProjectStatus(svcs)
-	_ = e.projectService.UpdateProjectStatus(ctx, projectID, newStatus)
+	if e.projectService != nil {
+		_ = e.projectService.UpdateProjectStatus(ctx, projectID, newStatus)
+	}
 	if e.wsHub != nil {
 		projectChannel := fmt.Sprintf("project:%s", projectID.String())
 		_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
@@ -386,8 +455,6 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	execCtx, execCancel := context.WithCancel(ctx)
 	defer execCancel()
-	e.RegisterActiveCancel(serviceDeploymentID, execCancel)
-	defer e.UnregisterActiveCancel(serviceDeploymentID)
 
 	service, err := e.serviceService.GetService(execCtx, serviceDeploy.ServiceID)
 	if err != nil {
@@ -398,6 +465,23 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	if err != nil {
 		return fmt.Errorf("failed to get project %s: %w", service.ProjectID, err)
 	}
+
+	if service.ProjectID != project.ID {
+		return fmt.Errorf("service %s does not belong to project %s", service.ID, project.ID)
+	}
+
+	if serviceDeploy.DeploymentID != nil {
+		parentDeploy, err := e.deploymentService.GetDeployment(ctx, *serviceDeploy.DeploymentID)
+		if err != nil {
+			return fmt.Errorf("failed to get parent deployment: %w", err)
+		}
+		if parentDeploy.ProjectID != project.ID {
+			return fmt.Errorf("parent deployment %s does not belong to project %s", parentDeploy.ID, project.ID)
+		}
+	}
+
+	e.registerActiveExec(serviceDeploymentID, project.ID, execCancel)
+	defer e.unregisterActiveExec(serviceDeploymentID)
 
 	if project.Status == models.ProjectStatusDeleting {
 		return errors.New("deployment aborted: project deletion is in progress")
@@ -483,6 +567,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	emitStatus := func(newStatus string, hostPort *int, failureReason *string) {
 		if err := e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, newStatus, failureReason); err != nil {
 			slog.Warn("failed to update service deployment status in db", "service_deployment_id", serviceDeploy.ID, "status", newStatus, "error", err)
+			return
 		}
 		coarseStatus := toCoarseServiceStatus(newStatus, hasPreviousHealthy)
 		_ = e.serviceService.UpdateServiceStatus(ctx, service.ID, coarseStatus, nil, nil, nil)
@@ -1866,13 +1951,18 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 
 	execCtx, execCancel := context.WithCancel(ctx)
 	defer execCancel()
-	e.RegisterActiveCancel(deploymentID, execCancel)
-	defer e.UnregisterActiveCancel(deploymentID)
 
 	project, err := e.getProjectByID(execCtx, deployment.ProjectID)
 	if err != nil {
 		return fmt.Errorf("failed to get project %s: %w", deployment.ProjectID, err)
 	}
+
+	if deployment.ProjectID != project.ID {
+		return fmt.Errorf("deployment %s does not belong to project %s", deployment.ID, project.ID)
+	}
+
+	e.registerActiveExec(deploymentID, project.ID, execCancel)
+	defer e.unregisterActiveExec(deploymentID)
 
 	if project.Status == models.ProjectStatusDeleting {
 		return errors.New("deployment aborted: project deletion is in progress")
@@ -1913,6 +2003,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	updateReleaseStatus := func(newStatus string, failureReason *string) {
 		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason); err != nil {
 			slog.Warn("failed to update release deployment status in db", "deployment_id", deployment.ID, "status", newStatus, "error", err)
+			return
 		}
 		if e.wsHub != nil {
 			channel := "deployment:" + deployment.ID.String()
@@ -2208,6 +2299,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		prevStatus := deployment.Status
 		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, newStatus, failureReason); err != nil {
 			slog.Warn("failed to update deployment status in db", "deployment_id", deployment.ID, "status", newStatus, "error", err)
+			return
 		}
 		deployment.Status = newStatus
 		if e.wsHub != nil {

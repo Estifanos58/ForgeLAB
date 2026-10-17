@@ -185,3 +185,22 @@ ForgeLAB enforces strict configuration validation across all non-development env
 - **Source Root Constraints:** `FORGELAB_ALLOWED_SOURCE_ROOTS` must be explicitly configured and cannot be set to root (`/`), drive roots (`C:\`), or system directories (`/etc`, `/var`, `/usr`, `/var/run`, etc.).
 - **Boundary Restriction:** Development defaults (such as CORS and frontend URL defaulting to `http://localhost:3000`) are strictly confined to local development (`isDev`).
 
+---
+
+## 7. Multi-Tenant Cross-Project Authorization Boundaries
+
+ForgeLAB strictly validates project ownership and cross-project isolation across both HTTP API boundaries and privileged internal engine operations:
+- **HTTP Endpoint Enforcement:** In `ServiceHandler` and `ProjectHandler`, all service lifecycle endpoints (`start`, `stop`, `restart`, `deploy`, `rollback`) and deployment read/log endpoints (`ListDeployments`, `GetDeployment`, `GetLogs`, `GetDeploymentLogs`, `ListServiceDeployments`) verify that the project is owned by the authenticated user, that the service belongs to the project (`service.ProjectID == projectID`), and that any deployment belongs to the specified service and project. Cross-project access attempts are rejected immediately with `400 Bad Request`, `404 Not Found`, or `403 Forbidden`.
+- **Privileged Engine Invariant Checks:** Inside `docker.Engine`, privileged lifecycle and execution methods (`StopService`, `StartService`, `RestartService`, `ExecuteServiceDeployment`, and `ExecuteDeployment`) assert that services, parent deployments, and target deployments belong to the authorized project ID before touching Docker daemon containers or state.
+
+---
+
+## 8. Lifecycle Correctness, Worker Draining & Startup Reconciliation
+
+- **Project Deletion & Safe Worker Draining:** When a project is deleted, all in-flight deployment workers are cancelled and synchronously drained via `CancelAndDrainProjectDeployments` before Docker container, network, or image cleanup commences. This ensures workers never create resources after cleanup has completed. Database and cancellation errors are strictly propagated to the caller, and all new deployment and rollback requests are rejected with `409 Conflict` (`ErrProjectDeleting`) while deletion is pending or retrying.
+- **Lifecycle Error Propagation:** `StopApp`, `StartApp`, `RestartApp`, `StopService`, `StartService`, and `RestartService` strictly propagate all Docker and database errors, ensuring failures are never reported as successes.
+- **Intentional Stop Protection:** `CheckContinuousRuntimeHealth` distinguishes between intentional clean stops (service status `stopped` with exit code 0, 137, or 143 from SIGTERM/SIGKILL) and unexpected crashes, preventing intentional user stops from being erroneously marked as crashes.
+- **Startup Reconciliation:** Initial Docker daemon container and runtime state reconciliation executes synchronously on server startup before deployment queue workers are launched, eliminating races between queue job processing and daemon state synchronization.
+- **State Machine & WebSocket Consistency:** Deployment status transitions are broadcast over WebSocket only when database persistence succeeds. The state machine strictly prevents direct invalid jumps from `queued` to `running`.
+
+

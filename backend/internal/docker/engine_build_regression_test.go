@@ -279,6 +279,12 @@ func TestEngine_BuildImage_LocalAgentStreamedTarArchive_RemainsOpenDuringBuildRe
 	)
 
 	mockDockerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("API-Version", "1.41")
+		if strings.Contains(r.URL.Path, "/_ping") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+			return
+		}
 		if r.Method == http.MethodPost && (r.URL.Path == "/v1.41/build" || r.URL.Path == "/build") {
 			// Read the streamed tar context in small chunks to verify the stream is kept open
 			buf := make([]byte, 64)

@@ -109,28 +109,41 @@ func (e *Engine) StopApp(ctx context.Context, projectID, ownerID uuid.UUID) erro
 	// 1. Stop legacy deployment container if present
 	deployment, err := e.deploymentService.GetDeployment(ctx, *project.CurrentDeploymentID)
 	if err == nil && deployment.ContainerID != nil && *deployment.ContainerID != "" {
-		if err := e.dockerClient.ContainerStop(ctx, *deployment.ContainerID, container.StopOptions{}); err != nil {
-			slog.Error("failed to stop container", "container_id", *deployment.ContainerID, "error", err)
+		if err := e.dockerClient.ContainerStop(ctx, *deployment.ContainerID, container.StopOptions{}); err != nil && !client.IsErrNotFound(err) {
+			return fmt.Errorf("failed to stop container: %w", err)
 		}
-		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusStopped, nil)
+		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusStopped, nil); err != nil {
+			return fmt.Errorf("failed to update deployment status: %w", err)
+		}
 	}
 
 	// 2. Stop all service containers for multi-service configurations
 	if e.serviceService != nil {
-		svcs, _ := e.serviceService.ListServices(ctx, projectID)
+		svcs, err := e.serviceService.ListServices(ctx, projectID)
+		if err != nil {
+			return fmt.Errorf("failed to list services: %w", err)
+		}
 		for _, svc := range svcs {
 			if svc.CurrentServiceDeploymentID != nil {
 				e.StopLogCollector(*svc.CurrentServiceDeploymentID)
 			}
 			if svc.ContainerID != nil && *svc.ContainerID != "" {
-				_ = e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{})
+				if err := e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{}); err != nil && !client.IsErrNotFound(err) {
+					return fmt.Errorf("failed to stop service container: %w", err)
+				}
 			}
-			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil)
+			if err := e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil); err != nil {
+				return fmt.Errorf("failed to update service status: %w", err)
+			}
 		}
 	}
 
-	_, _ = e.recalculateAndUpdateProjectStatus(ctx, projectID)
-	_ = e.deploymentService.SetCurrentDeployment(ctx, projectID, *project.CurrentDeploymentID, models.ProjectStatusStopped)
+	if _, err := e.recalculateAndUpdateProjectStatus(ctx, projectID); err != nil {
+		return fmt.Errorf("failed to update project status: %w", err)
+	}
+	if err := e.deploymentService.SetCurrentDeployment(ctx, projectID, *project.CurrentDeploymentID, models.ProjectStatusStopped); err != nil {
+		return fmt.Errorf("failed to set current deployment: %w", err)
+	}
 
 	slog.Info("project app stopped", "project_id", projectID)
 	return nil
@@ -153,24 +166,35 @@ func (e *Engine) StartApp(ctx context.Context, projectID, ownerID uuid.UUID) err
 		if err := e.dockerClient.ContainerStart(ctx, *deployment.ContainerID, container.StartOptions{}); err != nil {
 			return fmt.Errorf("failed to start container: %w", err)
 		}
-		_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusRunning, nil)
+		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusRunning, nil); err != nil {
+			return fmt.Errorf("failed to update deployment status: %w", err)
+		}
 	}
 
 	// 2. Start all service containers for multi-service configurations
 	if e.serviceService != nil {
-		svcs, _ := e.serviceService.ListServices(ctx, projectID)
+		svcs, err := e.serviceService.ListServices(ctx, projectID)
+		if err != nil {
+			return fmt.Errorf("failed to list services: %w", err)
+		}
 		for _, svc := range svcs {
 			if svc.ContainerID != nil && *svc.ContainerID != "" {
 				if err := e.dockerClient.ContainerStart(ctx, *svc.ContainerID, container.StartOptions{}); err != nil {
-					slog.Warn("failed to start service container", "service_id", svc.ID, "error", err)
+					return fmt.Errorf("failed to start service container: %w", err)
 				}
 			}
-			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusRunning, nil, nil, nil)
+			if err := e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusRunning, nil, nil, nil); err != nil {
+				return fmt.Errorf("failed to update service status: %w", err)
+			}
 		}
 	}
 
-	_, _ = e.recalculateAndUpdateProjectStatus(ctx, projectID)
-	_ = e.deploymentService.SetCurrentDeployment(ctx, projectID, *project.CurrentDeploymentID, models.ProjectStatusRunning)
+	if _, err := e.recalculateAndUpdateProjectStatus(ctx, projectID); err != nil {
+		return fmt.Errorf("failed to update project status: %w", err)
+	}
+	if err := e.deploymentService.SetCurrentDeployment(ctx, projectID, *project.CurrentDeploymentID, models.ProjectStatusRunning); err != nil {
+		return fmt.Errorf("failed to set current deployment: %w", err)
+	}
 
 	slog.Info("project app started", "project_id", projectID)
 	return nil
@@ -199,8 +223,12 @@ func (e *Engine) RestartApp(ctx context.Context, projectID, ownerID uuid.UUID) e
 		}
 	}
 
-	_ = e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusRunning, nil)
-	_ = e.deploymentService.SetCurrentDeployment(ctx, projectID, deployment.ID, models.ProjectStatusRunning)
+	if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusRunning, nil); err != nil {
+		return fmt.Errorf("failed to update deployment status: %w", err)
+	}
+	if err := e.deploymentService.SetCurrentDeployment(ctx, projectID, deployment.ID, models.ProjectStatusRunning); err != nil {
+		return fmt.Errorf("failed to set current deployment: %w", err)
+	}
 
 	slog.Info("project app restarted", "project_id", projectID)
 	return nil
@@ -219,16 +247,28 @@ func (e *Engine) StopService(ctx context.Context, projectID, serviceID, ownerID 
 	if err != nil {
 		return err
 	}
+	if svc.ProjectID != project.ID {
+		return fmt.Errorf("service %s does not belong to project %s", serviceID, project.ID)
+	}
 	if svc.CurrentServiceDeploymentID != nil {
 		e.StopLogCollector(*svc.CurrentServiceDeploymentID)
 	}
 	if svc.ContainerID != nil && *svc.ContainerID != "" {
-		_ = e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{})
+		if err := e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{}); err != nil && !client.IsErrNotFound(err) {
+			return fmt.Errorf("failed to stop service container: %w", err)
+		}
 	}
-	_ = e.serviceService.UpdateServiceStatus(ctx, serviceID, models.ServiceStatusStopped, nil, nil, nil)
-	svcs, _ := e.serviceService.ListServices(ctx, project.ID)
+	if err := e.serviceService.UpdateServiceStatus(ctx, serviceID, models.ServiceStatusStopped, nil, nil, nil); err != nil {
+		return fmt.Errorf("failed to update service status: %w", err)
+	}
+	svcs, err := e.serviceService.ListServices(ctx, project.ID)
+	if err != nil {
+		return fmt.Errorf("failed to list services: %w", err)
+	}
 	newStatus := services.CalculateProjectStatus(svcs)
-	_ = e.projectService.UpdateProjectStatus(ctx, project.ID, newStatus)
+	if err := e.projectService.UpdateProjectStatus(ctx, project.ID, newStatus); err != nil {
+		return fmt.Errorf("failed to update project status: %w", err)
+	}
 	return nil
 }
 
@@ -245,21 +285,33 @@ func (e *Engine) StartService(ctx context.Context, projectID, serviceID, ownerID
 	if err != nil {
 		return err
 	}
+	if svc.ProjectID != project.ID {
+		return fmt.Errorf("service %s does not belong to project %s", serviceID, project.ID)
+	}
 	if svc.ContainerID != nil && *svc.ContainerID != "" {
 		if err := e.dockerClient.ContainerStart(ctx, *svc.ContainerID, container.StartOptions{}); err != nil {
 			return fmt.Errorf("failed to start service container: %w", err)
 		}
 	}
-	_ = e.serviceService.UpdateServiceStatus(ctx, serviceID, models.ServiceStatusRunning, nil, nil, nil)
-	svcs, _ := e.serviceService.ListServices(ctx, project.ID)
+	if err := e.serviceService.UpdateServiceStatus(ctx, serviceID, models.ServiceStatusRunning, nil, nil, nil); err != nil {
+		return fmt.Errorf("failed to update service status: %w", err)
+	}
+	svcs, err := e.serviceService.ListServices(ctx, project.ID)
+	if err != nil {
+		return fmt.Errorf("failed to list services: %w", err)
+	}
 	newStatus := services.CalculateProjectStatus(svcs)
-	_ = e.projectService.UpdateProjectStatus(ctx, project.ID, newStatus)
+	if err := e.projectService.UpdateProjectStatus(ctx, project.ID, newStatus); err != nil {
+		return fmt.Errorf("failed to update project status: %w", err)
+	}
 	return nil
 }
 
 // RestartService restarts an individual service.
 func (e *Engine) RestartService(ctx context.Context, projectID, serviceID, ownerID uuid.UUID) error {
-	_ = e.StopService(ctx, projectID, serviceID, ownerID)
+	if err := e.StopService(ctx, projectID, serviceID, ownerID); err != nil {
+		return err
+	}
 	return e.StartService(ctx, projectID, serviceID, ownerID)
 }
 
@@ -274,6 +326,11 @@ func (e *Engine) CleanUpProjectContainers(ctx context.Context, projectID uuid.UU
 func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUID) error {
 	if e.dockerClient == nil {
 		return nil
+	}
+
+	// 0. Cancel and drain all active in-flight deployment workers for this project
+	if err := e.CancelAndDrainProjectDeployments(ctx, projectID); err != nil {
+		slog.Warn("timeout or error waiting to drain project deployments during cleanup", "project_id", projectID, "error", err)
 	}
 
 	var cleanupErrs []error
@@ -939,6 +996,9 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 		}
 
 		if insp.State.OOMKilled {
+			if svc.Status == models.ServiceStatusStopped {
+				continue
+			}
 			reason := "Container was terminated by kernel OOM (Out Of Memory) killer. Review memory quota or memory limits."
 			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
 			if svc.CurrentServiceDeploymentID != nil && e.deploymentService != nil {
@@ -947,6 +1007,10 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 			slog.Warn("continuous health: container OOM killed", "service_id", svc.ID, "container_id", *svc.ContainerID)
 			touchedProjects[svc.ProjectID] = true
 		} else if !insp.State.Running {
+			if svc.Status == models.ServiceStatusStopped || svc.Classification == models.ClassificationJob {
+				// Intentionally stopped service or completed one-shot job: do NOT mark as crashed
+				continue
+			}
 			if insp.State.ExitCode != 0 {
 				reason := fmt.Sprintf("Container crashed with non-zero exit code (%d)", insp.State.ExitCode)
 				_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
@@ -955,7 +1019,7 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 				}
 				slog.Warn("continuous health: container exited with failure", "service_id", svc.ID, "exit_code", insp.State.ExitCode)
 				touchedProjects[svc.ProjectID] = true
-			} else if svc.Status != models.ServiceStatusStopped {
+			} else {
 				// Clean exit code 0 when service was not marked stopped: record intentional/clean stop
 				_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil)
 				slog.Info("continuous health: container exited cleanly (code 0), marked stopped", "service_id", svc.ID)

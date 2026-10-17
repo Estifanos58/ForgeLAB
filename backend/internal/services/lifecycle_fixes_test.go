@@ -322,4 +322,3 @@ func TestLifecycle_DeploymentsBlockedDuringDeletion(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, services.ErrProjectDeleting, "CreateServiceDeployment must be rejected with ErrProjectDeleting")
 }
-

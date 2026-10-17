@@ -1682,4 +1682,3 @@ func (s *SourceService) UserExists(ctx context.Context, userID uuid.UUID) bool {
 	err := s.db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", userID).Scan(&exists)
 	return err == nil && exists
 }
-

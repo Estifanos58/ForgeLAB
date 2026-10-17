@@ -96,7 +96,45 @@ func (h *ServiceHandler) Stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify project ownership
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify project access")
+		return
+	}
+
+	// Verify service belongs to project
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
+		return
+	}
+
 	if err := h.dockerEngine.StopService(r.Context(), projectID, serviceID, userID); err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) || errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to stop service: "+err.Error())
 		return
 	}
@@ -124,7 +162,45 @@ func (h *ServiceHandler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify project ownership
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify project access")
+		return
+	}
+
+	// Verify service belongs to project
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
+		return
+	}
+
 	if err := h.dockerEngine.StartService(r.Context(), projectID, serviceID, userID); err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) || errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to start service: "+err.Error())
 		return
 	}
@@ -152,7 +228,45 @@ func (h *ServiceHandler) Restart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify project ownership
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify project access")
+		return
+	}
+
+	// Verify service belongs to project
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
+		return
+	}
+
 	if err := h.dockerEngine.RestartService(r.Context(), projectID, serviceID, userID); err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) || errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to restart service: "+err.Error())
 		return
 	}
@@ -293,6 +407,10 @@ func (h *ServiceHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "a deployment is already in progress for this service")
 			return
 		}
+		if errors.Is(err, services.ErrProjectDeleting) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if errors.Is(err, services.ErrNoDeploymentToRollback) {
 			writeError(w, http.StatusBadRequest, "no previous successful deployment found to roll back to")
 			return
@@ -350,6 +468,20 @@ func (h *ServiceHandler) ListDeployments(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
+		return
+	}
+
 	deployments, err := h.deploymentService.ListServiceDeploymentsByService(r.Context(), serviceID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list service deployments: "+err.Error())
@@ -396,6 +528,20 @@ func (h *ServiceHandler) GetDeployment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
 		return
 	}
 
@@ -450,6 +596,20 @@ func (h *ServiceHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to project")
 		return
 	}
 

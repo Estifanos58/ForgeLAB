@@ -37,12 +37,12 @@ var (
 
 // ProjectService handles project-related business logic.
 type ProjectService struct {
-	db             *pgxpool.Pool
-	pathValidator  *security.PathValidator
-	sourceService  *SourceService
-	githubService  *GitHubService
-	serviceService *ServiceService
-	secretService  *SecretService
+	db                *pgxpool.Pool
+	pathValidator     *security.PathValidator
+	sourceService     *SourceService
+	githubService     *GitHubService
+	serviceService    *ServiceService
+	secretService     *SecretService
 	deploymentService *DeploymentService
 }
 
@@ -957,23 +957,31 @@ func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID u
 	}
 
 	// 1. Mark project as deleting in DB so no deployments can be created or queued
-	_, _ = s.db.Exec(ctx, "UPDATE projects SET status = $1, updated_at = NOW() WHERE id = $2", models.ProjectStatusDeleting, project.ID)
+	if s.db != nil {
+		if _, err := s.db.Exec(ctx, "UPDATE projects SET status = $1, updated_at = NOW() WHERE id = $2", models.ProjectStatusDeleting, project.ID); err != nil {
+			return fmt.Errorf("failed to mark project as deleting: %w", err)
+		}
+	}
 
 	// 2. Drain / cancel active or queued deployments
 	if s.deploymentService != nil {
-		_ = s.deploymentService.CancelAllProjectDeployments(ctx, project.ID)
+		if err := s.deploymentService.CancelAllProjectDeployments(ctx, project.ID); err != nil {
+			return fmt.Errorf("failed to cancel project deployments: %w", err)
+		}
 	} else if s.db != nil {
 		now := time.Now()
 		reason := "Project deletion in progress"
-		_, _ = s.db.Exec(ctx,
+		if _, err := s.db.Exec(ctx,
 			`UPDATE deployments SET
 			 status = $1, failure_reason = $2, finished_at = $3
 			 WHERE project_id = $4 AND status IN ($5, $6, $7, $8, $9)`,
 			models.DeployStatusFailed, reason, now, project.ID,
 			models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
 			models.DeployStatusStarting, models.DeployStatusHealthChecking,
-		)
-		_, _ = s.db.Exec(ctx,
+		); err != nil {
+			return fmt.Errorf("failed to fail active deployments: %w", err)
+		}
+		if _, err := s.db.Exec(ctx,
 			`UPDATE service_deployments SET
 			 status = $1, failure_reason = $2, finished_at = $3
 			 WHERE service_id IN (SELECT id FROM services WHERE project_id = $4)
@@ -981,7 +989,9 @@ func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID u
 			models.DeployStatusFailed, reason, now, project.ID,
 			models.DeployStatusQueued, models.DeployStatusCloning, models.DeployStatusBuilding,
 			models.DeployStatusStarting, models.DeployStatusHealthChecking,
-		)
+		); err != nil {
+			return fmt.Errorf("failed to fail active service deployments: %w", err)
+		}
 	}
 
 	// 3. Error-aware resource cleanup
@@ -989,15 +999,21 @@ func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID u
 		if err := cleanupFunc(ctx, project.ID); err != nil {
 			slog.Error("resource cleanup failed during project deletion", "project_id", project.ID, "error", err)
 			// Do not permanently delete project records when cleanup fails; provide a retryable cleanup path.
-			_, _ = s.db.Exec(ctx, "UPDATE projects SET status = $1, updated_at = NOW() WHERE id = $2", models.ProjectStatusFailed, project.ID)
+			if s.db != nil {
+				if _, dbErr := s.db.Exec(ctx, "UPDATE projects SET status = $1, updated_at = NOW() WHERE id = $2", models.ProjectStatusFailed, project.ID); dbErr != nil {
+					return fmt.Errorf("cleanup failed: %w; additionally failed to update project status: %v", err, dbErr)
+				}
+			}
 			return fmt.Errorf("cleanup failed: %w (project preserved for retry)", err)
 		}
 	}
 
 	// 4. Cleanup succeeded: permanently remove project records
-	_, err = s.db.Exec(ctx, "DELETE FROM projects WHERE id = $1", project.ID)
-	if err != nil {
-		return fmt.Errorf("failed to delete project: %w", err)
+	if s.db != nil {
+		_, err = s.db.Exec(ctx, "DELETE FROM projects WHERE id = $1", project.ID)
+		if err != nil {
+			return fmt.Errorf("failed to delete project: %w", err)
+		}
 	}
 
 	slog.Info("project deleted", "project_id", project.ID)
