@@ -45,6 +45,8 @@ export function parseWSLogEntry(data: any, channel: string | null): DeploymentLo
   };
 }
 
+export const MAX_STORED_LOGS = 2000;
+
 export function useDeploymentWS({
   channel,
   onSubscribed,
@@ -103,7 +105,7 @@ export function useDeploymentWS({
       }
 
       // 3. Sort chronologically by timestamp, then by database ID
-      return Array.from(map.values()).sort((a, b) => {
+      const sorted = Array.from(map.values()).sort((a, b) => {
         const timeA = new Date(a.timestamp).getTime();
         const timeB = new Date(b.timestamp).getTime();
         if (timeA !== timeB) return timeA - timeB;
@@ -112,6 +114,12 @@ export function useDeploymentWS({
         }
         return 0;
       });
+
+      // 4. Bound frontend memory growth to MAX_STORED_LOGS
+      if (sorted.length > MAX_STORED_LOGS) {
+        return sorted.slice(sorted.length - MAX_STORED_LOGS);
+      }
+      return sorted;
     });
   }, []);
 
@@ -249,6 +257,8 @@ export function useDeploymentWS({
               break;
 
             case 'log':
+            case 'service_deployment_log':
+            case 'release_log':
               if (msg.data) {
                 const logEntry: DeploymentLog = parseWSLogEntry(msg.data, channel);
 
@@ -275,7 +285,11 @@ export function useDeploymentWS({
                   if (process.env.NODE_ENV === 'development') {
                     console.log(`[ForgeLAB WS] merged log ${logEntry.id ?? 'noid'}`);
                   }
-                  return [...prev, logEntry];
+                  const updated = [...prev, logEntry];
+                  if (updated.length > MAX_STORED_LOGS) {
+                    return updated.slice(updated.length - MAX_STORED_LOGS);
+                  }
+                  return updated;
                 });
 
                 onLogRef.current?.(logEntry);

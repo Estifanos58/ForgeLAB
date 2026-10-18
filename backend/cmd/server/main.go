@@ -480,6 +480,9 @@ func main() {
 				r.Post("/{id}/env/import", envHandler.ImportLocalEnv)
 				r.Delete("/{id}/env/{key}", envHandler.Delete)
 
+				// Project-level logs
+				r.Get("/{id}/logs", projectHandler.GetProjectLogs)
+
 				// Deployments
 				r.With(deployThrottle).Post("/{id}/deployments", projectHandler.Deploy)
 				r.Get("/{id}/deployments", projectHandler.ListDeployments)

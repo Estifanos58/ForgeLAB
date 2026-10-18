@@ -544,6 +544,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if e.wsHub != nil {
 			data := map[string]interface{}{
 				"id":                    persistedLog.ID,
+				"sequence":              persistedLog.ID,
 				"service_deployment_id": serviceDeploy.ID.String(),
 				"service_id":            service.ID.String(),
 				"service_name":          service.Name,
@@ -556,9 +557,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			// ALWAYS publish to the canonical service-deployment channel (works for independent AND release deploys)
 			sdChannel := fmt.Sprintf("service-deployment:%s", serviceDeploy.ID.String())
 			_ = e.wsHub.PublishEvent(sdChannel, &ws.EventMessage{
-				Type:    "log",
-				Channel: sdChannel,
-				Data:    data,
+				Type:     "log",
+				Channel:  sdChannel,
+				Sequence: persistedLog.ID,
+				Data:     data,
 			})
 
 			// If part of a release, also publish to the release-scoped channels
@@ -566,22 +568,25 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				data["deployment_id"] = serviceDeploy.DeploymentID.String()
 				serviceChannel := fmt.Sprintf("deployment:%s:service:%s", serviceDeploy.DeploymentID.String(), service.ID.String())
 				_ = e.wsHub.PublishEvent(serviceChannel, &ws.EventMessage{
-					Type:    "log",
-					Channel: serviceChannel,
-					Data:    data,
+					Type:     "log",
+					Channel:  serviceChannel,
+					Sequence: persistedLog.ID,
+					Data:     data,
 				})
 				channel := "deployment:" + serviceDeploy.DeploymentID.String()
 				_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
-					Type:    "log",
-					Channel: channel,
-					Data:    data,
+					Type:     "log",
+					Channel:  channel,
+					Sequence: persistedLog.ID,
+					Data:     data,
 				})
 			}
 			projectChannel := fmt.Sprintf("project:%s", project.ID.String())
 			_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
-				Type:    "service_deployment_log",
-				Channel: projectChannel,
-				Data:    data,
+				Type:     "service_deployment_log",
+				Channel:  projectChannel,
+				Sequence: persistedLog.ID,
+				Data:     data,
 			})
 		}
 	}
@@ -1832,7 +1837,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started for service '%s'.", containerID[:12], service.Name))
 
 	// Start runtime log collector — continuously reads container stdout/stderr
-	e.startRuntimeLogCollector(execCtx, containerID, serviceDeploy.ID, service.ID, project.ID, redactor, emitLog)
+	e.StartRuntimeLogCollector(RuntimeCollectorParams{
+		ContainerID:         containerID,
+		ProjectID:           project.ID,
+		DeploymentID:        serviceDeploy.DeploymentID,
+		ServiceDeploymentID: &serviceDeploy.ID,
+		ServiceID:           &service.ID,
+		ServiceName:         service.Name,
+		Redactor:            redactor,
+	})
 
 	if isJob {
 		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Service '%s' is a one-shot job (classification: %s). Waiting for container execution to complete...", service.Name, service.Classification))
@@ -1841,6 +1854,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			select {
 			case err := <-errCh:
 				if err != nil {
+					e.StopLogCollector(serviceDeploy.ID)
+					e.StopContainerLogCollector(containerID)
 					reason := fmt.Sprintf("Failed waiting for job container '%s': %v", service.Name, err)
 					emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
 					emitStatus(models.DeployStatusFailed, nil, &reason)
@@ -1848,12 +1863,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				}
 			case status := <-statusCh:
 				if status.Error != nil && status.Error.Message != "" {
+					e.StopLogCollector(serviceDeploy.ID)
+					e.StopContainerLogCollector(containerID)
 					reason := fmt.Sprintf("Job container '%s' failed: %s (exit code %d)", service.Name, status.Error.Message, status.StatusCode)
 					emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
 					emitStatus(models.DeployStatusFailed, nil, &reason)
 					return errors.New(reason)
 				}
 				if status.StatusCode != 0 {
+					e.StopLogCollector(serviceDeploy.ID)
+					e.StopContainerLogCollector(containerID)
 					reason := fmt.Sprintf("Job container '%s' exited with non-zero status code %d", service.Name, status.StatusCode)
 					emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
 					emitStatus(models.DeployStatusFailed, nil, &reason)
@@ -1861,12 +1880,15 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				}
 				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Job container '%s' completed successfully with exit code 0.", service.Name))
 			case <-execCtx.Done():
+				e.StopLogCollector(serviceDeploy.ID)
+				e.StopContainerLogCollector(containerID)
 				reason := fmt.Sprintf("Job execution timed out or was cancelled for service '%s'", service.Name)
 				emitStatus(models.DeployStatusFailed, nil, &reason)
 				return errors.New(reason)
 			}
 		}
 		e.StopLogCollector(serviceDeploy.ID)
+		e.StopContainerLogCollector(containerID)
 		err = e.serviceService.PromoteServiceDeployment(ctx, service.ID, serviceDeploy.ID, containerID, runImage, nil)
 		if err != nil {
 			reason := fmt.Sprintf("Failed to promote job service deployment '%s': %v", service.Name, err)
@@ -1920,6 +1942,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 		// Destroy newly spawned broken container and preserve previously healthy container intact!
 		e.StopLogCollector(serviceDeploy.ID)
+		e.StopContainerLogCollector(containerID)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
 		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
@@ -1947,6 +1970,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		// The new container must not replace the previous current deployment,
 		// the new deployment must become failed, and the old container must remain intact.
 		e.StopLogCollector(serviceDeploy.ID)
+		e.StopContainerLogCollector(containerID)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
 		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
@@ -1980,9 +2004,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			if previousDeploymentID != nil {
 				e.StopLogCollector(*previousDeploymentID)
 			}
+			e.StopContainerLogCollector(*previousContainerID)
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			_ = e.dockerClient.ContainerStop(cleanupCtx, *previousContainerID, container.StopOptions{})
 			cleanupCancel()
+		} else {
+			e.StopContainerLogCollector(*previousContainerID)
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = e.dockerClient.ContainerRemove(cleanupCtx, *previousContainerID, container.RemoveOptions{Force: true})
@@ -2047,6 +2074,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		if e.wsHub != nil {
 			data := map[string]interface{}{
 				"id":            persistedLog.ID,
+				"sequence":      persistedLog.ID,
 				"deployment_id": deployment.ID.String(),
 				"timestamp":     persistedLog.Timestamp.Format(time.RFC3339Nano),
 				"phase":         persistedLog.Phase,
@@ -2055,15 +2083,17 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 			}
 			channel := "deployment:" + deployment.ID.String()
 			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
-				Type:    "log",
-				Channel: channel,
-				Data:    data,
+				Type:     "log",
+				Channel:  channel,
+				Sequence: persistedLog.ID,
+				Data:     data,
 			})
 			projectChannel := fmt.Sprintf("project:%s", project.ID.String())
 			_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
-				Type:    "release_log",
-				Channel: projectChannel,
-				Data:    data,
+				Type:     "release_log",
+				Channel:  projectChannel,
+				Sequence: persistedLog.ID,
+				Data:     data,
 			})
 		}
 	}
@@ -2359,6 +2389,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		if e.wsHub != nil {
 			data := map[string]interface{}{
 				"id":            persistedLog.ID,
+				"sequence":      persistedLog.ID,
 				"deployment_id": deployment.ID.String(),
 				"timestamp":     persistedLog.Timestamp.Format(time.RFC3339Nano),
 				"phase":         persistedLog.Phase,
@@ -2367,9 +2398,17 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			}
 			channel := "deployment:" + deployment.ID.String()
 			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
-				Type:    "log",
-				Channel: channel,
-				Data:    data,
+				Type:     "log",
+				Channel:  channel,
+				Sequence: persistedLog.ID,
+				Data:     data,
+			})
+			projectChannel := fmt.Sprintf("project:%s", project.ID.String())
+			_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
+				Type:     "release_log",
+				Channel:  projectChannel,
+				Sequence: persistedLog.ID,
+				Data:     data,
 			})
 		}
 	}
@@ -2943,6 +2982,8 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	if !healthy {
 		detailedReason := fmt.Sprintf("Health verification failed: %s", healthReason)
 		emitLog(models.LogPhaseHealth, models.LogStreamStderr, detailedReason)
+		e.StopLogCollector(deployment.ID)
+		e.StopContainerLogCollector(containerID)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
 		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
@@ -2958,9 +2999,19 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, models.ProjectStatusRunning)
 	_, _ = e.projectService.UpdateProjectPort(ctx, project.ID, allocatedPort)
 
+	// Start runtime log collector for legacy single-container deployment
+	e.StartRuntimeLogCollector(RuntimeCollectorParams{
+		ContainerID:  containerID,
+		ProjectID:    project.ID,
+		DeploymentID: &deployment.ID,
+		Redactor:     redactor,
+	})
+
 	if oldDeploymentID != nil && *oldDeploymentID != deployment.ID {
 		oldDeploy, err := e.deploymentService.GetDeployment(ctx, *oldDeploymentID)
 		if err == nil && oldDeploy.ContainerID != nil && *oldDeploy.ContainerID != "" {
+			e.StopLogCollector(oldDeploy.ID)
+			e.StopContainerLogCollector(*oldDeploy.ContainerID)
 			emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Stopping previous deployment %d container...", oldDeploy.DeployNumber))
 			_ = e.dockerClient.ContainerStop(ctx, *oldDeploy.ContainerID, container.StopOptions{})
 			_ = e.dockerClient.ContainerRemove(ctx, *oldDeploy.ContainerID, container.RemoveOptions{Force: true})

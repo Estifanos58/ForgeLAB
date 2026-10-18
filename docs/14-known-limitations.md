@@ -41,9 +41,9 @@ These are deliberate scoping decisions for the current platform release. They ar
    - **ForgeLAB continuous self-healing / auto-rollback (`NOT IMPLEMENTED`):** ForgeLAB does not implement automatic rollback, automated crash-loop recovery, or automated re-promotion upon runtime failure. If an application enters a broken state or fails long after reaching `RUNNING`, ForgeLAB flags the service as failed and logs diagnostics, but takes no automated remedial rollback action.
 6. **No Zero-Downtime Rolling Traffic Shift:**
    - Promotion stops the old container and starts traffic on the new port. Because there is no proxy layer to gracefully drain connections or shift HTTP traffic, a brief connection gap can occur.
-7. **REST Pre-Fetch Required for Logs (No WebSocket Replay):**
-   - Connecting to a WebSocket channel only streams events that occur *after* the connection is established.
-   - To view prior build or startup logs, clients must explicitly query the REST API endpoint (`GET /api/projects/:id/deployments/:did/logs`).
+7. **REST Pre-Fetch & WebSocket Sequence Replay (`RESOLVED IN ARCHITECTURE`):**
+   - Historical logs are fetched via REST endpoints (`GET /api/projects/:id/logs` or `GET /api/projects/:id/deployments/:did/logs`) with subquery-based recent log ordering (`ORDER BY id DESC LIMIT N` wrapped in `ORDER BY id ASC`).
+   - On WebSocket reconnection, clients transmit `last_sequence` with their subscription frame, triggering the backend WebSocket Hub to stream missing historical logs from PostgreSQL before live events, preventing gaps or duplicates.
 
 ---
 
@@ -156,6 +156,10 @@ These are identified codebase behaviors that require investigation and resolutio
 ### 26. Configuration Hardening & Secret Protection (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml), [`backend/internal/services/source_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/source_service.go)
 - **Resolution:** Docker Compose explicitly passes `APP_ENV: ${APP_ENV:-development}` to the backend service, activating production security validations in production mode. Removed the hard-coded default encryption key fallback in `SourceService`, failing closed if encryption is unavailable. External port exposures in Docker Compose default to loopback `127.0.0.1` (`${BACKEND_PORT_BINDING:-127.0.0.1:8080}:8080`, `${FRONTEND_PORT_BINDING:-127.0.0.1:3000}:3000`).
+
+### 27. Runtime Log Collector Lifecycle & Reconnection Replay (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go), [`backend/internal/services/deployment_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/deployment_service.go), [`backend/internal/websocket/hub.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/websocket/hub.go), [`frontend/src/features/projects/logs-section.tsx`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/features/projects/logs-section.tsx)
+- **Resolution:** Runtime log collectors now run with an independent root context decoupled from deployment execution, continuing after deployment returns. Collectors stop explicitly when their container is stopped, replaced, removed, or during control-plane shutdown. Collectors execute up to 5 bounded retries with backoff if streams drop while containers are running. On backend restart, `ReconcileDaemonContainers` restores collectors for all running multi-service and legacy containers. Log retrieval uses subquery ordering (`ORDER BY id DESC LIMIT N` wrapped in `ORDER BY id ASC`), ensuring latest production logs are returned in chronological order rather than truncated by initial build lines. On WebSocket reconnect with `last_sequence`, missing logs are replayed from PostgreSQL. Frontend memory growth is bounded to 2,000 entries (`MAX_STORED_LOGS`).
 
 ---
 

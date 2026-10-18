@@ -75,6 +75,10 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Frontend Historical Logs** | IMPLEMENTED | NOT RECORDED | — | — | — | — | REST log fetch on deployment selection |
 | **Frontend Live Logs** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Live terminal log auto-scrolling via WebSocket |
 | **Frontend Deployment Switching** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Switching deployment updates channel & log viewer |
+| **Continuous Runtime Log Collection** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Runtime collector continues after deployment returns, stops on container stop |
+| **Backend Restart Collector Recovery** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Daemon reconciliation restores collectors for running containers on backend startup |
+| **Log UI Phase Filters & Service Scoping** | IMPLEMENTED | NOT RECORDED | — | — | — | — | All Logs, Deployment, Production filters with count badges and All Services view |
+| **Historical Log Retrieval & Replay** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Recent logs query subquery, cursor pagination, and WebSocket sequence replay |
 
 ---
 
@@ -1177,3 +1181,92 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Date:** —
 - **Environment:** —
 - **Notes:** —
+
+---
+
+### 20. Resilient Runtime Log Collection & Backend Restart Recovery
+
+#### Test Procedure 20.1 — Continuous Runtime Log Stream After Deployment Completion
+1. Deploy a multi-service or single-service project (e.g. backend service that produces HTTP request logs on stdout/stderr).
+2. Wait for deployment status to reach `running`.
+3. Verify the deployment execution returned (e.g. notification badge says deployment completed, status is `running`).
+4. Generate traffic against the service:
+   ```bash
+   curl http://localhost:<mapped_port>/health
+   curl http://localhost:<mapped_port>/api/hello
+   ```
+5. Observe the live terminal logs in ForgeLAB UI:
+   - Verify incoming runtime logs appear in real time under the `Production` tab with phase `runtime` and stream `stdout`.
+   - Verify log lines are not dropped or truncated after the build/promotion phase ended.
+6. Stop the service or project via ForgeLAB UI ("Stop Service" or "Stop Project"):
+   - Verify the log collector terminates cleanly.
+   - Verify no orphaned goroutines or docker log streams remain spinning.
+
+#### Test Procedure 20.2 — Log Collector Recovery After Backend Restart
+1. With a service confirmed running and producing logs, stop the ForgeLAB backend server:
+   ```bash
+   docker compose stop backend
+   ```
+   (or kill the host backend process if running in Environment A).
+2. Generate additional traffic or background logs in the running container while the backend is down:
+   ```bash
+   curl http://localhost:<mapped_port>/health
+   ```
+3. Restart the ForgeLAB backend server:
+   ```bash
+   docker compose start backend
+   ```
+4. Check backend logs to verify daemon reconciliation:
+   ```bash
+   docker compose logs backend | grep -i "restoring runtime log collector"
+   ```
+   - Verify log collector was restored for each running container (`multi-service` and `legacy`).
+5. Open the ForgeLAB UI and navigate to the project logs:
+   - Verify live log streaming resumes immediately upon WebSocket connection.
+   - Verify subsequent container output appears in the UI without needing to redeploy.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 21. Log UI Phase Filtering, Service Aggregation, and WebSocket Reconnect Replay
+
+#### Test Procedure 21.1 — Phase Filtering (All Logs, Deployment, Production) & Service Scoping
+1. Deploy a project with multiple services (e.g. `web` and `api`).
+2. Open the project logs view.
+3. Verify the Phase Filter toolbar:
+   - **All Logs**: displays all logs with total count badge `(N)`.
+   - **Deployment**: displays only `source`, `build`, `startup`, and `health` logs with badge count matching deployment entries.
+   - **Production**: displays only ongoing runtime `stdout`/`stderr` logs with badge count matching runtime entries.
+4. Click **Deployment**:
+   - Verify runtime lines disappear; only build and startup steps are shown.
+5. Click **Production**:
+   - Verify build lines disappear; only ongoing application stdout/stderr output is shown.
+6. Verify Service Scoping:
+   - Click **All Services**: verify logs from all services (frontend, backend, databases, workers) are displayed in chronological order, each marked with its color-coded service badge (e.g. `[api]`, `[web]`).
+   - Click individual service pill (e.g. `api`): verify only logs from that specific service are displayed.
+
+#### Test Procedure 21.2 — WebSocket Reconnect Sequence Replay & Bounded Memory
+1. In the browser, open the developer tools Console and Network (WS) tabs.
+2. Observe active log streaming on `project:<id>`. Note the last log ID received (e.g. `last_sequence = 150`).
+3. Simulate network drop by toggling "Offline" in Chrome DevTools Network tab for 5 seconds, then toggle back to "Online".
+4. Observe WebSocket reconnection frame:
+   - Reconnect sends frame: `{"type": "subscribe", "channel": "project:<id>", "last_sequence": 150}`.
+   - Backend queries PostgreSQL for `id > 150` and replays missing events before live streaming resumes.
+5. Verify no gap in log numbering and no duplicate log entries rendered in the terminal viewer.
+6. Simulate a high-volume stream (e.g. over 2,500 log lines):
+   - Verify frontend memory remains bounded at `MAX_STORED_LOGS = 2000`.
+   - Verify browser performance remains smooth and responsive without memory exhaustion.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+

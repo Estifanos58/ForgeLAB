@@ -1922,73 +1922,132 @@ func (s *DeploymentService) AddDeploymentServiceLog(
 	return log, nil
 }
 
-// GetDeploymentLogs retrieves logs for a release deployment with bounded limit (default 2000, max 5000).
+// LogQueryOptions specifies parameters for querying historical deployment and service logs.
+type LogQueryOptions struct {
+	ServiceID *uuid.UUID
+	Phase     string // "all", "deployment", "production", or exact phase name
+	AfterID   int64  // cursor for forward pagination (id > AfterID)
+	BeforeID  int64  // cursor for backward pagination (id < BeforeID)
+	Limit     int    // bounded limit (default 1000, max 5000)
+}
+
+func buildPhaseClause(phase string, argIndex *int, args *[]interface{}) string {
+	lower := strings.ToLower(strings.TrimSpace(phase))
+	if lower == "" || lower == "all" {
+		return ""
+	}
+	if lower == "deployment" {
+		return " AND phase IN ('source', 'build', 'startup', 'health')"
+	}
+	if lower == "production" {
+		return " AND phase = 'runtime'"
+	}
+	clause := fmt.Sprintf(" AND phase = $%d", *argIndex)
+	*args = append(*args, lower)
+	*argIndex++
+	return clause
+}
+
+func scanLogs(rows pgx.Rows) ([]*models.DeploymentLog, error) {
+	defer rows.Close()
+	var logs []*models.DeploymentLog
+	for rows.Next() {
+		l := &models.DeploymentLog{}
+		if err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceDeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message); err != nil {
+			return nil, fmt.Errorf("failed to scan log: %w", err)
+		}
+		logs = append(logs, l)
+	}
+	if logs == nil {
+		logs = []*models.DeploymentLog{}
+	}
+	return logs, nil
+}
+
+// GetDeploymentLogs retrieves recent logs for a release deployment with bounded limit (default 2000, max 5000).
 func (s *DeploymentService) GetDeploymentLogs(ctx context.Context, deploymentID uuid.UUID, pagination ...int) ([]*models.DeploymentLog, error) {
 	limit := 2000
 	if len(pagination) > 0 && pagination[0] > 0 {
 		limit = pagination[0]
-		if limit > 5000 {
-			limit = 5000
-		}
+	}
+	return s.GetDeploymentLogsWithOptions(ctx, deploymentID, LogQueryOptions{Limit: limit})
+}
+
+// GetDeploymentLogsWithOptions retrieves logs for a release deployment with cursor-based pagination and filtering.
+func (s *DeploymentService) GetDeploymentLogsWithOptions(ctx context.Context, deploymentID uuid.UUID, opts LogQueryOptions) ([]*models.DeploymentLog, error) {
+	if s.db == nil {
+		return []*models.DeploymentLog{}, nil
+	}
+	limit := opts.Limit
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
 	}
 
-	rows, err := s.db.Query(ctx,
-		`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
-		 FROM deployment_logs WHERE deployment_id = $1 ORDER BY timestamp ASC, id ASC
-		 LIMIT $2`,
-		deploymentID, limit,
-	)
+	argIndex := 1
+	var args []interface{}
+
+	baseWhere := fmt.Sprintf("deployment_id = $%d", argIndex)
+	args = append(args, deploymentID)
+	argIndex++
+
+	if opts.ServiceID != nil {
+		baseWhere += fmt.Sprintf(" AND service_id = $%d", argIndex)
+		args = append(args, *opts.ServiceID)
+		argIndex++
+	}
+
+	phaseClause := buildPhaseClause(opts.Phase, &argIndex, &args)
+	fullWhere := baseWhere + phaseClause
+
+	var query string
+	if opts.AfterID > 0 {
+		query = fmt.Sprintf(
+			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+			 FROM deployment_logs
+			 WHERE %s AND id > $%d
+			 ORDER BY id ASC LIMIT $%d`,
+			fullWhere, argIndex, argIndex+1,
+		)
+		args = append(args, opts.AfterID, limit)
+	} else if opts.BeforeID > 0 {
+		query = fmt.Sprintf(
+			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+			 FROM (
+				 SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+				 FROM deployment_logs
+				 WHERE %s AND id < $%d
+				 ORDER BY id DESC LIMIT $%d
+			 ) sub
+			 ORDER BY id ASC`,
+			fullWhere, argIndex, argIndex+1,
+		)
+		args = append(args, opts.BeforeID, limit)
+	} else {
+		// Return recent logs chronologically
+		query = fmt.Sprintf(
+			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+			 FROM (
+				 SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+				 FROM deployment_logs
+				 WHERE %s
+				 ORDER BY id DESC LIMIT $%d
+			 ) sub
+			 ORDER BY id ASC`,
+			fullWhere, argIndex,
+		)
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get deployment logs: %w", err)
 	}
-	defer rows.Close()
-
-	var logs []*models.DeploymentLog
-	for rows.Next() {
-		l := &models.DeploymentLog{}
-		err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceDeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan deployment log: %w", err)
-		}
-		logs = append(logs, l)
-	}
-
-	if logs == nil {
-		logs = []*models.DeploymentLog{}
-	}
-
-	return logs, nil
+	return scanLogs(rows)
 }
 
 // GetServiceLogs retrieves logs scoped strictly to a specific release and service.
 func (s *DeploymentService) GetServiceLogs(ctx context.Context, deploymentID, serviceID uuid.UUID) ([]*models.DeploymentLog, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
-		 FROM deployment_logs 
-		 WHERE deployment_id = $1 AND service_id = $2
-		 ORDER BY timestamp ASC, id ASC`,
-		deploymentID, serviceID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get service deployment logs: %w", err)
-	}
-	defer rows.Close()
-
-	var logs []*models.DeploymentLog
-	for rows.Next() {
-		l := &models.DeploymentLog{}
-		err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceDeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan service log: %w", err)
-		}
-		logs = append(logs, l)
-	}
-
-	if logs == nil {
-		logs = []*models.DeploymentLog{}
-	}
-
-	return logs, nil
+	return s.GetDeploymentLogsWithOptions(ctx, deploymentID, LogQueryOptions{ServiceID: &serviceID, Limit: 2000})
 }
 
 // VerifyServiceBelongsToProject verifies whether a serviceID belongs to the given projectID.
@@ -2004,86 +2063,166 @@ func (s *DeploymentService) VerifyServiceBelongsToProject(ctx context.Context, s
 	return count > 0, nil
 }
 
-// GetServiceDeploymentLogs retrieves logs scoped strictly to an individual service deployment record.
-func (s *DeploymentService) GetServiceDeploymentLogs(ctx context.Context, serviceDeploymentID uuid.UUID) ([]*models.DeploymentLog, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
-		 FROM deployment_logs 
-		 WHERE service_deployment_id = $1
-		 ORDER BY timestamp ASC, id ASC`,
-		serviceDeploymentID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get service deployment logs: %w", err)
+// GetServiceDeploymentLogs retrieves recent logs scoped strictly to an individual service deployment record.
+func (s *DeploymentService) GetServiceDeploymentLogs(ctx context.Context, serviceDeploymentID uuid.UUID, pagination ...int) ([]*models.DeploymentLog, error) {
+	limit := 2000
+	if len(pagination) > 0 && pagination[0] > 0 {
+		limit = pagination[0]
 	}
-	defer rows.Close()
-
-	var logs []*models.DeploymentLog
-	for rows.Next() {
-		l := &models.DeploymentLog{}
-		err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceDeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan service deployment log: %w", err)
-		}
-		logs = append(logs, l)
-	}
-
-	if logs == nil {
-		logs = []*models.DeploymentLog{}
-	}
-
-	return logs, nil
+	return s.GetServiceDeploymentLogsWithOptions(ctx, serviceDeploymentID, LogQueryOptions{Limit: limit})
 }
 
-// GetDeploymentLogsAfter retrieves logs for a deployment created after a given log ID sequence.
-func (s *DeploymentService) GetDeploymentLogsAfter(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
+// GetServiceDeploymentLogsWithOptions retrieves logs for an individual service deployment with cursor pagination.
+func (s *DeploymentService) GetServiceDeploymentLogsWithOptions(ctx context.Context, serviceDeploymentID uuid.UUID, opts LogQueryOptions) ([]*models.DeploymentLog, error) {
 	if s.db == nil {
 		return []*models.DeploymentLog{}, nil
 	}
+	limit := opts.Limit
 	if limit <= 0 || limit > 5000 {
 		limit = 1000
 	}
 
-	var (
-		rows pgx.Rows
-		err  error
-	)
-	if serviceID != nil {
-		rows, err = s.db.Query(ctx,
+	argIndex := 1
+	var args []interface{}
+
+	baseWhere := fmt.Sprintf("service_deployment_id = $%d", argIndex)
+	args = append(args, serviceDeploymentID)
+	argIndex++
+
+	phaseClause := buildPhaseClause(opts.Phase, &argIndex, &args)
+	fullWhere := baseWhere + phaseClause
+
+	var query string
+	if opts.AfterID > 0 {
+		query = fmt.Sprintf(
 			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
-			 FROM deployment_logs 
-			 WHERE deployment_id = $1 AND service_id = $2 AND id > $3
-			 ORDER BY id ASC LIMIT $4`,
-			deploymentID, *serviceID, afterID, limit,
+			 FROM deployment_logs
+			 WHERE %s AND id > $%d
+			 ORDER BY id ASC LIMIT $%d`,
+			fullWhere, argIndex, argIndex+1,
 		)
+		args = append(args, opts.AfterID, limit)
+	} else if opts.BeforeID > 0 {
+		query = fmt.Sprintf(
+			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+			 FROM (
+				 SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+				 FROM deployment_logs
+				 WHERE %s AND id < $%d
+				 ORDER BY id DESC LIMIT $%d
+			 ) sub
+			 ORDER BY id ASC`,
+			fullWhere, argIndex, argIndex+1,
+		)
+		args = append(args, opts.BeforeID, limit)
 	} else {
-		rows, err = s.db.Query(ctx,
+		query = fmt.Sprintf(
 			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
-			 FROM deployment_logs 
-			 WHERE deployment_id = $1 AND id > $2
-			 ORDER BY id ASC LIMIT $3`,
-			deploymentID, afterID, limit,
+			 FROM (
+				 SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+				 FROM deployment_logs
+				 WHERE %s
+				 ORDER BY id DESC LIMIT $%d
+			 ) sub
+			 ORDER BY id ASC`,
+			fullWhere, argIndex,
 		)
+		args = append(args, limit)
 	}
+
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get deployment logs after sequence: %w", err)
+		return nil, fmt.Errorf("failed to get service deployment logs: %w", err)
 	}
-	defer rows.Close()
+	return scanLogs(rows)
+}
 
-	var logs []*models.DeploymentLog
-	for rows.Next() {
-		l := &models.DeploymentLog{}
-		if err := rows.Scan(&l.ID, &l.DeploymentID, &l.ServiceDeploymentID, &l.ServiceID, &l.Timestamp, &l.Phase, &l.Stream, &l.Message); err != nil {
-			return nil, fmt.Errorf("failed to scan log: %w", err)
-		}
-		logs = append(logs, l)
+// GetDeploymentLogsAfter retrieves logs for a deployment created after a given log ID sequence.
+func (s *DeploymentService) GetDeploymentLogsAfter(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
+	return s.GetDeploymentLogsWithOptions(ctx, deploymentID, LogQueryOptions{
+		ServiceID: serviceID,
+		AfterID:   afterID,
+		Limit:     limit,
+	})
+}
+
+// GetProjectLogs retrieves logs across all services and releases belonging to a project.
+func (s *DeploymentService) GetProjectLogs(ctx context.Context, projectID uuid.UUID, opts LogQueryOptions) ([]*models.DeploymentLog, error) {
+	if s.db == nil {
+		return []*models.DeploymentLog{}, nil
+	}
+	limit := opts.Limit
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
 	}
 
-	if logs == nil {
-		logs = []*models.DeploymentLog{}
+	argIndex := 1
+	var args []interface{}
+
+	baseWhere := fmt.Sprintf("(service_id IN (SELECT id FROM services WHERE project_id = $%d) OR deployment_id IN (SELECT id FROM deployments WHERE project_id = $%d))", argIndex, argIndex)
+	args = append(args, projectID)
+	argIndex++
+
+	if opts.ServiceID != nil {
+		baseWhere += fmt.Sprintf(" AND service_id = $%d", argIndex)
+		args = append(args, *opts.ServiceID)
+		argIndex++
 	}
 
-	return logs, nil
+	phaseClause := buildPhaseClause(opts.Phase, &argIndex, &args)
+	fullWhere := baseWhere + phaseClause
+
+	var query string
+	if opts.AfterID > 0 {
+		query = fmt.Sprintf(
+			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+			 FROM deployment_logs
+			 WHERE %s AND id > $%d
+			 ORDER BY id ASC LIMIT $%d`,
+			fullWhere, argIndex, argIndex+1,
+		)
+		args = append(args, opts.AfterID, limit)
+	} else if opts.BeforeID > 0 {
+		query = fmt.Sprintf(
+			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+			 FROM (
+				 SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+				 FROM deployment_logs
+				 WHERE %s AND id < $%d
+				 ORDER BY id DESC LIMIT $%d
+			 ) sub
+			 ORDER BY id ASC`,
+			fullWhere, argIndex, argIndex+1,
+		)
+		args = append(args, opts.BeforeID, limit)
+	} else {
+		query = fmt.Sprintf(
+			`SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+			 FROM (
+				 SELECT id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message
+				 FROM deployment_logs
+				 WHERE %s
+				 ORDER BY id DESC LIMIT $%d
+			 ) sub
+			 ORDER BY id ASC`,
+			fullWhere, argIndex,
+		)
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get project logs: %w", err)
+	}
+	return scanLogs(rows)
+}
+
+// GetProjectLogsAfter retrieves logs for a project created after a given log ID sequence (used for WS replay).
+func (s *DeploymentService) GetProjectLogsAfter(ctx context.Context, projectID uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
+	return s.GetProjectLogs(ctx, projectID, LogQueryOptions{
+		AfterID: afterID,
+		Limit:   limit,
+	})
 }
 
 // ListServiceDeployments retrieves all service deployment records for a release.

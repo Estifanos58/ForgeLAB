@@ -7,6 +7,8 @@ import { WSConnectionState } from '@/lib/websocket/use-deployment-ws';
 import { cn } from '@/lib/utils/cn';
 import { Radio, ExternalLink } from 'lucide-react';
 
+export type LogPhaseFilter = 'all' | 'deployment' | 'production';
+
 interface LogsSectionProps {
   deployments: Deployment[];
   selectedDeployment?: Deployment | null;
@@ -36,14 +38,40 @@ export function LogsSection({
   onClearLogs,
   primaryPreviewUrl,
 }: LogsSectionProps) {
-  // If target is a service deployment, show all its logs directly.
-  // Otherwise filter release logs client-side if a specific service scope is selected.
-  const displayedLogs =
+  const [phaseFilter, setPhaseFilter] = React.useState<LogPhaseFilter>('all');
+
+  // 1. Service Scope:
+  // If target is a service deployment, show its logs directly.
+  // Otherwise if a specific service is selected, filter to that service.
+  // Otherwise ("All Services"), include all services (frontend, backend, databases, workers, independent).
+  const scopedLogs =
     selectedLogTarget?.type === 'service'
       ? logs
       : selectedServiceId
       ? logs.filter((l) => l.service_id === selectedServiceId)
       : logs;
+
+  // Calculate counts for phase filter badges
+  const countAll = scopedLogs.length;
+  const countDeployment = scopedLogs.filter((l) =>
+    ['source', 'build', 'startup', 'health'].includes(l.phase)
+  ).length;
+  const countProduction = scopedLogs.filter((l) => l.phase === 'runtime').length;
+
+  // 2. Phase Category Filter:
+  // - "deployment": source, build, startup, and health phases
+  // - "production": ongoing runtime stdout/stderr
+  // - "all": everything
+  const displayedLogs = scopedLogs.filter((log) => {
+    if (phaseFilter === 'all') return true;
+    if (phaseFilter === 'deployment') {
+      return ['source', 'build', 'startup', 'health'].includes(log.phase);
+    }
+    if (phaseFilter === 'production') {
+      return log.phase === 'runtime';
+    }
+    return true;
+  });
 
   const currentDeployNumber =
     selectedLogTarget?.type === 'service'
@@ -89,10 +117,9 @@ export function LogsSection({
         </div>
       )}
 
-      {/* Scope Toolbar: Release Selector & Service Scope Filter */}
-      <div className="shrink-0 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 min-w-0">
-        {/* Release Selector Bar */}
-        {deployments.length > 0 && (
+      {/* Release Selector Bar (when multiple releases exist) */}
+      {deployments.length > 0 && (
+        <div className="shrink-0 flex items-center justify-between gap-2.5 min-w-0">
           <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs font-mono min-w-0 max-w-full">
             <span className="text-neutral-500 shrink-0 text-[11px] uppercase tracking-wider font-semibold">
               Release:
@@ -105,6 +132,7 @@ export function LogsSection({
                 <button
                   key={d.id}
                   type="button"
+                  id={`release-selector-${d.deploy_number}`}
                   onClick={() => onSelectDeployment(d)}
                   className={cn(
                     'px-2.5 py-1 rounded border text-[11px] shrink-0 transition-colors',
@@ -118,15 +146,13 @@ export function LogsSection({
               );
             })}
           </div>
-        )}
 
-        <div className="flex items-center gap-2 sm:ml-auto flex-wrap">
           {primaryPreviewUrl && (
             <a
               href={primaryPreviewUrl}
               target="_blank"
               rel="noreferrer"
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-semibold shadow-sm transition-colors shrink-0 font-sans"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-semibold shadow-sm transition-colors shrink-0 font-sans ml-auto"
               title="Open application preview in new tab"
             >
               <Radio className="w-3 h-3 text-black animate-pulse" />
@@ -134,61 +160,112 @@ export function LogsSection({
               <ExternalLink className="w-3 h-3" />
             </a>
           )}
-
-          {/* Service Scope Tabs */}
-          {services.length > 0 && (
-            <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono overflow-x-auto max-w-full min-w-0 shrink-0">
-              <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold shrink-0">
-                Scope:
-              </span>
-              <button
-                type="button"
-                onClick={() => onSelectServiceScope(null)}
-                className={cn(
-                  'px-2.5 py-1 rounded transition-colors text-xs font-medium shrink-0 whitespace-nowrap',
-                  selectedLogTarget?.type === 'release' && selectedServiceId === null
-                    ? 'bg-white text-black font-semibold shadow-sm'
-                    : 'text-neutral-400 hover:text-white'
-                )}
-              >
-                All Services
-              </button>
-              {services.map((svc) => {
-                const isServiceActive =
-                  (selectedLogTarget?.type === 'service' && selectedLogTarget.serviceDeployment.service_id === svc.id) ||
-                  (selectedLogTarget?.type === 'release' && selectedServiceId === svc.id);
-                return (
-                  <button
-                    key={svc.id}
-                    type="button"
-                    onClick={() => onSelectServiceScope(svc.id)}
-                    className={cn(
-                      'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5 shrink-0 whitespace-nowrap',
-                      isServiceActive
-                        ? 'bg-white text-black font-semibold shadow-sm'
-                        : 'text-neutral-400 hover:text-white'
-                    )}
-                  >
-                    <span
-                      className={cn(
-                        'w-1.5 h-1.5 rounded-full shrink-0',
-                        svc.status === 'running'
-                          ? 'bg-emerald-500'
-                          : svc.status === 'failed'
-                          ? 'bg-rose-500'
-                          : svc.status === 'deploying' || svc.status === 'building' || svc.status === 'starting'
-                          ? 'bg-amber-400 animate-pulse'
-                          : 'bg-neutral-500'
-                      )}
-                    />
-                    <span>{svc.name}</span>
-                    <span className="text-[10px] opacity-70 uppercase font-sans">({svc.role})</span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
         </div>
+      )}
+
+      {/* Scope & Phase Filter Toolbar */}
+      <div className="shrink-0 flex flex-wrap items-center justify-between gap-2.5 min-w-0">
+        {/* Phase Filter Tabs: All Logs | Deployment | Production */}
+        <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono shrink-0">
+          <button
+            type="button"
+            id="log-filter-all"
+            onClick={() => setPhaseFilter('all')}
+            className={cn(
+              'px-2.5 py-1 rounded transition-colors text-xs font-medium shrink-0 flex items-center gap-1.5',
+              phaseFilter === 'all'
+                ? 'bg-white text-black font-semibold shadow-sm'
+                : 'text-neutral-400 hover:text-white'
+            )}
+          >
+            <span>All Logs</span>
+            <span className="text-[10px] opacity-75 font-sans">({countAll})</span>
+          </button>
+          <button
+            type="button"
+            id="log-filter-deployment"
+            onClick={() => setPhaseFilter('deployment')}
+            className={cn(
+              'px-2.5 py-1 rounded transition-colors text-xs font-medium shrink-0 flex items-center gap-1.5',
+              phaseFilter === 'deployment'
+                ? 'bg-white text-black font-semibold shadow-sm'
+                : 'text-neutral-400 hover:text-white'
+            )}
+          >
+            <span>Deployment</span>
+            <span className="text-[10px] opacity-75 font-sans">({countDeployment})</span>
+          </button>
+          <button
+            type="button"
+            id="log-filter-production"
+            onClick={() => setPhaseFilter('production')}
+            className={cn(
+              'px-2.5 py-1 rounded transition-colors text-xs font-medium shrink-0 flex items-center gap-1.5',
+              phaseFilter === 'production'
+                ? 'bg-white text-black font-semibold shadow-sm'
+                : 'text-neutral-400 hover:text-white'
+            )}
+          >
+            <span>Production</span>
+            <span className="text-[10px] opacity-75 font-sans">({countProduction})</span>
+          </button>
+        </div>
+
+        {/* Service Scope Filter Tabs */}
+        {services.length > 0 && (
+          <div className="flex items-center gap-1 p-1 rounded-md bg-surface border border-surface-border text-xs font-mono overflow-x-auto max-w-full min-w-0 shrink-0 ml-auto">
+            <span className="text-neutral-500 text-[10px] px-2 uppercase tracking-wider font-semibold shrink-0">
+              Scope:
+            </span>
+            <button
+              type="button"
+              id="log-scope-all"
+              onClick={() => onSelectServiceScope(null)}
+              className={cn(
+                'px-2.5 py-1 rounded transition-colors text-xs font-medium shrink-0 whitespace-nowrap',
+                selectedServiceId === null
+                  ? 'bg-white text-black font-semibold shadow-sm'
+                  : 'text-neutral-400 hover:text-white'
+              )}
+            >
+              All Services
+            </button>
+            {services.map((svc) => {
+              const isServiceActive =
+                (selectedLogTarget?.type === 'service' && selectedLogTarget.serviceDeployment.service_id === svc.id) ||
+                selectedServiceId === svc.id;
+              return (
+                <button
+                  key={svc.id}
+                  type="button"
+                  id={`log-scope-${svc.name}`}
+                  onClick={() => onSelectServiceScope(svc.id)}
+                  className={cn(
+                    'px-2.5 py-1 rounded transition-colors text-xs font-medium flex items-center gap-1.5 shrink-0 whitespace-nowrap',
+                    isServiceActive
+                      ? 'bg-white text-black font-semibold shadow-sm'
+                      : 'text-neutral-400 hover:text-white'
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'w-1.5 h-1.5 rounded-full shrink-0',
+                      svc.status === 'running'
+                        ? 'bg-emerald-500'
+                        : svc.status === 'failed'
+                        ? 'bg-rose-500'
+                        : svc.status === 'deploying' || svc.status === 'building' || svc.status === 'starting'
+                        ? 'bg-amber-400 animate-pulse'
+                        : 'bg-neutral-500'
+                    )}
+                  />
+                  <span>{svc.name}</span>
+                  <span className="text-[10px] opacity-70 uppercase font-sans">({svc.role})</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Terminal Logs Output */}

@@ -260,6 +260,15 @@ export interface DeploymentLog {
   message: string;
 }
 
+export interface LogQueryOptions {
+  serviceId?: string;
+  phase?: 'all' | 'deployment' | 'production' | string;
+  cursor?: number;
+  afterId?: number;
+  beforeId?: number;
+  limit?: number;
+}
+
 export type LogTarget =
   | { type: 'release'; deployment: Deployment }
   | { type: 'service'; serviceDeployment: ServiceDeployment; service?: Service | null };

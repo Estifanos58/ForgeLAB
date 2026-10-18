@@ -159,19 +159,20 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
   const addHistoricalLogsRef = useRef<(logs: DeploymentLog[]) => void>(() => {});
 
-  // Fetch historical logs from the correct REST endpoint for service vs release deployments
+  // Fetch historical logs from the correct REST endpoint for service vs release vs project
   const fetchHistoricalLogs = useCallback(
-    (target: LogTarget) => {
+    (target: LogTarget | null) => {
       const currentGen = ++logFetchGenRef.current;
 
-      const fetchPromise =
-        target.type === 'release'
-          ? api.projects.getLogs(projectId, target.deployment.id)
-          : api.services.getDeploymentLogs(
-              projectId,
-              target.serviceDeployment.service_id,
-              target.serviceDeployment.id
-            );
+      const fetchPromise = !target
+        ? api.projects.getProjectLogs(projectId, { limit: 200 })
+        : target.type === 'release'
+        ? api.projects.getLogs(projectId, target.deployment.id, selectedServiceId ? { serviceId: selectedServiceId } : undefined)
+        : api.services.getDeploymentLogs(
+            projectId,
+            target.serviceDeployment.service_id,
+            target.serviceDeployment.id
+          );
 
       fetchPromise
         .then((historyLogs) => {
@@ -183,12 +184,23 @@ export default function ProjectPage({ params }: ProjectPageProps) {
           console.warn('[ForgeLAB WS] Failed to sync historical logs:', err);
         });
     },
-    [projectId]
+    [projectId, selectedServiceId]
   );
 
   // When WebSocket subscribes or reconnects, fetch historical logs for the active target
   const handleWSSubscribed = useCallback(
     (channel: string) => {
+      if (channel.startsWith('project:')) {
+        api.projects.getProjectLogs(projectId, { limit: 200 })
+          .then((historyLogs) => {
+            addHistoricalLogsRef.current(historyLogs);
+          })
+          .catch((err) => {
+            console.warn('[ForgeLAB WS] Failed to sync project logs on subscribe:', err);
+          });
+        return;
+      }
+
       if (!selectedLogTarget) return;
 
       if (channel.startsWith('deployment:')) {
@@ -203,7 +215,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
         }
       }
     },
-    [selectedLogTarget, fetchHistoricalLogs]
+    [projectId, selectedLogTarget, fetchHistoricalLogs]
   );
 
   // Handle realtime status transitions without unnecessary loadData() churn
@@ -280,14 +292,13 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   // Sync historical logs when selected log target changes
   const targetKey = selectedLogTarget
     ? selectedLogTarget.type === 'release'
-      ? `release:${selectedLogTarget.deployment.id}`
+      ? `release:${selectedLogTarget.deployment.id}:${selectedServiceId || 'all'}`
       : `service:${selectedLogTarget.serviceDeployment.id}`
-    : null;
+    : 'project';
 
   useEffect(() => {
-    if (!selectedLogTarget) return;
     fetchHistoricalLogs(selectedLogTarget);
-  }, [targetKey, fetchHistoricalLogs]);
+  }, [targetKey, fetchHistoricalLogs, selectedLogTarget]);
 
   // Fallback REST fetch if offline
   useEffect(() => {

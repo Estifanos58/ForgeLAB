@@ -18,24 +18,23 @@
 
 ## 1. Scope Distinction: MVP Reality vs. Future Replay
 
-ForgeLAB separates three distinct realtime layers:
+ForgeLAB provides unified realtime streaming and historical replay across deployment and project scopes:
 
 ```text
-1. CURRENT IMPLEMENTED REALTIME ARCHITECTURE
-   Deployment-scoped WebSocket subscriptions ("deployment:<uuid>")
-   + REST-fetched historical logs ("GET /api/projects/:id/deployments/:did/logs")
-   + live WebSocket log streaming with persistent database IDs
+1. REALTIME STREAMING ARCHITECTURE
+   Deployment-scoped ("deployment:<uuid>", "service-deployment:<uuid>") & Project-scoped ("project:<uuid>")
+   + live WebSocket log streaming with persistent database IDs and sequence numbers
    + single-event framing (1 JSON event = 1 WebSocket text frame)
    + unified Redis pub/sub distribution (exactly-once local delivery)
    + frontend exponential-backoff reconnect and safe log merging
+   + memory bounds capped at MAX_STORED_LOGS (2,000 entries)
 
-2. EXISTING PROJECT-LEVEL CHANNEL CONTRACT
-   Channel "project:<uuid>" authorization exists in WebSocket Hub.
-   Ready for future project-level lifecycle events.
-
-3. FUTURE / PROPOSED EVENT-REPLAY ARCHITECTURE
-   A dedicated Deployment Event Service, database event ledger, and replay-on-connect
-   handshake. (PLANNED / NOT IMPLEMENTED IN CURRENT MVP).
+2. REPLAY & RECONNECTION ARCHITECTURE
+   Client subscription with "last_sequence" (> 0) triggers historical replay from PostgreSQL
+   + queries deployment_logs where id > last_sequence (ordered by id ASC)
+   + streams missing log events over WebSocket before live events
+   + deduplicates on frontend by persistent PostgreSQL ID
+   + prevents gaps or duplicates during network reconnects or page loads
 ```
 
 ---
@@ -98,22 +97,25 @@ All channels use durable **UUIDv4** strings. Channels are never keyed by project
 ### Client-to-Server Message Formats
 
 ```typescript
-// Subscribe to a service-deployment channel
+// Subscribe to a service-deployment channel (optionally passing last_sequence for replay)
 {
   "type": "subscribe",
-  "channel": "service-deployment:e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b"
+  "channel": "service-deployment:e1f2a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+  "last_sequence": 12340 // Optional: PostgreSQL log ID to replay missing events since reconnect
 }
 
-// Subscribe to a deployment channel
+// Subscribe to a deployment channel with replay
 {
   "type": "subscribe",
-  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f"
+  "channel": "deployment:c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f",
+  "last_sequence": 450
 }
 
-// Subscribe to a project channel
+// Subscribe to a project-level channel with replay
 {
   "type": "subscribe",
-  "channel": "project:a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"
+  "channel": "project:a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+  "last_sequence": 890
 }
 
 // Unsubscribe from a channel
@@ -228,12 +230,13 @@ The frontend hook (`useDeploymentWS`) exposes an explicit connection state:
 - Reconnect attempts and timers are cleanly cancelled on component unmount or channel change.
 - Sockets in `CONNECTING` or `OPEN` states are closed during teardown, preventing orphaned connections.
 
-### REST + WebSocket Safe Log Merging
-1. When switching deployments, logs are cleared for the new deployment view.
-2. Live WebSocket logs start streaming immediately.
-3. In parallel, historical logs are fetched via `GET /api/projects/:id/deployments/:did/logs`.
-4. When the historical REST request resolves, `addHistoricalLogs(historyLogs)` merges historical logs with live logs by persistent database ID and sorts chronologically.
-5. In-flight WebSocket logs that arrived while the REST request was in flight are never wiped out.
+### REST + WebSocket Safe Log Merging & Reconnect Replay
+1. When switching targets or deployments, logs are cleared and `last_sequence` resets to 0.
+2. Live WebSocket logs start streaming immediately. Incoming events track the highest persistent PostgreSQL ID seen in `last_sequence`.
+3. In parallel, historical logs are fetched via REST (`GET /api/projects/:id/logs` or `GET /api/projects/:id/deployments/:did/logs`).
+4. When historical logs resolve, `addHistoricalLogs(historyLogs)` merges historical logs with live logs by persistent database ID and sorts chronologically. In-flight WebSocket logs are preserved.
+5. **Memory Bounds:** Array size is bounded to `MAX_STORED_LOGS = 2000` entries on both live ingestion and historical merges (`slice(-MAX_STORED_LOGS)`), eliminating browser tab memory exhaustion during long-running production log streams.
+6. **Reconnect Without Gaps:** On WebSocket reconnection, the client transmits `{ type: "subscribe", channel, last_sequence }`. The backend Hub queries PostgreSQL for logs with `id > last_sequence` and streams them immediately before live events, preventing gaps or duplicates.
 
 ---
 

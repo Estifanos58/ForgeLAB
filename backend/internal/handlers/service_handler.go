@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -625,7 +626,46 @@ func (h *ServiceHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logs, err := h.deploymentService.GetServiceDeploymentLogs(r.Context(), deploymentID)
+	limit := 1000
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if lim, parseErr := strconv.Atoi(limitStr); parseErr == nil && lim > 0 {
+			limit = lim
+		}
+	}
+
+	var afterID int64
+	afterStr := r.URL.Query().Get("cursor")
+	if afterStr == "" {
+		afterStr = r.URL.Query().Get("after_id")
+	}
+	if afterStr == "" {
+		afterStr = r.URL.Query().Get("after")
+	}
+	if afterStr != "" {
+		if val, parseErr := strconv.ParseInt(afterStr, 10, 64); parseErr == nil && val > 0 {
+			afterID = val
+		}
+	}
+
+	var beforeID int64
+	beforeStr := r.URL.Query().Get("before_id")
+	if beforeStr == "" {
+		beforeStr = r.URL.Query().Get("before")
+	}
+	if beforeStr != "" {
+		if val, parseErr := strconv.ParseInt(beforeStr, 10, 64); parseErr == nil && val > 0 {
+			beforeID = val
+		}
+	}
+
+	phase := r.URL.Query().Get("phase")
+
+	logs, err := h.deploymentService.GetServiceDeploymentLogsWithOptions(r.Context(), deploymentID, services.LogQueryOptions{
+		Phase:    phase,
+		AfterID:  afterID,
+		BeforeID: beforeID,
+		Limit:    limit,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to get service deployment logs: "+err.Error())
 		return

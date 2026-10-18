@@ -16,6 +16,7 @@ import {
   GitHubStatus,
   ListRepositoriesResponse,
   LocalPathValidationResult,
+  LogQueryOptions,
   Project,
   Service,
   ServiceDeployment,
@@ -180,6 +181,22 @@ async function agentFetch<T>(endpoint: string, options: RequestInit = {}, token?
   return response.json();
 }
 
+function buildLogQuery(options?: LogQueryOptions | string): string {
+  if (!options) return '';
+  if (typeof options === 'string') {
+    return `?service_id=${encodeURIComponent(options)}`;
+  }
+  const params = new URLSearchParams();
+  if (options.serviceId) params.set('service_id', options.serviceId);
+  if (options.phase && options.phase !== 'all') params.set('phase', options.phase);
+  if (options.cursor !== undefined) params.set('cursor', String(options.cursor));
+  if (options.afterId !== undefined) params.set('after_id', String(options.afterId));
+  if (options.beforeId !== undefined) params.set('before_id', String(options.beforeId));
+  if (options.limit !== undefined) params.set('limit', String(options.limit));
+  const qs = params.toString();
+  return qs ? `?${qs}` : '';
+}
+
 export const api = {
   auth: {
     async register(data: { email: string; password: string; display_name?: string }): Promise<AuthResponse> {
@@ -288,9 +305,12 @@ export const api = {
       return apiFetch<Deployment>(`/api/projects/${projectId}/deployments/${deploymentId}`);
     },
 
-    async getLogs(projectId: string, deploymentId: string, serviceId?: string): Promise<DeploymentLog[]> {
-      const query = serviceId ? `?service_id=${encodeURIComponent(serviceId)}` : '';
-      return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/deployments/${deploymentId}/logs${query}`);
+    async getLogs(projectId: string, deploymentId: string, options?: LogQueryOptions | string): Promise<DeploymentLog[]> {
+      return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/deployments/${deploymentId}/logs${buildLogQuery(options)}`);
+    },
+
+    async getProjectLogs(projectId: string, options?: LogQueryOptions): Promise<DeploymentLog[]> {
+      return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/logs${buildLogQuery(options)}`);
     },
   },
 
@@ -337,8 +357,8 @@ export const api = {
       return apiFetch<ServiceDeployment>(`/api/projects/${projectId}/services/${serviceId}/deployments/${deploymentId}`);
     },
 
-    async getDeploymentLogs(projectId: string, serviceId: string, deploymentId: string): Promise<DeploymentLog[]> {
-      return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/services/${serviceId}/deployments/${deploymentId}/logs`);
+    async getDeploymentLogs(projectId: string, serviceId: string, deploymentId: string, options?: LogQueryOptions): Promise<DeploymentLog[]> {
+      return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/services/${serviceId}/deployments/${deploymentId}/logs${buildLogQuery(options)}`);
     },
 
     async getServiceDeployments(projectId: string, deploymentId: string): Promise<ServiceDeployment[]> {

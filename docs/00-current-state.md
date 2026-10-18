@@ -72,7 +72,14 @@ ForgeLAB is a single control-plane, self-hosted application deployment platform.
   - Build concurrency is conservatively throttled dynamically by CPU cores (1 slot on <=2 CPUs, 2 slots on <=4 CPUs, up to 4 on multi-core hosts) with full build queue diagnostics exposed via `/health/queue`. Shared builds are coordinated via a thread-safe `SharedBuildCoordinator` with fail-safe promise resolution, automatic eviction of failed build promises on retry, and comprehensive configuration cache hashing.
   - The background queue reconciler recovers orphaned queued release deployments, and workers perform cancellation checks on every heartbeat tick to promptly abort cancelled deployments.
 - **Port Allocation:** Dynamic host port allocation in the range **`10000–60000`** managed by `internal/network/PortManager`.
-- **Realtime Pipeline:** Deployment events and container logs are pushed to Redis Pub/Sub channels (`forgelab:pubsub:deployment:<uuid>`), bridged to an in-memory WebSocket Hub, and streamed to authenticated client subscriptions.
+- **Realtime Pipeline & Resilient Container Logging:**
+  - Deployment events and container logs are pushed to Redis Pub/Sub channels (`forgelab:pubsub:deployment:<uuid>`), bridged to an in-memory WebSocket Hub, and streamed to authenticated client subscriptions.
+  - **Runtime Collector Lifecycle:** The runtime log collector (`StartRuntimeLogCollector`) runs in an independent goroutine with a root context that continues after deployment execution returns (`ExecuteServiceDeployment` / `executeLegacySingleContainerDeployment`). Collectors stop explicitly when their container is stopped, replaced, removed, or ForgeLAB shuts down.
+  - **Bounded Retries & Stream Continuity:** If a container's log stream drops while the container remains running, the collector performs up to 5 bounded retries with backoff before terminating.
+  - **Daemon Container Collector Recovery:** On backend restart, `ReconcileDaemonContainers` inspects active containers across all running multi-service and legacy deployments and restores log collectors for running containers lacking an active collector.
+  - **Log Querying & Historical Replay:** Historical logs are fetched with bounded cursor pagination (`service_id`, `phase`, `cursor`, `after_id`, `before_id`, `limit`). Chronological ordering is preserved via subqueries (`ORDER BY id DESC LIMIT N` wrapped in `ORDER BY id ASC`), ensuring recent runtime logs are never truncated by initial build lines.
+  - **WebSocket Historical Replay:** On client subscription (`last_sequence > 0`), the WebSocket Hub queries and streams missing historical logs without gaps or duplicate delivery.
+  - **UI Filter States & Memory Bounds:** The log UI provides **All Logs**, **Deployment** (`source`, `build`, `startup`, `health`), and **Production** (`runtime`) filter tabs with real-time log count badges, alongside "All Services" aggregation (with distinct service badges) and per-service scope selection. Frontend memory growth is bounded to 2,000 log entries (`MAX_STORED_LOGS`).
 - **Rollback & Safety Invariant:** When a deployment fails at any stage (build, container startup, or readiness check), the previous running deployment container remains untouched, and `projects.current_deployment_id` remains unchanged. Rollback creates a new deployment referencing the prior known-good Docker image.
 - **Container Restart & Runtime Health Monitoring:**
   - **Docker Runtime Restart Policy:** Containers are created with `RestartPolicy: "unless-stopped"`. The Docker daemon itself automatically restarts crashed containers.
@@ -131,7 +138,7 @@ The status classifications strictly follow these definitions:
 | **Encrypted Local Agent Credentials** | IMPLEMENTED | NOT RECORDED | Verified agent session token encrypted via AES-256-GCM in `sources.encrypted_session_token`, decrypted during deployment; zero exposure over REST, WS, or logs |
 | **Secret Log Redaction** | IMPLEMENTED | NOT RECORDED | In-memory pattern replacement (`[REDACTED]`) before write |
 | **WebSocket Subscription Auth** | IMPLEMENTED | NOT RECORDED | Verifies user ownership of deployment project before subscribe |
-| **Deployment & Service Log Streaming** | IMPLEMENTED | NOT RECORDED | Streams live build & runtime logs to `service-deployment:<uuid>`, `deployment:<uuid>`, and `project:<uuid>` |
+| **Deployment & Service Log Streaming** | IMPLEMENTED | NOT RECORDED | Streams live build & runtime logs to `service-deployment:<uuid>`, `deployment:<uuid>`, and `project:<uuid>`; persistent collectors continue post-deployment |
 | **Project-Level WebSocket Channels** | IMPLEMENTED | NOT RECORDED | Actively produces `service_deployment_log`, `service_status_change`, and `project_status` on `project:<uuid>` |
 | **Frontend UI (Next.js 16 App Router)** | IMPLEMENTED | NOT RECORDED | Next.js 16.3.6 LTS, React 19, Tailwind CSS, landing page, dashboard, proxy.ts |
 | **Authoritative Discovery Engine** | IMPLEMENTED | NOT RECORDED | Consolidated topology, multi-service, Compose, static, Laravel, Django/Flask detection |
@@ -156,7 +163,8 @@ The status classifications strictly follow these definitions:
 | **Container Reconciliation & Resource Isolation** | IMPLEMENTED | NOT RECORDED | Reconciler excludes terminal deployments from container protection, preserves intentionally stopped services and persistent volumes |
 | **Source Scanning Concurrency & Validation** | IMPLEMENTED | NOT RECORDED | Bounded filesystem scanning concurrency semaphore, timeout and context cancellation propagation, and session deduplication |
 | **Role-Based Access Control (RBAC)**| NOT IMPLEMENTED | — | Single owner model active; teams/roles deferred |
-| **WebSocket Event Replay Service** | NOT IMPLEMENTED | — | Replay from DB; client currently fetches REST logs first |
+| **WebSocket Event Replay Service** | IMPLEMENTED | NOT RECORDED | Replay from PostgreSQL on WebSocket subscription when `last_sequence > 0` across project and deployment channels |
+| **Log Filtering & Bounded Cursor Pagination** | IMPLEMENTED | NOT RECORDED | All Logs / Deployment / Production filters, All Services aggregation, subquery-based recent log retrieval, bounded 2000-entry frontend memory |
 | **Multi-Node Workers** | NOT IMPLEMENTED | — | In-process embedded worker active; multi-node deferred |
 
 ---

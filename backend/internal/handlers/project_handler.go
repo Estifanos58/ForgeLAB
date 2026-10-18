@@ -611,25 +611,139 @@ func (h *ProjectHandler) GetDeploymentLogs(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	var logs []*models.DeploymentLog
-	cursorStr := r.URL.Query().Get("cursor")
-	if cursorStr == "" {
-		cursorStr = r.URL.Query().Get("after_id")
+	var afterID int64
+	afterStr := r.URL.Query().Get("cursor")
+	if afterStr == "" {
+		afterStr = r.URL.Query().Get("after_id")
+	}
+	if afterStr == "" {
+		afterStr = r.URL.Query().Get("after")
+	}
+	if afterStr != "" {
+		if val, parseErr := strconv.ParseInt(afterStr, 10, 64); parseErr == nil && val > 0 {
+			afterID = val
+		}
 	}
 
-	if cursorStr != "" {
-		if cursorVal, parseErr := strconv.ParseInt(cursorStr, 10, 64); parseErr == nil && cursorVal > 0 {
-			logs, err = h.deploymentService.GetDeploymentLogsAfter(r.Context(), deploymentID, serviceUUIDPtr, cursorVal, limit)
-		} else {
-			logs, err = h.deploymentService.GetDeploymentLogs(r.Context(), deploymentID)
-		}
-	} else if serviceUUIDPtr != nil {
-		logs, err = h.deploymentService.GetServiceLogs(r.Context(), deploymentID, *serviceUUIDPtr)
-	} else {
-		logs, err = h.deploymentService.GetDeploymentLogs(r.Context(), deploymentID)
+	var beforeID int64
+	beforeStr := r.URL.Query().Get("before_id")
+	if beforeStr == "" {
+		beforeStr = r.URL.Query().Get("before")
 	}
+	if beforeStr != "" {
+		if val, parseErr := strconv.ParseInt(beforeStr, 10, 64); parseErr == nil && val > 0 {
+			beforeID = val
+		}
+	}
+
+	phase := r.URL.Query().Get("phase")
+
+	logs, err := h.deploymentService.GetDeploymentLogsWithOptions(r.Context(), deploymentID, services.LogQueryOptions{
+		ServiceID: serviceUUIDPtr,
+		Phase:     phase,
+		AfterID:   afterID,
+		BeforeID:  beforeID,
+		Limit:     limit,
+	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to get deployment logs")
+		writeError(w, http.StatusInternalServerError, "failed to get deployment logs: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, logs)
+}
+
+// GetProjectLogs handles GET /api/projects/{id}/logs
+func (h *ProjectHandler) GetProjectLogs(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	// Verify ownership
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify project access")
+		return
+	}
+
+	var serviceUUIDPtr *uuid.UUID
+	if serviceIDStr := r.URL.Query().Get("service_id"); serviceIDStr != "" {
+		serviceUUID, parseErr := uuid.Parse(serviceIDStr)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid service_id")
+			return
+		}
+		belongs, err := h.deploymentService.VerifyServiceBelongsToProject(r.Context(), serviceUUID, projectID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to verify service access")
+			return
+		}
+		if !belongs {
+			writeError(w, http.StatusBadRequest, "service does not belong to project")
+			return
+		}
+		serviceUUIDPtr = &serviceUUID
+	}
+
+	limit := 1000
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if lim, parseErr := strconv.Atoi(limitStr); parseErr == nil && lim > 0 {
+			limit = lim
+		}
+	}
+
+	var afterID int64
+	afterStr := r.URL.Query().Get("cursor")
+	if afterStr == "" {
+		afterStr = r.URL.Query().Get("after_id")
+	}
+	if afterStr == "" {
+		afterStr = r.URL.Query().Get("after")
+	}
+	if afterStr != "" {
+		if val, parseErr := strconv.ParseInt(afterStr, 10, 64); parseErr == nil && val > 0 {
+			afterID = val
+		}
+	}
+
+	var beforeID int64
+	beforeStr := r.URL.Query().Get("before_id")
+	if beforeStr == "" {
+		beforeStr = r.URL.Query().Get("before")
+	}
+	if beforeStr != "" {
+		if val, parseErr := strconv.ParseInt(beforeStr, 10, 64); parseErr == nil && val > 0 {
+			beforeID = val
+		}
+	}
+
+	phase := r.URL.Query().Get("phase")
+
+	logs, err := h.deploymentService.GetProjectLogs(r.Context(), projectID, services.LogQueryOptions{
+		ServiceID: serviceUUIDPtr,
+		Phase:     phase,
+		AfterID:   afterID,
+		BeforeID:  beforeID,
+		Limit:     limit,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get project logs: "+err.Error())
 		return
 	}
 

@@ -64,6 +64,7 @@ type ProjectAuthorizer interface {
 type DeploymentResolver interface {
 	GetDeployment(ctx context.Context, id uuid.UUID) (*models.Deployment, error)
 	GetDeploymentLogsAfter(ctx context.Context, deploymentID uuid.UUID, serviceID *uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error)
+	GetProjectLogsAfter(ctx context.Context, projectID uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error)
 }
 
 // ServiceDeploymentResolver defines the interface for resolving service deployments and their logs for WS replay.
@@ -811,6 +812,44 @@ func (c *Client) handleSubscribe(channel string, lastSequence ...int64) {
 				}
 				if l.ServiceID != nil {
 					logData["service_id"] = l.ServiceID.String()
+				}
+				if l.DeploymentID != nil {
+					logData["deployment_id"] = l.DeploymentID.String()
+				}
+				c.sendEvent(&EventMessage{
+					Type:     "log",
+					Channel:  channel,
+					Sequence: l.ID,
+					Data:     logData,
+				})
+			}
+		}
+	}
+
+	// Replay missed logs for project channels
+	if channelType == "project" && lastSeq > 0 && c.hub.deploymentService != nil {
+		replayLogs, err := c.hub.deploymentService.GetProjectLogsAfter(ctx, resourceID, lastSeq, 2000)
+		if err == nil && len(replayLogs) > 0 {
+			slog.Info("replaying missed project logs",
+				"user_id", c.userID,
+				"channel", channel,
+				"last_sequence", lastSeq,
+				"count", len(replayLogs),
+			)
+			for _, l := range replayLogs {
+				logData := map[string]interface{}{
+					"id":        l.ID,
+					"sequence":  l.ID,
+					"timestamp": l.Timestamp.Format(time.RFC3339Nano),
+					"phase":     l.Phase,
+					"stream":    l.Stream,
+					"message":   l.Message,
+				}
+				if l.ServiceID != nil {
+					logData["service_id"] = l.ServiceID.String()
+				}
+				if l.ServiceDeploymentID != nil {
+					logData["service_deployment_id"] = l.ServiceDeploymentID.String()
 				}
 				if l.DeploymentID != nil {
 					logData["deployment_id"] = l.DeploymentID.String()

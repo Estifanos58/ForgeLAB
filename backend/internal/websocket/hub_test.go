@@ -52,6 +52,13 @@ func (m *mockDeploymentResolver) GetDeploymentLogsAfter(ctx context.Context, dep
 	return []*models.DeploymentLog{}, nil
 }
 
+func (m *mockDeploymentResolver) GetProjectLogsAfter(ctx context.Context, projectID uuid.UUID, afterID int64, limit int) ([]*models.DeploymentLog, error) {
+	if m.getLogsAfterFn != nil {
+		return m.getLogsAfterFn(ctx, projectID, nil, afterID, limit)
+	}
+	return []*models.DeploymentLog{}, nil
+}
+
 // 1. Channel isolation test
 func TestHubChannelIsolation(t *testing.T) {
 	hub := NewHub(nil, nil, nil, nil)

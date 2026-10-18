@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,60 +23,328 @@ import (
 	"github.com/forgelab/backend/internal/logging"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/services"
+	ws "github.com/forgelab/backend/internal/websocket"
 )
 
-// startRuntimeLogCollector starts a background goroutine that reads container stdout/stderr
-// from the Docker daemon and persists + publishes each individual line with phase=runtime.
-// It uses a cancellable context tied to the deployment lifecycle, and exits cleanly when the
-// container exits (io.EOF) or the context is cancelled.
-func (e *Engine) startRuntimeLogCollector(parentCtx context.Context, containerID string, serviceDeployID, serviceID, projectID uuid.UUID, redactor *logging.LogRedactor, emitLog func(phase, stream, message string)) {
-	logCtx, logCancel := context.WithCancel(parentCtx)
-	collectorKey := serviceDeployID.String()
+// RuntimeCollectorParams holds parameters for attaching a continuous runtime log collector.
+type RuntimeCollectorParams struct {
+	ContainerID         string
+	ProjectID           uuid.UUID
+	DeploymentID        *uuid.UUID // release deployment ID or legacy deployment ID
+	ServiceDeploymentID *uuid.UUID // nil for legacy deployment
+	ServiceID           *uuid.UUID // nil for legacy deployment
+	ServiceName         string     // for service badge
+	Redactor            *logging.LogRedactor
+	Since               time.Time
+}
 
-	// Cancel any previous collector for this service deployment
+// buildLogRedactor constructs a LogRedactor loaded with decrypted secrets for the project/service.
+func (e *Engine) buildLogRedactor(ctx context.Context, projectID uuid.UUID, serviceID *uuid.UUID, envSnapshot json.RawMessage) *logging.LogRedactor {
+	redactor := logging.NewLogRedactor()
+	if e.secretService == nil {
+		return redactor
+	}
+	_, _, allSecrets, err := e.secretService.GetBuildVariables(ctx, projectID, serviceID, envSnapshot)
+	if err == nil {
+		redactor.SetSecrets(allSecrets)
+	}
+	return redactor
+}
+
+// emitRuntimeLog redacts, persists to PostgreSQL with phase=runtime, and publishes to all appropriate WebSocket channels.
+func (e *Engine) emitRuntimeLog(p RuntimeCollectorParams, stream, message string) {
+	if e.deploymentService == nil {
+		return
+	}
+	redactedMsg := message
+	if p.Redactor != nil {
+		redactedMsg = p.Redactor.Redact(message)
+	}
+
+	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	persistedLog, err := e.deploymentService.AddDeploymentServiceLog(
+		persistCtx,
+		p.DeploymentID,
+		p.ServiceDeploymentID,
+		p.ServiceID,
+		models.LogPhaseRuntime,
+		stream,
+		redactedMsg,
+	)
+	if err != nil {
+		cid := p.ContainerID
+		if len(cid) > 12 {
+			cid = cid[:12]
+		}
+		slog.Error("failed to persist runtime log", "container", cid, "error", err)
+		return
+	}
+
+	if e.wsHub != nil {
+		data := map[string]interface{}{
+			"id":        persistedLog.ID,
+			"sequence":  persistedLog.ID,
+			"timestamp": persistedLog.Timestamp.Format(time.RFC3339Nano),
+			"phase":     persistedLog.Phase,
+			"stream":    persistedLog.Stream,
+			"message":   persistedLog.Message,
+		}
+		if p.ServiceDeploymentID != nil {
+			data["service_deployment_id"] = p.ServiceDeploymentID.String()
+		}
+		if p.ServiceID != nil {
+			data["service_id"] = p.ServiceID.String()
+		}
+		if p.ServiceName != "" {
+			data["service_name"] = p.ServiceName
+		}
+		if p.DeploymentID != nil {
+			data["deployment_id"] = p.DeploymentID.String()
+		}
+
+		if p.ServiceDeploymentID != nil {
+			sdChannel := fmt.Sprintf("service-deployment:%s", p.ServiceDeploymentID.String())
+			_ = e.wsHub.PublishEvent(sdChannel, &ws.EventMessage{
+				Type:     "log",
+				Channel:  sdChannel,
+				Sequence: persistedLog.ID,
+				Data:     data,
+			})
+			if p.DeploymentID != nil && p.ServiceID != nil {
+				serviceChannel := fmt.Sprintf("deployment:%s:service:%s", p.DeploymentID.String(), p.ServiceID.String())
+				_ = e.wsHub.PublishEvent(serviceChannel, &ws.EventMessage{
+					Type:     "log",
+					Channel:  serviceChannel,
+					Sequence: persistedLog.ID,
+					Data:     data,
+				})
+			}
+			if p.DeploymentID != nil {
+				channel := fmt.Sprintf("deployment:%s", p.DeploymentID.String())
+				_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
+					Type:     "log",
+					Channel:  channel,
+					Sequence: persistedLog.ID,
+					Data:     data,
+				})
+			}
+		} else if p.DeploymentID != nil {
+			channel := fmt.Sprintf("deployment:%s", p.DeploymentID.String())
+			_ = e.wsHub.PublishEvent(channel, &ws.EventMessage{
+				Type:     "log",
+				Channel:  channel,
+				Sequence: persistedLog.ID,
+				Data:     data,
+			})
+		}
+
+		// Always publish runtime logs to project channel
+		projectChannel := fmt.Sprintf("project:%s", p.ProjectID.String())
+		_ = e.wsHub.PublishEvent(projectChannel, &ws.EventMessage{
+			Type:     "log",
+			Channel:  projectChannel,
+			Sequence: persistedLog.ID,
+			Data:     data,
+		})
+	}
+}
+
+// StartRuntimeLogCollector starts a persistent background runtime log collector for a container.
+// The collector lifecycle is independent of deployment execution (does not exit when deployment completes).
+// It stops explicitly when the container is stopped, replaced, or removed, or when ForgeLAB shuts down.
+// It includes bounded retries with exponential backoff if the Docker log stream drops while the container is running.
+func (e *Engine) StartRuntimeLogCollector(p RuntimeCollectorParams) {
+	if e.dockerClient == nil || p.ContainerID == "" {
+		return
+	}
+
+	var collectorKey string
+	if p.ServiceDeploymentID != nil {
+		collectorKey = p.ServiceDeploymentID.String()
+	} else if p.DeploymentID != nil {
+		collectorKey = p.DeploymentID.String()
+	} else {
+		collectorKey = p.ContainerID
+	}
+
+	// Cancel previous collector for this deployment/container if active
 	if prev, loaded := e.activeLogCollectors.LoadAndDelete(collectorKey); loaded {
 		if cancelFn, ok := prev.(context.CancelFunc); ok {
 			cancelFn()
 		}
 	}
+	if prev, loaded := e.activeLogCollectors.LoadAndDelete("container:" + p.ContainerID); loaded {
+		if cancelFn, ok := prev.(context.CancelFunc); ok {
+			cancelFn()
+		}
+	}
+
+	logCtx, logCancel := context.WithCancel(context.Background())
 	e.activeLogCollectors.Store(collectorKey, logCancel)
+	e.activeLogCollectors.Store("container:"+p.ContainerID, logCancel)
 
 	go func() {
 		defer func() {
 			e.activeLogCollectors.Delete(collectorKey)
+			e.activeLogCollectors.Delete("container:" + p.ContainerID)
 			logCancel()
 		}()
 
-		reader, err := e.dockerClient.ContainerLogs(logCtx, containerID, container.LogsOptions{
-			ShowStdout: true,
-			ShowStderr: true,
-			Follow:     true,
-			Timestamps: true,
-			Since:      time.Now().Add(-2 * time.Second).Format(time.RFC3339),
-		})
-		if err != nil {
-			slog.Error("failed to attach runtime log collector", "container", containerID[:12], "error", err)
-			return
+		const maxRetries = 5
+		retryCount := 0
+		lastLogTime := p.Since
+		if lastLogTime.IsZero() {
+			lastLogTime = time.Now().Add(-2 * time.Second)
 		}
-		defer reader.Close()
 
-		if err := DemuxDockerStream(logCtx, reader, func(stream string, line string) {
-			emitLog(models.LogPhaseRuntime, stream, line)
-		}); err != nil && !errors.Is(err, context.Canceled) {
-			slog.Warn("runtime log collector demux error", "container", containerID[:12], "error", err)
-		} else {
-			slog.Info("runtime log collector ended", "container", containerID[:12], "service_deployment_id", serviceDeployID)
+		for {
+			if logCtx.Err() != nil {
+				return
+			}
+
+			reader, err := e.dockerClient.ContainerLogs(logCtx, p.ContainerID, container.LogsOptions{
+				ShowStdout: true,
+				ShowStderr: true,
+				Follow:     true,
+				Timestamps: true,
+				Since:      lastLogTime.Format(time.RFC3339Nano),
+			})
+			if err != nil {
+				if logCtx.Err() != nil {
+					return
+				}
+				insp, inspErr := e.dockerClient.ContainerInspect(logCtx, p.ContainerID)
+				if inspErr != nil || !insp.State.Running {
+					cid := p.ContainerID
+					if len(cid) > 12 {
+						cid = cid[:12]
+					}
+					slog.Info("container no longer running, ending log collector", "container", cid)
+					return
+				}
+
+				retryCount++
+				if retryCount > maxRetries {
+					cid := p.ContainerID
+					if len(cid) > 12 {
+						cid = cid[:12]
+					}
+					slog.Warn("runtime log collector retries exhausted", "container", cid, "error", err)
+					return
+				}
+
+				backoff := time.Duration(retryCount*500) * time.Millisecond
+				select {
+				case <-time.After(backoff):
+					continue
+				case <-logCtx.Done():
+					return
+				}
+			}
+
+			// Connection established, reset retry counter
+			retryCount = 0
+
+			demuxErr := DemuxDockerStream(logCtx, reader, func(stream string, line string) {
+				lastLogTime = time.Now()
+				e.emitRuntimeLog(p, stream, line)
+			})
+			_ = reader.Close()
+
+			if logCtx.Err() != nil {
+				return
+			}
+
+			// Stream closed; check if container is still running
+			insp, inspErr := e.dockerClient.ContainerInspect(logCtx, p.ContainerID)
+			if inspErr != nil || !insp.State.Running {
+				cid := p.ContainerID
+				if len(cid) > 12 {
+					cid = cid[:12]
+				}
+				slog.Info("container stopped or exited, runtime collector ending", "container", cid)
+				return
+			}
+
+			// Container is still running; retry attaching stream with backoff
+			retryCount++
+			if retryCount > maxRetries {
+				cid := p.ContainerID
+				if len(cid) > 12 {
+					cid = cid[:12]
+				}
+				slog.Warn("runtime log collector retries exhausted after disconnect", "container", cid, "last_err", demuxErr)
+				return
+			}
+
+			backoff := time.Duration(retryCount*500) * time.Millisecond
+			select {
+			case <-time.After(backoff):
+			case <-logCtx.Done():
+				return
+			}
 		}
 	}()
 }
 
-// StopLogCollector stops the runtime log collector for a specific service deployment.
-func (e *Engine) StopLogCollector(serviceDeployID uuid.UUID) {
-	if cancelFn, loaded := e.activeLogCollectors.LoadAndDelete(serviceDeployID.String()); loaded {
+// startRuntimeLogCollector provides a backward-compatible wrapper for StartRuntimeLogCollector.
+func (e *Engine) startRuntimeLogCollector(parentCtx context.Context, containerID string, serviceDeployID, serviceID, projectID uuid.UUID, redactor *logging.LogRedactor, emitLog func(phase, stream, message string)) {
+	e.StartRuntimeLogCollector(RuntimeCollectorParams{
+		ContainerID:         containerID,
+		ProjectID:           projectID,
+		ServiceDeploymentID: &serviceDeployID,
+		ServiceID:           &serviceID,
+		Redactor:            redactor,
+	})
+}
+
+// StopLogCollector stops the runtime log collector for a specific deployment or service deployment.
+func (e *Engine) StopLogCollector(id uuid.UUID) {
+	if cancelFn, loaded := e.activeLogCollectors.LoadAndDelete(id.String()); loaded {
 		if fn, ok := cancelFn.(context.CancelFunc); ok {
 			fn()
 		}
 	}
+}
+
+// StopContainerLogCollector stops the runtime log collector for a specific container ID.
+func (e *Engine) StopContainerLogCollector(containerID string) {
+	if containerID == "" {
+		return
+	}
+	if cancelFn, loaded := e.activeLogCollectors.LoadAndDelete("container:" + containerID); loaded {
+		if fn, ok := cancelFn.(context.CancelFunc); ok {
+			fn()
+		}
+	}
+	if len(containerID) > 12 {
+		if cancelFn, loaded := e.activeLogCollectors.LoadAndDelete("container:" + containerID[:12]); loaded {
+			if fn, ok := cancelFn.(context.CancelFunc); ok {
+				fn()
+			}
+		}
+	}
+}
+
+// IsLogCollectorActive checks if a log collector is active for the given ID.
+func (e *Engine) IsLogCollectorActive(id uuid.UUID) bool {
+	_, ok := e.activeLogCollectors.Load(id.String())
+	return ok
+}
+
+// IsContainerLogCollectorActive checks if a log collector is active for the given container ID.
+func (e *Engine) IsContainerLogCollectorActive(containerID string) bool {
+	if _, ok := e.activeLogCollectors.Load("container:" + containerID); ok {
+		return true
+	}
+	if len(containerID) > 12 {
+		if _, ok := e.activeLogCollectors.Load("container:" + containerID[:12]); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // StopAllLogCollectors stops all active runtime log collector goroutines (used during shutdown).
@@ -109,6 +378,8 @@ func (e *Engine) StopApp(ctx context.Context, projectID, ownerID uuid.UUID) erro
 	// 1. Stop legacy deployment container if present
 	deployment, err := e.deploymentService.GetDeployment(ctx, *project.CurrentDeploymentID)
 	if err == nil && deployment.ContainerID != nil && *deployment.ContainerID != "" {
+		e.StopLogCollector(deployment.ID)
+		e.StopContainerLogCollector(*deployment.ContainerID)
 		if err := e.dockerClient.ContainerStop(ctx, *deployment.ContainerID, container.StopOptions{}); err != nil && !client.IsErrNotFound(err) {
 			return fmt.Errorf("failed to stop container: %w", err)
 		}
@@ -128,6 +399,7 @@ func (e *Engine) StopApp(ctx context.Context, projectID, ownerID uuid.UUID) erro
 				e.StopLogCollector(*svc.CurrentServiceDeploymentID)
 			}
 			if svc.ContainerID != nil && *svc.ContainerID != "" {
+				e.StopContainerLogCollector(*svc.ContainerID)
 				if err := e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{}); err != nil && !client.IsErrNotFound(err) {
 					return fmt.Errorf("failed to stop service container: %w", err)
 				}
@@ -166,6 +438,13 @@ func (e *Engine) StartApp(ctx context.Context, projectID, ownerID uuid.UUID) err
 		if err := e.dockerClient.ContainerStart(ctx, *deployment.ContainerID, container.StartOptions{}); err != nil {
 			return fmt.Errorf("failed to start container: %w", err)
 		}
+		redactor := e.buildLogRedactor(ctx, project.ID, nil, deployment.EnvSnapshot)
+		e.StartRuntimeLogCollector(RuntimeCollectorParams{
+			ContainerID:  *deployment.ContainerID,
+			ProjectID:    project.ID,
+			DeploymentID: &deployment.ID,
+			Redactor:     redactor,
+		})
 		if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusRunning, nil); err != nil {
 			return fmt.Errorf("failed to update deployment status: %w", err)
 		}
@@ -182,6 +461,16 @@ func (e *Engine) StartApp(ctx context.Context, projectID, ownerID uuid.UUID) err
 				if err := e.dockerClient.ContainerStart(ctx, *svc.ContainerID, container.StartOptions{}); err != nil {
 					return fmt.Errorf("failed to start service container: %w", err)
 				}
+				redactor := e.buildLogRedactor(ctx, project.ID, &svc.ID, nil)
+				e.StartRuntimeLogCollector(RuntimeCollectorParams{
+					ContainerID:         *svc.ContainerID,
+					ProjectID:           project.ID,
+					DeploymentID:        project.CurrentDeploymentID,
+					ServiceID:           &svc.ID,
+					ServiceName:         svc.Name,
+					ServiceDeploymentID: svc.CurrentServiceDeploymentID,
+					Redactor:            redactor,
+				})
 			}
 			if err := e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusRunning, nil, nil, nil); err != nil {
 				return fmt.Errorf("failed to update service status: %w", err)
@@ -217,10 +506,19 @@ func (e *Engine) RestartApp(ctx context.Context, projectID, ownerID uuid.UUID) e
 	}
 
 	if deployment.ContainerID != nil && *deployment.ContainerID != "" {
+		e.StopLogCollector(deployment.ID)
+		e.StopContainerLogCollector(*deployment.ContainerID)
 		timeout := 10
 		if err := e.dockerClient.ContainerRestart(ctx, *deployment.ContainerID, container.StopOptions{Timeout: &timeout}); err != nil {
 			return fmt.Errorf("failed to restart container: %w", err)
 		}
+		redactor := e.buildLogRedactor(ctx, project.ID, nil, deployment.EnvSnapshot)
+		e.StartRuntimeLogCollector(RuntimeCollectorParams{
+			ContainerID:  *deployment.ContainerID,
+			ProjectID:    project.ID,
+			DeploymentID: &deployment.ID,
+			Redactor:     redactor,
+		})
 	}
 
 	if err := e.deploymentService.UpdateDeploymentStatus(ctx, deployment.ID, models.DeployStatusRunning, nil); err != nil {
@@ -254,6 +552,7 @@ func (e *Engine) StopService(ctx context.Context, projectID, serviceID, ownerID 
 		e.StopLogCollector(*svc.CurrentServiceDeploymentID)
 	}
 	if svc.ContainerID != nil && *svc.ContainerID != "" {
+		e.StopContainerLogCollector(*svc.ContainerID)
 		if err := e.dockerClient.ContainerStop(ctx, *svc.ContainerID, container.StopOptions{}); err != nil && !client.IsErrNotFound(err) {
 			return fmt.Errorf("failed to stop service container: %w", err)
 		}
@@ -292,6 +591,16 @@ func (e *Engine) StartService(ctx context.Context, projectID, serviceID, ownerID
 		if err := e.dockerClient.ContainerStart(ctx, *svc.ContainerID, container.StartOptions{}); err != nil {
 			return fmt.Errorf("failed to start service container: %w", err)
 		}
+		redactor := e.buildLogRedactor(ctx, project.ID, &svc.ID, nil)
+		e.StartRuntimeLogCollector(RuntimeCollectorParams{
+			ContainerID:         *svc.ContainerID,
+			ProjectID:           project.ID,
+			DeploymentID:        project.CurrentDeploymentID,
+			ServiceID:           &svc.ID,
+			ServiceName:         svc.Name,
+			ServiceDeploymentID: svc.CurrentServiceDeploymentID,
+			Redactor:            redactor,
+		})
 	}
 	if err := e.serviceService.UpdateServiceStatus(ctx, serviceID, models.ServiceStatusRunning, nil, nil, nil); err != nil {
 		return fmt.Errorf("failed to update service status: %w", err)
@@ -383,6 +692,7 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 		}
 
 		if isOwned {
+			e.StopContainerLogCollector(c.ID)
 			// Stop container (ignore not found or already stopped)
 			_ = e.dockerClient.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &stopTimeout})
 
@@ -543,6 +853,10 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 						continue
 					}
 					// Container disappeared while offline
+					e.StopContainerLogCollector(cID)
+					if svc.CurrentServiceDeploymentID != nil {
+						e.StopLogCollector(*svc.CurrentServiceDeploymentID)
+					}
 					_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
 					if svc.CurrentServiceDeploymentID != nil {
 						_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, "Container disappeared from Docker daemon while backend was offline")
@@ -558,6 +872,10 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 						slog.Info("reconciliation: service container stopped as expected", "service_id", svc.ID, "container_id", cID)
 					} else {
 						// Container is dead or exited while service was expected to be running
+						e.StopContainerLogCollector(cID)
+						if svc.CurrentServiceDeploymentID != nil {
+							e.StopLogCollector(*svc.CurrentServiceDeploymentID)
+						}
 						_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
 						if svc.CurrentServiceDeploymentID != nil {
 							_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, fmt.Sprintf("Container stopped with state '%s' while backend was offline", dockCont.State))
@@ -569,6 +887,19 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 					legitimateContainers[dockCont.ID] = true
 					if len(dockCont.ID) > 12 {
 						legitimateContainers[dockCont.ID[:12]] = true
+					}
+					// Restore runtime log collector if not active (e.g. after backend restart)
+					if !e.IsContainerLogCollectorActive(dockCont.ID) {
+						redactor := e.buildLogRedactor(ctx, svc.ProjectID, &svc.ID, nil)
+						e.StartRuntimeLogCollector(RuntimeCollectorParams{
+							ContainerID:         dockCont.ID,
+							ProjectID:           svc.ProjectID,
+							ServiceID:           &svc.ID,
+							ServiceName:         svc.Name,
+							ServiceDeploymentID: svc.CurrentServiceDeploymentID,
+							Redactor:            redactor,
+						})
+						slog.Info("reconciliation: restored runtime log collector for running service", "service_id", svc.ID, "container_id", dockCont.ID[:12])
 					}
 				}
 			}
@@ -681,6 +1012,8 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 				cID := *d.ContainerID
 				dockCont, exists := containerMap[cID]
 				if !exists || dockCont.State != "running" {
+					e.StopLogCollector(d.ID)
+					e.StopContainerLogCollector(cID)
 					stateMsg := "missing"
 					if exists {
 						stateMsg = dockCont.State
@@ -695,6 +1028,17 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 					legitimateContainers[dockCont.ID] = true
 					if len(dockCont.ID) > 12 {
 						legitimateContainers[dockCont.ID[:12]] = true
+					}
+					// Restore runtime log collector if not active (e.g. after backend restart)
+					if !e.IsContainerLogCollectorActive(dockCont.ID) {
+						redactor := e.buildLogRedactor(ctx, d.ProjectID, nil, d.EnvSnapshot)
+						e.StartRuntimeLogCollector(RuntimeCollectorParams{
+							ContainerID:  dockCont.ID,
+							ProjectID:    d.ProjectID,
+							DeploymentID: &d.ID,
+							Redactor:     redactor,
+						})
+						slog.Info("reconciliation: restored runtime log collector for running legacy deployment", "deployment_id", d.ID, "container_id", dockCont.ID[:12])
 					}
 				}
 			}
@@ -743,6 +1087,7 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 				cShort = cShort[:12]
 			}
 			slog.Info("reconciliation: removing orphaned container", "container_id", cShort, "labels", c.Labels)
+			e.StopContainerLogCollector(c.ID)
 			_ = e.dockerClient.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &stopTimeout})
 			_ = e.dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: false})
 			orphansCleaned++
@@ -1040,6 +1385,10 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 			if svc.Status == models.ServiceStatusStopped {
 				continue
 			}
+			e.StopContainerLogCollector(*svc.ContainerID)
+			if svc.CurrentServiceDeploymentID != nil {
+				e.StopLogCollector(*svc.CurrentServiceDeploymentID)
+			}
 			reason := "Container was terminated by kernel OOM (Out Of Memory) killer. Review memory quota or memory limits."
 			_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
 			if svc.CurrentServiceDeploymentID != nil && e.deploymentService != nil {
@@ -1051,6 +1400,10 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 			if svc.Status == models.ServiceStatusStopped || svc.Classification == models.ClassificationJob {
 				// Intentionally stopped service or completed one-shot job: do NOT mark as crashed
 				continue
+			}
+			e.StopContainerLogCollector(*svc.ContainerID)
+			if svc.CurrentServiceDeploymentID != nil {
+				e.StopLogCollector(*svc.CurrentServiceDeploymentID)
 			}
 			if insp.State.ExitCode != 0 {
 				reason := fmt.Sprintf("Container crashed with non-zero exit code (%d)", insp.State.ExitCode)
@@ -1065,6 +1418,18 @@ func (e *Engine) CheckContinuousRuntimeHealth(ctx context.Context) error {
 				_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil)
 				slog.Info("continuous health: container exited cleanly (code 0), marked stopped", "service_id", svc.ID)
 				touchedProjects[svc.ProjectID] = true
+			}
+		} else if insp.State.Running {
+			if !e.IsContainerLogCollectorActive(*svc.ContainerID) {
+				redactor := e.buildLogRedactor(ctx, svc.ProjectID, &svc.ID, nil)
+				e.StartRuntimeLogCollector(RuntimeCollectorParams{
+					ContainerID:         *svc.ContainerID,
+					ProjectID:           svc.ProjectID,
+					ServiceID:           &svc.ID,
+					ServiceName:         svc.Name,
+					ServiceDeploymentID: svc.CurrentServiceDeploymentID,
+					Redactor:            redactor,
+				})
 			}
 		}
 	}

@@ -753,10 +753,53 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ---
 
+### `GET /api/projects/{id}/logs`
+- **Authentication:** Required (Bearer JWT)
+- **Authorization:** Checks user ownership of parent project.
+- **Purpose:** Fetches historical build and runtime logs aggregated across all project services (frontend, backend, databases, workers, and independent services).
+- **Query Parameters:**
+  - `service_id` (optional): Filter to a specific service UUID.
+  - `phase` (optional): Filter phase category: `"all"` (all phases), `"deployment"` (`source`, `build`, `startup`, `health`), `"production"` (`runtime` stdout/stderr), or exact phase name.
+  - `cursor` / `after_id` (optional): Int64 log ID cursor. Returns logs with `id > cursor`.
+  - `before_id` (optional): Int64 log ID cursor. Returns logs with `id < before_id`.
+  - `limit` (optional): Integer (default `500`, max `2000`).
+- **Ordering Guarantee:** Returns the most recent matching logs in ascending chronological order (`ORDER BY id ASC`), ensuring latest production logs are never truncated by initial build output.
+- **Success Response:** `200 OK`
+  ```json
+  [
+    {
+      "id": 101,
+      "deployment_id": "d1e2f3a4-b5c6-7d8e-9f0a-1b2c3d4e5f6a",
+      "service_id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e",
+      "timestamp": "2026-09-26T11:00:02Z",
+      "phase": "source",
+      "stream": "system",
+      "message": "Acquiring source snapshot for project 'Production API'..."
+    },
+    {
+      "id": 102,
+      "deployment_id": "d1e2f3a4-b5c6-7d8e-9f0a-1b2c3d4e5f6a",
+      "service_id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e",
+      "timestamp": "2026-09-26T11:00:05Z",
+      "phase": "runtime",
+      "stream": "stdout",
+      "message": "Server listening on :8080"
+    }
+  ]
+  ```
+
+---
+
 ### `GET /api/projects/{id}/deployments/{deploymentId}/logs`
 - **Authentication:** Required (Bearer JWT)
 - **Authorization:** Checks user ownership of parent project.
-- **Purpose:** Fetches historical build and runtime logs stored in PostgreSQL.
+- **Purpose:** Fetches historical build and runtime logs for an orchestration release deployment.
+- **Query Parameters:**
+  - `service_id` (optional): Filter to a specific service UUID.
+  - `phase` (optional): `"all"`, `"deployment"`, `"production"`, or specific phase.
+  - `cursor` / `after_id` (optional): Int64 log ID cursor.
+  - `before_id` (optional): Int64 log ID cursor.
+  - `limit` (optional): Integer (default `500`, max `2000`).
 - **Success Response:** `200 OK`
   ```json
   [
@@ -880,7 +923,12 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ### `GET /api/projects/{id}/services/{serviceId}/deployments/{deploymentId}/logs`
 - **Authentication:** Required (Bearer JWT)
-- **Success Response:** `200 OK` (Array of DeploymentLog entries scoped to the specific service deployment).
+- **Query Parameters:**
+  - `phase` (optional): `"all"`, `"deployment"`, `"production"`, or specific phase.
+  - `cursor` / `after_id` (optional): Int64 log ID cursor.
+  - `before_id` (optional): Int64 log ID cursor.
+  - `limit` (optional): Integer (default `500`, max `2000`).
+- **Success Response:** `200 OK` (Array of DeploymentLog entries scoped to the specific service deployment, sorted chronologically).
 
 ---
 
