@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -52,9 +53,13 @@ func (e *Engine) buildLogRedactor(ctx context.Context, projectID uuid.UUID, serv
 }
 
 // emitRuntimeLog redacts, persists to PostgreSQL with phase=runtime, and publishes to all appropriate WebSocket channels.
-func (e *Engine) emitRuntimeLog(p RuntimeCollectorParams, stream, message string) {
+func (e *Engine) emitRuntimeLog(p RuntimeCollectorParams, instanceID, stream, message string) {
 	if e.deploymentService == nil {
 		return
+	}
+	const maxLogMsgBytes = 64 * 1024
+	if len(message) > maxLogMsgBytes {
+		message = message[:maxLogMsgBytes] + " ... [truncated: exceeded 64KB log size limit]"
 	}
 	redactedMsg := message
 	if p.Redactor != nil {
@@ -74,6 +79,9 @@ func (e *Engine) emitRuntimeLog(p RuntimeCollectorParams, stream, message string
 		redactedMsg,
 	)
 	if err != nil {
+		if instanceID != "" {
+			e.getCollectorRegistry().RecordPersistenceError(instanceID, err)
+		}
 		cid := p.ContainerID
 		if len(cid) > 12 {
 			cid = cid[:12]
@@ -169,26 +177,26 @@ func (e *Engine) StartRuntimeLogCollector(p RuntimeCollectorParams) {
 		collectorKey = p.ContainerID
 	}
 
-	// Cancel previous collector for this deployment/container if active
-	if prev, loaded := e.activeLogCollectors.LoadAndDelete(collectorKey); loaded {
-		if cancelFn, ok := prev.(context.CancelFunc); ok {
-			cancelFn()
-		}
-	}
-	if prev, loaded := e.activeLogCollectors.LoadAndDelete("container:" + p.ContainerID); loaded {
-		if cancelFn, ok := prev.(context.CancelFunc); ok {
-			cancelFn()
-		}
+	keys := []string{collectorKey, "container:" + p.ContainerID}
+	if len(p.ContainerID) > 12 {
+		keys = append(keys, "container:"+p.ContainerID[:12])
 	}
 
 	logCtx, logCancel := context.WithCancel(context.Background())
-	e.activeLogCollectors.Store(collectorKey, logCancel)
-	e.activeLogCollectors.Store("container:"+p.ContainerID, logCancel)
+	instanceID := e.getCollectorRegistry().Register(p, logCancel, keys...)
+
+	for _, k := range keys {
+		e.activeLogCollectors.Store(k, logCancel)
+	}
 
 	go func() {
 		defer func() {
-			e.activeLogCollectors.Delete(collectorKey)
-			e.activeLogCollectors.Delete("container:" + p.ContainerID)
+			e.getCollectorRegistry().Unregister(instanceID, keys...)
+			for _, k := range keys {
+				if !e.getCollectorRegistry().IsActive(k) {
+					e.activeLogCollectors.Delete(k)
+				}
+			}
 			logCancel()
 		}()
 
@@ -215,6 +223,7 @@ func (e *Engine) StartRuntimeLogCollector(p RuntimeCollectorParams) {
 				if logCtx.Err() != nil {
 					return
 				}
+				e.getCollectorRegistry().RecordCollectionError(instanceID, err)
 				insp, inspErr := e.dockerClient.ContainerInspect(logCtx, p.ContainerID)
 				if inspErr != nil || !insp.State.Running {
 					cid := p.ContainerID
@@ -249,12 +258,16 @@ func (e *Engine) StartRuntimeLogCollector(p RuntimeCollectorParams) {
 
 			demuxErr := DemuxDockerStream(logCtx, reader, func(stream string, line string) {
 				lastLogTime = time.Now()
-				e.emitRuntimeLog(p, stream, line)
+				e.getCollectorRegistry().RecordActivity(instanceID, 1)
+				e.emitRuntimeLog(p, instanceID, stream, line)
 			})
 			_ = reader.Close()
 
 			if logCtx.Err() != nil {
 				return
+			}
+			if demuxErr != nil && !errors.Is(demuxErr, io.EOF) {
+				e.getCollectorRegistry().RecordCollectionError(instanceID, demuxErr)
 			}
 
 			// Stream closed; check if container is still running
@@ -302,6 +315,7 @@ func (e *Engine) startRuntimeLogCollector(parentCtx context.Context, containerID
 
 // StopLogCollector stops the runtime log collector for a specific deployment or service deployment.
 func (e *Engine) StopLogCollector(id uuid.UUID) {
+	e.getCollectorRegistry().Stop(id.String())
 	if cancelFn, loaded := e.activeLogCollectors.LoadAndDelete(id.String()); loaded {
 		if fn, ok := cancelFn.(context.CancelFunc); ok {
 			fn()
@@ -314,12 +328,15 @@ func (e *Engine) StopContainerLogCollector(containerID string) {
 	if containerID == "" {
 		return
 	}
+	reg := e.getCollectorRegistry()
+	reg.Stop("container:" + containerID)
 	if cancelFn, loaded := e.activeLogCollectors.LoadAndDelete("container:" + containerID); loaded {
 		if fn, ok := cancelFn.(context.CancelFunc); ok {
 			fn()
 		}
 	}
 	if len(containerID) > 12 {
+		reg.Stop("container:" + containerID[:12])
 		if cancelFn, loaded := e.activeLogCollectors.LoadAndDelete("container:" + containerID[:12]); loaded {
 			if fn, ok := cancelFn.(context.CancelFunc); ok {
 				fn()
@@ -330,12 +347,22 @@ func (e *Engine) StopContainerLogCollector(containerID string) {
 
 // IsLogCollectorActive checks if a log collector is active for the given ID.
 func (e *Engine) IsLogCollectorActive(id uuid.UUID) bool {
+	if e.getCollectorRegistry().IsActive(id.String()) {
+		return true
+	}
 	_, ok := e.activeLogCollectors.Load(id.String())
 	return ok
 }
 
 // IsContainerLogCollectorActive checks if a log collector is active for the given container ID.
 func (e *Engine) IsContainerLogCollectorActive(containerID string) bool {
+	reg := e.getCollectorRegistry()
+	if reg.IsActive("container:" + containerID) {
+		return true
+	}
+	if len(containerID) > 12 && reg.IsActive("container:" + containerID[:12]) {
+		return true
+	}
 	if _, ok := e.activeLogCollectors.Load("container:" + containerID); ok {
 		return true
 	}
@@ -349,6 +376,7 @@ func (e *Engine) IsContainerLogCollectorActive(containerID string) bool {
 
 // StopAllLogCollectors stops all active runtime log collector goroutines (used during shutdown).
 func (e *Engine) StopAllLogCollectors() {
+	e.getCollectorRegistry().StopAll()
 	e.activeLogCollectors.Range(func(key, value interface{}) bool {
 		if cancelFn, ok := value.(context.CancelFunc); ok {
 			cancelFn()

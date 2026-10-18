@@ -1007,8 +1007,10 @@ func (s *DeploymentService) ListActiveDeployments(ctx context.Context) ([]*model
 
 	rows, err := s.db.Query(ctx,
 		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
-		 image_tag, container_id, source_revision, build_strategy, build_command,
-		 start_command, runtime_type, internal_port, health_strategy,
+		 image_tag, container_id, source_revision,
+		 COALESCE(build_strategy, 'auto'), COALESCE(build_command, ''),
+		 COALESCE(start_command, ''), COALESCE(runtime_type, 'generic'),
+		 COALESCE(internal_port, 8080), COALESCE(health_strategy, 'auto'),
 		 COALESCE(execution_mode, 'build'), image_digest, env_config_hash, env_snapshot,
 		 started_at, built_at, deployed_at, finished_at, duration_ms, failure_reason, created_at,
 		 COALESCE(deployment_strategy, 'dockerfile'), deployment_plan
@@ -1050,7 +1052,7 @@ func (s *DeploymentService) ListActiveServiceDeployments(ctx context.Context) ([
 	}
 
 	rows, err := s.db.Query(ctx,
-		`SELECT id, deployment_id, service_id, deploy_number, status, container_id, host_port, internal_port, created_at
+		`SELECT id, deployment_id, service_id, COALESCE(deploy_number, 1), status, container_id, host_port, COALESCE(internal_port, 8080), created_at
 		 FROM service_deployments
 		 WHERE status IN ('queued', 'cloning', 'building', 'starting', 'health_checking', 'running')`,
 	)
@@ -3154,3 +3156,54 @@ func (s *DeploymentService) CancelAllProjectDeployments(ctx context.Context, pro
 
 	return nil
 }
+
+// PruneLogs deletes deployment logs according to retentionDays and maxLogsPerDeployment.
+// If retentionDays > 0, logs with timestamps older than retentionDays are deleted.
+// If maxLogsPerDeployment > 0, older logs exceeding the per-deployment count limit are deleted.
+// Returns the total number of deleted log records.
+func (s *DeploymentService) PruneLogs(ctx context.Context, retentionDays int, maxLogsPerDeployment int) (int64, error) {
+	if s.db == nil {
+		return 0, nil
+	}
+	var totalPruned int64
+
+	if retentionDays > 0 {
+		cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+		tag, err := s.db.Exec(ctx, "DELETE FROM deployment_logs WHERE timestamp < $1", cutoff)
+		if err != nil {
+			return totalPruned, fmt.Errorf("failed to prune expired logs: %w", err)
+		}
+		totalPruned += tag.RowsAffected()
+	}
+
+	if maxLogsPerDeployment > 0 {
+		query := `
+			WITH OverLimitDeployments AS (
+				SELECT deployment_id
+				FROM deployment_logs
+				GROUP BY deployment_id
+				HAVING COUNT(*) > $1
+			),
+			RankedLogs AS (
+				SELECT dl.id, ROW_NUMBER() OVER (
+					PARTITION BY dl.deployment_id
+					ORDER BY dl.id DESC
+				) AS rank
+				FROM deployment_logs dl
+				JOIN OverLimitDeployments old ON dl.deployment_id = old.deployment_id
+			)
+			DELETE FROM deployment_logs
+			WHERE id IN (
+				SELECT id FROM RankedLogs WHERE rank > $1
+			)
+		`
+		tag, err := s.db.Exec(ctx, query, maxLogsPerDeployment)
+		if err != nil {
+			return totalPruned, fmt.Errorf("failed to prune oversized deployment logs: %w", err)
+		}
+		totalPruned += tag.RowsAffected()
+	}
+
+	return totalPruned, nil
+}
+

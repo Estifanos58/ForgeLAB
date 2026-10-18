@@ -164,3 +164,117 @@ func TestStripDockerTimestamp(t *testing.T) {
 		}
 	}
 }
+
+func TestDemuxDockerStream_OversizedFrameDoesNotDesynchronize(t *testing.T) {
+	var buf bytes.Buffer
+
+	// Frame 1: Valid stdout line
+	buf.Write(makeDockerFrame(1, []byte("before oversized\n")))
+
+	// Frame 2: Oversized frame payload (e.g. DefaultMaxFrameSize + 1024 bytes)
+	// In the past, this caused stream desynchronization because the payload wasn't read
+	oversizedPayloadLen := logging.DefaultMaxFrameSize + 1024
+	oversizedHdr := make([]byte, 8)
+	oversizedHdr[0] = 1
+	binary.BigEndian.PutUint32(oversizedHdr[4:], uint32(oversizedPayloadLen))
+	buf.Write(oversizedHdr)
+	buf.Write(bytes.Repeat([]byte("A"), oversizedPayloadLen))
+
+	// Frame 3: Valid stdout line immediately following oversized frame
+	buf.Write(makeDockerFrame(1, []byte("after oversized stdout\n")))
+
+	// Frame 4: Valid stderr line
+	buf.Write(makeDockerFrame(2, []byte("after oversized stderr\n")))
+
+	var lines []string
+	ctx := context.Background()
+	err := logging.DemuxDockerStream(ctx, &buf, func(stream string, line string) {
+		lines = append(lines, stream+":"+line)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := []string{
+		"stdout:before oversized",
+		"stdout:after oversized stdout",
+		"stderr:after oversized stderr",
+	}
+
+	if len(lines) != len(expected) {
+		t.Fatalf("expected %d lines, got %d: %+v", len(expected), len(lines), lines)
+	}
+
+	for i, exp := range expected {
+		if lines[i] != exp {
+			t.Errorf("line %d = %q, want %q", i, lines[i], exp)
+		}
+	}
+}
+
+func TestDemuxDockerStream_NewlineFreeOutputMemoryBounded(t *testing.T) {
+	var buf bytes.Buffer
+
+	// Continuous 150KB payload without any newline character
+	totalBytes := 150 * 1024
+	rawPayload := bytes.Repeat([]byte("x"), totalBytes)
+	buf.Write(makeDockerFrame(1, rawPayload))
+
+	var lines []string
+	ctx := context.Background()
+	err := logging.DemuxDockerStream(ctx, &buf, func(stream string, line string) {
+		lines = append(lines, line)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// With DefaultMaxLineLength = 64KB (65536 bytes):
+	// 150KB (153600 bytes) should be chunked into:
+	// Chunk 1: 65536 bytes
+	// Chunk 2: 65536 bytes
+	// Chunk 3: 22528 bytes (flushed on EOF)
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 chunked lines, got %d: lengths: %v", len(lines), func() []int {
+			lens := make([]int, len(lines))
+			for i, l := range lines {
+				lens[i] = len(l)
+			}
+			return lens
+		}())
+	}
+
+	if len(lines[0]) != logging.DefaultMaxLineLength {
+		t.Errorf("chunk 1 length = %d, want %d", len(lines[0]), logging.DefaultMaxLineLength)
+	}
+	if len(lines[1]) != logging.DefaultMaxLineLength {
+		t.Errorf("chunk 2 length = %d, want %d", len(lines[1]), logging.DefaultMaxLineLength)
+	}
+	if len(lines[2]) != totalBytes-2*logging.DefaultMaxLineLength {
+		t.Errorf("chunk 3 length = %d, want %d", len(lines[2]), totalBytes-2*logging.DefaultMaxLineLength)
+	}
+}
+
+func TestDemuxDockerStream_UnknownStreamTypeDiscardedSafely(t *testing.T) {
+	var buf bytes.Buffer
+
+	// Stream type 9 (unknown/invalid)
+	buf.Write(makeDockerFrame(9, []byte("ignored payload\n")))
+
+	// Stream type 1 (valid stdout)
+	buf.Write(makeDockerFrame(1, []byte("valid message\n")))
+
+	var lines []string
+	ctx := context.Background()
+	err := logging.DemuxDockerStream(ctx, &buf, func(stream string, line string) {
+		lines = append(lines, line)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(lines) != 1 || lines[0] != "valid message" {
+		t.Fatalf("expected 1 line 'valid message', got: %+v", lines)
+	}
+}
+

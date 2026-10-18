@@ -146,10 +146,13 @@ type DockerConfig struct {
 	PruneFilterLabel    string        // optional label filter for scoped image pruning
 }
 
-// LogConfig holds logging settings.
+// LogConfig holds logging and log retention settings.
 type LogConfig struct {
-	Level  string
-	Format string
+	Level                string
+	Format               string
+	RetentionDays        int           // number of days to keep logs (0 = disable age-based retention)
+	MaxLogsPerDeployment int           // maximum logs kept per deployment (0 = unlimited)
+	CleanupInterval      time.Duration // interval between log retention cleanup runs
 }
 
 // Load reads configuration from environment variables.
@@ -294,8 +297,11 @@ func Load() (*Config, error) {
 			PruneFilterLabel:    getEnv("FORGELAB_PRUNE_FILTER_LABEL", ""),
 		},
 		Log: LogConfig{
-			Level:  getEnv("LOG_LEVEL", "debug"),
-			Format: getEnv("LOG_FORMAT", "text"),
+			Level:                getEnv("LOG_LEVEL", "debug"),
+			Format:               getEnv("LOG_FORMAT", "text"),
+			RetentionDays:        parseIntEnv("FORGELAB_LOG_RETENTION_DAYS", 30),
+			MaxLogsPerDeployment: parseIntEnv("FORGELAB_LOG_MAX_PER_DEPLOYMENT", 10000),
+			CleanupInterval:      parseDurationEnv("FORGELAB_LOG_CLEANUP_INTERVAL", 1*time.Hour),
 		},
 		App: AppConfig{
 			Environment:        envMode,

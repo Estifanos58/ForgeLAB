@@ -232,3 +232,92 @@ func TestHealthHandler_BuildQueueDiagnostics(t *testing.T) {
 		t.Errorf("expected build_queue in response, got %v", raw)
 	}
 }
+
+type mockLogCollectorProvider struct {
+	diag docker.LogCollectorDiagnostics
+}
+
+func (m *mockLogCollectorProvider) GetLogCollectorDiagnostics() docker.LogCollectorDiagnostics {
+	return m.diag
+}
+
+func TestHealthHandler_LogCollectorDiagnostics_NotConfigured(t *testing.T) {
+	h := NewHealthHandler(nil, nil, nil)
+	req := httptest.NewRequest("GET", "/health/logs", nil)
+	rec := httptest.NewRecorder()
+
+	h.LogCollectorDiagnostics(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 Not Implemented, got %d", rec.Code)
+	}
+}
+
+func TestHealthHandler_LogCollectorDiagnostics_Success(t *testing.T) {
+	h := NewHealthHandler(nil, nil, nil)
+	mock := &mockLogCollectorProvider{
+		diag: docker.LogCollectorDiagnostics{
+			ActiveCollectors:       2,
+			TotalLinesCollected:    1234,
+			TotalCollectionErrors:  0,
+			TotalPersistenceErrors: 1,
+			Collectors: []docker.LogCollectorInfo{
+				{
+					ID:                "test-uuid-1",
+					ContainerID:       "cid-12345",
+					ServiceName:       "backend",
+					LinesCollected:    1234,
+					PersistenceErrors: 1,
+					LastError:         "sanitized persistence error",
+				},
+			},
+		},
+	}
+	h.SetLogCollectorDiagnosticsProvider(mock)
+
+	req := httptest.NewRequest("GET", "/health/logs", nil)
+	rec := httptest.NewRecorder()
+
+	h.LogCollectorDiagnostics(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	var diag docker.LogCollectorDiagnostics
+	if err := json.Unmarshal(rec.Body.Bytes(), &diag); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if diag.ActiveCollectors != 2 || diag.TotalLinesCollected != 1234 {
+		t.Errorf("unexpected diagnostics: %+v", diag)
+	}
+	if len(diag.Collectors) != 1 || diag.Collectors[0].ServiceName != "backend" {
+		t.Errorf("unexpected collectors list: %+v", diag.Collectors)
+	}
+}
+
+func TestHealthHandler_Readiness_WithLogCollectorDiagnostics(t *testing.T) {
+	h := NewHealthHandler(nil, nil, nil)
+	h.SetLogCollectorDiagnosticsProvider(&mockLogCollectorProvider{
+		diag: docker.LogCollectorDiagnostics{
+			ActiveCollectors:    3,
+			TotalLinesCollected: 500,
+		},
+	})
+
+	req := httptest.NewRequest("GET", "/ready", nil)
+	rec := httptest.NewRecorder()
+	h.Readiness(rec, req)
+
+	var resp ReadinessResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal readiness response: %v", err)
+	}
+
+	if resp.LogCollectors == nil {
+		t.Fatalf("expected log collectors diagnostics in readiness response, got nil")
+	}
+	if resp.LogCollectors.ActiveCollectors != 3 || resp.LogCollectors.TotalLinesCollected != 500 {
+		t.Errorf("unexpected log collectors metrics: %+v", resp.LogCollectors)
+	}
+}

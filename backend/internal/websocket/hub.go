@@ -323,6 +323,36 @@ func (h *Hub) PublishEvent(channel string, event *EventMessage) error {
 	return nil
 }
 
+// RegisterTestSubscriber registers a test channel to receive raw JSON messages for a channel.
+// Returns an unregister function.
+func (h *Hub) RegisterTestSubscriber(channel string, ch chan []byte) func() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	client := &Client{
+		hub:           h,
+		subscriptions: map[string]bool{channel: true},
+		send:          ch,
+	}
+	h.clients[client] = true
+	if h.channels[channel] == nil {
+		h.channels[channel] = make(map[*Client]bool)
+	}
+	h.channels[channel][client] = true
+
+	return func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		delete(h.clients, client)
+		if subs, ok := h.channels[channel]; ok {
+			delete(subs, client)
+			if len(subs) == 0 {
+				delete(h.channels, channel)
+			}
+		}
+	}
+}
+
 func (h *Hub) listenRedisPubSub() {
 	backoff := 1 * time.Second
 	for {

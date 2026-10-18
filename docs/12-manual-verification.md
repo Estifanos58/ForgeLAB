@@ -79,6 +79,11 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Backend Restart Collector Recovery** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Daemon reconciliation restores collectors for running containers on backend startup |
 | **Log UI Phase Filters & Service Scoping** | IMPLEMENTED | NOT RECORDED | — | — | — | — | All Logs, Deployment, Production filters with count badges and All Services view |
 | **Historical Log Retrieval & Replay** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Recent logs query subquery, cursor pagination, and WebSocket sequence replay |
+| **Hardened Docker Log Parsing** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Bounded 32KB streaming, oversized frame discard (>8MB) without stream desync, 64KB line truncation |
+| **Race-Safe Collector Concurrency** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Instance-scoped registration prevents older collectors from deregistering active replacements |
+| **Log Collector Observability** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Exposes active collectors, log activity timestamps, collection/persistence errors at `/health/logs` and `/ready` |
+| **Configurable Log Retention** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Time-based (`FORGELAB_LOG_RETENTION_DAYS`) and volume-based (`FORGELAB_LOG_MAX_PER_DEPLOYMENT`) background pruning |
+
 
 ---
 
@@ -1269,4 +1274,89 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Date:** —
 - **Environment:** —
 - **Notes:** —
+
+---
+
+### 22. Hardened Docker Log Stream Parsing & Race-Safe Collector Lifecycle
+
+#### Test Procedure 22.1 — Oversized-Frame and Non-Terminated Stream Resilience
+1. Start a service container that emits extreme log payloads:
+   - Case A: A continuous stream of bytes without newline characters exceeding 64KB (e.g. continuous base64 payload or minified bundle).
+   - Case B: An oversized Docker multiplexed stream header advertising a payload > 8MB.
+2. In Case A (continuous newline-free output):
+   - Monitor ForgeLAB backend memory consumption.
+   - Verify memory does not grow unbounded; lines are chunked and flushed safely at `DefaultMaxLineLength` (64KB).
+   - In UI terminal and database, verify the log entry is truncated with `... [truncated: exceeded 64KB log size limit]`.
+3. In Case B (malformed/oversized multiplexed frame):
+   - Verify the parser discards the oversized payload bytes cleanly via `io.Discard` without desynchronizing the stream.
+   - Verify subsequent standard log frames sent on stdout or stderr are parsed accurately without corrupting the 8-byte frame header boundary.
+
+#### Test Procedure 22.2 — Collector Replacement Race Safety on Rapid Container Redeploy
+1. Trigger a fast redeploy or container recreation on an existing service while the prior container's runtime log collector is still actively draining output.
+2. When the new container starts, a new collector instance is registered for the service deployment.
+3. Allow the old container collector to exit its loop and execute its deferred cleanup:
+   - Verify the old collector's exit hook checks instance ownership and does NOT deregister or close the replacement collector's context.
+   - Verify the replacement collector continues streaming stdout/stderr without interruption.
+4. Verify backend logs and health diagnostics show the replacement collector remaining registered and active.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 23. Log Collector Observability and Configurable Retention Cleanup
+
+#### Test Procedure 23.1 — Collector Health Diagnostics via `/health/logs` and `/ready`
+1. Ensure the ForgeLAB backend is running with active deployed containers.
+2. Query the readiness endpoint:
+   ```bash
+   curl -s http://localhost:8080/ready | jq .
+   ```
+   - Verify HTTP 200 OK.
+   - Verify response contains `log_collectors` block with fields: `active_collectors`, `total_registered`, `total_unregistered`, `total_collection_errors`, `total_persistence_errors`.
+3. Query the dedicated log collector diagnostics endpoint:
+   ```bash
+   curl -s http://localhost:8080/health/logs | jq .
+   ```
+   - Verify response returns detailed collector states under `collectors`:
+     - `key` (e.g. `service:<service_deployment_id>` or `container:<container_id>`)
+     - `instance_id` (unique UUID)
+     - `container_id`
+     - `service_deployment_id`
+     - `project_id`
+     - `started_at`
+     - `last_log_at`
+     - `error_count`
+     - `is_active` (boolean)
+4. Verify that secrets, tokens, and raw log payloads are strictly omitted from diagnostic output.
+
+#### Test Procedure 23.2 — Configurable Log Retention Policy & Automatic Cleanup
+1. Configure test retention limits in `.env` or environment variables:
+   ```bash
+   FORGELAB_LOG_RETENTION_DAYS=7
+   FORGELAB_LOG_MAX_PER_DEPLOYMENT=500
+   FORGELAB_LOG_CLEANUP_INTERVAL=1m
+   ```
+2. Insert test log records into `deployment_logs` exceeding age (e.g. created 10 days ago) or exceeding count (e.g. 600 records for a single deployment).
+3. Wait for the background cleanup ticker (or trigger pruning cycle):
+   - Verify backend logs output: `log pruning cycle completed: pruned N log rows`.
+   - In PostgreSQL, query `deployment_logs`:
+     ```sql
+     SELECT COUNT(*) FROM deployment_logs WHERE deployment_id = '<target-id>';
+     ```
+     - Verify records older than 7 days have been safely deleted.
+     - Verify total log count for the over-limit deployment has been pruned down to `FORGELAB_LOG_MAX_PER_DEPLOYMENT` (500), keeping the newest records based on `id DESC`.
+4. Verify other deployments below the limit are unaffected.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
 

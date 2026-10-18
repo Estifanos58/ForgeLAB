@@ -22,6 +22,10 @@ type BuildQueueDiagnosticsProvider interface {
 	GetSharedBuildDiagnostics() docker.SharedBuildDiagnostics
 }
 
+type LogCollectorDiagnosticsProvider interface {
+	GetLogCollectorDiagnostics() docker.LogCollectorDiagnostics
+}
+
 type DependencyStatus struct {
 	Status    string `json:"status"`               // "up" or "down"
 	LatencyMs *int64 `json:"latency_ms,omitempty"` // round-trip ping time
@@ -29,19 +33,21 @@ type DependencyStatus struct {
 }
 
 type ReadinessResponse struct {
-	Status       string                      `json:"status"` // "ready" or "not_ready"
-	Timestamp    string                      `json:"timestamp"`
-	Dependencies map[string]DependencyStatus `json:"dependencies"`
-	Queue        *queue.QueueDiagnostics     `json:"queue,omitempty"`
-	BuildQueue   interface{}                 `json:"build_queue,omitempty"`
+	Status        string                          `json:"status"` // "ready" or "not_ready"
+	Timestamp     string                          `json:"timestamp"`
+	Dependencies  map[string]DependencyStatus     `json:"dependencies"`
+	Queue         *queue.QueueDiagnostics         `json:"queue,omitempty"`
+	BuildQueue    interface{}                     `json:"build_queue,omitempty"`
+	LogCollectors *docker.LogCollectorDiagnostics `json:"log_collectors,omitempty"`
 }
 
 type HealthHandler struct {
-	db                 *pgxpool.Pool
-	redisClient        *redis.Client
-	dockerClient       *client.Client
-	queueProvider      QueueDiagnosticsProvider
-	buildQueueProvider BuildQueueDiagnosticsProvider
+	db                   *pgxpool.Pool
+	redisClient          *redis.Client
+	dockerClient         *client.Client
+	queueProvider        QueueDiagnosticsProvider
+	buildQueueProvider   BuildQueueDiagnosticsProvider
+	logCollectorProvider LogCollectorDiagnosticsProvider
 }
 
 func NewHealthHandler(db *pgxpool.Pool, redisClient *redis.Client, dockerClient *client.Client) *HealthHandler {
@@ -58,6 +64,10 @@ func (h *HealthHandler) SetQueueDiagnosticsProvider(provider QueueDiagnosticsPro
 
 func (h *HealthHandler) SetBuildQueueDiagnosticsProvider(provider BuildQueueDiagnosticsProvider) {
 	h.buildQueueProvider = provider
+}
+
+func (h *HealthHandler) SetLogCollectorDiagnosticsProvider(provider LogCollectorDiagnosticsProvider) {
+	h.logCollectorProvider = provider
 }
 
 // Liveness handles GET /health (lightweight liveness probe)
@@ -179,6 +189,12 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 		buildDiag = h.buildQueueProvider.GetSharedBuildDiagnostics()
 	}
 
+	var logDiag *docker.LogCollectorDiagnostics
+	if h.logCollectorProvider != nil {
+		diag := h.logCollectorProvider.GetLogCollectorDiagnostics()
+		logDiag = &diag
+	}
+
 	overallStatus := "ready"
 	httpStatus := http.StatusOK
 	if !allReady {
@@ -187,11 +203,12 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := ReadinessResponse{
-		Status:       overallStatus,
-		Timestamp:    time.Now().UTC().Format(time.RFC3339),
-		Dependencies: deps,
-		Queue:        queueDiag,
-		BuildQueue:   buildDiag,
+		Status:        overallStatus,
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+		Dependencies:  deps,
+		Queue:         queueDiag,
+		BuildQueue:    buildDiag,
+		LogCollectors: logDiag,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -239,4 +256,19 @@ func (h *HealthHandler) QueueDiagnostics(w http.ResponseWriter, r *http.Request)
 	}
 
 	_ = json.NewEncoder(w).Encode(queueDiag)
+}
+
+// LogCollectorDiagnostics handles GET /health/logs (runtime log collector health and operational diagnostics)
+func (h *HealthHandler) LogCollectorDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if h.logCollectorProvider == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "log collector diagnostics provider not configured"})
+		return
+	}
+
+	diag := h.logCollectorProvider.GetLogCollectorDiagnostics()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(diag)
 }

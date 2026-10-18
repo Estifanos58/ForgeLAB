@@ -330,6 +330,31 @@ func main() {
 		}
 	}()
 
+	// Launch periodic log retention cleanup
+	logCleanupInterval := cfg.Log.CleanupInterval
+	if logCleanupInterval <= 0 {
+		logCleanupInterval = 1 * time.Hour
+	}
+	if cfg.Log.RetentionDays > 0 || cfg.Log.MaxLogsPerDeployment > 0 {
+		go func() {
+			logTicker := time.NewTicker(logCleanupInterval)
+			defer logTicker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-logTicker.C:
+					pruned, err := deploymentService.PruneLogs(ctx, cfg.Log.RetentionDays, cfg.Log.MaxLogsPerDeployment)
+					if err != nil {
+						slog.Warn("failed to prune deployment logs", "error", err)
+					} else if pruned > 0 {
+						slog.Info("pruned expired/excess deployment logs", "count", pruned)
+					}
+				}
+			}
+		}()
+	}
+
 	// Rate Limiting (Fixed-Window Counter with Trusted Proxy validation)
 	rateLimiter := ratelimit.NewLimiter(redisClient, cfg.RateLimit.Enabled, cfg.RateLimit.TrustedProxies...)
 	wsHub.SetRateLimiter(rateLimiter, cfg.RateLimit.WSSubscriptionLimit)
@@ -347,6 +372,7 @@ func main() {
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
 	healthHandler.SetQueueDiagnosticsProvider(deployQueue)
 	healthHandler.SetBuildQueueDiagnosticsProvider(dockerEngine)
+	healthHandler.SetLogCollectorDiagnosticsProvider(dockerEngine)
 
 	// Setup router
 	r := chi.NewRouter()
@@ -364,6 +390,7 @@ func main() {
 	r.Get("/ready", healthHandler.Readiness)
 	r.Get("/health/ready", healthHandler.Readiness)
 	r.Get("/health/queue", healthHandler.QueueDiagnostics)
+	r.Get("/health/logs", healthHandler.LogCollectorDiagnostics)
 
 	// Throttles for sensitive endpoints
 	authThrottle := ratelimit.Middleware(rateLimiter, "auth", cfg.RateLimit.AuthLimit, time.Minute)

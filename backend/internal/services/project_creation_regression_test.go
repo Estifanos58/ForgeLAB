@@ -323,7 +323,11 @@ func TestMigration_FreshDatabaseAppliesAllMigrations(t *testing.T) {
 	version, dirty, err := m.Version()
 	require.NoError(t, err)
 	assert.False(t, dirty, "migration state must not be dirty")
-	assert.Equal(t, uint(17), version, "latest migration version must be 17")
+	assert.GreaterOrEqual(t, version, uint(17), "latest migration version must be at least 17")
+
+	// Ensure we are at version 17 to test migration 000017 effects and rollback
+	err = m.Migrate(17)
+	require.NoError(t, err)
 
 	// Connect to fresh database to verify migration 000017 effects and rollback safety
 	freshPool, err := pgxpool.New(ctx, freshDBURL)

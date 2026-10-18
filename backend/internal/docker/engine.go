@@ -69,6 +69,7 @@ type Engine struct {
 	buildMaintenanceMu   sync.RWMutex // synchronizes Docker image builds vs image pruning/maintenance
 	pruneFilterLabel     string       // optional label filter for scoped image pruning
 	activeLogCollectors  sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
+	collectorRegistry    *LogCollectorRegistry // race-safe registry and operational diagnostics for runtime log collectors
 	activeCancels        sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
 	activeExecMu         sync.Mutex   // protects activeExecs map
 	activeExecs          map[uuid.UUID]*activeExecEntry
@@ -150,8 +151,25 @@ func NewEngine(
 		buildSem:            NewBuildSemaphore(DefaultMaxConcurrentBuilds()),
 		sharedCoordinator:   NewSharedBuildCoordinator(),
 		activeExecs:         make(map[uuid.UUID]*activeExecEntry),
+		collectorRegistry:   NewLogCollectorRegistry(),
 		startTime:           time.Now(),
 	}
+}
+
+func (e *Engine) getCollectorRegistry() *LogCollectorRegistry {
+	if e.collectorRegistry == nil {
+		e.semMu.Lock()
+		if e.collectorRegistry == nil {
+			e.collectorRegistry = NewLogCollectorRegistry()
+		}
+		e.semMu.Unlock()
+	}
+	return e.collectorRegistry
+}
+
+// GetLogCollectorDiagnostics returns operational observability metrics for all runtime log collectors.
+func (e *Engine) GetLogCollectorDiagnostics() LogCollectorDiagnostics {
+	return e.getCollectorRegistry().GetDiagnostics()
 }
 
 func (e *Engine) getBuildSemaphore() *BuildSemaphore {

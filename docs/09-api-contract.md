@@ -76,6 +76,84 @@ Common status codes:
   }
   ```
 
+### `GET /ready` & `GET /health/ready`
+- **Authentication:** None (Public)
+- **Authorization:** None
+- **Purpose:** Full dependency readiness probe checking PostgreSQL, Redis, Docker Engine, deployment queue state, shared build status, and active log collectors.
+- **Success Response:** `200 OK` (when all dependencies are healthy) or `503 Service Unavailable` (when any core dependency is down).
+  ```json
+  {
+    "status": "ready",
+    "timestamp": "2026-10-18T14:30:00Z",
+    "dependencies": {
+      "postgres": { "status": "up", "latency_ms": 2 },
+      "redis": { "status": "up", "latency_ms": 1 },
+      "docker": { "status": "up", "latency_ms": 4 }
+    },
+    "queue": {
+      "pending_jobs": 0,
+      "processing_jobs": 0,
+      "dead_letter_jobs": 0,
+      "total_recovered_jobs": 0
+    },
+    "log_collectors": {
+      "active_collectors": 2,
+      "total_lines_collected": 1284,
+      "total_collection_errors": 0,
+      "total_persistence_errors": 0,
+      "collectors": [
+        {
+          "id": "e93ab817-6ff5-408a-b864-16a7f9a1cb01",
+          "container_id": "c1a2b3c4d5e6",
+          "deployment_id": "78331ea6-cf0b-4616-942e-8d80b895d895",
+          "service_deployment_id": "00aead97-d237-4833-b6ef-81d77d30d240",
+          "service_name": "backend",
+          "started_at": "2026-10-18T14:28:00Z",
+          "last_activity": "2026-10-18T14:29:55Z",
+          "lines_collected": 850,
+          "retries": 0,
+          "collection_errors": 0,
+          "persistence_errors": 0
+        }
+      ]
+    }
+  }
+  ```
+
+### `GET /health/logs`
+- **Authentication:** None (Public)
+- **Authorization:** None
+- **Purpose:** Operational observability diagnostics for all active Docker runtime log collectors.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "active_collectors": 2,
+    "total_lines_collected": 1284,
+    "total_collection_errors": 0,
+    "total_persistence_errors": 0,
+    "collectors": [
+      {
+        "id": "e93ab817-6ff5-408a-b864-16a7f9a1cb01",
+        "container_id": "c1a2b3c4d5e6",
+        "service_deployment_id": "00aead97-d237-4833-b6ef-81d77d30d240",
+        "service_name": "backend",
+        "started_at": "2026-10-18T14:28:00Z",
+        "last_activity": "2026-10-18T14:29:55Z",
+        "lines_collected": 850,
+        "retries": 0,
+        "collection_errors": 0,
+        "persistence_errors": 0
+      }
+    ]
+  }
+  ```
+
+### `GET /health/queue`
+- **Authentication:** None (Public)
+- **Authorization:** None
+- **Purpose:** Deployment worker queue and shared image build diagnostics.
+- **Success Response:** `200 OK`
+
 ---
 
 ## 3. Authentication Endpoints (`/api/auth`)
