@@ -28,6 +28,7 @@ import (
 	"github.com/forgelab/backend/internal/config"
 	"github.com/forgelab/backend/internal/crypto"
 	"github.com/forgelab/backend/internal/detector"
+	"github.com/forgelab/backend/internal/models"
 )
 
 var (
@@ -87,12 +88,16 @@ type GitHubBranch struct {
 }
 
 type GitHubStatus struct {
-	Connected   bool       `json:"connected"`
-	Username    string     `json:"username,omitempty"`
-	Scopes      []string   `json:"scopes,omitempty"`
-	NeedsReauth bool       `json:"needs_reauth"`
-	AuthType    string     `json:"auth_type,omitempty"` // "oauth" or "pat"
-	UpdatedAt   *time.Time `json:"updated_at,omitempty"`
+	Connected         bool                           `json:"connected"`
+	Username          string                         `json:"username,omitempty"`
+	Scopes            []string                       `json:"scopes,omitempty"`
+	NeedsReauth       bool                           `json:"needs_reauth"`
+	AuthType          string                         `json:"auth_type,omitempty"` // "app", "oauth", "pat", or "none"
+	UpdatedAt         *time.Time                     `json:"updated_at,omitempty"`
+	AppConfigured     bool                           `json:"app_configured"`
+	AppSlug           string                         `json:"app_slug,omitempty"`
+	Installations     []models.GitHubAppInstallation `json:"installations,omitempty"`
+	ReconnectGuidance string                         `json:"reconnect_guidance,omitempty"`
 }
 
 type GitHubOrg struct {
@@ -104,6 +109,7 @@ type GitHubService struct {
 	db           *pgxpool.Pool
 	encryptor    *crypto.Encryptor
 	githubCfg    config.OAuthConfig
+	appManager   *GitHubAppManager
 	redis        *redis.Client
 	httpClient   *http.Client
 	fallbackMem  sync.Map
@@ -114,6 +120,11 @@ type GitHubService struct {
 func (s *GitHubService) SetHTTPClient(c *http.Client) {
 	s.httpClient = c
 }
+
+func (s *GitHubService) SetGitHubAppManager(mgr *GitHubAppManager) {
+	s.appManager = mgr
+}
+
 
 func (s *GitHubService) SetTokenGetterForTest(fn func(ctx context.Context, userID uuid.UUID) (string, string, error)) {
 	s.tokenGetter = fn
@@ -138,52 +149,105 @@ func NewGitHubService(
 	}
 }
 
-// GetStatus checks whether the user has granted repository-access OAuth permissions.
+// GetStatus checks whether the user has granted repository-access OAuth permissions or installed GitHub App.
 func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHubStatus, error) {
 	if s.statusGetter != nil {
 		return s.statusGetter(ctx, userID)
 	}
+
+	appConfigured := s.appManager != nil && s.appManager.IsConfigured()
+	appSlug := ""
+	if s.appManager != nil {
+		appSlug = s.appManager.AppSlug()
+	}
+
+	// 1. Check if user has active GitHub App installations
+	var installations []models.GitHubAppInstallation
+	if s.appManager != nil {
+		if insts, err := s.appManager.ListUserInstallations(ctx, userID); err == nil && len(insts) > 0 {
+			installations = insts
+		}
+	}
+
+	if len(installations) > 0 {
+		return &GitHubStatus{
+			Connected:     true,
+			Username:      installations[0].AccountLogin,
+			NeedsReauth:   false,
+			AuthType:      "app",
+			AppConfigured: appConfigured,
+			AppSlug:       appSlug,
+			Installations: installations,
+		}, nil
+	}
+
+	if s.db == nil {
+		return &GitHubStatus{
+			Connected:     false,
+			AuthType:      "none",
+			AppConfigured: appConfigured,
+			AppSlug:       appSlug,
+		}, nil
+	}
+
+	// 2. Check if user has connected OAuth or PAT in github_integrations
 	var (
 		encryptedToken []byte
 		username       string
 		scope          string
+		authTypeCol    string
 		updatedAt      time.Time
 	)
 
 	err := s.db.QueryRow(ctx,
-		`SELECT encrypted_access_token, github_username, scope, updated_at
+		`SELECT encrypted_access_token, github_username, scope, COALESCE(auth_type, 'oauth'), updated_at
 		 FROM github_integrations WHERE user_id = $1`,
 		userID,
-	).Scan(&encryptedToken, &username, &scope, &updatedAt)
+	).Scan(&encryptedToken, &username, &scope, &authTypeCol, &updatedAt)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return &GitHubStatus{Connected: false}, nil
+			return &GitHubStatus{
+				Connected:     false,
+				AuthType:      "none",
+				AppConfigured: appConfigured,
+				AppSlug:       appSlug,
+			}, nil
 		}
 		return nil, fmt.Errorf("failed to query github integration: %w", err)
 	}
 
 	// Verify token can be decrypted
-	if _, err := s.encryptor.Decrypt(encryptedToken); err != nil {
+	plainToken, err := s.encryptor.Decrypt(encryptedToken)
+	if err != nil {
 		slog.Error("failed to decrypt github access token", "user_id", userID, "error", err)
-		return &GitHubStatus{Connected: false}, nil
+		return &GitHubStatus{
+			Connected:     false,
+			AuthType:      "none",
+			AppConfigured: appConfigured,
+			AppSlug:       appSlug,
+		}, nil
 	}
 
+	plainTokenStr := string(plainToken)
 	scopes := parseOAuthScopes(scope)
 	hasRepoScope := false
-	authType := "oauth"
-	for _, sc := range scopes {
-		if sc == "pat" {
-			authType = "pat"
-		}
-	}
+	authType := authTypeCol
 
-	if authType == "pat" {
-		// PAT: verified for repository access upon connection
+	// Detect token capabilities: GitHub App user tokens (ghu_) and PATs
+	if strings.HasPrefix(plainTokenStr, "ghu_") || authType == "app" {
+		authType = "app"
+		hasRepoScope = true
+	} else if strings.HasPrefix(plainTokenStr, "github_pat_") || strings.HasPrefix(plainTokenStr, "ghp_") || authType == "pat" {
+		authType = "pat"
 		hasRepoScope = true
 	} else {
-		// OAuth: must explicitly contain "repo" scope. Empty scopes or read:user requires reauth!
 		for _, sc := range scopes {
+			if sc == "pat" {
+				authType = "pat"
+				hasRepoScope = true
+				break
+			}
 			if sc == "repo" {
 				hasRepoScope = true
 				break
@@ -191,15 +255,32 @@ func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHu
 		}
 	}
 
+	if hasRepoScope && len(scopes) == 0 {
+		if authType == "app" {
+			scopes = []string{"app", "repo"}
+		} else {
+			scopes = []string{"pat", "repo"}
+		}
+	}
+
+	reconnectGuidance := ""
+	if appConfigured {
+		reconnectGuidance = "GitHub App is available on this server. Install the GitHub App for fine-grained repository access without personal OAuth tokens."
+	}
+
 	return &GitHubStatus{
-		Connected:   true,
-		Username:    username,
-		Scopes:      scopes,
-		NeedsReauth: !hasRepoScope,
-		AuthType:    authType,
-		UpdatedAt:   &updatedAt,
+		Connected:         true,
+		Username:          username,
+		Scopes:            scopes,
+		NeedsReauth:       !hasRepoScope,
+		AuthType:          authType,
+		UpdatedAt:         &updatedAt,
+		AppConfigured:     appConfigured,
+		AppSlug:           appSlug,
+		ReconnectGuidance: reconnectGuidance,
 	}, nil
 }
+
 
 type GitHubRepoStateRecord struct {
 	UserID  string    `json:"user_id"`
@@ -399,17 +480,48 @@ func (s *GitHubService) HandleCallback(ctx context.Context, code, state, nonce s
 	ghUserIDStr := fmt.Sprintf("%d", ghUser.ID)
 	now := time.Now()
 
+	authType := "oauth"
+	storedScope := strings.TrimSpace(tokenRes.Scope)
+	if storedScope == "" {
+		storedScope = strings.TrimSpace(userResp.Header.Get("X-OAuth-Scopes"))
+	}
+
+	if strings.HasPrefix(tokenRes.AccessToken, "ghu_") {
+		authType = "app"
+		if storedScope == "" {
+			storedScope = "repo,read:user,user:email"
+		}
+	} else if strings.HasPrefix(tokenRes.AccessToken, "github_pat_") || strings.HasPrefix(tokenRes.AccessToken, "ghp_") {
+		authType = "pat"
+		if storedScope == "" {
+			storedScope = "pat,repo"
+		}
+	} else if storedScope == "" {
+		// Probe if classic OAuth token has repo access
+		repoCheckReq, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/repos?per_page=1", nil)
+		repoCheckReq.Header.Set("Authorization", "Bearer "+tokenRes.AccessToken)
+		repoCheckReq.Header.Set("Accept", "application/vnd.github+json")
+		repoCheckReq.Header.Set("User-Agent", "ForgeLAB-App")
+		if repoCheckResp, checkErr := s.httpClient.Do(repoCheckReq); checkErr == nil {
+			if repoCheckResp.StatusCode == http.StatusOK {
+				storedScope = "repo,read:user"
+			}
+			repoCheckResp.Body.Close()
+		}
+	}
+
 	// 4. Upsert into github_integrations
 	_, err = s.db.Exec(ctx,
-		`INSERT INTO github_integrations (user_id, encrypted_access_token, github_user_id, github_username, scope, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO github_integrations (user_id, encrypted_access_token, github_user_id, github_username, scope, auth_type, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   encrypted_access_token = EXCLUDED.encrypted_access_token,
 		   github_user_id = EXCLUDED.github_user_id,
 		   github_username = EXCLUDED.github_username,
 		   scope = EXCLUDED.scope,
+		   auth_type = EXCLUDED.auth_type,
 		   updated_at = EXCLUDED.updated_at`,
-		userID, encryptedToken, ghUserIDStr, ghUser.Login, tokenRes.Scope, now, now,
+		userID, encryptedToken, ghUserIDStr, ghUser.Login, storedScope, authType, now, now,
 	)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("failed to save github integration: %w", err)
@@ -507,15 +619,16 @@ func (s *GitHubService) ConnectWithPAT(ctx context.Context, userID uuid.UUID, pa
 	ghUserIDStr := fmt.Sprintf("%d", ghUser.ID)
 
 	_, err = s.db.Exec(ctx,
-		`INSERT INTO github_integrations (user_id, encrypted_access_token, github_user_id, github_username, scope, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO github_integrations (user_id, encrypted_access_token, github_user_id, github_username, scope, auth_type, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   encrypted_access_token = EXCLUDED.encrypted_access_token,
 		   github_user_id = EXCLUDED.github_user_id,
 		   github_username = EXCLUDED.github_username,
 		   scope = EXCLUDED.scope,
+		   auth_type = EXCLUDED.auth_type,
 		   updated_at = EXCLUDED.updated_at`,
-		userID, encryptedToken, ghUserIDStr, ghUser.Login, savedScope, now, now,
+		userID, encryptedToken, ghUserIDStr, ghUser.Login, savedScope, "pat", now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to save GitHub integration: %w", err)
@@ -586,8 +699,9 @@ func (s *GitHubService) getDecryptedTokenAndScope(ctx context.Context, userID uu
 	var (
 		encryptedToken []byte
 		scope          string
+		authType       string
 	)
-	err := s.db.QueryRow(ctx, "SELECT encrypted_access_token, scope FROM github_integrations WHERE user_id = $1", userID).Scan(&encryptedToken, &scope)
+	err := s.db.QueryRow(ctx, "SELECT encrypted_access_token, scope, COALESCE(auth_type, 'oauth') FROM github_integrations WHERE user_id = $1", userID).Scan(&encryptedToken, &scope, &authType)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", "", ErrGitHubNotConnected
@@ -599,7 +713,29 @@ func (s *GitHubService) getDecryptedTokenAndScope(ctx context.Context, userID uu
 	if err != nil {
 		return "", "", fmt.Errorf("failed to decrypt github token: %w", err)
 	}
-	return string(plainToken), scope, nil
+	tokenStr := string(plainToken)
+
+	// If token is a GitHub App user token (ghu_) or fine-grained PAT, or auth_type is app/pat,
+	// ensure scope reflects repo capability so downstream callers do not falsely reject it.
+	if strings.HasPrefix(tokenStr, "ghu_") || strings.HasPrefix(tokenStr, "github_pat_") || authType == "app" || authType == "pat" {
+		scopes := parseOAuthScopes(scope)
+		hasRepo := false
+		for _, sc := range scopes {
+			if sc == "repo" {
+				hasRepo = true
+				break
+			}
+		}
+		if !hasRepo {
+			if scope == "" {
+				scope = "repo"
+			} else {
+				scope = "repo," + scope
+			}
+		}
+	}
+
+	return tokenStr, scope, nil
 }
 
 // getDecryptedToken retrieves and decrypts the GitHub access token for a user.
@@ -608,9 +744,37 @@ func (s *GitHubService) getDecryptedToken(ctx context.Context, userID uuid.UUID)
 	return tok, err
 }
 
+// getDecryptedTokenForRepo finds the best access token for a given owner/repo:
+// 1. Checks if a GitHub App installation for this user has access to owner/repo.
+// 2. Falls back to user's decrypted OAuth or PAT token.
+// 3. Returns empty string with nil error if user has no credentials (enabling public repository access).
+func (s *GitHubService) getDecryptedTokenForRepo(ctx context.Context, userID uuid.UUID, owner, repo string) (string, error) {
+	if s.tokenGetter != nil {
+		tok, _, err := s.tokenGetter(ctx, userID)
+		return tok, err
+	}
+
+	// 1. Try GitHub App installation token
+	if s.appManager != nil && s.appManager.IsConfigured() {
+		tok, _, err := s.appManager.FindTokenForRepo(ctx, userID, owner, repo)
+		if err == nil && tok != "" {
+			return tok, nil
+		}
+	}
+
+	// 2. Try user-level OAuth token or PAT
+	tok, err := s.getDecryptedToken(ctx, userID)
+	if err == nil && tok != "" {
+		return tok, nil
+	}
+
+	// 3. Return empty string with nil error (allow public access)
+	return "", nil
+}
+
 // GetRepo verifies access and fetches metadata for a specific repository.
 func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, repo string) (*GitHubRepo, error) {
-	token, tokenErr := s.getDecryptedToken(ctx, userID)
+	token, _ := s.getDecryptedTokenForRepo(ctx, userID, owner, repo)
 
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s", url.PathEscape(owner), url.PathEscape(repo))
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
@@ -630,7 +794,10 @@ func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, re
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		_ = s.Disconnect(ctx, userID)
+		if token != "" {
+			_ = s.Disconnect(ctx, userID)
+			return nil, ErrGitHubNeedsReauth
+		}
 		return nil, ErrGitHubNotConnected
 	}
 	if resp.StatusCode == http.StatusForbidden {
@@ -640,11 +807,14 @@ func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, re
 		if sso := resp.Header.Get("X-GitHub-SSO"); sso != "" {
 			return nil, fmt.Errorf("%w: organization SAML SSO authorization required (%s)", ErrGitHubSSORequired, sso)
 		}
-		return nil, ErrGitHubNeedsReauth
+		if token != "" {
+			return nil, ErrGitHubNeedsReauth
+		}
+		return nil, ErrGitHubRateLimited
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		if token == "" && errors.Is(tokenErr, ErrGitHubNotConnected) {
-			return nil, ErrGitHubNotConnected
+		if token == "" {
+			return nil, fmt.Errorf("%w: repository not found or access denied (if this repository is private, connecting GitHub is required)", ErrGitHubRepoNotFound)
 		}
 		return nil, ErrGitHubRepoNotFound
 	}
@@ -683,8 +853,45 @@ func (s *GitHubService) GetRepo(ctx context.Context, userID uuid.UUID, owner, re
 	}, nil
 }
 
-// ListRepositories retrieves repositories accessible to the user via their GitHub authorization.
+// ListRepositories retrieves repositories accessible to the user via their GitHub authorization (App installations or OAuth).
 func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, page, perPage int, orgFilter ...string) ([]GitHubRepo, bool, error) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 || perPage > 100 {
+		perPage = 30
+	}
+
+	var targetOrg string
+	if len(orgFilter) > 0 && strings.TrimSpace(orgFilter[0]) != "" {
+		targetOrg = strings.TrimSpace(orgFilter[0])
+	}
+
+	// 1. Try listing from GitHub App installations if configured and linked
+	if s.appManager != nil && s.appManager.IsConfigured() {
+		installations, err := s.appManager.ListUserInstallations(ctx, userID)
+		if err == nil && len(installations) > 0 {
+			var allRepos []GitHubRepo
+			hasMoreTotal := false
+			for _, inst := range installations {
+				if targetOrg != "" && !strings.EqualFold(inst.AccountLogin, targetOrg) {
+					continue
+				}
+				instRepos, more, err := s.appManager.ListInstallationRepositories(ctx, inst.ID, page, perPage)
+				if err == nil {
+					allRepos = append(allRepos, instRepos...)
+					if more {
+						hasMoreTotal = true
+					}
+				}
+			}
+			if len(allRepos) > 0 || targetOrg != "" {
+				return allRepos, hasMoreTotal, nil
+			}
+		}
+	}
+
+	// 2. Fall back to user-level OAuth token / PAT
 	token, scope, err := s.getDecryptedTokenAndScope(ctx, userID)
 	if err != nil {
 		return nil, false, err
@@ -701,21 +908,13 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 			hasRepo = true
 		}
 	}
-	if !isPAT && !hasRepo {
+	if !isPAT && !hasRepo && !strings.HasPrefix(token, "ghu_") && !strings.HasPrefix(token, "github_pat_") {
 		return nil, false, ErrGitHubNeedsReauth
 	}
 
-	if page < 1 {
-		page = 1
-	}
-	if perPage < 1 || perPage > 100 {
-		perPage = 30
-	}
-
 	var apiURL string
-	if len(orgFilter) > 0 && strings.TrimSpace(orgFilter[0]) != "" {
-		cleanOrg := strings.TrimSpace(orgFilter[0])
-		apiURL = fmt.Sprintf("https://api.github.com/orgs/%s/repos?sort=updated&direction=desc&page=%d&per_page=%d", url.PathEscape(cleanOrg), page, perPage)
+	if targetOrg != "" {
+		apiURL = fmt.Sprintf("https://api.github.com/orgs/%s/repos?sort=updated&direction=desc&page=%d&per_page=%d", url.PathEscape(targetOrg), page, perPage)
 	} else {
 		apiURL = fmt.Sprintf("https://api.github.com/user/repos?visibility=all&affiliation=owner,collaborator,organization_member&sort=updated&direction=desc&page=%d&per_page=%d", page, perPage)
 	}
@@ -735,7 +934,6 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		// Token was revoked or expired on GitHub
 		_ = s.Disconnect(ctx, userID)
 		return nil, false, ErrGitHubNotConnected
 	}
@@ -794,10 +992,7 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 
 // ListBranches retrieves branches for a specific repository.
 func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owner, repo string) ([]GitHubBranch, error) {
-	token, tokenErr := s.getDecryptedToken(ctx, userID)
-	if tokenErr != nil {
-		return nil, tokenErr
-	}
+	token, _ := s.getDecryptedTokenForRepo(ctx, userID, owner, repo)
 
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/branches?per_page=100", url.PathEscape(owner), url.PathEscape(repo))
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
@@ -817,7 +1012,10 @@ func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owne
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		_ = s.Disconnect(ctx, userID)
+		if token != "" {
+			_ = s.Disconnect(ctx, userID)
+			return nil, ErrGitHubNeedsReauth
+		}
 		return nil, ErrGitHubNotConnected
 	}
 	if resp.StatusCode == http.StatusForbidden {
@@ -830,9 +1028,6 @@ func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owne
 		return nil, ErrGitHubNeedsReauth
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		if token == "" && errors.Is(tokenErr, ErrGitHubNotConnected) {
-			return nil, ErrGitHubNotConnected
-		}
 		return nil, ErrGitHubRepoNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -856,7 +1051,6 @@ func (s *GitHubService) ListBranches(ctx context.Context, userID uuid.UUID, owne
 			CommitSHA: b.Commit.SHA,
 		}
 	}
-
 	return branches, nil
 }
 
@@ -953,12 +1147,17 @@ func (s *GitHubService) DetectRepo(ctx context.Context, userID uuid.UUID, owner,
 
 // ResolveCommitSHA resolves a branch/ref to the exact 40-character commit SHA.
 func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, owner, repo, ref string) (string, error) {
-	token, tokenErr := s.getDecryptedToken(ctx, userID)
-	if tokenErr != nil {
-		return "", tokenErr
+	token, _ := s.getDecryptedTokenForRepo(ctx, userID, owner, repo)
+
+	if ref == "" {
+		meta, err := s.GetRepo(ctx, userID, owner, repo)
+		if err != nil {
+			return "", fmt.Errorf("failed to determine repository default branch: %w", err)
+		}
+		ref = strings.TrimSpace(meta.DefaultBranch)
 	}
 	if ref == "" {
-		ref = "main"
+		return "", errors.New("repository does not define a default branch")
 	}
 
 	commitURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s",
@@ -981,7 +1180,10 @@ func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		_ = s.Disconnect(ctx, userID)
+		if token != "" {
+			_ = s.Disconnect(ctx, userID)
+			return "", ErrGitHubNeedsReauth
+		}
 		return "", ErrGitHubNotConnected
 	}
 	if resp.StatusCode == http.StatusForbidden {
@@ -994,10 +1196,7 @@ func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, 
 		return "", ErrGitHubNeedsReauth
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		if token == "" && errors.Is(tokenErr, ErrGitHubNotConnected) {
-			return "", ErrGitHubNotConnected
-		}
-		return "", ErrGitHubRepoNotFound
+		return "", fmt.Errorf("%w: commit or branch %q not found in %s/%s", ErrGitHubRepoNotFound, ref, owner, repo)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("github returned HTTP %d when resolving commit for %s", resp.StatusCode, ref)
@@ -1011,6 +1210,7 @@ func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, 
 	}
 	return commitData.SHA, nil
 }
+
 
 // MaterializeGitHubSnapshot downloads and extracts an isolated source snapshot pinned to exact commit SHA.
 func (s *GitHubService) MaterializeGitHubSnapshot(ctx context.Context, userID uuid.UUID, owner, repo, ref, destDir string) (string, error) {
@@ -1128,11 +1328,7 @@ func copyDirectoryContentsWithPerms(src, dst string, dirPerm os.FileMode, filePe
 // It verifies repository authorization before serving cached or newly downloaded snapshots.
 // Private repository snapshots are strictly isolated per ForgeLAB user.
 func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID, owner, repo, branch, targetDir string) error {
-	token, _ := s.getDecryptedToken(ctx, userID)
-
-	if branch == "" {
-		branch = "main"
-	}
+	token, _ := s.getDecryptedTokenForRepo(ctx, userID, owner, repo)
 
 	destClean := filepath.Clean(targetDir)
 
@@ -1142,6 +1338,14 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	if err != nil {
 		return fmt.Errorf("authorization check failed for repository %s/%s: %w", owner, repo, err)
 	}
+
+	if branch == "" {
+		branch = repoMeta.DefaultBranch
+	}
+	if branch == "" {
+		branch = "main"
+	}
+
 
 	// Always resolve exact commit SHA to guarantee reproducibility and prevent SHA bypass.
 	resolvedSHA, err := s.ResolveCommitSHA(ctx, userID, owner, repo, branch)

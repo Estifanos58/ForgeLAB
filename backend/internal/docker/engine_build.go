@@ -116,11 +116,27 @@ func (e *Engine) SetLocalBuildMode(mode string) {
 
 // resolveSourceDirectory acquires or resolves the source code directory for build operations.
 func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Project, execID string, emitLog func(phase, stream, message string), sourceRevision ...string) (buildSourceDir string, cleanupDir string, err error) {
-	if project.SourceType == models.SourceTypeGitHub {
+	if project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic {
 		snapshotDir := filepath.Join(e.workDir, execID)
 		_ = os.MkdirAll(snapshotDir, 0755)
 		cleanupDir = snapshotDir
 		buildSourceDir = snapshotDir
+
+		// Check if an immutable repository snapshot is cached in source metadata
+		if project.SourceID != nil && e.sourceService != nil {
+			if src, err := e.sourceService.GetSourceByID(ctx, *project.SourceID); err == nil && src != nil && src.Metadata != nil {
+				if snapVal, ok := src.Metadata["snapshot_path"].(string); ok && snapVal != "" {
+					if info, err := os.Stat(snapVal); err == nil && info.IsDir() {
+						emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Reusing immutable repository snapshot from %s...", snapVal))
+						if err := copyDirectory(snapVal, snapshotDir); err == nil {
+							emitLog(models.LogPhaseSource, models.LogStreamSystem, "Immutable repository snapshot reused successfully.")
+							return buildSourceDir, cleanupDir, nil
+						}
+						emitLog(models.LogPhaseSource, models.LogStreamSystem, "Notice: failed to copy immutable snapshot, falling back to archive acquisition")
+					}
+				}
+			}
+		}
 
 		ref := project.Branch
 		if len(sourceRevision) > 0 && sourceRevision[0] != "" {

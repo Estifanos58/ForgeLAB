@@ -70,7 +70,7 @@ func setupGuestTestRouter(
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, nil, nil)
 	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, deploymentService, nil, nil)
 	envHandler := handlers.NewEnvHandler(secretService, projectService)
-	integrationHandler := handlers.NewIntegrationHandler(nil, "http://localhost:3000", false)
+	integrationHandler := handlers.NewIntegrationHandler(nil, nil, nil, "http://localhost:3000", false)
 	sourceHandler := handlers.NewSourceHandler(sourceService, nil)
 	discoveryHandler := handlers.NewDiscoveryHandler(nil, sourceService, nil, secretService)
 

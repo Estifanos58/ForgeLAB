@@ -48,8 +48,9 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Project Creation & Ownership** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `POST /api/projects` user-scoped ownership |
 | **Local Source Folder/Zip Upload** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests directory & archive upload to isolated workspace |
 | **Zip Slip & Traversal Guard**| IMPLEMENTED | NOT RECORDED | — | — | — | — | Rejects archive path traversal & symlink escapes |
-| **GitHub Repository Connect** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests dedicated `repo` scope OAuth flow & AES encryption |
-| **GitHub Repository Picker** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests scoped repository & branch listing API |
+| **GitHub App Installation & Short-Lived Tokens** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests GitHub App installation flow, token minting, permissions, and OAuth/PAT fallbacks |
+| **Public GitHub Ingestion (No Account Required)** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests public repository URL import without login or GitHub connection |
+| **Durable Import Pipeline & Snapshot Reuse** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests background import lifecycle (`POST /api/integrations/github/imports`), polling, single snapshot reuse in deployment |
 | **Heuristic Runtime Detection**| IMPLEMENTED | NOT RECORDED | — | — | — | — | Inspects package.json, python, go, dockerfile |
 | **Automatic Build Strategy** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Builds non-Dockerfile apps via multi-stage generator |
 | **Dynamic Internal Port Mapping**| IMPLEMENTED | NOT RECORDED | — | — | — | — | Maps container internal port (3000, 8000) to host port |

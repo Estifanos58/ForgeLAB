@@ -170,6 +170,26 @@ These are identified codebase behaviors that require investigation and resolutio
   - *Operational Observability:* Exposed operational health diagnostics via `GET /health/logs` and `GET /ready` (`active_collectors`, `lines_collected`, `last_activity`, `collection_errors`, `persistence_errors`) with sanitized secret masking.
   - *Configurable Log Retention:* Implemented `DeploymentService.PruneLogs` with age-based (`FORGELAB_LOG_RETENTION_DAYS`, default 30) and per-deployment count-based (`FORGELAB_LOG_MAX_PER_DEPLOYMENT`, default 10,000) cleanup, scheduled via a background ticker (`FORGELAB_LOG_CLEANUP_INTERVAL`, default 1h).
 
+### 18. GitHub Repository Importing & Authorization Architecture (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/repository_import_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/repository_import_service.go), [`backend/internal/services/github_app.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/github_app.go), [`backend/internal/services/github_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/github_service.go), [`frontend/src/components/dashboard/create-project-modal.tsx`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/components/dashboard/create-project-modal.tsx)
+- **Defects Fixed:**
+  - Removed all fake repository metadata (`id: Date.now()`) and synthetic default-branch fallbacks (`main`). Network and authorization failures strictly return actionable errors instead of masking missing permissions.
+  - Fixed frontend session refresh: `/api/integrations/github` is no longer excluded from automatic 401 token refresh retries.
+  - Distinct state handling: UI and backend distinguish connected, reauthorization-required (`needs_reauth`), SAML/SSO required (`sso_required`), and repository access denied (`not_found` / `404`).
+  - Public repository imports: Anonymous visitors (Guest Mode) and registered users can import public GitHub repositories without connecting GitHub accounts (`source_type: "github_public"`).
+- **GitHub App Authorization:**
+  - Preferred access mechanism using GitHub App with read-only **Contents** and **Metadata** permissions.
+  - Backend signs RS256 JWTs using configured private key, mints short-lived installation access tokens, and validates installation ownership server-side.
+  - Backward compatibility: Retains encrypted OAuth and Personal Access Token (PAT) storage via AES-256-GCM.
+- **Durable Import Pipeline & Immutable Snapshot Reuse:**
+  - Background asynchronous import pipeline tracked via `repository_imports` table (`pending` → `verifying` → `resolving` → `downloading` → `extracting` → `discovering` → `ready`).
+  - Resolves exact 40-character commit SHA and downloads one tarball archive into isolated workspace (`data/sources/imports/<id>`).
+  - The discovery engine scans the snapshot, produces DAG tiers and service definitions, and generates an authoritative deployment plan pinned to the resolved commit SHA.
+  - Project creation transfers the immutable snapshot directory reference to `sources.metadata["snapshot_path"]`.
+  - Docker deployment engine reuses the snapshot directory directly without making any secondary network or GitHub requests.
+  - Enforces archive security bounds: 100MB compressed, 100MB uncompressed, 10,000 files, 50MB single file, traversal and symlink guards.
+  - Periodic background ticker prunes expired or abandoned import snapshots and database records after 24 hours.
+
 ---
 
 ## 3. Security Hardening Items (Deferred Backlog)

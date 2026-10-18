@@ -119,8 +119,9 @@ The status classifications strictly follow these definitions:
 | **.dockerignore Early Directory Pruning** | IMPLEMENTED | NOT RECORDED | Prunes `node_modules`, `.git`, `.next`, cache dirs before filesystem descent |
 | **Local Source Archive Upload** | IMPLEMENTED | NOT RECORDED | Optional fallback for .zip/.tar.gz archives via `POST /api/sources/upload`, 100MB limit |
 | **Source Workspace Ownership & Deletion**| IMPLEMENTED | NOT RECORDED | Persistent ownership in `source_workspaces` table, `DELETE /api/sources/{id}`, multi-tenant user isolation |
-| **GitHub Repository Authorization** | IMPLEMENTED | NOT RECORDED | Dedicated OAuth `repo` scope flow or fine-grained PAT; active API access verification (`/user/repos`); encrypted at rest via AES-256-GCM |
-| **GitHub Repository & Branch Picker**| IMPLEMENTED | NOT RECORDED | Scoped listing of accessible repos and branches via `/api/integrations/github` |
+| **GitHub App Installation & Short-Lived Tokens** | IMPLEMENTED | NOT RECORDED | GitHub App (read-only Contents & Metadata), server-side RS256 JWT, short-lived installation access tokens, personal & org installations, OAuth & PAT fallbacks |
+| **Public GitHub Ingestion (No Account Required)** | IMPLEMENTED | NOT RECORDED | Public repository inspection & download without connecting GitHub; available to registered & guest users |
+| **Durable Import Lifecycle & Immutable Snapshot Reuse** | IMPLEMENTED | NOT RECORDED | `repository_imports` lifecycle table, background tracking, archive traversal guards, single immutable snapshot reused across discovery, plan generation, project creation, and initial deploy |
 | **Heuristic Runtime Detection** | IMPLEMENTED | NOT RECORDED | Fast inspection of package.json, go.mod, python, etc. without copying |
 | **Automatic Build Strategy** | IMPLEMENTED | NOT RECORDED | Multi-stage Dockerfile generation without requiring user Dockerfile |
 | **Dynamic Internal Port Mapping** | IMPLEMENTED | NOT RECORDED | Container internal port (3000, 8000, etc.) mapped to dynamic host port |

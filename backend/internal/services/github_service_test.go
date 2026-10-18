@@ -2,9 +2,11 @@ package services_test
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -183,6 +185,34 @@ func TestGitHubService_ListRepositories_NeedsReauthWhenMissingRepoScope(t *testi
 	assert.Nil(t, reposEmpty)
 	assert.ErrorIs(t, errEmpty, services.ErrGitHubNeedsReauth)
 }
+
+func TestGitHubService_ListRepositories_GitHubAppUserTokenAllowed(t *testing.T) {
+	customClient := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			assert.Equal(t, "Bearer ghu_test_app_user_token", req.Header.Get("Authorization"))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("[]")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	svc := services.NewGitHubService(nil, nil, config.OAuthConfig{}, nil)
+	svc.SetHTTPClient(customClient)
+	userID := uuid.New()
+
+	// Simulate GitHub App user token (ghu_) where scope is empty string
+	svc.SetTokenGetterForTest(func(ctx context.Context, uid uuid.UUID) (string, string, error) {
+		return "ghu_test_app_user_token", "", nil
+	})
+
+	repos, hasMore, err := svc.ListRepositories(context.Background(), userID, 1, 30)
+	require.NoError(t, err)
+	assert.False(t, hasMore)
+	assert.Empty(t, repos)
+}
+
 
 func TestGitHubService_GetStatus_DetectsNeedsReauth(t *testing.T) {
 	svc := services.NewGitHubService(nil, nil, config.OAuthConfig{}, nil)

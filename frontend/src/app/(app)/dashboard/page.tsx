@@ -63,7 +63,12 @@ export default function DashboardPage() {
     loadProjects();
     if (typeof window !== 'undefined' && !authLoading) {
       const params = new URLSearchParams(window.location.search);
-      if (params.get('deploy') === 'true' || params.get('create') === 'true') {
+      if (
+        params.get('deploy') === 'true' ||
+        params.get('create') === 'true' ||
+        params.get('github_connected') === 'true' ||
+        params.get('github_app_installed') === 'true'
+      ) {
         if (user || allowGuestMode) {
           setIsModalOpen(true);
         }

@@ -18,10 +18,12 @@ import {
   LocalPathValidationResult,
   LogQueryOptions,
   Project,
+  RepositoryImport,
   Service,
   ServiceDeployment,
   SetEnvInput,
   SourceUploadResult,
+  StartImportInput,
   UpdateProjectInput,
   UpdateServiceResourcesInput,
   User,
@@ -112,8 +114,7 @@ async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {}): Pro
     url.includes('/api/auth/login') ||
     url.includes('/api/auth/register') ||
     url.includes('/api/auth/refresh') ||
-    url.includes('/api/auth/logout') ||
-    url.includes('/api/integrations/github');
+    url.includes('/api/auth/logout');
 
   if (response.status === 401 && !options._retry && !isAuthEndpoint) {
     try {
@@ -471,6 +472,33 @@ export const api = {
         return apiFetch<DetectionResult>(
           `/api/integrations/github/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/detect${query}`
         );
+      },
+
+      async getAppInstallURL(): Promise<{ url: string; app_slug: string }> {
+        return apiFetch<{ url: string; app_slug: string }>('/api/integrations/github/app/install');
+      },
+
+      async startImport(input: StartImportInput): Promise<RepositoryImport> {
+        return apiFetch<RepositoryImport>('/api/integrations/github/imports', {
+          method: 'POST',
+          body: JSON.stringify(input),
+        });
+      },
+
+      async getImport(id: string): Promise<RepositoryImport> {
+        return apiFetch<RepositoryImport>(`/api/integrations/github/imports/${encodeURIComponent(id)}`);
+      },
+
+      async cancelImport(id: string): Promise<{ message: string }> {
+        return apiFetch<{ message: string }>(`/api/integrations/github/imports/${encodeURIComponent(id)}/cancel`, {
+          method: 'POST',
+        });
+      },
+
+      async retryImport(id: string): Promise<RepositoryImport> {
+        return apiFetch<RepositoryImport>(`/api/integrations/github/imports/${encodeURIComponent(id)}/retry`, {
+          method: 'POST',
+        });
       },
     },
   },

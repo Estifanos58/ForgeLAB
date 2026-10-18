@@ -288,7 +288,7 @@ export interface EnvVar {
 
 export interface CreateProjectInput {
   name: string;
-  source_type?: 'local' | 'local_directory' | 'local_upload' | 'local_agent' | 'github';
+  source_type?: 'local' | 'local_directory' | 'local_upload' | 'local_agent' | 'github' | 'github_public';
   source_reference?: string;
   agent_id?: string;
   repository_path?: string;
@@ -305,6 +305,7 @@ export interface CreateProjectInput {
   deployment_strategy?: string;
   deployment_plan?: any;
   services?: Partial<Service>[];
+  import_id?: string;
 }
 
 export interface UpdateProjectInput {
@@ -341,6 +342,18 @@ export interface UpdateServiceResourcesInput {
 
 export interface ApiError {
   error: string;
+  error_code?: string;
+}
+
+export interface GitHubAppInstallation {
+  id: number;
+  account_login: string;
+  account_id: number;
+  account_type: string;
+  account_avatar_url: string;
+  repository_selection: string;
+  permissions?: Record<string, string>;
+  created_at: string;
 }
 
 export interface GitHubStatus {
@@ -349,7 +362,52 @@ export interface GitHubStatus {
   scopes?: string[];
   needs_reauth?: boolean;
   updated_at?: string;
-  auth_type?: 'oauth' | 'pat';
+  auth_type?: 'app' | 'oauth' | 'pat' | 'none';
+  app_configured?: boolean;
+  app_slug?: string;
+  installations?: GitHubAppInstallation[];
+  reconnect_guidance?: string;
+}
+
+export type RepositoryImportStatus =
+  | 'pending'
+  | 'verifying'
+  | 'resolving'
+  | 'downloading'
+  | 'extracting'
+  | 'discovering'
+  | 'ready'
+  | 'failed'
+  | 'cancelled'
+  | 'completed';
+
+export interface RepositoryImport {
+  id: string;
+  owner_id: string;
+  source_type: string;
+  repository_id?: string;
+  repository_full_name: string;
+  is_private: boolean;
+  branch: string;
+  commit_sha: string;
+  root_dir: string;
+  status: RepositoryImportStatus;
+  progress: number;
+  stage: string;
+  error_message?: string;
+  error_code?: string;
+  discovery_result?: DetectionResult;
+  deployment_plan?: any;
+  project_id?: string;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+}
+
+export interface StartImportInput {
+  repository: string;
+  branch?: string;
+  root_dir?: string;
 }
 
 export interface GitHubOrg {

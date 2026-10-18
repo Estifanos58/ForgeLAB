@@ -1214,19 +1214,147 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ## 7. GitHub Integration Endpoints (`/api/integrations/github`)
 
-### `GET /api/integrations/github`
-- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
-- **Purpose:** Checks whether the authenticated user has granted repository-access OAuth permissions.
+### `GET /api/integrations/github/status` (also `GET /api/integrations/github`)
+- **Authentication:** Optional (Registered or Guest)
+- **Purpose:** Checks GitHub connection status, authentication type (`app`, `oauth`, `pat`), connected username, active installations, and reconnection guidance.
 - **Success Response:** `200 OK`
   ```json
   {
     "connected": true,
     "username": "octocat",
     "scopes": ["repo", "read:user"],
-    "updated_at": "2026-09-27T08:00:00Z"
+    "auth_type": "app",
+    "app_configured": true,
+    "app_slug": "forgelab-ci",
+    "installations": [
+      {
+        "id": 881122,
+        "account_login": "my-org",
+        "account_type": "Organization",
+        "account_avatar_url": "https://avatars.githubusercontent.com/u/123",
+        "repository_selection": "all"
+      }
+    ],
+    "needs_reauth": false,
+    "reconnect_guidance": ""
   }
   ```
-- **When Not Connected:** `200 OK` with `{"connected": false}`.
+- **When Not Connected:** `200 OK` with `{"connected": false, "app_configured": true, "app_slug": "..."}`.
+
+---
+
+### `GET /api/integrations/github/app/install`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Purpose:** Generates a secure installation URL for the configured GitHub App.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "url": "https://github.com/apps/forgelab-ci/installations/new?state=..."
+  }
+  ```
+
+---
+
+### `GET /api/integrations/github/app/callback`
+- **Authentication:** Public callback with `installation_id` query parameter from GitHub App installation flow.
+- **Purpose:** Verifies server-side installation ownership via GitHub API, persists installation in `github_app_installations`, and redirects to frontend dashboard.
+- **Response:** `302 Found` redirecting to `${FRONTEND_URL}/dashboard?github_app_installed=true`.
+
+---
+
+### `POST /api/integrations/github/imports`
+- **Authentication:** Optional (Registered or Guest; public repos accessible to all)
+- **Request Body:**
+  ```json
+  {
+    "repository": "owner/repo",
+    "branch": "main",
+    "root_dir": "apps/web"
+  }
+  ```
+- **Purpose:** Initiates asynchronous, durable import pipeline: verifies access, resolves commit SHA, downloads tarball, safely extracts snapshot to `data/sources/imports/<id>`, executes discovery engine, and generates deployment plan.
+- **Success Response:** `201 Created`
+  ```json
+  {
+    "id": "e8101b22-b189-49b5-ae04-fc30562371b8",
+    "owner_id": "...",
+    "source_type": "github",
+    "repository_full_name": "owner/repo",
+    "is_private": false,
+    "branch": "main",
+    "commit_sha": "",
+    "root_dir": "apps/web",
+    "status": "pending",
+    "progress": 5,
+    "stage": "Initializing import",
+    "created_at": "2026-10-18T17:00:00Z"
+  }
+  ```
+
+---
+
+### `GET /api/integrations/github/imports/{id}`
+- **Authentication:** Optional (Registered or Guest)
+- **Purpose:** Polls the status, progress, stage, error, discovery result, and deployment plan of an active or completed import.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "id": "e8101b22-b189-49b5-ae04-fc30562371b8",
+    "repository_full_name": "owner/repo",
+    "is_private": false,
+    "branch": "main",
+    "commit_sha": "7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b",
+    "root_dir": "apps/web",
+    "status": "ready",
+    "progress": 100,
+    "stage": "ready",
+    "discovery_result": { "services": [...] },
+    "deployment_plan": { "source_revision": "7a8b9c...", "services": [...] },
+    "project_id": null,
+    "created_at": "2026-10-18T17:00:00Z",
+    "expires_at": "2026-10-19T17:00:00Z"
+  }
+  ```
+
+---
+
+### `POST /api/integrations/github/imports/{id}/cancel`
+- **Authentication:** Optional (Registered or Guest)
+- **Purpose:** Cancels an in-flight background import and cleans up the temporary snapshot workspace.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "message": "import cancelled"
+  }
+  ```
+
+---
+
+### `POST /api/integrations/github/imports/{id}/retry`
+- **Authentication:** Optional (Registered or Guest)
+- **Purpose:** Restarts a failed import with fresh status and progress tracking.
+- **Success Response:** `200 OK` returning updated import record.
+
+---
+
+### `POST /api/integrations/github/pat`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Request Body:**
+  ```json
+  {
+    "token": "ghp_... or github_pat_..."
+  }
+  ```
+- **Purpose:** Connects repository access using a Personal Access Token (classic or fine-grained). Validates token against GitHub API and encrypts it at rest via AES-256-GCM.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "connected": true,
+    "username": "octocat",
+    "scopes": ["repo", "read:user"],
+    "auth_type": "pat"
+  }
+  ```
 
 ---
 
@@ -1251,7 +1379,7 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ### `POST /api/integrations/github/disconnect`
 - **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
-- **Purpose:** Disconnects repository access and deletes encrypted OAuth token from `github_integrations`.
+- **Purpose:** Disconnects repository access and deletes encrypted OAuth token or PAT from `github_integrations`.
 - **Success Response:** `200 OK`
   ```json
   {
@@ -1266,7 +1394,8 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 - **Query Parameters:**
   - `page`: Page number (default: 1)
   - `per_page`: Repositories per page (default: 30, max: 100)
-- **Purpose:** Returns repositories accessible under the user's encrypted GitHub token.
+  - `org`: Optional organization login to list organization-specific repositories
+- **Purpose:** Returns repositories accessible under the user's active GitHub App installations or encrypted GitHub token.
 - **Success Response:** `200 OK`
   ```json
   {
@@ -1288,13 +1417,13 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
   }
   ```
 - **Error Responses:**
-  - `403 Forbidden`: GitHub repository access not authorized.
+  - `403 Forbidden`: GitHub repository access not authorized (`not_connected: true` or `needs_reauth: true`).
 
 ---
 
 ### `GET /api/integrations/github/repositories/{owner}/{repo}/branches`
-- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
-- **Purpose:** Lists branches for an authorized repository.
+- **Authentication:** Optional (Registered or Guest; public repos accessible unauthenticated)
+- **Purpose:** Lists branches for an authorized or public repository.
 - **Success Response:** `200 OK`
   ```json
   {
@@ -1310,11 +1439,11 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 ---
 
 ### `GET /api/integrations/github/repositories/{owner}/{repo}/detect`
-- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Authentication:** Optional (Registered or Guest; public repos accessible unauthenticated)
 - **Query Parameters:**
-  - `branch`: Git branch to inspect (default: default branch)
+  - `branch`: Git branch to inspect (default: repository default branch)
   - `root_dir`: Subdirectory root path (default: ".")
-- **Purpose:** Inspects files from the GitHub repository tree to automatically detect runtime, framework, commands, and port before project creation.
+- **Purpose:** Inspects files from the GitHub repository tree to detect runtime, framework, commands, and port before project creation.
 - **Success Response:** `200 OK`
   ```json
   {
@@ -1329,6 +1458,9 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
     "detected_files": ["requirements.txt", "main.py"]
   }
   ```
+- **Error Responses:**
+  - `404 Not Found`: Repository not found or access denied (`not_found: true`).
+  - `403 Forbidden`: Re-authorization required (`needs_reauth: true`).
 
 ---
 

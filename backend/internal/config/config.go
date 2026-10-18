@@ -26,8 +26,10 @@ type Config struct {
 	App        AppConfig
 	Google     OAuthConfig
 	GitHub     OAuthConfig
+	GitHubApp  GitHubAppConfig
 	RateLimit  RateLimitConfig
 }
+
 
 // RateLimitConfig holds throttling limits for sensitive API endpoints and WebSockets.
 type RateLimitConfig struct {
@@ -102,6 +104,29 @@ func (o OAuthConfig) IsConfigured() bool {
 	}
 	return true
 }
+
+// GitHubAppConfig holds GitHub App settings for repository access and installation tokens.
+type GitHubAppConfig struct {
+	AppID          string
+	PrivateKey     string
+	PrivateKeyPath string
+	Slug           string
+	WebhookSecret  string
+	ClientID       string
+	ClientSecret   string
+}
+
+// IsConfigured returns true if the GitHub App has an AppID and PrivateKey configured.
+func (g GitHubAppConfig) IsConfigured() bool {
+	if strings.TrimSpace(g.AppID) == "" {
+		return false
+	}
+	if g.AppID == "example-github-app-id" {
+		return false
+	}
+	return strings.TrimSpace(g.PrivateKey) != "" || strings.TrimSpace(g.PrivateKeyPath) != ""
+}
+
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
@@ -328,6 +353,16 @@ func Load() (*Config, error) {
 			RedirectURL:     getEnv("GITHUB_REDIRECT_URL", "http://localhost:3000/api/auth/github/callback"),
 			RepoRedirectURL: getEnv("GITHUB_REPO_REDIRECT_URL", getEnv("FRONTEND_URL", "http://localhost:3000")+"/api/integrations/github/callback"),
 		},
+		GitHubApp: GitHubAppConfig{
+			AppID:          getEnv("GITHUB_APP_ID", ""),
+			PrivateKey:     getEnv("GITHUB_APP_PRIVATE_KEY", ""),
+			PrivateKeyPath: getEnv("GITHUB_APP_PRIVATE_KEY_PATH", ""),
+			Slug:           getEnv("GITHUB_APP_SLUG", ""),
+			WebhookSecret:  getEnv("GITHUB_APP_WEBHOOK_SECRET", ""),
+			ClientID:       getEnv("GITHUB_APP_CLIENT_ID", ""),
+			ClientSecret:   getEnv("GITHUB_APP_CLIENT_SECRET", ""),
+		},
+
 		RateLimit: RateLimitConfig{
 			Enabled:             getEnv("RATE_LIMIT_ENABLED", "true") != "false",
 			AuthLimit:           parseIntEnv("RATE_LIMIT_AUTH_PER_MINUTE", 30),

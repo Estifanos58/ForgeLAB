@@ -159,6 +159,10 @@ func main() {
 
 	sourceService := services.NewSourceService(pool, cfg.Docker.SourcesDir, encryptor)
 	githubService := services.NewGitHubService(pool, encryptor, cfg.GitHub, redisClient)
+	githubAppManager := services.NewGitHubAppManager(cfg.GitHubApp, pool, nil)
+	githubService.SetGitHubAppManager(githubAppManager)
+	repositoryImportService := services.NewRepositoryImportService(pool, cfg.Docker.SourcesDir, githubService)
+
 	userService := services.NewUserService(pool, jwtManager)
 	if cfg.App.AllowGuestMode {
 		if err := userService.EnsureGuestUser(ctx); err != nil {
@@ -170,6 +174,7 @@ func main() {
 	serviceService := services.NewServiceService(pool)
 	projectService := services.NewProjectService(pool, pathValidator, sourceService, githubService)
 	projectService.SetServiceService(serviceService)
+	projectService.SetImportService(repositoryImportService)
 	deploymentService := services.NewDeploymentService(pool)
 	secretService := services.NewSecretService(pool, encryptor, projectService)
 	deploymentService.SetSecretService(secretService)
@@ -355,6 +360,20 @@ func main() {
 		}()
 	}
 
+	// Launch periodic expired repository imports cleanup
+	go func() {
+		importTicker := time.NewTicker(30 * time.Minute)
+		defer importTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-importTicker.C:
+				repositoryImportService.PruneExpiredImports(ctx)
+			}
+		}
+	}()
+
 	// Rate Limiting (Fixed-Window Counter with Trusted Proxy validation)
 	rateLimiter := ratelimit.NewLimiter(redisClient, cfg.RateLimit.Enabled, cfg.RateLimit.TrustedProxies...)
 	wsHub.SetRateLimiter(rateLimiter, cfg.RateLimit.WSSubscriptionLimit)
@@ -366,7 +385,7 @@ func main() {
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
 	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, deploymentService, dockerEngine, deployQueue)
 	envHandler := handlers.NewEnvHandler(secretService, projectService)
-	integrationHandler := handlers.NewIntegrationHandler(githubService, cfg.App.FrontendURL, cfg.App.CookieSecure)
+	integrationHandler := handlers.NewIntegrationHandler(githubService, githubAppManager, repositoryImportService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
 	discoveryHandler := handlers.NewDiscoveryHandler(githubService, sourceService, pathValidator, secretService)
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
@@ -405,8 +424,9 @@ func main() {
 	r.Route("/api", func(r chi.Router) {
 		r.Use(middleware.ContentTypeJSON)
 
-		// Public GitHub OAuth integration callback
+		// Public GitHub OAuth & GitHub App integration callbacks
 		r.Get("/integrations/github/callback", integrationHandler.GitHubCallback)
+		r.Get("/integrations/github/app/callback", integrationHandler.GitHubAppCallback)
 
 		// Agent session validation (token-authenticated by agent)
 		r.Post("/sources/agent/session/validate", sourceHandler.ValidateAgentSession)
@@ -432,9 +452,9 @@ func main() {
 			})
 		})
 
-		// Registered-only integrations (GitHub)
+		// GitHub Integrations & Imports (accessible to registered and guest users; permissions enforced per-repo)
 		r.Group(func(r chi.Router) {
-			r.Use(middleware.AuthMiddleware(jwtManager))
+			r.Use(middleware.AuthOrGuestMiddleware(jwtManager, cfg.App.AllowGuestMode, cfg.App.AllowedOriginsList()...))
 
 			// Integrations (GitHub Repository Access)
 			r.Route("/integrations", func(r chi.Router) {
@@ -443,6 +463,7 @@ func main() {
 					r.Get("/connect", integrationHandler.ConnectGitHub)
 					r.Post("/connect", integrationHandler.ConnectGitHub)
 					r.Post("/token", integrationHandler.ConnectGitHubPAT)
+					r.Get("/app/install", integrationHandler.GetAppInstallURL)
 					r.Get("/orgs", integrationHandler.ListOrganizations)
 					r.Post("/disconnect", integrationHandler.DisconnectGitHub)
 					r.Get("/repositories", integrationHandler.ListRepositories)
@@ -450,6 +471,10 @@ func main() {
 					r.Get("/repositories/{owner}/{repo}/branches", integrationHandler.ListBranches)
 					r.Get("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
 					r.Post("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
+					r.Post("/imports", integrationHandler.StartImport)
+					r.Get("/imports/{id}", integrationHandler.GetImport)
+					r.Post("/imports/{id}/cancel", integrationHandler.CancelImport)
+					r.Post("/imports/{id}/retry", integrationHandler.RetryImport)
 				})
 			})
 		})

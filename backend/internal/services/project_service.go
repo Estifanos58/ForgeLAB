@@ -44,6 +44,7 @@ type ProjectService struct {
 	serviceService    *ServiceService
 	secretService     *SecretService
 	deploymentService *DeploymentService
+	importService     *RepositoryImportService
 }
 
 // NewProjectService creates a new ProjectService.
@@ -81,6 +82,10 @@ func (s *ProjectService) SetDeploymentService(ds *DeploymentService) {
 	s.deploymentService = ds
 }
 
+func (s *ProjectService) SetImportService(is *RepositoryImportService) {
+	s.importService = is
+}
+
 type CreateServiceInput struct {
 	Name                string                     `json:"name"`
 	Role                string                     `json:"role"`
@@ -112,7 +117,7 @@ type CreateServiceInput struct {
 // CreateProjectInput holds the data needed to create a project.
 type CreateProjectInput struct {
 	Name               string               `json:"name"`
-	SourceType         string               `json:"source_type"`      // "local", "local_directory", "local_upload", "local_agent", "github"
+	SourceType         string               `json:"source_type"`      // "local", "local_directory", "local_upload", "local_agent", "github", "github_public"
 	SourceReference    string               `json:"source_reference"` // repo "owner/repo", upload source_id, or agent source_id
 	AgentID            string               `json:"agent_id"`
 	RepositoryPath     string               `json:"repository_path"` // legacy/optional host path
@@ -129,6 +134,7 @@ type CreateProjectInput struct {
 	HealthCheckPath    *string              `json:"health_check_path"`
 	HealthStrategy     string               `json:"health_strategy"`
 	Services           []CreateServiceInput `json:"services"`
+	ImportID           *uuid.UUID           `json:"import_id,omitempty"`
 }
 
 // UpdateProjectInput holds the data that can be updated on a project.
@@ -183,21 +189,70 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 	sourceRef := strings.TrimSpace(input.SourceReference)
 	repoPath := strings.TrimSpace(input.RepositoryPath)
 
-	switch sourceType {
-	case models.SourceTypeGitHub:
-		if models.IsGuest(ownerID) {
-			return nil, fmt.Errorf("%w: registration required for github deployments", ErrValidationFailed)
+	var importedRecord *models.RepositoryImport
+	if input.ImportID != nil {
+		if s.importService != nil {
+			imp, err := s.importService.GetImport(ctx, ownerID, *input.ImportID)
+			if err != nil {
+				return nil, fmt.Errorf("%w: import not found or unauthorized: %v", ErrInvalidSource, err)
+			}
+			if imp.Status != models.ImportStatusReady {
+				return nil, fmt.Errorf("%w: repository import is not ready (status: %s)", ErrValidationFailed, imp.Status)
+			}
+			importedRecord = imp
+		} else if s.db != nil {
+			imp := &models.RepositoryImport{}
+			err := s.db.QueryRow(ctx,
+				`SELECT id, owner_id, repository_full_name, repository_id, is_private, branch, commit_sha, root_dir, source_type, status, snapshot_path, deployment_plan 
+				 FROM repository_imports WHERE id = $1 AND owner_id = $2`,
+				*input.ImportID, ownerID,
+			).Scan(&imp.ID, &imp.OwnerID, &imp.RepositoryFullName, &imp.RepositoryID, &imp.IsPrivate, &imp.Branch, &imp.CommitSHA, &imp.RootDir, &imp.SourceType, &imp.Status, &imp.SnapshotPath, &imp.DeploymentPlan)
+			if err != nil {
+				return nil, fmt.Errorf("%w: import not found or unauthorized: %v", ErrInvalidSource, err)
+			}
+			if imp.Status != models.ImportStatusReady {
+				return nil, fmt.Errorf("%w: repository import is not ready (status: %s)", ErrValidationFailed, imp.Status)
+			}
+			importedRecord = imp
 		}
+	}
+
+	if importedRecord != nil {
+		sourceRef = importedRecord.RepositoryFullName
+		if input.Branch == "" {
+			input.Branch = importedRecord.Branch
+		}
+		if importedRecord.IsPrivate {
+			sourceType = models.SourceTypeGitHub
+		} else {
+			sourceType = models.SourceTypeGitHubPublic
+		}
+		if len(input.DeploymentPlan) == 0 || string(input.DeploymentPlan) == "{}" {
+			if len(importedRecord.DeploymentPlan) > 0 && string(importedRecord.DeploymentPlan) != "{}" {
+				input.DeploymentPlan = importedRecord.DeploymentPlan
+			}
+		}
+	}
+
+	switch sourceType {
+	case models.SourceTypeGitHub, models.SourceTypeGitHubPublic:
 		if sourceRef == "" {
 			return nil, fmt.Errorf("%w: github repository (owner/name) is required", ErrValidationFailed)
 		}
-		if s.githubService != nil {
-			status, err := s.githubService.GetStatus(ctx, ownerID)
-			if err != nil || !status.Connected {
-				return nil, ErrGitHubNotConnected
+		if importedRecord != nil {
+			// Access was already verified and repository snapshot downloaded during import
+		} else if sourceType == models.SourceTypeGitHub {
+			if models.IsGuest(ownerID) {
+				return nil, fmt.Errorf("%w: registration required for github deployments", ErrValidationFailed)
 			}
-			if status.NeedsReauth {
-				return nil, ErrGitHubNeedsReauth
+			if s.githubService != nil {
+				status, err := s.githubService.GetStatus(ctx, ownerID)
+				if err != nil || !status.Connected {
+					return nil, ErrGitHubNotConnected
+				}
+				if status.NeedsReauth {
+					return nil, ErrGitHubNeedsReauth
+				}
 			}
 		}
 	case models.SourceTypeLocalAgent:
@@ -615,15 +670,34 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 	}
 
 	// 1. Insert or update source record
+	fingerprint := ""
+	metadataJSON := []byte("{}")
+	if importedRecord != nil {
+		fingerprint = importedRecord.CommitSHA
+		metaMap := map[string]interface{}{
+			"snapshot_path": importedRecord.SnapshotPath,
+			"commit_sha":    importedRecord.CommitSHA,
+			"import_id":     importedRecord.ID.String(),
+			"root_dir":      importedRecord.RootDir,
+			"source_type":   importedRecord.SourceType,
+			"is_private":    importedRecord.IsPrivate,
+		}
+		if b, err := json.Marshal(metaMap); err == nil {
+			metadataJSON = b
+		}
+	}
+
 	_, err = tx.Exec(ctx,
-		`INSERT INTO sources (id, owner_id, source_type, source_reference, agent_id, metadata, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, '{}', NOW(), NOW())
+		`INSERT INTO sources (id, owner_id, source_type, source_reference, agent_id, fingerprint, metadata, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
 		 ON CONFLICT (id) DO UPDATE SET
 		    source_type = EXCLUDED.source_type,
 		    source_reference = EXCLUDED.source_reference,
 		    agent_id = EXCLUDED.agent_id,
+		    fingerprint = EXCLUDED.fingerprint,
+		    metadata = EXCLUDED.metadata,
 		    updated_at = NOW()`,
-		sourceUUID, ownerID, sourceType, sourceRef, agentIDStr,
+		sourceUUID, ownerID, sourceType, sourceRef, agentIDStr, fingerprint, metadataJSON,
 	)
 	if err != nil {
 		slog.Error("source persistence failure during project creation",
@@ -699,6 +773,15 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			"error", err,
 		)
 		return nil, fmt.Errorf("transaction commit failure: %w", err)
+	}
+
+	// If imported repository, mark the import as completed
+	if importedRecord != nil {
+		if s.importService != nil {
+			_ = s.importService.MarkCompleted(ctx, ownerID, importedRecord.ID, project.ID)
+		} else if s.db != nil {
+			_, _ = s.db.Exec(ctx, `UPDATE repository_imports SET status = 'completed', project_id = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND owner_id = $3`, project.ID, importedRecord.ID, ownerID)
+		}
 	}
 
 	// If local agent source, mark session consumed in SessionManager
@@ -1355,8 +1438,17 @@ func (s *ProjectService) ImportProjectEnvironment(ctx context.Context, project *
 				}
 			}
 
-		case models.SourceTypeGitHub:
-			if s.githubService != nil && project.SourceReference != "" {
+		case models.SourceTypeGitHub, models.SourceTypeGitHubPublic:
+			if project.SourceID != nil && s.sourceService != nil {
+				if src, err := s.sourceService.GetSourceByID(ctx, *project.SourceID); err == nil && src != nil && src.Metadata != nil {
+					if snapVal, ok := src.Metadata["snapshot_path"].(string); ok && snapVal != "" {
+						if info, err := os.Stat(snapVal); err == nil && info.IsDir() {
+							workspaceDir = snapVal
+						}
+					}
+				}
+			}
+			if workspaceDir == "" && s.githubService != nil && project.SourceReference != "" {
 				parts := strings.Split(project.SourceReference, "/")
 				if len(parts) == 2 {
 					tempDir, err := os.MkdirTemp("", "forgelab-env-import-*")

@@ -63,7 +63,7 @@ func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *
 		return nil, nil
 	}
 
-	if project.SourceType == models.SourceTypeGitHub {
+	if project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic {
 		var targetSHA string
 		if commitSHA != nil && len(*commitSHA) == 40 {
 			targetSHA = *commitSHA
@@ -82,6 +82,22 @@ func (s *DeploymentService) resolveSourceRevision(ctx context.Context, project *
 				}
 				if resolvedSHA, err := s.githubService.ResolveCommitSHA(ctx, project.OwnerID, owner, repo, branch); err == nil && len(resolvedSHA) == 40 {
 					targetSHA = resolvedSHA
+				}
+			}
+		}
+		if targetSHA == "" && project.SourceID != nil && s.db != nil {
+			var fp string
+			var metaBytes []byte
+			if err := s.db.QueryRow(ctx, "SELECT fingerprint, metadata FROM sources WHERE id = $1", *project.SourceID).Scan(&fp, &metaBytes); err == nil {
+				if len(fp) == 40 {
+					targetSHA = fp
+				} else if len(metaBytes) > 0 {
+					var meta map[string]interface{}
+					if err := json.Unmarshal(metaBytes, &meta); err == nil {
+						if csha, ok := meta["commit_sha"].(string); ok && len(csha) == 40 {
+							targetSHA = csha
+						}
+					}
 				}
 			}
 		}
@@ -336,11 +352,11 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	if err != nil {
 		return nil, err
 	}
-	if project.SourceType == models.SourceTypeGitHub && (sourceRevision == nil || len(*sourceRevision) != 40) {
+	if (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic) && (sourceRevision == nil || len(*sourceRevision) != 40) {
 		return nil, fmt.Errorf("failed to pin immutable 40-character commit SHA for GitHub deployment of project '%s'", project.Name)
 	}
 	deployment.SourceRevision = sourceRevision
-	if project.SourceType == models.SourceTypeGitHub && sourceRevision != nil && len(*sourceRevision) == 40 {
+	if (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic) && sourceRevision != nil && len(*sourceRevision) == 40 {
 		deployment.CommitSHA = sourceRevision
 	}
 
@@ -683,7 +699,7 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	if err != nil {
 		return nil, err
 	}
-	if project.SourceType == models.SourceTypeGitHub && (sourceRevision == nil || len(*sourceRevision) != 40) {
+	if (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic) && (sourceRevision == nil || len(*sourceRevision) != 40) {
 		return nil, fmt.Errorf("failed to pin immutable 40-character commit SHA for GitHub service deployment of service '%s'", targetService.Name)
 	}
 

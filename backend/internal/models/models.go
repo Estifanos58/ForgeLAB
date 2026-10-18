@@ -381,7 +381,62 @@ const (
 	SourceTypeLocalUpload    = "local_upload"    // uploaded zip/tar.gz source workspace
 	SourceTypeLocalAgent     = "local_agent"     // connected ForgeLAB local agent
 	SourceTypeGitHub         = "github"          // GitHub repository
+	SourceTypeGitHubPublic   = "github_public"   // GitHub public repository (no auth required)
 )
+
+// Repository import lifecycle statuses
+const (
+	ImportStatusPending     = "pending"
+	ImportStatusVerifying   = "verifying"
+	ImportStatusResolving   = "resolving"
+	ImportStatusDownloading = "downloading"
+	ImportStatusExtracting  = "extracting"
+	ImportStatusDiscovering = "discovering"
+	ImportStatusReady       = "ready"
+	ImportStatusFailed      = "failed"
+	ImportStatusCancelled   = "cancelled"
+	ImportStatusCompleted   = "completed"
+	ImportStatusExpired     = "expired"
+)
+
+// RepositoryImport represents a durable repository import lifecycle record.
+type RepositoryImport struct {
+	ID                 uuid.UUID       `json:"id"`
+	OwnerID            uuid.UUID       `json:"owner_id"`
+	SourceType         string          `json:"source_type"` // "github", "github_public"
+	RepositoryID       string          `json:"repository_id,omitempty"`
+	RepositoryFullName string          `json:"repository_full_name"` // "owner/repo"
+	IsPrivate          bool            `json:"is_private"`
+	Branch             string          `json:"branch"`
+	CommitSHA          string          `json:"commit_sha"`
+	RootDir            string          `json:"root_dir"`
+	SnapshotPath       string          `json:"-"` // Internal disk path, not exposed in JSON
+	Status             string          `json:"status"`
+	Progress           int             `json:"progress"`
+	Stage              string          `json:"stage"`
+	ErrorMessage       string          `json:"error_message,omitempty"`
+	ErrorCode          string          `json:"error_code,omitempty"`
+	DiscoveryResult    json.RawMessage `json:"discovery_result,omitempty"`
+	DeploymentPlan     json.RawMessage `json:"deployment_plan,omitempty"`
+	ProjectID          *uuid.UUID      `json:"project_id,omitempty"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
+	ExpiresAt          time.Time       `json:"expires_at"`
+}
+
+// GitHubAppInstallation represents an authorized GitHub App installation for personal or organization accounts.
+type GitHubAppInstallation struct {
+	ID                  int64           `json:"id"`
+	AccountLogin        string          `json:"account_login"`
+	AccountID           int64           `json:"account_id"`
+	AccountType         string          `json:"account_type"`
+	AccountAvatarURL    string          `json:"account_avatar_url"`
+	RepositorySelection string          `json:"repository_selection"`
+	Permissions         json.RawMessage `json:"permissions,omitempty"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UpdatedAt           time.Time       `json:"updated_at"`
+}
+
 
 // Service roles
 const (

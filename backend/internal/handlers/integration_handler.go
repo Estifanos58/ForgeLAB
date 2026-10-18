@@ -18,20 +18,47 @@ import (
 
 type IntegrationHandler struct {
 	githubService *services.GitHubService
+	appManager    *services.GitHubAppManager
+	importService *services.RepositoryImportService
 	frontendURL   string
 	cookieSecure  bool
 }
 
-func NewIntegrationHandler(githubService *services.GitHubService, frontendURL string, cookieSecure ...bool) *IntegrationHandler {
+func NewIntegrationHandler(
+	githubService *services.GitHubService,
+	appManager *services.GitHubAppManager,
+	importService *services.RepositoryImportService,
+	frontendURL string,
+	cookieSecure ...bool,
+) *IntegrationHandler {
 	secure := false
 	if len(cookieSecure) > 0 {
 		secure = cookieSecure[0]
 	}
 	return &IntegrationHandler{
 		githubService: githubService,
+		appManager:    appManager,
+		importService: importService,
 		frontendURL:   frontendURL,
 		cookieSecure:  secure,
 	}
+}
+
+func (h *IntegrationHandler) SetGitHubAppManager(app *services.GitHubAppManager) {
+	h.appManager = app
+}
+
+func (h *IntegrationHandler) SetRepositoryImportService(imp *services.RepositoryImportService) {
+	h.importService = imp
+}
+
+func (h *IntegrationHandler) getAuthenticatedUserID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return uuid.Nil, false
+	}
+	return userID, true
 }
 
 func (h *IntegrationHandler) getRegisteredUserID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
@@ -46,6 +73,7 @@ func (h *IntegrationHandler) getRegisteredUserID(w http.ResponseWriter, r *http.
 	}
 	return userID, true
 }
+
 
 // GetGitHubStatus handles GET /api/integrations/github
 func (h *IntegrationHandler) GetGitHubStatus(w http.ResponseWriter, r *http.Request) {
@@ -249,7 +277,7 @@ func (h *IntegrationHandler) handleGitHubError(w http.ResponseWriter, err error,
 
 // GetRepository handles GET /api/integrations/github/repositories/{owner}/{repo}
 func (h *IntegrationHandler) GetRepository(w http.ResponseWriter, r *http.Request) {
-	userID, ok := h.getRegisteredUserID(w, r)
+	userID, ok := h.getAuthenticatedUserID(w, r)
 	if !ok {
 		return
 	}
@@ -303,7 +331,7 @@ func (h *IntegrationHandler) ListRepositories(w http.ResponseWriter, r *http.Req
 
 // ListBranches handles GET /api/integrations/github/repositories/{owner}/{repo}/branches
 func (h *IntegrationHandler) ListBranches(w http.ResponseWriter, r *http.Request) {
-	userID, ok := h.getRegisteredUserID(w, r)
+	userID, ok := h.getAuthenticatedUserID(w, r)
 	if !ok {
 		return
 	}
@@ -325,6 +353,165 @@ func (h *IntegrationHandler) ListBranches(w http.ResponseWriter, r *http.Request
 		"branches": branches,
 	})
 }
+
+// GetAppInstallURL handles GET /api/integrations/github/app/install
+func (h *IntegrationHandler) GetAppInstallURL(w http.ResponseWriter, r *http.Request) {
+	if h.appManager == nil || !h.appManager.IsConfigured() {
+		writeError(w, http.StatusServiceUnavailable, "GitHub App is not configured on the server")
+		return
+	}
+
+	slug := h.appManager.AppSlug()
+	if slug == "" {
+		writeError(w, http.StatusServiceUnavailable, "GitHub App slug is not configured")
+		return
+	}
+
+	state := uuid.New().String()
+	installURL := fmt.Sprintf("https://github.com/apps/%s/installations/new?state=%s", url.PathEscape(slug), state)
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"url": installURL,
+	})
+}
+
+// GitHubAppCallback handles GET /api/integrations/github/app/callback
+func (h *IntegrationHandler) GitHubAppCallback(w http.ResponseWriter, r *http.Request) {
+	installationIDStr := r.URL.Query().Get("installation_id")
+	if installationIDStr == "" {
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=missing_installation_id", http.StatusFound)
+		return
+	}
+
+	installationID, err := strconv.ParseInt(installationIDStr, 10, 64)
+	if err != nil {
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=invalid_installation_id", http.StatusFound)
+		return
+	}
+
+	userID, ok := getUserIDFromContext(r)
+	if ok && h.appManager != nil {
+		details, err := h.appManager.GetInstallationDetails(r.Context(), installationID)
+		if err == nil && details != nil {
+			_ = h.appManager.SaveInstallation(r.Context(), userID, details)
+		}
+	}
+
+	http.Redirect(w, r, h.frontendURL+"/dashboard?github_app_installed=true", http.StatusFound)
+}
+
+// StartImport handles POST /api/integrations/github/imports
+func (h *IntegrationHandler) StartImport(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getAuthenticatedUserID(w, r)
+	if !ok {
+		return
+	}
+
+	if h.importService == nil {
+		writeError(w, http.StatusInternalServerError, "repository import service not configured")
+		return
+	}
+
+	var input services.StartImportInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	imp, err := h.importService.StartImport(r.Context(), userID, input)
+	if err != nil {
+		if errors.Is(err, services.ErrImportInvalidInput) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to start import: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, imp)
+}
+
+// GetImport handles GET /api/integrations/github/imports/{id}
+func (h *IntegrationHandler) GetImport(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getAuthenticatedUserID(w, r)
+	if !ok {
+		return
+	}
+
+	importIDStr := chi.URLParam(r, "id")
+	importID, err := uuid.Parse(importIDStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid import id")
+		return
+	}
+
+	imp, err := h.importService.GetImport(r.Context(), userID, importID)
+	if err != nil {
+		if errors.Is(err, services.ErrImportNotFound) {
+			writeError(w, http.StatusNotFound, "import not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get import status")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, imp)
+}
+
+// CancelImport handles POST /api/integrations/github/imports/{id}/cancel
+func (h *IntegrationHandler) CancelImport(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getAuthenticatedUserID(w, r)
+	if !ok {
+		return
+	}
+
+	importIDStr := chi.URLParam(r, "id")
+	importID, err := uuid.Parse(importIDStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid import id")
+		return
+	}
+
+	imp, err := h.importService.CancelImport(r.Context(), userID, importID)
+	if err != nil {
+		if errors.Is(err, services.ErrImportNotFound) {
+			writeError(w, http.StatusNotFound, "import not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to cancel import")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, imp)
+}
+
+// RetryImport handles POST /api/integrations/github/imports/{id}/retry
+func (h *IntegrationHandler) RetryImport(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getAuthenticatedUserID(w, r)
+	if !ok {
+		return
+	}
+
+	importIDStr := chi.URLParam(r, "id")
+	importID, err := uuid.Parse(importIDStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid import id")
+		return
+	}
+
+	imp, err := h.importService.RetryImport(r.Context(), userID, importID)
+	if err != nil {
+		if errors.Is(err, services.ErrImportNotFound) {
+			writeError(w, http.StatusNotFound, "import not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to retry import")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, imp)
+}
+
 
 // DetectRepository handles GET /api/integrations/github/repositories/{owner}/{repo}/detect
 func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Request) {
