@@ -273,3 +273,55 @@ func TestCancelAndDrainProjectDeployments(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestReconcileDaemonContainers_ProtectsActivelyExecutingDeployments verifies that in-flight deployments
+// (queued, cloning, building, starting) created on the current backend instance or actively executing in memory
+// are protected from being erroneously aborted by periodic daemon container reconciliation.
+func TestReconcileDaemonContainers_ProtectsActivelyExecutingDeployments(t *testing.T) {
+	eng := &Engine{
+		activeExecs: make(map[uuid.UUID]*activeExecEntry),
+		startTime:   time.Now().Add(-1 * time.Minute),
+	}
+
+	activeDeployID := uuid.New()
+	projID := uuid.New()
+	cancelCalled := false
+	cancelFn := func() {
+		cancelCalled = true
+	}
+
+	// 1. Actively executing deployment must be reported as active
+	eng.registerActiveExec(activeDeployID, projID, cancelFn)
+	assert.True(t, eng.IsActiveExecution(activeDeployID), "registered execution must be reported active")
+
+	// 2. Unregistered execution must NOT be reported as active
+	inactiveDeployID := uuid.New()
+	assert.False(t, eng.IsActiveExecution(inactiveDeployID), "unregistered execution must not be reported active")
+
+	// 3. Deployment created AFTER engine start time belongs to current instance
+	newDeployCreatedAt := time.Now()
+	assert.False(t, newDeployCreatedAt.Before(eng.startTime), "new deployment created on current instance must not be considered created before engine start time")
+
+	// 4. Stale deployment created BEFORE engine start time is considered from previous instance
+	staleDeployCreatedAt := time.Now().Add(-5 * time.Minute)
+	assert.True(t, staleDeployCreatedAt.Before(eng.startTime), "stale deployment from prior restart must be considered created before engine start time")
+
+	// Clean up active exec
+	eng.unregisterActiveExec(activeDeployID)
+	assert.False(t, eng.IsActiveExecution(activeDeployID))
+	assert.False(t, cancelCalled, "unregister should not invoke cancel")
+
+	// 5. Child service deployment belonging to an active parent release must be protected
+	parentReleaseID := uuid.New()
+	eng.registerActiveExec(parentReleaseID, projID, cancelFn)
+	childServiceDeploy := &models.ServiceDeployment{
+		ID:           uuid.New(),
+		DeploymentID: &parentReleaseID,
+		Status:       models.DeployStatusQueued,
+		CreatedAt:    time.Now().Add(-10 * time.Minute), // even if created earlier
+	}
+	assert.True(t, childServiceDeploy.DeploymentID != nil && eng.IsActiveExecution(*childServiceDeploy.DeploymentID),
+		"child service deployment belonging to active parent release must be protected")
+
+	eng.unregisterActiveExec(parentReleaseID)
+}

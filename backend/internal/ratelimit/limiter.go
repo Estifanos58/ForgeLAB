@@ -194,17 +194,36 @@ func ExtractClientIP(r *http.Request, trustedProxies ...[]string) string {
 		xff := r.Header.Get("X-Forwarded-For")
 		if xff != "" {
 			parts := strings.Split(xff, ",")
-			ip := strings.TrimSpace(parts[0])
-			if ip != "" {
-				return ip
+			// Walk from right to left (closest trusted proxy to furthest)
+			for i := len(parts) - 1; i >= 0; i-- {
+				candidate := strings.TrimSpace(parts[i])
+				if candidate == "" {
+					continue
+				}
+				// Validate that candidate is a valid IP address
+				if net.ParseIP(candidate) == nil {
+					continue
+				}
+				// If candidate is another trusted proxy in the chain, step left
+				if IsTrustedProxy(candidate, proxies) {
+					continue
+				}
+				// The first non-trusted IP from the right is the genuine client IP
+				return candidate
+			}
+			// If all IPs in the chain were trusted proxies, return leftmost valid IP
+			for _, p := range parts {
+				candidate := strings.TrimSpace(p)
+				if net.ParseIP(candidate) != nil {
+					return candidate
+				}
 			}
 		}
 
-		xri := r.Header.Get("X-Real-IP")
-		if xri != "" {
-			ip := strings.TrimSpace(xri)
-			if ip != "" {
-				return ip
+		xri := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+		if xri != "" && net.ParseIP(xri) != nil {
+			if !IsTrustedProxy(xri, proxies) {
+				return xri
 			}
 		}
 	}

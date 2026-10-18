@@ -200,7 +200,8 @@ ForgeLAB strictly validates project ownership and cross-project isolation across
 - **Project Deletion & Safe Worker Draining:** When a project is deleted, all in-flight deployment workers are cancelled and synchronously drained via `CancelAndDrainProjectDeployments` before Docker container, network, or image cleanup commences. This ensures workers never create resources after cleanup has completed. Database and cancellation errors are strictly propagated to the caller, and all new deployment and rollback requests are rejected with `409 Conflict` (`ErrProjectDeleting`) while deletion is pending or retrying.
 - **Lifecycle Error Propagation:** `StopApp`, `StartApp`, `RestartApp`, `StopService`, `StartService`, and `RestartService` strictly propagate all Docker and database errors, ensuring failures are never reported as successes.
 - **Intentional Stop Protection:** `CheckContinuousRuntimeHealth` distinguishes between intentional clean stops (service status `stopped` with exit code 0, 137, or 143 from SIGTERM/SIGKILL) and unexpected crashes, preventing intentional user stops from being erroneously marked as crashes.
-- **Startup Reconciliation:** Initial Docker daemon container and runtime state reconciliation executes synchronously on server startup before deployment queue workers are launched, eliminating races between queue job processing and daemon state synchronization.
+- **Startup Reconciliation & Interrupted In-Flight Deployments:** Initial Docker daemon container and runtime state reconciliation executes synchronously on server startup before deployment queue workers are launched, eliminating races between queue job processing and daemon state synchronization. In addition, any deployment or service deployment interrupted mid-progress by a backend restart (`queued`, `cloning`, `building`, `starting`, `health_checking`) is detected and transitioned to `FAILED` with diagnostics (`Deployment interrupted: backend restarted while deployment was in progress`), unblocking redeployments.
+- **Port Exposure & Internal Services:** Only web/API services configured with public exposure have host ports allocated. Internal infrastructure (databases, caches, message brokers), background workers, and batch jobs are strictly forbidden from binding host ports (`shouldExposePort`), shielding internal communication within the project Docker network.
 - **State Machine & WebSocket Consistency:** Deployment status transitions are broadcast over WebSocket only when database persistence succeeds. The state machine strictly prevents direct invalid jumps from `queued` to `running`.
 
 ---
@@ -235,9 +236,12 @@ ForgeLAB supports registration-free local deployments for self-hosted and single
    - ForgeLAB is a self-hosted platform. Guest mode is enabled by default for single-user local development installations (`isDev`).
    - For remote or publicly accessible production installations, guest mode is disabled by default unless explicitly configured via `FORGELAB_ALLOW_GUEST_MODE=true`. This ensures shared guest access is never unintentionally exposed to untrusted public networks.
 
-6. **Abuse Protection & Rate Limiting:**
+6. **Abuse Protection, Rate Limiting & Resource Ceilings:**
    - Rate limiting for guest requests is enforced per client IP (`ip:<client_ip>:<resource>`) rather than using a single shared user counter, preventing one visitor from exhausting the global guest rate limit.
-   - Guest workspace enforces a maximum project limit (20 projects) to prevent resource exhaustion.
+   - Client IP extraction uses a secure trusted-proxy model: incoming `X-Forwarded-For` chains are traversed right-to-left stripping configured trusted proxies (`RATE_LIMIT_TRUSTED_PROXIES`), preventing header spoofing from untrusted clients. The Next.js API proxy also drops spoofed forwarding headers from untrusted external clients.
+   - Guest workspace enforces a maximum project limit (20 projects) and service limit (5 services per project).
+   - Guest services enforce strict resource ceilings: maximum 1000 millicores (1 core) CPU and 1024 MB RAM per service both at project creation and resource update.
+   - In-flight concurrent deployments for guests are strictly capped at 5 concurrent builds across both project and service deployments.
    - Source upload body size limits (`100MB`) and strict timeout/decompression guards apply equally to guest uploads.
 
 7. **Lifecycle & Docker Cleanliness:**

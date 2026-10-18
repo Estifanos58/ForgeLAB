@@ -60,15 +60,28 @@ func getMigrationsPath() string {
 }
 
 func TestMigration_Version14To15Ordering(t *testing.T) {
-	pool, dbURL := connectTestDB(t)
-	defer pool.Close()
+	basePool, _ := connectTestDB(t)
+	defer basePool.Close()
 
 	ctx := context.Background()
+	orderingDBName := fmt.Sprintf("forgelab_ord_%x", time.Now().UnixNano())
+
+	// Create a new separate database for migration ordering verification
+	_, err := basePool.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", orderingDBName))
+	require.NoError(t, err, "failed to create temporary ordering test database")
+	defer func() {
+		_, _ = basePool.Exec(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", orderingDBName))
+	}()
+
+	orderingDBURL := fmt.Sprintf("postgres://forgelab:forgelab_dev_password@localhost:5432/%s?sslmode=disable", orderingDBName)
+	pool, err := pgxpool.New(ctx, orderingDBURL)
+	require.NoError(t, err)
+	defer pool.Close()
 
 	// Locate migrations directory
 	migrationsPath := getMigrationsPath()
-	m, err := migrate.New(migrationsPath, dbURL)
-	require.NoError(t, err, "failed to initialize migrate")
+	m, err := migrate.New(migrationsPath, orderingDBURL)
+	require.NoError(t, err, "failed to initialize migrate on ordering database")
 	defer m.Close()
 
 	// Ensure we are at migration 15 first
@@ -134,7 +147,6 @@ func TestMigration_Version14To15Ordering(t *testing.T) {
 	`).Scan(&colCount)
 	require.NoError(t, err)
 	assert.Equal(t, 1, colCount, "networks column must exist on service_deployments at migration 15")
-	_ = m.Up()
 }
 
 func TestProjectCreation_WithComposeSemanticsRegression(t *testing.T) {
@@ -311,7 +323,43 @@ func TestMigration_FreshDatabaseAppliesAllMigrations(t *testing.T) {
 	version, dirty, err := m.Version()
 	require.NoError(t, err)
 	assert.False(t, dirty, "migration state must not be dirty")
-	assert.Equal(t, uint(16), version, "latest migration version must be 16")
+	assert.Equal(t, uint(17), version, "latest migration version must be 17")
+
+	// Connect to fresh database to verify migration 000017 effects and rollback safety
+	freshPool, err := pgxpool.New(ctx, freshDBURL)
+	require.NoError(t, err)
+	defer freshPool.Close()
+
+	var guestExists bool
+	err = freshPool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND email = $2)", models.GuestUserID, models.GuestUserEmail).Scan(&guestExists)
+	require.NoError(t, err)
+	assert.True(t, guestExists, "guest user must exist after migration 000017")
+
+	// Verify safe rollback of migration 000017 to version 000016
+	err = m.Steps(-1)
+	require.NoError(t, err, "rollback of migration 000017 must succeed when no guest resources exist")
+
+	rbVersion, rbDirty, err := m.Version()
+	require.NoError(t, err)
+	assert.False(t, rbDirty, "migration state must not be dirty after rollback")
+	assert.Equal(t, uint(16), rbVersion, "version must be 16 after rolling back migration 000017")
+
+	err = freshPool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", models.GuestUserID).Scan(&guestExists)
+	require.NoError(t, err)
+	assert.False(t, guestExists, "guest user must be deleted at migration version 16")
+
+	// Re-apply migration 000017 to verify idempotency
+	err = m.Steps(1)
+	require.NoError(t, err, "re-applying migration 000017 must succeed")
+
+	reVersion, reDirty, err := m.Version()
+	require.NoError(t, err)
+	assert.False(t, reDirty, "migration state must not be dirty after re-applying")
+	assert.Equal(t, uint(17), reVersion, "version must be 17 after re-applying migration 000017")
+
+	err = freshPool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", models.GuestUserID).Scan(&guestExists)
+	require.NoError(t, err)
+	assert.True(t, guestExists, "guest user must be restored after re-applying migration 000017")
 }
 
 func TestProjectCreation_NormalLocalProject_NoFailedToCreateProjectError(t *testing.T) {

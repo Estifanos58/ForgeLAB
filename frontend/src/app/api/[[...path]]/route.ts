@@ -1,9 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { extractClientIp } from '@/lib/api/trusted-proxy';
 
 export const dynamic = 'force-dynamic';
 
 function getBackendBaseUrl(): string {
   return process.env.BACKEND_INTERNAL_URL || process.env.BACKEND_URL || 'http://localhost:8080';
+}
+
+function getTrustedProxies(): string[] {
+  const envVal = process.env.RATE_LIMIT_TRUSTED_PROXIES || process.env.TRUSTED_PROXIES || '';
+  const parsed = envVal
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parsed.length === 0 && process.env.NODE_ENV !== 'production') {
+    return ['127.0.0.1', '::1', 'localhost'];
+  }
+  return parsed;
 }
 
 async function handleProxy(request: NextRequest) {
@@ -24,7 +37,8 @@ async function handleProxy(request: NextRequest) {
       lowerKey === 'upgrade' ||
       lowerKey.startsWith('x-forwarded-') ||
       lowerKey === 'x-real-ip' ||
-      lowerKey === 'forwarded'
+      lowerKey === 'forwarded' ||
+      lowerKey === 'cf-connecting-ip'
     ) {
       return; // Strip hop-by-hop and client-supplied forwarding headers
     }
@@ -41,8 +55,11 @@ async function handleProxy(request: NextRequest) {
     forwardedHeaders.set('authorization', authHeader);
   }
 
-  // Derive actual client IP from trusted request environment (not untrusted client header)
-  const clientIp = (request as any).ip || (request as any).socket?.remoteAddress || '127.0.0.1';
+  // Derive authoritative client IP using trusted-proxy model
+  const trustedProxies = getTrustedProxies();
+  const isDev = process.env.NODE_ENV !== 'production';
+  const directPeerIp = (request as any).ip || (request as any).socket?.remoteAddress;
+  const clientIp = extractClientIp(request.headers, trustedProxies, isDev, directPeerIp);
   const proto = request.nextUrl.protocol.replace(':', '') || 'http';
   const host = request.headers.get('host') || 'localhost:3000';
 

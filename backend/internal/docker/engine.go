@@ -77,6 +77,7 @@ type Engine struct {
 	sharedCoordMu        sync.Mutex              // protects initialization and mutation of sharedCoordinator
 	sharedCoordinator    *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
 	cachedBuilderVer     atomic.Value            // stores types.BuilderVersion advertised by Docker daemon
+	startTime            time.Time               // instance boot timestamp for tracking interrupted deployments
 }
 
 func (e *Engine) trackActiveContainer(id string) {
@@ -149,6 +150,7 @@ func NewEngine(
 		buildSem:            NewBuildSemaphore(DefaultMaxConcurrentBuilds()),
 		sharedCoordinator:   NewSharedBuildCoordinator(),
 		activeExecs:         make(map[uuid.UUID]*activeExecEntry),
+		startTime:           time.Now(),
 	}
 }
 
@@ -299,6 +301,14 @@ func (e *Engine) unregisterActiveExec(id uuid.UUID) {
 	e.activeCancels.Delete(id)
 }
 
+// IsActiveExecution reports whether a release deployment or service deployment is currently actively executing in memory.
+func (e *Engine) IsActiveExecution(id uuid.UUID) bool {
+	e.activeExecMu.Lock()
+	defer e.activeExecMu.Unlock()
+	_, ok := e.activeExecs[id]
+	return ok
+}
+
 // RegisterActiveCancel registers a cancellation function for an active deployment execution.
 func (e *Engine) RegisterActiveCancel(deploymentID uuid.UUID, cancel context.CancelFunc) {
 	e.activeCancels.Store(deploymentID, cancel)
@@ -440,11 +450,23 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	// Stale / superseded deployment check: if already terminal (e.g. superseded while in queue or cancelled), do not run!
 	if models.IsDeploymentTerminalStatus(serviceDeploy.Status) {
-		slog.Info("service deployment already in terminal state; skipping execution", "service_deployment_id", serviceDeploymentID, "status", serviceDeploy.Status)
-		if serviceDeploy.Status == models.DeployStatusRunning {
-			return nil
+		// If service deployment was prematurely marked failed by backend restart reconciliation,
+		// but its parent release deployment is actively running right now, recover it to queued!
+		if serviceDeploy.Status == models.DeployStatusFailed &&
+			serviceDeploy.FailureReason != nil &&
+			strings.Contains(*serviceDeploy.FailureReason, "interrupted: backend restarted") &&
+			serviceDeploy.DeploymentID != nil &&
+			e.IsActiveExecution(*serviceDeploy.DeploymentID) {
+			slog.Info("recovering service deployment prematurely marked interrupted by backend restart", "service_deployment_id", serviceDeploymentID)
+			_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploymentID, models.DeployStatusQueued, nil)
+			serviceDeploy.Status = models.DeployStatusQueued
+		} else {
+			slog.Info("service deployment already in terminal state; skipping execution", "service_deployment_id", serviceDeploymentID, "status", serviceDeploy.Status)
+			if serviceDeploy.Status == models.DeployStatusRunning {
+				return nil
+			}
+			return fmt.Errorf("service deployment %s is already in terminal state '%s'", serviceDeploymentID, serviceDeploy.Status)
 		}
-		return fmt.Errorf("service deployment %s is already in terminal state '%s'", serviceDeploymentID, serviceDeploy.Status)
 	}
 	if e.deploymentService != nil {
 		if superseded, err := e.deploymentService.IsServiceDeploymentSuperseded(ctx, serviceDeploy.ServiceID, serviceDeploy.DeployNumber); err == nil && superseded {
@@ -1735,10 +1757,37 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	_ = e.dockerClient.ContainerRemove(cleanupCtx, containerName, container.RemoveOptions{Force: true})
 	cleanupCancel()
 
+	hasWritableVolume := false
+	for _, v := range service.Volumes {
+		if !v.ReadOnly {
+			hasWritableVolume = true
+			break
+		}
+	}
+	isStateful := hasWritableVolume || len(binds) > 0 || service.Classification == models.ClassificationInfrastructure
+
+	var stoppedPreviousForStateful bool
+	if isStateful && hasPreviousHealthy && previousContainerID != nil && *previousContainerID != "" {
+		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for stateful service '%s' to release volume locks...", (*previousContainerID)[:12], service.Name))
+		if previousDeploymentID != nil {
+			e.StopLogCollector(*previousDeploymentID)
+		}
+		stopTimeoutSec := 15
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = e.dockerClient.ContainerStop(stopCtx, *previousContainerID, container.StopOptions{Timeout: &stopTimeoutSec})
+		stopCancel()
+		stoppedPreviousForStateful = true
+	}
+
 	resp, err := e.dockerClient.ContainerCreate(execCtx, containerConfig, hostConfig, netConfig, nil, containerName)
 	if err != nil {
 		if hostPort != nil {
 			e.portManager.ReleasePort(*hostPort)
+		}
+		if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
+			restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
+			restartCancel()
 		}
 		reason := fmt.Sprintf("Failed to create container for service '%s': %v", service.Name, err)
 		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
@@ -1768,6 +1817,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		cleanupCancel()
 		if hostPort != nil {
 			e.portManager.ReleasePort(*hostPort)
+		}
+		if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
+			restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
+			restartCancel()
 		}
 		reason := fmt.Sprintf("Failed to start container for service '%s': %v", service.Name, err)
 		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
@@ -1875,6 +1929,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 
 		if hasPreviousHealthy {
+			if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
+				restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
+				restartCancel()
+			}
 			emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("SAFETY INVARIANT ENFORCED: New deployment for '%s' failed health check. Previous healthy container remains active!", service.Name))
 		}
 		emitStatus(models.DeployStatusFailed, nil, &detailedReason)
@@ -1899,6 +1958,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		reason := fmt.Sprintf("Failed to promote service deployment '%s': %v", service.Name, err)
 		emitLog(models.LogPhaseHealth, models.LogStreamStderr, reason)
 		if hasPreviousHealthy {
+			if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
+				restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
+				restartCancel()
+			}
 			emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("SAFETY INVARIANT ENFORCED: Promotion failed for '%s'. Previous healthy container and deployment remain active!", service.Name))
 		}
 		emitStatus(models.DeployStatusFailed, nil, &reason)
@@ -1911,12 +1975,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	// 6. Cleanup previous container for this service if different
 	if previousContainerID != nil && *previousContainerID != "" && *previousContainerID != containerID {
-		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for service '%s'...", (*previousContainerID)[:12], service.Name))
-		if previousDeploymentID != nil {
-			e.StopLogCollector(*previousDeploymentID)
+		if !stoppedPreviousForStateful {
+			emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for service '%s'...", (*previousContainerID)[:12], service.Name))
+			if previousDeploymentID != nil {
+				e.StopLogCollector(*previousDeploymentID)
+			}
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = e.dockerClient.ContainerStop(cleanupCtx, *previousContainerID, container.StopOptions{})
+			cleanupCancel()
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = e.dockerClient.ContainerStop(cleanupCtx, *previousContainerID, container.StopOptions{})
 		_ = e.dockerClient.ContainerRemove(cleanupCtx, *previousContainerID, container.RemoveOptions{Force: true})
 		cleanupCancel()
 	}
@@ -2143,14 +2211,25 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		for _, sd := range tier {
 			// If service deployment is already terminal failed or skipped from a prior attempt, mark as failed
 			if sd.Status == models.DeployStatusFailed || sd.Status == models.DeployStatusSkipped || sd.Status == models.DeployStatusCrashed {
-				mu.Lock()
-				allHealthy = false
-				failedServices[sd.ServiceName] = true
-				serviceExitCodes[sd.ServiceName] = 1
-				serviceHealthy[sd.ServiceName] = false
-				errList = append(errList, fmt.Sprintf("%s: service deployment is already in terminal state '%s'", sd.ServiceName, sd.Status))
-				mu.Unlock()
-				continue
+				// If this service deployment was prematurely marked interrupted by backend restart reconciliation,
+				// recover it so it can execute in this active release run
+				if sd.Status == models.DeployStatusFailed &&
+					sd.FailureReason != nil &&
+					strings.Contains(*sd.FailureReason, "interrupted: backend restarted") {
+					slog.Info("recovering tier service deployment prematurely marked interrupted by backend restart", "service_deployment_id", sd.ID, "service", sd.ServiceName)
+					_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusQueued, nil)
+					sd.Status = models.DeployStatusQueued
+					sd.FailureReason = nil
+				} else {
+					mu.Lock()
+					allHealthy = false
+					failedServices[sd.ServiceName] = true
+					serviceExitCodes[sd.ServiceName] = 1
+					serviceHealthy[sd.ServiceName] = false
+					errList = append(errList, fmt.Sprintf("%s: service deployment is already in terminal state '%s'", sd.ServiceName, sd.Status))
+					mu.Unlock()
+					continue
+				}
 			}
 
 			// If already running from a prior healthy deployment in this release, preserve healthy state

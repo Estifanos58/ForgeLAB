@@ -598,6 +598,26 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 			slog.Warn("reconciliation: failed to list active service deployments", "error", err)
 		} else {
 			for _, sd := range activeSDs {
+				// Reconcile interrupted in-flight deployments whose workers terminated when backend restarted.
+				// A deployment can only be interrupted by a backend restart if:
+				// 1. It was created BEFORE this backend instance started up, AND
+				// 2. Neither it NOR its parent release deployment is currently actively executing in memory.
+				if sd.Status == models.DeployStatusQueued ||
+					sd.Status == models.DeployStatusCloning ||
+					sd.Status == models.DeployStatusBuilding ||
+					sd.Status == models.DeployStatusStarting ||
+					sd.Status == models.DeployStatusHealthChecking {
+					if e.IsActiveExecution(sd.ID) ||
+						(sd.DeploymentID != nil && e.IsActiveExecution(*sd.DeploymentID)) ||
+						(!sd.CreatedAt.IsZero() && !sd.CreatedAt.Before(e.startTime)) {
+						continue
+					}
+					reason := "Deployment interrupted: backend restarted while service deployment was in progress"
+					_ = e.deploymentService.FailServiceDeployment(ctx, sd.ID, reason)
+					slog.Info("reconciliation: interrupted in-flight service deployment marked failed", "service_deployment_id", sd.ID, "status", sd.Status)
+					continue
+				}
+
 				if sd.ContainerID == nil || *sd.ContainerID == "" {
 					continue
 				}
@@ -634,6 +654,27 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 			slog.Warn("reconciliation: failed to list active deployments", "error", err)
 		} else {
 			for _, d := range deployments {
+				// Reconcile interrupted in-flight deployments whose workers terminated when backend restarted.
+				// A deployment can only be interrupted by a backend restart if:
+				// 1. It was created BEFORE this backend instance started up, AND
+				// 2. It is not currently actively executing in memory.
+				if d.Status == models.DeployStatusQueued ||
+					d.Status == models.DeployStatusCloning ||
+					d.Status == models.DeployStatusBuilding ||
+					d.Status == models.DeployStatusStarting ||
+					d.Status == models.DeployStatusHealthChecking {
+					if e.IsActiveExecution(d.ID) || (!d.CreatedAt.IsZero() && !d.CreatedAt.Before(e.startTime)) {
+						continue
+					}
+					reason := "Deployment interrupted: backend restarted while deployment was in progress"
+					_ = e.deploymentService.UpdateDeploymentStatus(ctx, d.ID, models.DeployStatusFailed, &reason)
+					if e.projectService != nil {
+						_ = e.projectService.UpdateProjectStatus(ctx, d.ProjectID, models.ProjectStatusStopped)
+					}
+					slog.Info("reconciliation: interrupted in-flight deployment marked failed", "deployment_id", d.ID, "status", d.Status)
+					continue
+				}
+
 				if d.ContainerID == nil || *d.ContainerID == "" {
 					continue
 				}

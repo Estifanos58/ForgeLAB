@@ -93,6 +93,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-debug}
       FORGELAB_IN_DOCKER: "true"
       FORGELAB_AGENT_URL: ${FORGELAB_AGENT_URL:-http://host.docker.internal:4142}
+      RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - forgelab_builds:/app/data/builds
@@ -127,6 +128,7 @@ services:
       NODE_ENV: production
       BACKEND_INTERNAL_URL: http://backend:8080
       NEXT_PUBLIC_APP_URL: http://localhost:3000
+      RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
     depends_on:
       backend:
         condition: service_healthy

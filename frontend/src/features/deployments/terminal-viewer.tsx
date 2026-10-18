@@ -156,16 +156,57 @@ export function TerminalViewer({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const getStreamColor = (stream: string) => {
-    switch (stream) {
-      case 'stderr':
-        return 'text-red-400';
-      case 'system':
-        return 'text-neutral-200 font-medium';
-      case 'stdout':
-      default:
-        return 'text-neutral-300';
+  const getLogTextColor = (message: string, stream: string) => {
+    const trimmed = message.trim();
+    const lower = trimmed.toLowerCase();
+
+    // Explicit error patterns
+    const isError =
+      lower.startsWith('error') ||
+      lower.startsWith('fatal') ||
+      lower.includes('[error]') ||
+      lower.includes('level=error') ||
+      lower.includes('error:') ||
+      lower.includes('fatal:') ||
+      lower.includes('panic:') ||
+      lower.includes('exception:') ||
+      (lower.includes('failed') && !lower.includes('0 failed'));
+
+    // Informational patterns that commonly appear on stderr (e.g. Postgres LOG, package managers, progress)
+    const isInfoNotice =
+      lower.startsWith('log:') ||
+      lower.includes(' log: ') ||
+      lower.startsWith('notice:') ||
+      lower.startsWith('detail:') ||
+      lower.startsWith('hint:') ||
+      lower.startsWith('step ') ||
+      lower.includes('level=info') ||
+      lower.startsWith('info:') ||
+      lower.includes('[info]');
+
+    if (isError && !isInfoNotice) {
+      return 'text-red-400';
     }
+
+    // Warning patterns
+    const isWarning =
+      lower.startsWith('warn') ||
+      lower.startsWith('warning') ||
+      lower.includes('[warn]') ||
+      lower.includes('level=warn') ||
+      lower.includes('warning:') ||
+      lower.includes('deprecated');
+
+    if (isWarning && !isInfoNotice) {
+      return 'text-amber-400';
+    }
+
+    if (stream === 'system') {
+      return 'text-neutral-200 font-medium';
+    }
+
+    // Standard stdout and non-error stderr output are rendered with clean neutral contrast
+    return 'text-neutral-300';
   };
 
   const getPhaseColor = (phase: string) => {
@@ -302,7 +343,7 @@ export function TerminalViewer({
                   {log.phase}
                 </span>
 
-                <span className={cn('break-all whitespace-pre-wrap flex-1', getStreamColor(log.stream))}>
+                <span className={cn('break-all whitespace-pre-wrap flex-1', getLogTextColor(log.message, log.stream))}>
                   {log.message}
                 </span>
 

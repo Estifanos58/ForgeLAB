@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/docker"
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/queue"
 	"github.com/forgelab/backend/internal/services"
 )
@@ -721,6 +722,17 @@ func (h *ServiceHandler) UpdateResources(w http.ResponseWriter, r *http.Request)
 	if input.EphemeralStorageMB != nil && *input.EphemeralStorageMB > 0 {
 		writeError(w, http.StatusBadRequest, "ephemeral_storage_mb is not supported on this host environment; remove or leave empty")
 		return
+	}
+
+	if models.IsGuest(userID) {
+		if cfg.CpuMillicores > 1000 {
+			writeError(w, http.StatusBadRequest, "guest quota exceeded: maximum 1000 millicores (1 core) per service")
+			return
+		}
+		if cfg.MemoryMB > 1024 {
+			writeError(w, http.StatusBadRequest, "guest quota exceeded: maximum 1024 MB (1 GB) per service")
+			return
+		}
 	}
 
 	if err := h.serviceService.UpdateServiceResources(r.Context(), serviceID, cfg); err != nil {

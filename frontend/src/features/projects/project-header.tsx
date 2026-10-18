@@ -52,11 +52,12 @@ export function ProjectHeader({
     }
   }
 
-  // Fallback if not resolved from individual services: check project-level preview_url or port
-  // strictly when project is confirmed running or partially_running
+  // Fallback if not resolved from individual services: only for legacy single-service projects
+  // strictly when project is confirmed running
   if (
     !primaryPreviewUrl &&
-    (project.status === 'running' || project.status === 'partially_running') &&
+    services.length === 0 &&
+    project.status === 'running' &&
     (project.preview_url || project.port)
   ) {
     primaryPreviewUrl =

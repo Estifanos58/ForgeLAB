@@ -202,7 +202,11 @@ func Load() (*Config, error) {
 	}
 
 	// 5. Validate Trusted Proxies
-	trustedProxies := parseStringSlice(getEnv("RATE_LIMIT_TRUSTED_PROXIES", ""))
+	rawTrustedProxies := getEnv("RATE_LIMIT_TRUSTED_PROXIES", "")
+	if isDev && strings.TrimSpace(rawTrustedProxies) == "" {
+		rawTrustedProxies = "127.0.0.1,::1"
+	}
+	trustedProxies := parseStringSlice(rawTrustedProxies)
 	if err := validateTrustedProxies(trustedProxies, isDev, envMode); err != nil {
 		return nil, err
 	}
@@ -325,7 +329,7 @@ func Load() (*Config, error) {
 			DeployLimit:         parseIntEnv("RATE_LIMIT_DEPLOY_PER_MINUTE", 60),
 			WSConnLimit:         parseIntEnv("RATE_LIMIT_WS_CONN_PER_MINUTE", 120),
 			WSSubscriptionLimit: parseIntEnv("RATE_LIMIT_WS_SUB_PER_MINUTE", 120),
-			TrustedProxies:      parseStringSlice(getEnv("RATE_LIMIT_TRUSTED_PROXIES", "")),
+			TrustedProxies:      trustedProxies,
 		},
 	}
 

@@ -27,10 +27,26 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("unable to create connection pool: %w", err)
 	}
 
-	// Verify the connection
-	if err := pool.Ping(ctx); err != nil {
+	// Verify the connection with retries for startup readiness
+	var pingErr error
+	for attempt := 1; attempt <= 15; attempt++ {
+		pingErr = pool.Ping(ctx)
+		if pingErr == nil {
+			break
+		}
+		if attempt < 15 {
+			slog.Warn("database ping failed, retrying...", "attempt", attempt, "error", pingErr)
+			select {
+			case <-ctx.Done():
+				pool.Close()
+				return nil, ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+	if pingErr != nil {
 		pool.Close()
-		return nil, fmt.Errorf("unable to ping database: %w", err)
+		return nil, fmt.Errorf("unable to ping database after retries: %w", pingErr)
 	}
 
 	slog.Info("connected to PostgreSQL",

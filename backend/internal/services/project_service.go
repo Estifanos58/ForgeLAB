@@ -604,6 +604,14 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		if len(servicesToCreate) > 10 {
 			return nil, fmt.Errorf("%w: guest projects can have at most 10 services", ErrValidationFailed)
 		}
+		for _, s := range servicesToCreate {
+			if s.CpuMillicores > 1000 {
+				return nil, fmt.Errorf("%w: guest quota exceeded: maximum 1000 millicores (1 core) per service", ErrValidationFailed)
+			}
+			if s.MemoryMB > 1024 {
+				return nil, fmt.Errorf("%w: guest quota exceeded: maximum 1024 MB (1 GB) per service", ErrValidationFailed)
+			}
+		}
 	}
 
 	// 1. Insert or update source record
@@ -1171,8 +1179,11 @@ func (s *ProjectService) PopulateProjectPreviewURL(p *models.Project) {
 
 	for _, svc := range p.Services {
 		// Only running public services have an active live preview URL
-		isFrontend := svc.Role == models.RoleFrontend || strings.Contains(strings.ToLower(svc.Name), "frontend")
-		isPublic := svc.PublicExposed || isFrontend
+		isInternal := svc.Classification == models.ClassificationInfrastructure ||
+			svc.Classification == models.ClassificationWorker ||
+			svc.Classification == models.ClassificationJob
+		isFrontend := !isInternal && (svc.Role == models.RoleFrontend || strings.Contains(strings.ToLower(svc.Name), "frontend"))
+		isPublic := !isInternal && (svc.PublicExposed || isFrontend)
 		if svc.Status == models.ServiceStatusRunning && svc.HostPort != nil && *svc.HostPort > 0 && isPublic {
 			urlStr := fmt.Sprintf("http://%s:%d", publicHost, *svc.HostPort)
 			svc.PreviewURL = &urlStr
@@ -1191,7 +1202,7 @@ func (s *ProjectService) PopulateProjectPreviewURL(p *models.Project) {
 		p.PreviewURL = frontendSvcURL
 	} else if primarySvcURL != nil {
 		p.PreviewURL = primarySvcURL
-	} else if (p.Status == models.ProjectStatusRunning || p.Status == models.ProjectStatusPartiallyRunning) && p.Port != nil && *p.Port > 0 {
+	} else if len(p.Services) == 0 && (p.Status == models.ProjectStatusRunning || p.Status == models.ProjectStatusPartiallyRunning) && p.Port != nil && *p.Port > 0 {
 		urlStr := fmt.Sprintf("http://%s:%d", publicHost, *p.Port)
 		p.PreviewURL = &urlStr
 	} else {

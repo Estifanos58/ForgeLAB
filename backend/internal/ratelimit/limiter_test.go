@@ -206,4 +206,40 @@ func TestExtractClientIP_TrustedProxies(t *testing.T) {
 			t.Fatalf("expected real IP 198.51.100.99 from CIDR trusted proxy, got %s", ip)
 		}
 	})
+
+	t.Run("rejects spoofed X-Forwarded-For prefix by walking right to left", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		// Attacker injected 1.1.1.1; reverse proxy appended attacker's genuine IP 198.51.100.42
+		req.Header.Set("X-Forwarded-For", "1.1.1.1, 198.51.100.42")
+
+		ip := ExtractClientIP(req, trustedProxies)
+		if ip != "198.51.100.42" {
+			t.Fatalf("expected genuine IP 198.51.100.42, rejecting spoofed 1.1.1.1, got %s", ip)
+		}
+	})
+
+	t.Run("multi-hop trusted proxies are skipped right to left", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		// Chain: Client (198.51.100.42) -> Trusted Proxy 1 (10.0.0.5) -> Trusted Proxy 2 (127.0.0.1) -> Backend
+		req.Header.Set("X-Forwarded-For", "spoofed.ip, 198.51.100.42, 10.0.0.5")
+
+		ip := ExtractClientIP(req, trustedProxies)
+		if ip != "198.51.100.42" {
+			t.Fatalf("expected client IP 198.51.100.42 after skipping trusted proxy 10.0.0.5, got %s", ip)
+		}
+	})
+
+	t.Run("all trusted proxies in chain returns leftmost valid IP", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("X-Forwarded-For", "10.0.0.2, 10.0.0.3")
+
+		ip := ExtractClientIP(req, trustedProxies)
+		if ip != "10.0.0.2" {
+			t.Fatalf("expected leftmost IP 10.0.0.2 when all are trusted, got %s", ip)
+		}
+	})
 }
+

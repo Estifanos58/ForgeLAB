@@ -233,9 +233,11 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	if models.IsGuest(project.OwnerID) {
 		var activeGuestDeployments int
 		err = tx.QueryRow(ctx,
-			`SELECT COUNT(*) FROM deployments d
-			 JOIN projects p ON d.project_id = p.id
-			 WHERE p.owner_id = $1 AND d.status IN ($2, $3, $4, $5, $6)`,
+			`SELECT (
+				(SELECT COUNT(*) FROM deployments d JOIN projects p ON d.project_id = p.id WHERE p.owner_id = $1 AND d.status IN ($2, $3, $4, $5, $6))
+				+
+				(SELECT COUNT(*) FROM service_deployments sd JOIN services s ON sd.service_id = s.id JOIN projects p ON s.project_id = p.id WHERE p.owner_id = $1 AND sd.status IN ($2, $3, $4, $5, $6))
+			)`,
 			project.OwnerID,
 			models.DeployStatusQueued,
 			models.DeployStatusCloning,
@@ -537,10 +539,11 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	if models.IsGuest(project.OwnerID) {
 		var activeGuestDeployments int
 		err = tx.QueryRow(ctx,
-			`SELECT COUNT(*) FROM service_deployments sd
-			 JOIN services s ON sd.service_id = s.id
-			 JOIN projects p ON s.project_id = p.id
-			 WHERE p.owner_id = $1 AND sd.status IN ($2, $3, $4, $5, $6)`,
+			`SELECT (
+				(SELECT COUNT(*) FROM deployments d JOIN projects p ON d.project_id = p.id WHERE p.owner_id = $1 AND d.status IN ($2, $3, $4, $5, $6))
+				+
+				(SELECT COUNT(*) FROM service_deployments sd JOIN services s ON sd.service_id = s.id JOIN projects p ON s.project_id = p.id WHERE p.owner_id = $1 AND sd.status IN ($2, $3, $4, $5, $6))
+			)`,
 			project.OwnerID,
 			models.DeployStatusQueued,
 			models.DeployStatusCloning,
@@ -1009,7 +1012,7 @@ func (s *DeploymentService) ListActiveDeployments(ctx context.Context) ([]*model
 		 COALESCE(execution_mode, 'build'), image_digest, env_config_hash, env_snapshot,
 		 started_at, built_at, deployed_at, finished_at, duration_ms, failure_reason, created_at,
 		 COALESCE(deployment_strategy, 'dockerfile'), deployment_plan
-		 FROM deployments WHERE status IN ('running', 'cloning', 'building', 'starting', 'health_checking')
+		 FROM deployments WHERE status IN ('queued', 'running', 'cloning', 'building', 'starting', 'health_checking')
 		 ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -1047,7 +1050,7 @@ func (s *DeploymentService) ListActiveServiceDeployments(ctx context.Context) ([
 	}
 
 	rows, err := s.db.Query(ctx,
-		`SELECT id, service_id, deploy_number, status, container_id, host_port, internal_port
+		`SELECT id, deployment_id, service_id, deploy_number, status, container_id, host_port, internal_port, created_at
 		 FROM service_deployments
 		 WHERE status IN ('queued', 'cloning', 'building', 'starting', 'health_checking', 'running')`,
 	)
@@ -1060,8 +1063,8 @@ func (s *DeploymentService) ListActiveServiceDeployments(ctx context.Context) ([
 	for rows.Next() {
 		sd := &models.ServiceDeployment{}
 		err := rows.Scan(
-			&sd.ID, &sd.ServiceID, &sd.DeployNumber, &sd.Status,
-			&sd.ContainerID, &sd.HostPort, &sd.InternalPort,
+			&sd.ID, &sd.DeploymentID, &sd.ServiceID, &sd.DeployNumber, &sd.Status,
+			&sd.ContainerID, &sd.HostPort, &sd.InternalPort, &sd.CreatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan active service deployment: %w", err)

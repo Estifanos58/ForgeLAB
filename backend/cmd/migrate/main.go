@@ -80,12 +80,12 @@ func main() {
 
 	var m *migrate.Migrate
 	var err error
-	for attempts := 1; attempts <= 15; attempts++ {
+	for attempts := 1; attempts <= 45; attempts++ {
 		m, err = migrate.New(migrationsPath, databaseURL)
 		if err == nil {
 			break
 		}
-		log.Printf("Waiting for database to accept connections (attempt %d/15): %v", attempts, err)
+		log.Printf("Waiting for database to accept connections (attempt %d/45): %v", attempts, err)
 		time.Sleep(2 * time.Second)
 	}
 	if err != nil {

@@ -80,6 +80,11 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 	var discResult *discovery.DiscoveryResult
 	var workspaceDir string
 	var cleanupDir func()
+	defer func() {
+		if cleanupDir != nil {
+			cleanupDir()
+		}
+	}()
 	var sourceRevision string
 
 	switch req.SourceType {
@@ -240,9 +245,6 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if cleanupDir != nil {
-		defer cleanupDir()
-	}
 
 	// 1. Run authoritative discovery engine if not provided by authoritative agent
 	if discResult == nil {

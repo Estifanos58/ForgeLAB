@@ -30,8 +30,8 @@ interface ProjectPageProps {
 function derivePrimaryPreviewUrl(project: Project | null): string | null {
   if (!project) return null;
   const services = project.services || [];
-  const runningServices = services.filter((s) => s.status === 'running');
   if (services.length > 0) {
+    const runningServices = services.filter((s) => s.status === 'running');
     const frontendSvc = runningServices.find(
       (s) =>
         (s.role === 'frontend' || s.name.toLowerCase() === 'frontend') &&
@@ -56,10 +56,13 @@ function derivePrimaryPreviewUrl(project: Project | null): string | null {
           : null)
       );
     }
+    // If services exist, never fall back to project.port if no running public service exists
+    return null;
   }
 
+  // Fallback for single-service legacy projects without independent services
   if (
-    (project.status === 'running' || project.status === 'partially_running') &&
+    project.status === 'running' &&
     (project.preview_url || project.port)
   ) {
     return (
