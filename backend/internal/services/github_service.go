@@ -125,7 +125,6 @@ func (s *GitHubService) SetGitHubAppManager(mgr *GitHubAppManager) {
 	s.appManager = mgr
 }
 
-
 func (s *GitHubService) SetTokenGetterForTest(fn func(ctx context.Context, userID uuid.UUID) (string, string, error)) {
 	s.tokenGetter = fn
 }
@@ -280,7 +279,6 @@ func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHu
 		ReconnectGuidance: reconnectGuidance,
 	}, nil
 }
-
 
 type GitHubRepoStateRecord struct {
 	UserID  string    `json:"user_id"`
@@ -1211,7 +1209,6 @@ func (s *GitHubService) ResolveCommitSHA(ctx context.Context, userID uuid.UUID, 
 	return commitData.SHA, nil
 }
 
-
 // MaterializeGitHubSnapshot downloads and extracts an isolated source snapshot pinned to exact commit SHA.
 func (s *GitHubService) MaterializeGitHubSnapshot(ctx context.Context, userID uuid.UUID, owner, repo, ref, destDir string) (string, error) {
 	sha, err := s.ResolveCommitSHA(ctx, userID, owner, repo, ref)
@@ -1345,7 +1342,6 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	if branch == "" {
 		branch = "main"
 	}
-
 
 	// Always resolve exact commit SHA to guarantee reproducibility and prevent SHA bypass.
 	resolvedSHA, err := s.ResolveCommitSHA(ctx, userID, owner, repo, branch)

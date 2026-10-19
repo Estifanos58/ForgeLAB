@@ -266,9 +266,19 @@ func (h *ProjectHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 			reason := "failed to enqueue deployment job: " + err.Error()
 			_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), deployment.ID, models.DeployStatusFailed, &reason)
 			_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
-			writeError(w, http.StatusInternalServerError, "failed to enqueue deployment job")
+			writeError(w, http.StatusServiceUnavailable, "deployment queue unavailable: "+err.Error())
 			return
 		}
+	} else if h.dockerEngine != nil {
+		go func() {
+			_ = h.dockerEngine.ExecuteDeployment(context.Background(), deployment.ID)
+		}()
+	} else {
+		reason := "no functioning deployment queue or execution engine available"
+		_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), deployment.ID, models.DeployStatusFailed, &reason)
+		_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
+		writeError(w, http.StatusServiceUnavailable, reason)
+		return
 	}
 
 	writeJSON(w, http.StatusCreated, deployment)
@@ -435,9 +445,19 @@ func (h *ProjectHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			reason := "failed to enqueue rollback deployment: " + err.Error()
 			_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), newDeploy.ID, models.DeployStatusFailed, &reason)
 			_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
-			writeError(w, http.StatusInternalServerError, "failed to enqueue rollback deployment")
+			writeError(w, http.StatusServiceUnavailable, "deployment queue unavailable: "+err.Error())
 			return
 		}
+	} else if h.dockerEngine != nil {
+		go func() {
+			_ = h.dockerEngine.ExecuteDeployment(context.Background(), newDeploy.ID)
+		}()
+	} else {
+		reason := "no functioning deployment queue or execution engine available"
+		_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), newDeploy.ID, models.DeployStatusFailed, &reason)
+		_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
+		writeError(w, http.StatusServiceUnavailable, reason)
+		return
 	}
 
 	writeJSON(w, http.StatusCreated, newDeploy)

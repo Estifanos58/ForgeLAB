@@ -342,13 +342,18 @@ func (h *ServiceHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	if h.deployQueue != nil {
 		if err := h.deployQueue.EnqueueServiceDeployment(r.Context(), deployment.ID); err != nil {
 			_ = h.deploymentService.FailServiceDeployment(r.Context(), deployment.ID, "failed to enqueue deployment job: "+err.Error())
-			writeError(w, http.StatusInternalServerError, "failed to enqueue deployment job")
+			writeError(w, http.StatusServiceUnavailable, "deployment queue unavailable: "+err.Error())
 			return
 		}
 	} else if h.dockerEngine != nil {
 		go func() {
 			_ = h.dockerEngine.ExecuteServiceDeployment(context.Background(), deployment.ID)
 		}()
+	} else {
+		reason := "no functioning deployment queue or execution engine available"
+		_ = h.deploymentService.FailServiceDeployment(r.Context(), deployment.ID, reason)
+		writeError(w, http.StatusServiceUnavailable, reason)
+		return
 	}
 
 	writeJSON(w, http.StatusCreated, deployment)
@@ -424,13 +429,18 @@ func (h *ServiceHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	if h.deployQueue != nil {
 		if err := h.deployQueue.EnqueueServiceDeployment(r.Context(), rollbackDeploy.ID); err != nil {
 			_ = h.deploymentService.FailServiceDeployment(r.Context(), rollbackDeploy.ID, "failed to enqueue rollback job: "+err.Error())
-			writeError(w, http.StatusInternalServerError, "failed to enqueue rollback job")
+			writeError(w, http.StatusServiceUnavailable, "deployment queue unavailable: "+err.Error())
 			return
 		}
 	} else if h.dockerEngine != nil {
 		go func() {
 			_ = h.dockerEngine.ExecuteServiceDeployment(context.Background(), rollbackDeploy.ID)
 		}()
+	} else {
+		reason := "no functioning deployment queue or execution engine available"
+		_ = h.deploymentService.FailServiceDeployment(r.Context(), rollbackDeploy.ID, reason)
+		writeError(w, http.StatusServiceUnavailable, reason)
+		return
 	}
 
 	writeJSON(w, http.StatusCreated, rollbackDeploy)

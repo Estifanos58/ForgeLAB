@@ -61,10 +61,10 @@ ForgeLAB’s security model rests on a fundamental distinction between the **For
                                                 └───────────────────┘
 ```
 
-### Critical Trust Realities:
+### Critical Trust Realities & Docker Socket Exposure Risk:
 
 ```text
-ForgeLab backend = highly trusted control-plane component.
+ForgeLAB backend = highly trusted control-plane component.
 
 Backend has Docker Engine control via /var/run/docker.sock.
 
@@ -73,21 +73,31 @@ User repositories = untrusted input.
 Repository source code must NEVER be treated as trusted merely because
 the user imported it.
 
-A compromise of the ForgeLab backend becomes a host-level Docker
+A compromise of the ForgeLAB backend becomes a host-level Docker
 control/security event.
 ```
 
-### Why This Trust Model Matters:
-1. **Local Repositories:** Even though a repository resides on the local host machine, the control plane must not trust its file hierarchy. A malicious repository could contain symlinks pointing to `/etc/shadow`, `C:\Windows\System32`, or developer SSH keys. `PathValidator` strictly resolves symlinks and validates canonical paths before snapshotting.
-2. **Future GitHub Repositories:** Remote repositories imported via OAuth are completely untrusted. They may contain poisoned build scripts, dependency confusion attacks, or malicious Dockerfiles.
-3. **Docker Builds:** The `docker build` process executes commands (`RUN`) as specified in the repository's `Dockerfile`. Any `RUN` command executes within the build container. Build contexts must **never** mount the host root or the Docker socket.
-4. **Runtime Containers:** User applications execute inside container sandboxes. They must never be granted `--privileged` mode, host network mode (`--net=host`), host filesystem volume mounts, or access to `/var/run/docker.sock`.
+#### Inherent Docker Socket Security Risk (Architectural Reality):
+The ForgeLAB control plane interacts directly with the Docker daemon via the Unix socket (`/var/run/docker.sock`). Because Docker Engine Unix sockets do not provide fine-grained, per-tenant Access Control Lists (ACLs), any entity capable of executing arbitrary commands against the Docker socket possesses **root-equivalent control over the host system**.
+
+**Why this risk cannot be eliminated without architectural isolation:**
+As long as the control plane shares the host Docker socket, the boundary between the control plane and the host OS relies entirely on software-level input validation, path normalization, and API enforcement within ForgeLAB itself. True isolation requires architectural separation:
+1. Running user workloads in isolated **Docker-in-Docker (DinD)** or **Rootless Docker** daemons.
+2. Moving container execution to isolated microVM hypervisor sandboxes (e.g. AWS Firecracker, Kata Containers, or gVisor runsc).
+3. Utilizing remote, physically isolated worker nodes rather than sharing the control-plane host daemon.
+
+**Active Operational Guardrails (Defense-in-Depth):**
+To mitigate this risk under the single-node architecture, ForgeLAB enforces strict multi-layered defenses:
+- **Zero Socket Exposure to Workloads:** Host Docker socket mounts (`/var/run/docker.sock` and `\\.\pipe\docker_engine`) are unconditionally rejected during preflight validation and sanitized from user Compose files. User containers are strictly prohibited from mounting or accessing the daemon socket.
+- **Strict Container Isolation:** All user containers are created with `CapDrop: ["ALL"]`, `SecurityOpt: ["no-new-privileges:true"]`, `Privileged: false`, isolated bridge networks (rejecting `--net=host` and `container:` network namespace sharing), and restricted resource limits (CPU millicores, RAM, and PIDs).
+- **Source Root Sandboxing:** All host directory mounts are validated with canonical symlink resolution and constrained strictly beneath administrator-configured `FORGELAB_ALLOWED_SOURCE_ROOTS`, rejecting system directories (`/etc`, `/proc`, `/sys`, `/dev`, etc.).
+- **Build Reproducibility:** Pinning immutable source revisions (commit SHAs or content fingerprints `fp_...`) ensures that builds fail closed if host files change after plan review.
 
 ---
 
 ## 2. Authentication Architecture & Token Security
 
-ForgeLAB implements backend-owned, cookie-based session management:
+ForgeLAB implements backend-owned, cookie-based session management and hardened realtime streaming:
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -100,6 +110,13 @@ ForgeLAB implements backend-owned, cookie-based session management:
 │   • Zero client-side persistence in localStorage            │
 │   • API client requests include 'credentials: include'      │
 │                                                             │
+│   WebSocket Realtime Security:                              │
+│   • URL query parameter tokens (?token=<jwt>) strictly      │
+│     REJECTED (HTTP 401) to prevent log & referrer leakage   │
+│   • Single-use short-lived tickets (POST /api/ws/ticket,    │
+│     60s TTL) or HttpOnly cookies / Authorization headers    │
+│   • Strict Origin validation enforced on all WS handshakes  │
+│                                                             │
 │   Multi-Provider Identity:                                  │
 │   • Email/password (bcrypt hashed)                          │
 │   • Google OAuth 2.0 (OpenID profile, email verified)       │
@@ -111,6 +128,13 @@ ForgeLAB implements backend-owned, cookie-based session management:
 │   • Tokens are never sent to browser or frontend storage    │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### WebSocket Token Hardening & Ticket Protocol
+Passing bearer tokens in URL query strings (`/api/ws?token=<jwt>`) creates security exposure: URLs are frequently recorded in reverse-proxy access logs, server telemetry, browser history, and HTTP `Referer` headers. ForgeLAB eliminates this vulnerability:
+1. **Query Token Rejection:** Connecting with `?token=...` is immediately rejected with HTTP `401 Unauthorized`.
+2. **Short-Lived Single-Use Tickets:** Clients obtain a ticket via `POST /api/ws/ticket` using their existing HttpOnly cookie or `Authorization: Bearer <jwt>` header. The server generates a random UUID ticket with a 60-second time-to-live stored in Redis (or in-memory store). The ticket is consumed via `GET /api/ws?ticket=<uuid>`. Upon redemption or expiration, the ticket is destroyed immediately, preventing replay attacks.
+3. **Origin Checking:** WebSocket handshake enforces strict origin verification against configured `CORS_ALLOWED_ORIGINS` and `FRONTEND_URL`, rejecting cross-site WebSocket hijacking (CSWSH) attempts.
+4. **Diagnostics Access Control:** Detailed queue metrics and container log-collector diagnostics on `/ready`, `/health/queue`, and `/health/logs` are restricted strictly to trusted internal loopback/private network callers or authenticated users, preventing unauthenticated external information disclosure.
 
 ---
 

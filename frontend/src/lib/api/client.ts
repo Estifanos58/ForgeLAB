@@ -67,8 +67,14 @@ export interface UploadProgress {
 
 let isRefreshing = false;
 let refreshPromise: Promise<void> | null = null;
+let lastRefreshSuccess = 0;
 
 async function executeRefresh(): Promise<void> {
+  // If a refresh succeeded very recently (within 2.5s), don't re-execute;
+  // the cookie jar is already updated with fresh tokens for concurrent or slightly delayed calls.
+  if (Date.now() - lastRefreshSuccess < 2500) {
+    return;
+  }
   if (isRefreshing && refreshPromise) {
     return refreshPromise;
   }
@@ -84,6 +90,7 @@ async function executeRefresh(): Promise<void> {
       if (!res.ok) {
         throw new Error('Session refresh failed');
       }
+      lastRefreshSuccess = Date.now();
     } finally {
       isRefreshing = false;
       refreshPromise = null;

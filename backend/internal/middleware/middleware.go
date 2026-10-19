@@ -152,6 +152,16 @@ func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool, all
 				return
 			}
 
+			// If an access token is absent but a refresh token cookie is present, this client is an
+			// authenticated user whose access token has expired (or was evicted by the browser).
+			// We MUST NOT silently downgrade them to guest identity, as doing so causes legitimate
+			// project operations to fail with "403 Forbidden: access denied" and prevents the frontend
+			// from executing its automatic 401 token refresh retry.
+			if cookie, err := r.Cookie("forgelab_refresh_token"); err == nil && cookie.Value != "" {
+				http.Error(w, `{"error": "access token expired or missing, refresh required"}`, http.StatusUnauthorized)
+				return
+			}
+
 			// No token provided: check if guest mode is permitted on this installation
 			if !allowGuestMode {
 				http.Error(w, `{"error": "authentication required: guest mode disabled on this installation"}`, http.StatusUnauthorized)

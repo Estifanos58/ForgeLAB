@@ -24,11 +24,16 @@
 - All durable identifiers are standard **UUIDv4** strings (`00000000-0000-0000-0000-000000000000`).
 
 ### Authentication & Token Transport
-- Authenticated requests require a JWT access token in the `Authorization` header:
+- Authenticated REST requests require a JWT access token in the `Authorization` header:
   ```http
   Authorization: Bearer <access_token>
   ```
-- Alternatively, the backend accepts `forgelab_access_token` in cookies or `token=<jwt>` in query parameters (primarily for WebSocket upgrades).
+- Browser clients authenticate via secure HttpOnly cookies (`forgelab_access_token` and `forgelab_refresh_token`).
+- **Security Hardening (Query Tokens Removed):** Query parameter token authentication (`?token=<jwt>`) is strictly rejected with `401 Unauthorized` across all REST and WebSocket endpoints to prevent token leakage in proxy logs, browser histories, and referrer headers.
+- **WebSocket Ticket Authentication:** WebSocket connections may authenticate via:
+  1. Secure HttpOnly cookie (`forgelab_access_token`)
+  2. Standard HTTP header `Authorization: Bearer <access_token>`
+  3. Short-lived single-use tickets: `POST /api/ws/ticket` returns a 60-second single-use ticket consumed via `GET /api/ws?ticket=<uuid>`. Once consumed or expired, the ticket is immediately invalidated.
 - Access tokens expire after 15 minutes (`JWT_ACCESS_TOKEN_EXPIRY`).
 - Refresh tokens expire after 7 days (`JWT_REFRESH_TOKEN_EXPIRY`) and use atomic single-use rotation.
 
@@ -77,10 +82,22 @@ Common status codes:
   ```
 
 ### `GET /ready` & `GET /health/ready`
-- **Authentication:** None (Public)
-- **Authorization:** None
-- **Purpose:** Full dependency readiness probe checking PostgreSQL, Redis, Docker Engine, deployment queue state, shared build status, and active log collectors.
-- **Success Response:** `200 OK` (when all dependencies are healthy) or `503 Service Unavailable` (when any core dependency is down).
+- **Authentication:** Optional (Public with diagnostics redaction; Trusted Internal / Bearer JWT for full diagnostics)
+- **Authorization:** Detailed internal diagnostics (`queue`, `build_queue`, `log_collectors`) require trusted internal access (loopback or trusted private proxies) or valid authentication. External unauthenticated callers receive a redacted response omitting internal diagnostics to prevent information leakage.
+- **Purpose:** Full dependency readiness probe checking PostgreSQL, Redis, and Docker Engine.
+- **Success Response (Public / External Unauthenticated):** `200 OK`
+  ```json
+  {
+    "status": "ready",
+    "timestamp": "2026-10-18T14:30:00Z",
+    "dependencies": {
+      "postgres": { "status": "up", "latency_ms": 2 },
+      "redis": { "status": "up", "latency_ms": 1 },
+      "docker": { "status": "up", "latency_ms": 4 }
+    }
+  }
+  ```
+- **Success Response (Trusted Internal / Authenticated):** `200 OK`
   ```json
   {
     "status": "ready",
@@ -120,9 +137,15 @@ Common status codes:
   }
   ```
 
+### `GET /health/queue`
+- **Authentication:** Required for external callers (Bearer JWT or trusted internal/loopback network access).
+- **Authorization:** External unauthenticated requests are rejected with `401 Unauthorized`.
+- **Purpose:** Detailed diagnostics on Redis deployment queue, in-flight leases, and build queue semaphores.
+- **Success Response:** `200 OK`
+
 ### `GET /health/logs`
-- **Authentication:** None (Public)
-- **Authorization:** None
+- **Authentication:** Required for external callers (Bearer JWT or trusted internal/loopback network access).
+- **Authorization:** External unauthenticated requests are rejected with `401 Unauthorized`.
 - **Purpose:** Operational observability diagnostics for all active Docker runtime log collectors.
 - **Success Response:** `200 OK`
   ```json
@@ -1571,10 +1594,34 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ## 9. Realtime WebSocket Protocol (`/api/ws`)
 
-### Connection Establishment:
-- **Endpoint:** `GET /api/ws?token=<jwt_access_token>`
+### `POST /api/ws/ticket`
+- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie; Guest mode allowed if configured)
+- **Purpose:** Request a short-lived (60-second), single-use ticket to establish a WebSocket connection without exposing JWT access tokens in URLs.
+- **Request Body:** None
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "ticket": "9a01666e-691a-4c28-98e6-e3d8f80164eb",
+    "expires_in": 60
+  }
+  ```
+- **Error Responses:**
+  - `401 Unauthorized`: Missing or invalid authentication.
+
+---
+
+### Connection Establishment (`GET /api/ws`):
+- **Endpoint:** `GET /api/ws` or `GET /api/ws?ticket=<ticket_uuid>`
 - **Upgrade Header:** `Upgrade: websocket`, `Connection: Upgrade`
-- **Security:** Verifies JWT signature and claims before socket upgrade.
+- **Supported Authentication Mechanisms:**
+  1. `forgelab_access_token` HttpOnly cookie sent automatically by the browser.
+  2. `Authorization: Bearer <access_token>` request header.
+  3. `ticket=<uuid>` query parameter using a ticket minted via `POST /api/ws/ticket`.
+- **Security & Origin Policy:**
+  - `?token=<jwt>` query parameter is **strictly rejected with 401 Unauthorized**.
+  - Enforces strict origin checking against configured frontend URLs (`CORS_ALLOWED_ORIGINS` and `FRONTEND_URL`) or same-origin host matching.
+  - Tickets are single-use and expire within 60 seconds. Attempting to reuse or pass an expired ticket returns `401 Unauthorized`.
+  - Verifies JWT signature and claims before socket upgrade.
 
 ### Client Messages:
 1. **Subscribe:**

@@ -259,10 +259,11 @@ func TestMultipleQueuedEventsAsSeparateWebSocketMessages(t *testing.T) {
 	}))
 	defer server.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/ws?token=" + token
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/ws"
+	header := http.Header{"Cookie": []string{"forgelab_access_token=" + token}}
 
 	// Dial WebSocket client
-	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("websocket dial failed: %v", err)
 	}
@@ -811,10 +812,13 @@ func TestWebSocketOriginAllowlist(t *testing.T) {
 		t.Fatalf("failed to generate access token: %v", err)
 	}
 
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 
 	// Allowed origin
-	headerAllowed := http.Header{"Origin": []string{"http://localhost:3000"}}
+	headerAllowed := http.Header{
+		"Origin": []string{"http://localhost:3000"},
+		"Cookie": []string{"forgelab_access_token=" + token},
+	}
 	connAllowed, respAllowed, err := websocket.DefaultDialer.Dial(wsURL, headerAllowed)
 	if err != nil {
 		t.Fatalf("expected allowed origin to succeed, got: %v", err)
@@ -825,7 +829,10 @@ func TestWebSocketOriginAllowlist(t *testing.T) {
 	}
 
 	// Disallowed origin
-	headerDisallowed := http.Header{"Origin": []string{"http://evil-attacker-site.com"}}
+	headerDisallowed := http.Header{
+		"Origin": []string{"http://evil-attacker-site.com"},
+		"Cookie": []string{"forgelab_access_token=" + token},
+	}
 	_, respDisallowed, err := websocket.DefaultDialer.Dial(wsURL, headerDisallowed)
 	if err == nil {
 		t.Errorf("expected disallowed origin to fail, but dial succeeded")
@@ -983,9 +990,10 @@ func TestWebSocketReconnectReplay(t *testing.T) {
 	defer server.Close()
 
 	token, _ := jwtManager.GenerateAccessToken(userID, "user@example.com")
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	header := http.Header{"Cookie": []string{"forgelab_access_token=" + token}}
 
-	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
@@ -1049,9 +1057,10 @@ func TestWebSocketLogEventsNotDroppedOnBurst(t *testing.T) {
 	defer server.Close()
 
 	token, _ := jwtManager.GenerateAccessToken(userID, "user@example.com")
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	header := http.Header{"Cookie": []string{"forgelab_access_token=" + token}}
 
-	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
@@ -1083,5 +1092,136 @@ func TestWebSocketLogEventsNotDroppedOnBurst(t *testing.T) {
 		if received.Sequence != int64(i) {
 			t.Fatalf("expected message sequence %d, got %d", i, received.Sequence)
 		}
+	}
+}
+
+// TestWebSocket_QueryTokenRejected verifies that query parameter JWT (?token=...) is strictly rejected with 401.
+func TestWebSocket_QueryTokenRejected(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000")
+	defer hub.cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeWS))
+	defer server.Close()
+
+	userID := uuid.New()
+	token, _ := jwtManager.GenerateAccessToken(userID, "user@example.com")
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
+
+	header := http.Header{"Origin": []string{"http://localhost:3000"}}
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatalf("expected query parameter token connection to be rejected, but dial succeeded")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for query parameter token, got: %v", resp)
+	}
+}
+
+// TestWebSocket_TicketAuthentication verifies single-use ticket lifecycle:
+// valid on first use, rejected on second use (single-use), and rejected if expired.
+func TestWebSocket_TicketAuthentication(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000")
+	defer hub.cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeWS))
+	defer server.Close()
+
+	userID := uuid.New()
+
+	// 1. Valid ticket succeeds
+	ticket, _, err := hub.CreateTicket(userID, "user@example.com", 60*time.Second)
+	if err != nil {
+		t.Fatalf("failed to create ticket: %v", err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?ticket=" + ticket
+	header := http.Header{"Origin": []string{"http://localhost:3000"}}
+
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("expected ticket connection to succeed, got: %v", err)
+	}
+	defer conn.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("expected status 101, got %d", resp.StatusCode)
+	}
+
+	// 2. Second use of same ticket must fail (single-use guarantee)
+	_, resp2, err2 := websocket.DefaultDialer.Dial(wsURL, header)
+	if err2 == nil {
+		t.Fatalf("expected second connection with same ticket to fail, but succeeded")
+	}
+	if resp2 == nil || resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on reused ticket, got: %v", resp2)
+	}
+
+	// 3. Expired ticket must fail
+	expiredTicket, _, err := hub.CreateTicket(userID, "user@example.com", -1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to create ticket: %v", err)
+	}
+	wsURLExpired := "ws" + strings.TrimPrefix(server.URL, "http") + "?ticket=" + expiredTicket
+	_, resp3, err3 := websocket.DefaultDialer.Dial(wsURLExpired, header)
+	if err3 == nil {
+		t.Fatalf("expected expired ticket to fail, but succeeded")
+	}
+	if resp3 == nil || resp3.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on expired ticket, got: %v", resp3)
+	}
+}
+
+// TestWebSocket_AuthorizationBearerHeader verifies authentication via Authorization: Bearer <token>.
+func TestWebSocket_AuthorizationBearerHeader(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000")
+	defer hub.cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeWS))
+	defer server.Close()
+
+	userID := uuid.New()
+	token, _ := jwtManager.GenerateAccessToken(userID, "user@example.com")
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	header := http.Header{
+		"Origin":        []string{"http://localhost:3000"},
+		"Authorization": []string{"Bearer " + token},
+	}
+
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("expected bearer auth to succeed, got: %v", err)
+	}
+	defer conn.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("expected status 101, got %d", resp.StatusCode)
+	}
+}
+
+// TestWebSocket_RefreshTokenPresentWithoutAccessTokenReturns401 verifies that if an access
+// token has expired but the user's refresh token cookie is still present, the WebSocket upgrade
+// is rejected with 401 Unauthorized rather than silently downgrading to guest identity.
+func TestWebSocket_RefreshTokenPresentWithoutAccessTokenReturns401(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000")
+	defer hub.cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeWS))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	header := http.Header{
+		"Origin": []string{"http://localhost:3000"},
+		"Cookie": []string{"forgelab_refresh_token=valid-refresh-token-value"},
+	}
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatalf("expected connection to fail with 401, but succeeded")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got: %v", resp)
 	}
 }

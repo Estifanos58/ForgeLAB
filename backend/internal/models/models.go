@@ -437,7 +437,6 @@ type GitHubAppInstallation struct {
 	UpdatedAt           time.Time       `json:"updated_at"`
 }
 
-
 // Service roles
 const (
 	RoleFrontend = "frontend"

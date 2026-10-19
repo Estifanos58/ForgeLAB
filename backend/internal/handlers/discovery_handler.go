@@ -245,7 +245,6 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-
 	// 1. Run authoritative discovery engine if not provided by authoritative agent
 	if discResult == nil {
 		targetDiscoveryDir := workspaceDir

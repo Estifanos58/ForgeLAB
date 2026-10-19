@@ -193,6 +193,21 @@ func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Pro
 			return "", "", fmt.Errorf("source path validation failed: %w", err)
 		}
 
+		// Enforce build reproducibility: verify source content matches reviewed source revision if pinned
+		if len(sourceRevision) > 0 && sourceRevision[0] != "" {
+			expectedRev := sourceRevision[0]
+			if strings.HasPrefix(expectedRev, "fp_") {
+				currentFP, fpErr := discovery.ComputeDirectoryContentFingerprintWithContext(ctx, canonicalSource)
+				if fpErr != nil {
+					return "", "", fmt.Errorf("failed to verify source content fingerprint: %w", fpErr)
+				}
+				if currentFP != expectedRev {
+					return "", "", fmt.Errorf("source content changed since deployment was created: expected fingerprint %s, got %s", expectedRev, currentFP)
+				}
+				emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Verified source content matches reviewed revision %s.", expectedRev))
+			}
+		}
+
 		emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Using local directory: %s", project.RepositoryPath))
 
 		if e.localBuildMode != "direct" {
@@ -623,4 +638,3 @@ func buildServiceDeploymentTiers(svcDeploys []*models.ServiceDeployment) ([][]*m
 	}
 	return tiers, nil
 }
-

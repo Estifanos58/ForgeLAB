@@ -3222,4 +3222,3 @@ func (s *DeploymentService) PruneLogs(ctx context.Context, retentionDays int, ma
 
 	return totalPruned, nil
 }
-

@@ -67,12 +67,12 @@ type Engine struct {
 	maxConcurrentBuilds  int
 	buildSem             *BuildSemaphore
 	semMu                sync.Mutex
-	buildMaintenanceMu   sync.RWMutex // synchronizes Docker image builds vs image pruning/maintenance
-	pruneFilterLabel     string       // optional label filter for scoped image pruning
-	activeLogCollectors  sync.Map     // map[string]context.CancelFunc — tracks running log collector goroutines
+	buildMaintenanceMu   sync.RWMutex          // synchronizes Docker image builds vs image pruning/maintenance
+	pruneFilterLabel     string                // optional label filter for scoped image pruning
+	activeLogCollectors  sync.Map              // map[string]context.CancelFunc — tracks running log collector goroutines
 	collectorRegistry    *LogCollectorRegistry // race-safe registry and operational diagnostics for runtime log collectors
-	activeCancels        sync.Map     // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
-	activeExecMu         sync.Mutex   // protects activeExecs map
+	activeCancels        sync.Map              // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	activeExecMu         sync.Mutex            // protects activeExecs map
 	activeExecs          map[uuid.UUID]*activeExecEntry
 	activeContainers     sync.Map                // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
 	sharedBuildArtifacts sync.Map                // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
@@ -80,6 +80,7 @@ type Engine struct {
 	sharedCoordinator    *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
 	cachedBuilderVer     atomic.Value            // stores types.BuilderVersion advertised by Docker daemon
 	startTime            time.Time               // instance boot timestamp for tracking interrupted deployments
+	publicHost           string                  // host name or IP used for browser-facing URLs
 }
 
 func (e *Engine) trackActiveContainer(id string) {
@@ -1640,7 +1641,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				} else if peer.CustomDomain != nil && *peer.CustomDomain != "" {
 					browserURL = fmt.Sprintf("https://%s", *peer.CustomDomain)
 				} else if peer.HostPort != nil && *peer.HostPort > 0 {
-					browserURL = fmt.Sprintf("http://localhost:%d", *peer.HostPort)
+					host := e.GetPublicHost()
+					browserURL = fmt.Sprintf("http://%s:%d", host, *peer.HostPort)
 				}
 
 				if browserURL != "" {
@@ -2013,82 +2015,119 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		stoppedPreviousForStateful = true
 	}
 
-	resp, err := e.dockerClient.ContainerCreate(execCtx, containerConfig, hostConfig, netConfig, nil, containerName)
-	if err != nil {
-		if hostPort != nil {
-			e.portManager.ReleasePort(*hostPort)
+	var containerID string
+	maxPortRetries := 3
+	for attempt := 0; attempt <= maxPortRetries; attempt++ {
+		resp, err := e.dockerClient.ContainerCreate(execCtx, containerConfig, hostConfig, netConfig, nil, containerName)
+		if err != nil {
+			if isPortConflictError(err) && hostPort != nil && attempt < maxPortRetries {
+				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Host port %d conflict during container create: %v. Retrying with a new port (attempt %d/%d)...", *hostPort, err, attempt+1, maxPortRetries))
+				e.portManager.RegisterUsedPort(*hostPort)
+				newPort, allocErr := e.portManager.AllocatePort()
+				if allocErr == nil {
+					hostPort = &newPort
+					portBindings[nat.Port(targetPortStr)] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", newPort)}}
+					hostConfig.PortBindings = portBindings
+					continue
+				}
+			}
+			if hostPort != nil {
+				e.portManager.ReleasePort(*hostPort)
+			}
+			if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
+				restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
+				restartCancel()
+			}
+			reason := fmt.Sprintf("Failed to create container for service '%s': %v", service.Name, err)
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
 		}
-		if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
-			restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
-			restartCancel()
-		}
-		reason := fmt.Sprintf("Failed to create container for service '%s': %v", service.Name, err)
-		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
-		emitStatus(models.DeployStatusFailed, nil, &reason)
-		return errors.New(reason)
-	}
 
-	// Connect to any secondary isolated project networks
-	for _, secNet := range secondaryNetworkNames {
-		if e.dockerClient != nil {
-			secComposeKey := secondaryNetworkComposeKeys[secNet]
-			var secAliases []string
-			secAliases = append(secAliases, service.Name)
-			if secComposeKey != "" {
-				if svcAliases, ok := planAliasesMap[service.Name]; ok {
-					for _, a := range svcAliases[secComposeKey] {
-						if a != "" && a != service.Name {
-							secAliases = append(secAliases, a)
+		containerID = resp.ID
+
+		// Connect to any secondary isolated project networks
+		var secNetErr error
+		for _, secNet := range secondaryNetworkNames {
+			if e.dockerClient != nil {
+				secComposeKey := secondaryNetworkComposeKeys[secNet]
+				var secAliases []string
+				secAliases = append(secAliases, service.Name)
+				if secComposeKey != "" {
+					if svcAliases, ok := planAliasesMap[service.Name]; ok {
+						for _, a := range svcAliases[secComposeKey] {
+							if a != "" && a != service.Name {
+								secAliases = append(secAliases, a)
+							}
 						}
 					}
 				}
-			}
 
-			if netConnErr := e.dockerClient.NetworkConnect(execCtx, secNet, resp.ID, &dockernetwork.EndpointSettings{
-				Aliases: secAliases,
-			}); netConnErr != nil {
-				if hostPort != nil {
-					e.portManager.ReleasePort(*hostPort)
+				if netConnErr := e.dockerClient.NetworkConnect(execCtx, secNet, resp.ID, &dockernetwork.EndpointSettings{
+					Aliases: secAliases,
+				}); netConnErr != nil {
+					secNetErr = fmt.Errorf("failed to attach required network '%s' to service '%s': %w", secNet, service.Name, netConnErr)
+					break
 				}
-				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_ = e.dockerClient.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
-				cleanupCancel()
-				if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
-					restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
-					_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
-					restartCancel()
-				}
-				reason := fmt.Sprintf("Failed to attach required network '%s' to service '%s': %v", secNet, service.Name, netConnErr)
-				emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
-				emitStatus(models.DeployStatusFailed, nil, &reason)
-				return errors.New(reason)
 			}
 		}
+
+		if secNetErr != nil {
+			if hostPort != nil {
+				e.portManager.ReleasePort(*hostPort)
+			}
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = e.dockerClient.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
+			cleanupCancel()
+			if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
+				restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
+				restartCancel()
+			}
+			reason := secNetErr.Error()
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
+		}
+
+		if err := e.dockerClient.ContainerStart(execCtx, containerID, container.StartOptions{}); err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+			cleanupCancel()
+
+			if isPortConflictError(err) && hostPort != nil && attempt < maxPortRetries {
+				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Host port %d conflict during container start: %v. Retrying with a new port (attempt %d/%d)...", *hostPort, err, attempt+1, maxPortRetries))
+				e.portManager.RegisterUsedPort(*hostPort)
+				newPort, allocErr := e.portManager.AllocatePort()
+				if allocErr == nil {
+					hostPort = &newPort
+					portBindings[nat.Port(targetPortStr)] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", newPort)}}
+					hostConfig.PortBindings = portBindings
+					continue
+				}
+			}
+
+			if hostPort != nil {
+				e.portManager.ReleasePort(*hostPort)
+			}
+			if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
+				restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
+				restartCancel()
+			}
+			reason := fmt.Sprintf("Failed to start container for service '%s': %v", service.Name, err)
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
+		}
+
+		break
 	}
 
-	containerID := resp.ID
 	e.trackActiveContainer(containerID)
 	defer e.untrackActiveContainer(containerID)
 	_ = e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort)
-
-	if err := e.dockerClient.ContainerStart(execCtx, containerID, container.StartOptions{}); err != nil {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
-		cleanupCancel()
-		if hostPort != nil {
-			e.portManager.ReleasePort(*hostPort)
-		}
-		if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
-			restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
-			restartCancel()
-		}
-		reason := fmt.Sprintf("Failed to start container for service '%s': %v", service.Name, err)
-		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
-		emitStatus(models.DeployStatusFailed, nil, &reason)
-		return errors.New(reason)
-	}
 
 	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started for service '%s'.", containerID[:12], service.Name))
 
@@ -2817,7 +2856,11 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 
 	if !reusingExistingImage {
 		updateStatus(models.DeployStatusCloning, nil)
-		buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, deployment.ID.String(), emitLog)
+		var srcRev string
+		if deployment.SourceRevision != nil {
+			srcRev = *deployment.SourceRevision
+		}
+		buildSourceDir, cleanupDir, err := e.resolveSourceDirectory(ctx, project, deployment.ID.String(), emitLog, srcRev)
 		if cleanupDir != "" {
 			defer func() {
 				_ = os.RemoveAll(cleanupDir)
@@ -3249,28 +3292,60 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	containerName := fmt.Sprintf("forgelab-%s-%d", project.Slug, deployment.DeployNumber)
 	_ = e.dockerClient.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
 
-	resp, err := e.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
-	if err != nil {
-		e.portManager.ReleasePort(allocatedPort)
-		reason := fmt.Sprintf("Failed to create container: %v", err)
-		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
+	var containerID string
+	maxLegacyPortRetries := 3
+	for attempt := 0; attempt <= maxLegacyPortRetries; attempt++ {
+		resp, err := e.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
+		if err != nil {
+			if isPortConflictError(err) && attempt < maxLegacyPortRetries {
+				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Host port %d conflict during container create: %v. Retrying with a new port (attempt %d/%d)...", allocatedPort, err, attempt+1, maxLegacyPortRetries))
+				e.portManager.RegisterUsedPort(allocatedPort)
+				newPort, allocErr := e.portManager.AllocatePort()
+				if allocErr == nil {
+					allocatedPort = newPort
+					containerConfig.ExposedPorts = nat.PortSet{nat.Port(targetPortStr): struct{}{}}
+					hostConfig.PortBindings = nat.PortMap{
+						nat.Port(targetPortStr): []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", allocatedPort)}},
+					}
+					continue
+				}
+			}
+			e.portManager.ReleasePort(allocatedPort)
+			reason := fmt.Sprintf("Failed to create container: %v", err)
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+
+		containerID = resp.ID
+
+		if err := e.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+			_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+			if isPortConflictError(err) && attempt < maxLegacyPortRetries {
+				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Host port %d conflict during container start: %v. Retrying with a new port (attempt %d/%d)...", allocatedPort, err, attempt+1, maxLegacyPortRetries))
+				e.portManager.RegisterUsedPort(allocatedPort)
+				newPort, allocErr := e.portManager.AllocatePort()
+				if allocErr == nil {
+					allocatedPort = newPort
+					containerConfig.ExposedPorts = nat.PortSet{nat.Port(targetPortStr): struct{}{}}
+					hostConfig.PortBindings = nat.PortMap{
+						nat.Port(targetPortStr): []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", allocatedPort)}},
+					}
+					continue
+				}
+			}
+			e.portManager.ReleasePort(allocatedPort)
+			reason := fmt.Sprintf("Failed to start container: %v", err)
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			updateStatus(models.DeployStatusFailed, &reason)
+			return errors.New(reason)
+		}
+		break
 	}
 
-	containerID := resp.ID
 	e.trackActiveContainer(containerID)
 	defer e.untrackActiveContainer(containerID)
 	_ = e.deploymentService.UpdateDeploymentContainer(ctx, deployment.ID, containerID)
-
-	if err := e.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
-		e.portManager.ReleasePort(allocatedPort)
-		reason := fmt.Sprintf("Failed to start container: %v", err)
-		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
-		updateStatus(models.DeployStatusFailed, &reason)
-		return errors.New(reason)
-	}
 
 	updateStatus(models.DeployStatusHealthChecking, nil)
 	emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("Starting health checks on port %d...", allocatedPort))

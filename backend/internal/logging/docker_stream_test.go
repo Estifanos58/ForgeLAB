@@ -277,4 +277,3 @@ func TestDemuxDockerStream_UnknownStreamTypeDiscardedSafely(t *testing.T) {
 		t.Fatalf("expected 1 line 'valid message', got: %+v", lines)
 	}
 }
-

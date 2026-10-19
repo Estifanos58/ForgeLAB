@@ -112,3 +112,41 @@ func TestProjectHandler_CancelDeployment_Validation(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 }
+
+func TestProjectHandler_Deploy_Validation(t *testing.T) {
+	handler := handlers.NewProjectHandler(nil, nil, nil, nil)
+
+	t.Run("401 Unauthorized without auth", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/123/deployments", nil)
+		rec := httptest.NewRecorder()
+		handler.Deploy(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("400 Bad Request on invalid project ID", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/invalid-uuid/deployments", nil)
+		req = req.WithContext(withTestUser(req.Context(), uuid.New()))
+		rec := httptest.NewRecorder()
+		handler.Deploy(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+}
+
+func TestProjectHandler_Rollback_Validation(t *testing.T) {
+	handler := handlers.NewProjectHandler(nil, nil, nil, nil)
+
+	t.Run("401 Unauthorized without auth", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/123/rollback", nil)
+		rec := httptest.NewRecorder()
+		handler.Rollback(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("400 Bad Request on invalid project ID", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/invalid-uuid/rollback", nil)
+		req = req.WithContext(withTestUser(req.Context(), uuid.New()))
+		rec := httptest.NewRecorder()
+		handler.Rollback(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+}

@@ -360,7 +360,7 @@ func (e *Engine) IsContainerLogCollectorActive(containerID string) bool {
 	if reg.IsActive("container:" + containerID) {
 		return true
 	}
-	if len(containerID) > 12 && reg.IsActive("container:" + containerID[:12]) {
+	if len(containerID) > 12 && reg.IsActive("container:"+containerID[:12]) {
 		return true
 	}
 	if _, ok := e.activeLogCollectors.Load("container:" + containerID); ok {
@@ -838,7 +838,7 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 			containerMap[c.ID[:12]] = c
 		}
 
-		if c.State == "running" {
+		if c.State == "running" || c.State == "restarting" || c.State == "created" || c.State == "paused" {
 			for _, p := range c.Ports {
 				if p.PublicPort > 0 {
 					runningPorts = append(runningPorts, int(p.PublicPort))
@@ -1303,7 +1303,6 @@ func (e *Engine) EnsureNetworkWithOptions(ctx context.Context, networkName strin
 
 	return fmt.Errorf("failed to create network '%s': %w", networkName, err)
 }
-
 
 // PruneDanglingNetworks cleans up orphaned ForgeLAB bridge networks that have zero connected containers.
 func (e *Engine) PruneDanglingNetworks(ctx context.Context) error {

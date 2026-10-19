@@ -84,6 +84,12 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Race-Safe Collector Concurrency** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Instance-scoped registration prevents older collectors from deregistering active replacements |
 | **Log Collector Observability** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Exposes active collectors, log activity timestamps, collection/persistence errors at `/health/logs` and `/ready` |
 | **Configurable Log Retention** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Time-based (`FORGELAB_LOG_RETENTION_DAYS`) and volume-based (`FORGELAB_LOG_MAX_PER_DEPLOYMENT`) background pruning |
+| **WebSocket Ticket Authentication** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Rejects `?token=...`, issues 60s tickets via `POST /api/ws/ticket`, single-use redemption |
+| **WebSocket Origin Policy Enforcement** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Validates `Origin` header against `CORS_ALLOWED_ORIGINS` & `FRONTEND_URL` or same-origin host |
+| **Diagnostics Access Control** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Redacts queue & log collectors on `/ready` for external callers; restricts `/health/queue` & `/health/logs` |
+| **Host Port Conflict Retries** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Automatic conflict detection, port manager re-allocation, and 3x retry on daemon collision |
+| **Build Reproducibility Fingerprinting** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Verifies local directory content fingerprint against pinned revision; fails closed on drift |
+
 
 
 ---
@@ -1359,5 +1365,152 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Date:** —
 - **Environment:** —
 - **Notes:** —
+
+---
+
+### 24. WebSocket Security Hardening and Single-Use Ticket Protocol
+
+#### Test Procedure 24.1 — Query String Token Rejection (`?token=...`)
+1. Obtain a valid JWT access token by logging into ForgeLAB.
+2. Attempt to open a WebSocket connection passing the token in the URL query string:
+   ```bash
+   # Using wscat or curl
+   curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+     "http://localhost:8080/api/ws?token=<jwt_access_token>"
+   ```
+3. Verify that the server rejects the request with **HTTP 401 Unauthorized** (or WebSocket connection failed).
+4. Verify that passing any `?token=...` parameter never establishes a WebSocket connection.
+
+#### Test Procedure 24.2 — Ticket Generation and Single-Use Consumption
+1. Mint a short-lived ticket via `POST /api/ws/ticket` using the valid Bearer token:
+   ```bash
+   curl -s -X POST http://localhost:8080/api/ws/ticket \
+     -H "Authorization: Bearer <jwt_access_token>" | jq .
+   ```
+2. Verify response contains `ticket` (UUID) and `expires_in` (60).
+3. Connect using the ticket parameter:
+   ```bash
+   curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+     -H "Origin: http://localhost:3000" \
+     "http://localhost:8080/api/ws?ticket=<ticket_uuid>"
+   ```
+4. Verify the server returns **HTTP 101 Switching Protocols**.
+5. Immediately attempt to connect again using the same ticket:
+   ```bash
+   curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+     -H "Origin: http://localhost:3000" \
+     "http://localhost:8080/api/ws?ticket=<ticket_uuid>"
+   ```
+6. Verify that second connection is rejected with **HTTP 401 Unauthorized** (enforcing single-use).
+
+#### Test Procedure 24.3 — WebSocket Origin Policy Enforcement
+1. Mint a ticket via `POST /api/ws/ticket`.
+2. Attempt connection with a disallowed external origin:
+   ```bash
+   curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+     -H "Origin: http://evil-attacker.com" \
+     "http://localhost:8080/api/ws?ticket=<ticket_uuid>"
+   ```
+3. Verify that connection is rejected with **HTTP 403 Forbidden** (or HTTP 401).
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 25. Diagnostics Access Control
+
+#### Test Procedure 25.1 — Public `/ready` Information Redaction for External Callers
+1. Simulate an external, unauthenticated client by making a request to `/ready` with an external peer address:
+   ```bash
+   curl -s http://localhost:8080/ready | jq .
+   ```
+2. Verify that the response returns HTTP 200 with dependency statuses (`postgres`, `redis`, `docker`).
+3. Verify that internal structures (`queue`, `build_queue`, `log_collectors`) are completely omitted or nil in the response.
+4. Now perform the request with an authenticated Bearer token:
+   ```bash
+   curl -s -H "Authorization: Bearer <jwt_access_token>" http://localhost:8080/ready | jq .
+   ```
+5. Verify that full diagnostics (`queue`, `build_queue`, `log_collectors`) are present in the response.
+
+#### Test Procedure 25.2 — Restriction of `/health/queue` and `/health/logs`
+1. Request `/health/queue` as an external unauthenticated caller:
+   ```bash
+   curl -i -s http://localhost:8080/health/queue
+   ```
+2. Verify that the server returns **HTTP 401 Unauthorized**.
+3. Repeat for `/health/logs`:
+   ```bash
+   curl -i -s http://localhost:8080/health/logs
+   ```
+4. Verify that the server returns **HTTP 401 Unauthorized**.
+5. Supply valid `Authorization: Bearer <token>`:
+   ```bash
+   curl -s -H "Authorization: Bearer <jwt_access_token>" http://localhost:8080/health/queue | jq .
+   ```
+6. Verify that HTTP 200 OK is returned with detailed queue diagnostic metrics.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 26. Docker Host Port Allocation Conflict Retries
+
+#### Test Procedure 26.1 — Port Conflict Detection and Transparent Retry
+1. Identify the port range configured for ForgeLAB (default 10000–60000).
+2. Manually bind a port in that range using `nc` or a dummy container outside ForgeLAB:
+   ```bash
+   nc -l 10500 &
+   ```
+3. Trigger a deployment in ForgeLAB where the port manager assigns 10500 (or simulate port conflict).
+4. Verify from the backend deployment logs that ForgeLAB detects `port is already allocated` / port conflict.
+5. Verify that ForgeLAB automatically:
+   - Marks port 10500 as conflicted/used in `PortManager`.
+   - Allocates a fresh port (e.g. 10501).
+   - Updates container host port bindings and retries creation/start.
+   - Completes deployment successfully on the new port without failing the deployment.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 27. Build Reproducibility and Source Revision Fingerprint Verification
+
+#### Test Procedure 27.1 — Content-Fingerprint Verification for Local Directory Builds
+1. Select a local directory project with reviewed plan.
+2. Record the computed content fingerprint (starts with `fp_`).
+3. Modify a source file in the directory (e.g. edit `index.js` or `package.json`).
+4. Trigger deployment referencing the prior deployment revision.
+5. Verify that deployment fails closed with:
+   `source content changed since deployment was created: expected fingerprint fp_..., got fp_...`
+6. Verify that the previous healthy container remains active and untouched.
+7. Trigger a new plan review so the fresh content fingerprint is registered, and deploy.
+8. Verify the deployment builds and starts successfully with `Verified source content matches reviewed revision fp_...` in the system build logs.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
 
 

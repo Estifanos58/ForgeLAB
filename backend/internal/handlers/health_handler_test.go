@@ -7,11 +7,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/forgelab/backend/internal/auth"
 	"github.com/forgelab/backend/internal/docker"
 	"github.com/forgelab/backend/internal/queue"
-	"github.com/redis/go-redis/v9"
 )
 
 func TestHealthHandler_Liveness(t *testing.T) {
@@ -130,6 +134,7 @@ func TestHealthHandler_QueueDiagnostics(t *testing.T) {
 	// 1. Without provider -> 501 Not Implemented
 	h := NewHealthHandler(nil, nil, nil)
 	req := httptest.NewRequest("GET", "/health/queue", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec := httptest.NewRecorder()
 	h.QueueDiagnostics(rec, req)
 
@@ -142,6 +147,8 @@ func TestHealthHandler_QueueDiagnostics(t *testing.T) {
 		err: errors.New("redis unavailable"),
 	}
 	h.SetQueueDiagnosticsProvider(mock)
+	req = httptest.NewRequest("GET", "/health/queue", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec = httptest.NewRecorder()
 	h.QueueDiagnostics(rec, req)
 
@@ -157,6 +164,8 @@ func TestHealthHandler_QueueDiagnostics(t *testing.T) {
 		DeadLetterJobs:     0,
 		TotalRecoveredJobs: 1,
 	}
+	req = httptest.NewRequest("GET", "/health/queue", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec = httptest.NewRecorder()
 	h.QueueDiagnostics(rec, req)
 
@@ -184,6 +193,7 @@ func TestHealthHandler_Readiness_WithQueueDiagnostics(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("GET", "/ready", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec := httptest.NewRecorder()
 	h.Readiness(rec, req)
 
@@ -217,6 +227,7 @@ func TestHealthHandler_BuildQueueDiagnostics(t *testing.T) {
 	h.SetBuildQueueDiagnosticsProvider(&mockBuildQueueProvider{diag: buildData})
 
 	req := httptest.NewRequest("GET", "/health/queue", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec := httptest.NewRecorder()
 	h.QueueDiagnostics(rec, req)
 
@@ -244,6 +255,7 @@ func (m *mockLogCollectorProvider) GetLogCollectorDiagnostics() docker.LogCollec
 func TestHealthHandler_LogCollectorDiagnostics_NotConfigured(t *testing.T) {
 	h := NewHealthHandler(nil, nil, nil)
 	req := httptest.NewRequest("GET", "/health/logs", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec := httptest.NewRecorder()
 
 	h.LogCollectorDiagnostics(rec, req)
@@ -276,6 +288,7 @@ func TestHealthHandler_LogCollectorDiagnostics_Success(t *testing.T) {
 	h.SetLogCollectorDiagnosticsProvider(mock)
 
 	req := httptest.NewRequest("GET", "/health/logs", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec := httptest.NewRecorder()
 
 	h.LogCollectorDiagnostics(rec, req)
@@ -306,6 +319,7 @@ func TestHealthHandler_Readiness_WithLogCollectorDiagnostics(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("GET", "/ready", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec := httptest.NewRecorder()
 	h.Readiness(rec, req)
 
@@ -319,5 +333,70 @@ func TestHealthHandler_Readiness_WithLogCollectorDiagnostics(t *testing.T) {
 	}
 	if resp.LogCollectors.ActiveCollectors != 3 || resp.LogCollectors.TotalLinesCollected != 500 {
 		t.Errorf("unexpected log collectors metrics: %+v", resp.LogCollectors)
+	}
+}
+
+func TestHealthHandler_DiagnosticsRestrictedForExternalCallers(t *testing.T) {
+	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
+	h := NewHealthHandler(nil, nil, nil)
+	h.SetSecurityContext(jwtManager, []string{"127.0.0.1", "::1"})
+
+	h.SetQueueDiagnosticsProvider(&mockQueueProvider{
+		diag: queue.QueueDiagnostics{PendingJobs: 10},
+	})
+	h.SetBuildQueueDiagnosticsProvider(&mockBuildQueueProvider{
+		diag: docker.SharedBuildDiagnostics{TotalEntries: 3},
+	})
+	h.SetLogCollectorDiagnosticsProvider(&mockLogCollectorProvider{
+		diag: docker.LogCollectorDiagnostics{ActiveCollectors: 4},
+	})
+
+	// 1. External unauthenticated request to /ready -> diagnostics omitted
+	reqReady := httptest.NewRequest("GET", "/ready", nil)
+	reqReady.RemoteAddr = "203.0.113.50:45678"
+	recReady := httptest.NewRecorder()
+	h.Readiness(recReady, reqReady)
+
+	var respReady ReadinessResponse
+	if err := json.Unmarshal(recReady.Body.Bytes(), &respReady); err != nil {
+		t.Fatalf("failed to decode readiness response: %v", err)
+	}
+	if respReady.Queue != nil {
+		t.Errorf("expected Queue diagnostics to be redacted for external caller, got %+v", respReady.Queue)
+	}
+	if respReady.BuildQueue != nil {
+		t.Errorf("expected BuildQueue to be redacted for external caller, got %+v", respReady.BuildQueue)
+	}
+	if respReady.LogCollectors != nil {
+		t.Errorf("expected LogCollectors to be redacted for external caller, got %+v", respReady.LogCollectors)
+	}
+
+	// 2. External unauthenticated request to /health/queue -> 401 Unauthorized
+	reqQueue := httptest.NewRequest("GET", "/health/queue", nil)
+	reqQueue.RemoteAddr = "203.0.113.50:45678"
+	recQueue := httptest.NewRecorder()
+	h.QueueDiagnostics(recQueue, reqQueue)
+	if recQueue.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized on external /health/queue, got %d", recQueue.Code)
+	}
+
+	// 3. External unauthenticated request to /health/logs -> 401 Unauthorized
+	reqLogs := httptest.NewRequest("GET", "/health/logs", nil)
+	reqLogs.RemoteAddr = "203.0.113.50:45678"
+	recLogs := httptest.NewRecorder()
+	h.LogCollectorDiagnostics(recLogs, reqLogs)
+	if recLogs.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized on external /health/logs, got %d", recLogs.Code)
+	}
+
+	// 4. External authenticated user request to /health/queue -> 200 OK
+	token, _ := jwtManager.GenerateAccessToken(uuid.New(), "admin@forgelab")
+	reqAuthQueue := httptest.NewRequest("GET", "/health/queue", nil)
+	reqAuthQueue.RemoteAddr = "203.0.113.50:45678"
+	reqAuthQueue.Header.Set("Authorization", "Bearer "+token)
+	recAuthQueue := httptest.NewRecorder()
+	h.QueueDiagnostics(recAuthQueue, reqAuthQueue)
+	if recAuthQueue.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for authenticated user on /health/queue, got %d", recAuthQueue.Code)
 	}
 }

@@ -74,7 +74,6 @@ func (h *IntegrationHandler) getRegisteredUserID(w http.ResponseWriter, r *http.
 	return userID, true
 }
 
-
 // GetGitHubStatus handles GET /api/integrations/github
 func (h *IntegrationHandler) GetGitHubStatus(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.getRegisteredUserID(w, r)
@@ -511,7 +510,6 @@ func (h *IntegrationHandler) RetryImport(w http.ResponseWriter, r *http.Request)
 
 	writeJSON(w, http.StatusOK, imp)
 }
-
 
 // DetectRepository handles GET /api/integrations/github/repositories/{owner}/{repo}/detect
 func (h *IntegrationHandler) DetectRepository(w http.ResponseWriter, r *http.Request) {

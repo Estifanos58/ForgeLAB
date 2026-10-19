@@ -45,7 +45,6 @@ type NetworkConfig struct {
 	External bool   `json:"external,omitempty"`
 }
 
-
 // EnvironmentProvenance tracks the origin and conflict status of an environment variable
 type EnvironmentProvenance struct {
 	Key                string `json:"key"`

@@ -30,7 +30,6 @@ type Config struct {
 	RateLimit  RateLimitConfig
 }
 
-
 // RateLimitConfig holds throttling limits for sensitive API endpoints and WebSockets.
 type RateLimitConfig struct {
 	Enabled             bool
@@ -49,6 +48,31 @@ type AppConfig struct {
 	CORSAllowedOrigins string
 	CookieSecure       bool
 	AllowGuestMode     bool
+	PublicHost         string
+}
+
+// PublicHostName returns the configured public host or domain, falling back to parsing FrontendURL or defaulting to localhost.
+func (a AppConfig) PublicHostName() string {
+	if a.PublicHost != "" {
+		return a.PublicHost
+	}
+	if a.FrontendURL != "" {
+		trimmed := strings.TrimPrefix(a.FrontendURL, "https://")
+		trimmed = strings.TrimPrefix(trimmed, "http://")
+		if host, _, err := net.SplitHostPort(trimmed); err == nil && host != "" {
+			return host
+		}
+		if idx := strings.Index(trimmed, "/"); idx != -1 {
+			trimmed = trimmed[:idx]
+		}
+		if idx := strings.Index(trimmed, ":"); idx != -1 {
+			trimmed = trimmed[:idx]
+		}
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return "localhost"
 }
 
 // AllowedOriginsList returns a slice of allowed origins parsed from CORSAllowedOrigins and FrontendURL.
@@ -126,7 +150,6 @@ func (g GitHubAppConfig) IsConfigured() bool {
 	}
 	return strings.TrimSpace(g.PrivateKey) != "" || strings.TrimSpace(g.PrivateKeyPath) != ""
 }
-
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
@@ -341,6 +364,7 @@ func Load() (*Config, error) {
 				// Default: enabled for local/single-user development, restricted for public/remote installations
 				return isDev
 			}(),
+			PublicHost: getEnv("FORGELAB_PUBLIC_HOST", getEnv("PUBLIC_HOST", "")),
 		},
 		Google: OAuthConfig{
 			ClientID:     getEnv("GOOGLE_CLIENT_ID", ""),

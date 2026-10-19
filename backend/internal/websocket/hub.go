@@ -16,9 +16,17 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/forgelab/backend/internal/auth"
+	"github.com/forgelab/backend/internal/middleware"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/ratelimit"
 )
+
+// TicketInfo stores single-use ticket claims and expiration.
+type TicketInfo struct {
+	UserID    uuid.UUID `json:"user_id"`
+	UserEmail string    `json:"user_email"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
 
 type Client struct {
 	hub           *Hub
@@ -95,6 +103,8 @@ type Hub struct {
 	rateLimiter              *ratelimit.Limiter
 	subscriptionLimit        int
 	allowGuestMode           bool
+	tickets                  map[string]TicketInfo
+	ticketMu                 sync.Mutex
 	ctx                      context.Context
 	cancel                   context.CancelFunc
 }
@@ -113,6 +123,7 @@ func NewHub(jwtManager *auth.JWTManager, projectService ProjectAuthorizer, deplo
 		redisClient:       redisClient,
 		allowedOrigins:    allowedOrigins,
 		allowGuestMode:    true,
+		tickets:           make(map[string]TicketInfo),
 		ctx:               ctx,
 		cancel:            cancel,
 	}
@@ -168,6 +179,12 @@ func (h *Hub) CheckOrigin(r *http.Request) bool {
 	}
 	origin = strings.TrimRight(strings.ToLower(origin), "/")
 
+	// Same-origin check: if origin matches request Host
+	host := strings.ToLower(r.Host)
+	if origin == "http://"+host || origin == "https://"+host {
+		return true
+	}
+
 	h.mu.RLock()
 	origins := h.allowedOrigins
 	h.mu.RUnlock()
@@ -187,6 +204,137 @@ func (h *Hub) CheckOrigin(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// CreateTicket generates a short-lived, single-use ticket for WebSocket authentication.
+func (h *Hub) CreateTicket(userID uuid.UUID, userEmail string, ttl time.Duration) (string, time.Time, error) {
+	if ttl == 0 {
+		ttl = 60 * time.Second
+	}
+	expiresAt := time.Now().Add(ttl)
+	ticketID := uuid.New().String()
+
+	info := TicketInfo{
+		UserID:    userID,
+		UserEmail: userEmail,
+		ExpiresAt: expiresAt,
+	}
+
+	if h.redisClient != nil {
+		data, err := json.Marshal(info)
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = h.redisClient.Set(ctx, "forgelab:ws_ticket:"+ticketID, data, ttl).Err()
+		}
+	}
+
+	h.ticketMu.Lock()
+	now := time.Now()
+	for k, v := range h.tickets {
+		if now.After(v.ExpiresAt) {
+			delete(h.tickets, k)
+		}
+	}
+	h.tickets[ticketID] = info
+	h.ticketMu.Unlock()
+
+	return ticketID, expiresAt, nil
+}
+
+// ConsumeTicket validates and consumes a single-use WebSocket ticket.
+func (h *Hub) ConsumeTicket(ticketID string) (*TicketInfo, bool) {
+	if ticketID == "" {
+		return nil, false
+	}
+
+	if h.redisClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		key := "forgelab:ws_ticket:" + ticketID
+		val, err := h.redisClient.GetDel(ctx, key).Result()
+		if err == nil && val != "" {
+			var info TicketInfo
+			if json.Unmarshal([]byte(val), &info) == nil {
+				if time.Now().Before(info.ExpiresAt) {
+					h.ticketMu.Lock()
+					delete(h.tickets, ticketID)
+					h.ticketMu.Unlock()
+					return &info, true
+				}
+			}
+		}
+	}
+
+	h.ticketMu.Lock()
+	defer h.ticketMu.Unlock()
+	info, exists := h.tickets[ticketID]
+	if !exists {
+		return nil, false
+	}
+	delete(h.tickets, ticketID)
+	if time.Now().After(info.ExpiresAt) {
+		return nil, false
+	}
+	return &info, true
+}
+
+// CreateTicketHandler handles POST /api/ws/ticket.
+func (h *Hub) CreateTicketHandler(w http.ResponseWriter, r *http.Request) {
+	var (
+		userID    uuid.UUID
+		userEmail string
+	)
+
+	if uID, ok := middleware.GetUserID(r.Context()); ok && uID != uuid.Nil {
+		userID = uID
+		userEmail = "user@forgelab"
+		if email, ok := middleware.GetUserEmail(r.Context()); ok && email != "" {
+			userEmail = email
+		}
+	} else {
+		var tokenString string
+		if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
+			tokenString = cookie.Value
+		} else if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+				tokenString = parts[1]
+			}
+		}
+		if tokenString != "" && h.jwtManager != nil {
+			if claims, err := h.jwtManager.ValidateAccessToken(tokenString); err == nil && claims != nil {
+				userID = claims.UserID
+				userEmail = claims.Email
+			}
+		}
+	}
+
+	if userID == uuid.Nil {
+		h.mu.RLock()
+		allowGuest := h.allowGuestMode
+		h.mu.RUnlock()
+		if allowGuest {
+			userID = models.GuestUserID
+			userEmail = models.GuestUserEmail
+		} else {
+			http.Error(w, `{"error": "unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+	}
+
+	ticket, expiresAt, err := h.CreateTicket(userID, userEmail, 60*time.Second)
+	if err != nil {
+		http.Error(w, `{"error": "failed to create ticket"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ticket":     ticket,
+		"expires_at": expiresAt.Format(time.RFC3339),
+	})
 }
 
 // NodeID returns the unique runtime identifier of this backend instance.
@@ -436,22 +584,18 @@ func (h *Hub) listenRedisPubSub() {
 
 // ServeWS handles GET /api/ws endpoint.
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
-	// Authenticate JWT token: 1. Cookie, 2. Auth header, 3. Query param (compatibility fallback)
-	var tokenString string
-	if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
-		tokenString = cookie.Value
+	// 1. Strictly enforce configured WebSocket origin policies on ALL connections
+	if !h.CheckOrigin(r) {
+		slog.Warn("ws connection rejected: untrusted origin", "origin", r.Header.Get("Origin"), "remote_addr", r.RemoteAddr)
+		http.Error(w, "forbidden: untrusted origin", http.StatusForbidden)
+		return
 	}
-	if tokenString == "" {
-		authHeader := r.Header.Get("Authorization")
-		if authHeader != "" {
-			parts := strings.SplitN(authHeader, " ", 2)
-			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
-				tokenString = parts[1]
-			}
-		}
-	}
-	if tokenString == "" {
-		tokenString = r.URL.Query().Get("token")
+
+	// 2. Reject deprecated query parameter token authentication
+	if r.URL.Query().Get("token") != "" {
+		slog.Warn("ws connection rejected: query parameter token authentication is removed", "remote_addr", r.RemoteAddr)
+		http.Error(w, "unauthorized: query parameter token authentication is removed; use cookies, Authorization header, or a single-use ticket", http.StatusUnauthorized)
+		return
 	}
 
 	var (
@@ -459,35 +603,69 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		userEmail string
 	)
 
-	if tokenString != "" {
-		claims, err := h.jwtManager.ValidateAccessToken(tokenString)
-		if err != nil {
-			slog.Warn("ws authentication failure", "remote_addr", r.RemoteAddr, "error", err, "reason", "invalid token")
-			http.Error(w, "unauthorized: invalid token", http.StatusUnauthorized)
+	// 3. Single-use ticket authentication (?ticket=<ticketID>)
+	if ticket := r.URL.Query().Get("ticket"); ticket != "" {
+		info, ok := h.ConsumeTicket(ticket)
+		if !ok {
+			slog.Warn("ws connection rejected: invalid or expired ticket", "remote_addr", r.RemoteAddr)
+			http.Error(w, "unauthorized: invalid or expired ticket", http.StatusUnauthorized)
 			return
 		}
-		userID = claims.UserID
-		userEmail = claims.Email
+		userID = info.UserID
+		userEmail = info.UserEmail
 	} else {
-		h.mu.RLock()
-		allowGuest := h.allowGuestMode
-		h.mu.RUnlock()
-
-		if !allowGuest {
-			slog.Warn("ws authentication failure", "remote_addr", r.RemoteAddr, "reason", "token required")
-			http.Error(w, "unauthorized: token required", http.StatusUnauthorized)
-			return
+		// 4. Authenticate via secure Cookie or Authorization Bearer header
+		var tokenString string
+		if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
+			tokenString = cookie.Value
+		}
+		if tokenString == "" {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader != "" {
+				parts := strings.SplitN(authHeader, " ", 2)
+				if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+					tokenString = parts[1]
+				}
+			}
 		}
 
-		// Strictly reject anonymous WebSocket connections with an untrusted origin
-		if !h.CheckOrigin(r) {
-			slog.Warn("ws anonymous connection rejected: untrusted origin", "origin", r.Header.Get("Origin"), "remote_addr", r.RemoteAddr)
-			http.Error(w, "forbidden: untrusted origin", http.StatusForbidden)
-			return
-		}
+		if tokenString != "" {
+			if h.jwtManager == nil {
+				http.Error(w, "unauthorized: auth manager unavailable", http.StatusUnauthorized)
+				return
+			}
+			claims, err := h.jwtManager.ValidateAccessToken(tokenString)
+			if err != nil {
+				slog.Warn("ws authentication failure", "remote_addr", r.RemoteAddr, "error", err, "reason", "invalid token")
+				http.Error(w, "unauthorized: invalid token", http.StatusUnauthorized)
+				return
+			}
+			userID = claims.UserID
+			userEmail = claims.Email
+		} else {
+			// If an access token is absent but a refresh token cookie is present, this client is an
+			// authenticated user whose access token has expired (or was evicted by the browser).
+			// We MUST NOT silently downgrade them to guest identity, as doing so causes legitimate
+			// project subscriptions to fail with "UNAUTHORIZED: access denied to this resource".
+			if cookie, err := r.Cookie("forgelab_refresh_token"); err == nil && cookie.Value != "" {
+				slog.Warn("ws authentication failure: refresh token present but access token missing", "remote_addr", r.RemoteAddr)
+				http.Error(w, "unauthorized: access token expired or missing, refresh required", http.StatusUnauthorized)
+				return
+			}
 
-		userID = models.GuestUserID
-		userEmail = models.GuestUserEmail
+			h.mu.RLock()
+			allowGuest := h.allowGuestMode
+			h.mu.RUnlock()
+
+			if !allowGuest {
+				slog.Warn("ws authentication failure", "remote_addr", r.RemoteAddr, "reason", "token required")
+				http.Error(w, "unauthorized: token required", http.StatusUnauthorized)
+				return
+			}
+
+			userID = models.GuestUserID
+			userEmail = models.GuestUserEmail
+		}
 	}
 
 	slog.Info("ws authentication success", "user_id", userID)

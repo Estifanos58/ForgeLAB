@@ -297,4 +297,26 @@ func TestAuthOrGuestMiddleware_OriginSecurity(t *testing.T) {
 			t.Fatalf("expected handler to execute for registered user")
 		}
 	})
+
+	t.Run("Guest_RefreshTokenPresent_Returns401RefreshRequired", func(t *testing.T) {
+		mutationExecuted = false
+		req := httptest.NewRequest("GET", "/api/projects", nil)
+		req.AddCookie(&http.Cookie{
+			Name:  "forgelab_refresh_token",
+			Value: "dummy-refresh-token-value",
+		})
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized when refresh token is present, got %d", rec.Code)
+		}
+		if mutationExecuted {
+			t.Fatalf("handler MUST NOT execute when access token is missing but refresh token is present")
+		}
+		if !strings.Contains(rec.Body.String(), "refresh required") {
+			t.Fatalf("expected response body to contain 'refresh required', got: %s", rec.Body.String())
+		}
+	})
 }

@@ -772,7 +772,6 @@ func GeneratePlan(res *DiscoveryResult, opts PlanOptions) (*DeploymentPlan, erro
 		return nil, fmt.Errorf("failed to validate service dependency graph: %w", err)
 	}
 
-
 	// 3. Compute endpoints
 	var publicEndpoints []PlannedEndpoint
 	var internalEndpoints []PlannedEndpoint

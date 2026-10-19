@@ -204,6 +204,7 @@ func main() {
 	dockerEngine.SetServiceService(serviceService)
 	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
 	dockerEngine.SetMaxConcurrentBuilds(cfg.Docker.MaxConcurrentBuilds)
+	dockerEngine.SetPublicHost(cfg.App.PublicHostName())
 	if cfg.Docker.PruneFilterLabel != "" {
 		dockerEngine.SetPruneFilterLabel(cfg.Docker.PruneFilterLabel)
 	}
@@ -389,6 +390,7 @@ func main() {
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
 	discoveryHandler := handlers.NewDiscoveryHandler(githubService, sourceService, pathValidator, secretService)
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
+	healthHandler.SetSecurityContext(jwtManager, cfg.RateLimit.TrustedProxies)
 	healthHandler.SetQueueDiagnosticsProvider(deployQueue)
 	healthHandler.SetBuildQueueDiagnosticsProvider(dockerEngine)
 	healthHandler.SetLogCollectorDiagnosticsProvider(dockerEngine)
@@ -417,8 +419,9 @@ func main() {
 	deployThrottle := ratelimit.Middleware(rateLimiter, "deploy", cfg.RateLimit.DeployLimit, time.Minute)
 	wsConnThrottle := ratelimit.Middleware(rateLimiter, "ws_conn", cfg.RateLimit.WSConnLimit, time.Minute)
 
-	// WebSocket endpoint
+	// WebSocket endpoint & ticket generation
 	r.With(wsConnThrottle).Get("/api/ws", wsHub.ServeWS)
+	r.With(wsConnThrottle).Post("/api/ws/ticket", wsHub.CreateTicketHandler)
 
 	// API routes
 	r.Route("/api", func(r chi.Router) {

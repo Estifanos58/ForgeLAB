@@ -242,4 +242,3 @@ func TestExtractClientIP_TrustedProxies(t *testing.T) {
 		}
 	})
 }
-

@@ -422,7 +422,6 @@ func translateBackendPathToDaemon(ctx context.Context, cli client.CommonAPIClien
 	return cleanBackend
 }
 
-
 // ResolveProjectSourcePaths determines the authoritative paths across the three namespaces:
 // 1. AgentPath: The canonical path reported by the local agent on the host
 // 2. BackendPath: The path accessible inside the running ForgeLAB backend container

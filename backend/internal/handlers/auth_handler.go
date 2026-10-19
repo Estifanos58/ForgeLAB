@@ -374,6 +374,10 @@ func (h *AuthHandler) redirectWithError(w http.ResponseWriter, r *http.Request, 
 }
 
 func (h *AuthHandler) setAuthCookies(w http.ResponseWriter, tokens *services.AuthTokens) {
+	accessMaxAge := 15 * 60
+	if tokens != nil && tokens.ExpiresIn > 0 {
+		accessMaxAge = tokens.ExpiresIn
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "forgelab_access_token",
 		Value:    tokens.AccessToken,
@@ -381,7 +385,7 @@ func (h *AuthHandler) setAuthCookies(w http.ResponseWriter, tokens *services.Aut
 		HttpOnly: true,
 		Secure:   h.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   15 * 60,
+		MaxAge:   accessMaxAge,
 	})
 	http.SetCookie(w, &http.Cookie{
 		Name:     "forgelab_refresh_token",

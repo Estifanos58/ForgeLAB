@@ -254,6 +254,14 @@ export function useDeploymentWS({
             case 'error':
               console.warn('[ForgeLAB WS] Server-side error:', msg.code, msg.message);
               onErrorRef.current?.(msg);
+              if (msg.code === 'UNAUTHORIZED') {
+                fetch('/api/auth/refresh', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  credentials: 'include',
+                  body: JSON.stringify({}),
+                }).catch(() => {});
+              }
               break;
 
             case 'log':

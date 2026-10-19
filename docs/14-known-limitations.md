@@ -237,22 +237,43 @@ These are identified codebase behaviors that require investigation and resolutio
   - Implemented dynamic daemon host path translation (`translateBackendPathToDaemon` and `DetectAllBackendContainerMounts`) to translate container storage volume paths to host paths visible to the Docker daemon (`/var/lib/docker/volumes/...`).
   - Permitted boundary-safe automatic directory creation for relative project subpaths (e.g. `./data`) during preflight while strictly maintaining path-escape rejections, restricted directory checks, and Docker socket mount bans.
 
----
+### 25. WebSocket Query String Token Removal & Single-Use Ticket Protocol (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/websocket/hub.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/websocket/hub.go), [`backend/cmd/server/main.go`](file:///home/estif/Projects/ForgeLAB/backend/cmd/server/main.go)
+- **Resolution:** Removed token authentication via URL query parameters (`?token=...`), which leaked JWT credentials into server/proxy access logs and browser histories. Connection requests containing `?token=` are strictly rejected with `401 Unauthorized`. Implemented short-lived (60s TTL), single-use tickets minted via `POST /api/ws/ticket` and consumed via `GET /api/ws?ticket=<uuid>`. Replayed or expired tickets are rejected with `401 Unauthorized`. Also supported authentication via secure HttpOnly `forgelab_access_token` cookies and `Authorization: Bearer <token>` headers.
 
+### 26. Enforced WebSocket Origin Policies (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/websocket/hub.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/websocket/hub.go)
+- **Resolution:** Replaced unconditional `CheckOrigin: func(...) { return true }` with strict origin verification. All WebSocket upgrade requests validate the incoming `Origin` header against configured frontend URLs (`CORS_ALLOWED_ORIGINS` and `FRONTEND_URL`) and same-origin host matching, eliminating cross-site WebSocket hijacking (CSWSH) vulnerabilities.
+
+### 27. Restricted Internal Diagnostics Access (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/handlers/health_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/health_handler.go), [`backend/cmd/server/main.go`](file:///home/estif/Projects/ForgeLAB/backend/cmd/server/main.go)
+- **Resolution:** Public `/ready` health probe no longer leaks internal operational details (`queue`, `build_queue`, `log_collectors`) to unauthenticated external clients; external callers receive a sanitized readiness status checking core dependencies. Detailed queue metrics and container log collector diagnostics via `/ready`, `/health/queue`, and `/health/logs` are restricted strictly to trusted loopback/internal callers or authenticated administrators, returning `401 Unauthorized` for external unauthenticated requests.
+
+### 28. Docker Host Port Conflict Retries & In-Transition Reconciliation (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_port.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_port.go), [`backend/internal/docker/engine_lifecycle.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_lifecycle.go)
+- **Resolution:** Implemented automatic conflict detection and retry logic (up to 3 retries) during container creation and startup. When Docker Engine reports that an allocated port is already bound on the host (`isPortConflictError`), ForgeLAB registers the conflicted port as used in `PortManager`, allocates a fresh port, updates port bindings, and reattempts creation/start. In addition, `ReconcileDaemonContainers` collects host ports from containers across `running`, `restarting`, `created`, and `paused` states, preventing collisions during service transitions.
+
+### 29. Build Reproducibility & Source Revision Fingerprint Verification (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_build.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_build.go)
+- **Resolution:** Pinned immutable source revisions across both release and independent service deployments. For local directory deployments, when a source revision fingerprint is pinned (`fp_...`), `resolveSourceDirectory` computes a fresh content-based fingerprint (`ComputeDirectoryContentFingerprintWithContext`) and fails closed with an informative error (`source content changed since deployment was created`) if disk files drift from the reviewed deployment revision before build execution.
+
+### 30. Remote Public Host URL Resolution (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/config/config.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/config/config.go), [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/cmd/server/main.go`](file:///home/estif/Projects/ForgeLAB/backend/cmd/server/main.go)
+- **Resolution:** Configured `PublicHost` via `FORGELAB_PUBLIC_HOST` or `PUBLIC_HOST` (falling back to host from `FRONTEND_URL`), preventing remote deployments from erroneously generating `localhost` browser URLs.
+
+---
 
 ## 3. Security Hardening Items (Deferred Backlog)
 
 1. **`localStorage` Token Storage (`RESOLVED IN ARCHITECTURE`):**
    - Authentication is backend-owned using `HttpOnly`, `Secure`, `SameSite=Lax` cookies (`forgelab_access_token` and `forgelab_refresh_token`). Client-side token storage in `localStorage` has been completely eliminated.
-2. **WebSocket Query String Token:**
-   - The WebSocket hook passes the JWT via URL query parameter (`?token=...`).
-   - Hardening: Authenticate WebSocket upgrades using the `forgelab_access_token` HttpOnly cookie or an initial authentication JSON frame after socket open.
-3. **Permissive WebSocket CORS / Origin Check:**
-   - In `backend/internal/websocket/hub.go:L24-L26`, `upgrader.CheckOrigin` returns `true` unconditionally.
-   - Hardening: Restrict allowed origins to configured domains (e.g. `http://localhost:3000`).
-4. **Backend Docker Socket Trust:**
+2. **WebSocket Query String Token (`RESOLVED IN ARCHITECTURE`):**
+   - Query string JWT authentication (`?token=...`) has been eliminated and is strictly rejected with `401 Unauthorized`. WebSocket connections authenticate via HttpOnly cookies, `Authorization` headers, or short-lived single-use tickets (`POST /api/ws/ticket`).
+3. **Permissive WebSocket CORS / Origin Check (`RESOLVED IN ARCHITECTURE`):**
+   - Strict origin validation is enforced across all WebSocket upgrades, matching against configured frontend URLs (`CORS_ALLOWED_ORIGINS` and `FRONTEND_URL`) or same-origin host headers.
+4. **Backend Docker Socket Trust (Inherent Architectural Boundary):**
    - The Go backend mounts `/var/run/docker.sock` with root-equivalent Docker Engine control.
-   - Hardening: Explore Docker rootless mode or a restricted daemon proxy to reduce blast radius.
+   - Architectural Hardening Required for Complete Elimination: Because the Docker daemon does not offer granular per-tenant Unix socket ACLs, root-equivalent control over the host cannot be eliminated purely in software on a shared single-node daemon. Complete architectural mitigation requires Docker-in-Docker (DinD), Rootless Docker, or isolated microVM hypervisors (Firecracker/gVisor). Active defense-in-depth mitigations (rejection of socket mounts into tenant containers, `CapDrop: ALL`, `no-new-privileges`, strict path validation) are currently enforced.
 5. **Container Resource Limits (`RESOLVED IN ARCHITECTURE`):**
    - `ValidateAndBuildSecureHostConfig` enforces CPU (`NanoCPUs`), Memory (`Memory`), and PIDs (`PidsLimit`) quotas per service within `container.HostConfig.Resources`. Ephemeral storage quotas are explicitly rejected.
 

@@ -867,4 +867,3 @@ func TestRegression_HealthCheck_None_VerifiesRunningContainer(t *testing.T) {
 	assert.True(t, healthy, "None health strategy must pass immediately for running container without network dials")
 	assert.Equal(t, "container verified running", reason)
 }
-

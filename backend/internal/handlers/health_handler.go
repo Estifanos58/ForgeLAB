@@ -3,15 +3,22 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/docker/docker/client"
-	"github.com/forgelab/backend/internal/docker"
-	"github.com/forgelab/backend/internal/queue"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/forgelab/backend/internal/auth"
+	"github.com/forgelab/backend/internal/docker"
+	"github.com/forgelab/backend/internal/models"
+	"github.com/forgelab/backend/internal/queue"
+	"github.com/forgelab/backend/internal/ratelimit"
 )
 
 type QueueDiagnosticsProvider interface {
@@ -48,6 +55,8 @@ type HealthHandler struct {
 	queueProvider        QueueDiagnosticsProvider
 	buildQueueProvider   BuildQueueDiagnosticsProvider
 	logCollectorProvider LogCollectorDiagnosticsProvider
+	jwtManager           *auth.JWTManager
+	trustedProxies       []string
 }
 
 func NewHealthHandler(db *pgxpool.Pool, redisClient *redis.Client, dockerClient *client.Client) *HealthHandler {
@@ -56,6 +65,52 @@ func NewHealthHandler(db *pgxpool.Pool, redisClient *redis.Client, dockerClient 
 		redisClient:  redisClient,
 		dockerClient: dockerClient,
 	}
+}
+
+func (h *HealthHandler) SetSecurityContext(jwtManager *auth.JWTManager, trustedProxies []string) {
+	h.jwtManager = jwtManager
+	h.trustedProxies = trustedProxies
+}
+
+func (h *HealthHandler) isAuthorizedForDiagnostics(r *http.Request) bool {
+	// 1. Authenticated user from middleware context
+	if userID, ok := getUserIDFromContext(r); ok && userID != uuid.Nil && userID != models.GuestUserID {
+		return true
+	}
+
+	// 2. Direct cookie or Bearer token verification if public probe bypassed auth middleware
+	if h.jwtManager != nil {
+		var tokenString string
+		if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
+			tokenString = cookie.Value
+		} else if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+				tokenString = parts[1]
+			}
+		}
+		if tokenString != "" {
+			if claims, err := h.jwtManager.ValidateAccessToken(tokenString); err == nil && claims != nil && claims.UserID != uuid.Nil && claims.UserID != models.GuestUserID {
+				return true
+			}
+		}
+	}
+
+	// 3. Trusted internal network check (loopback or private IP through trusted proxy)
+	clientIP := ratelimit.ExtractClientIP(r, h.trustedProxies)
+	parsedClientIP := net.ParseIP(clientIP)
+	if parsedClientIP != nil && (parsedClientIP.IsLoopback() || parsedClientIP.IsPrivate()) {
+		directHost, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			directHost = r.RemoteAddr
+		}
+		directIP := net.ParseIP(directHost)
+		if directIP != nil && (directIP.IsLoopback() || ratelimit.IsTrustedProxy(directHost, h.trustedProxies)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (h *HealthHandler) SetQueueDiagnosticsProvider(provider QueueDiagnosticsProvider) {
@@ -177,20 +232,22 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 
+	authorized := h.isAuthorizedForDiagnostics(r)
+
 	var queueDiag *queue.QueueDiagnostics
-	if h.queueProvider != nil {
+	if authorized && h.queueProvider != nil {
 		if qd, err := h.queueProvider.GetQueueDiagnostics(ctx); err == nil {
 			queueDiag = &qd
 		}
 	}
 
 	var buildDiag interface{}
-	if h.buildQueueProvider != nil {
+	if authorized && h.buildQueueProvider != nil {
 		buildDiag = h.buildQueueProvider.GetSharedBuildDiagnostics()
 	}
 
 	var logDiag *docker.LogCollectorDiagnostics
-	if h.logCollectorProvider != nil {
+	if authorized && h.logCollectorProvider != nil {
 		diag := h.logCollectorProvider.GetLogCollectorDiagnostics()
 		logDiag = &diag
 	}
@@ -218,6 +275,11 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 
 // QueueDiagnostics handles GET /health/queue (queue metrics and recovery statistics)
 func (h *HealthHandler) QueueDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if !h.isAuthorizedForDiagnostics(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized: queue diagnostics restricted to internal access or authenticated users")
+		return
+	}
+
 	if h.queueProvider == nil && h.buildQueueProvider == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotImplemented)
@@ -260,6 +322,11 @@ func (h *HealthHandler) QueueDiagnostics(w http.ResponseWriter, r *http.Request)
 
 // LogCollectorDiagnostics handles GET /health/logs (runtime log collector health and operational diagnostics)
 func (h *HealthHandler) LogCollectorDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if !h.isAuthorizedForDiagnostics(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized: log collector diagnostics restricted to internal access or authenticated users")
+		return
+	}
+
 	if h.logCollectorProvider == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotImplemented)

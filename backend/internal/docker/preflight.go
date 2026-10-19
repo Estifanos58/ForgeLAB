@@ -173,7 +173,6 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 		}
 	}
 
-
 	// 4. Service-specific preflight checks
 	for _, sd := range opts.Deployments {
 		var svc *models.Service

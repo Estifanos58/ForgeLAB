@@ -213,7 +213,6 @@ func TestGitHubService_ListRepositories_GitHubAppUserTokenAllowed(t *testing.T) 
 	assert.Empty(t, repos)
 }
 
-
 func TestGitHubService_GetStatus_DetectsNeedsReauth(t *testing.T) {
 	svc := services.NewGitHubService(nil, nil, config.OAuthConfig{}, nil)
 	userID := uuid.New()

@@ -1116,4 +1116,3 @@ func BuildDAG(services []DiscoveredService) (map[string][]string, [][]string, er
 	}
 	return ValidateAndBuildDAG(nodes)
 }
-
