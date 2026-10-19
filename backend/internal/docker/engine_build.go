@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/forgelab/backend/internal/agent"
+	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/tararchive"
 )
@@ -589,49 +590,37 @@ func resolveAgentBaseURL() string {
 }
 
 // buildServiceDeploymentTiers partitions service deployments into dependency execution tiers (DAG)
-func buildServiceDeploymentTiers(svcDeploys []*models.ServiceDeployment) [][]*models.ServiceDeployment {
-	nameToDeploy := make(map[string]*models.ServiceDeployment)
-	for _, sd := range svcDeploys {
-		nameToDeploy[sd.ServiceName] = sd
+// using the authoritative ValidateAndBuildDAG implementation. It returns an error if cycles,
+// unknown services, or invalid dependency conditions are detected, and never silently falls back.
+func buildServiceDeploymentTiers(svcDeploys []*models.ServiceDeployment) ([][]*models.ServiceDeployment, error) {
+	if len(svcDeploys) == 0 {
+		return nil, nil
 	}
 
-	deployed := make(map[string]bool)
-	remaining := make(map[string]*models.ServiceDeployment)
-	for _, sd := range svcDeploys {
-		remaining[sd.ServiceName] = sd
+	nameMap := make(map[string]*models.ServiceDeployment, len(svcDeploys))
+	nodes := make([]discovery.ServiceNode, len(svcDeploys))
+	for i, sd := range svcDeploys {
+		nameMap[strings.ToLower(strings.TrimSpace(sd.ServiceName))] = sd
+		nodes[i] = discovery.ServiceNode{
+			Name:                sd.ServiceName,
+			DependsOn:           sd.DependsOn,
+			DependsOnConditions: sd.DependsOnConditions,
+		}
 	}
 
-	var tiers [][]*models.ServiceDeployment
-	for len(remaining) > 0 {
-		var currentTier []*models.ServiceDeployment
-		for _, sd := range remaining {
-			depsSatisfied := true
-			for _, dep := range sd.DependsOn {
-				if _, exists := nameToDeploy[dep]; exists && !deployed[dep] {
-					depsSatisfied = false
-					break
-				}
-			}
-			if depsSatisfied {
-				currentTier = append(currentTier, sd)
-			}
-		}
-
-		if len(currentTier) == 0 {
-			// Circular dependency or unresolvable: group all remaining into a final tier
-			var fallback []*models.ServiceDeployment
-			for _, sd := range remaining {
-				fallback = append(fallback, sd)
-			}
-			tiers = append(tiers, fallback)
-			break
-		}
-
-		for _, sd := range currentTier {
-			deployed[sd.ServiceName] = true
-			delete(remaining, sd.ServiceName)
-		}
-		tiers = append(tiers, currentTier)
+	_, tierNames, err := discovery.ValidateAndBuildDAG(nodes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build dependency tiers: %w", err)
 	}
-	return tiers
+
+	tiers := make([][]*models.ServiceDeployment, len(tierNames))
+	for i, tier := range tierNames {
+		tierItems := make([]*models.ServiceDeployment, len(tier))
+		for j, sName := range tier {
+			tierItems[j] = nameMap[strings.ToLower(sName)]
+		}
+		tiers[i] = tierItems
+	}
+	return tiers, nil
 }
+

@@ -32,6 +32,24 @@ func (r *LogRedactor) SetSecrets(secrets []string) {
 	r.secretValues = valid
 }
 
+// AddSecrets appends additional secret values to the active list of values to redact.
+func (r *LogRedactor) AddSecrets(secrets ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, s := range secrets {
+		trimmed := strings.TrimSpace(s)
+		if len(trimmed) >= 3 {
+			r.secretValues = append(r.secretValues, trimmed)
+		}
+	}
+}
+
+// AddSecret appends a single secret value to the active list of values to redact.
+func (r *LogRedactor) AddSecret(secret string) {
+	r.AddSecrets(secret)
+}
+
 // Redact replaces any occurrence of configured secret values in message with [REDACTED].
 func (r *LogRedactor) Redact(message string) string {
 	r.mu.RLock()

@@ -402,7 +402,8 @@ func TestDAGExecution_TiersAndConditions(t *testing.T) {
 		},
 	}
 
-	tiers := buildServiceDeploymentTiers(svcDeploys)
+	tiers, err := buildServiceDeploymentTiers(svcDeploys)
+	require.NoError(t, err)
 	require.Len(t, tiers, 3, "should generate 3 distinct execution tiers")
 
 	assert.Equal(t, "db", tiers[0][0].ServiceName, "Tier 1 must be db")
@@ -541,7 +542,8 @@ func TestForgeLAB_OwnComposePipeline(t *testing.T) {
 	// Tier 2: migrate (depends on postgres)
 	// Tier 3: backend (depends on migrate, postgres, redis)
 	// Tier 4: frontend (depends on backend)
-	tiers := buildServiceDeploymentTiers(sanitizedDeploys)
+	tiers, err := buildServiceDeploymentTiers(sanitizedDeploys)
+	require.NoError(t, err)
 	require.Len(t, tiers, 4, "ForgeLAB release must produce exactly 4 DAG execution tiers")
 
 	tier1Names := map[string]bool{}

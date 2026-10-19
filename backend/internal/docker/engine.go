@@ -31,6 +31,7 @@ import (
 
 	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/detector"
+	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/logging"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/network"
@@ -1360,7 +1361,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		service.Classification == models.ClassificationJob ||
 		serviceDeploy.Classification == models.ClassificationInfrastructure ||
 		serviceDeploy.Classification == models.ClassificationWorker ||
-		serviceDeploy.Classification == models.ClassificationJob
+		serviceDeploy.Classification == models.ClassificationJob ||
+		discovery.ClassifyService(service.Name, service.Image, nil, "") == discovery.ClassificationInfrastructure ||
+		discovery.ClassifyService(service.Name, service.Image, nil, "") == discovery.ClassificationWorker ||
+		discovery.ClassifyService(service.Name, service.Image, nil, "") == discovery.ClassificationJob
 	shouldExposePort := !isInternalService && (service.PublicExposed || service.Role == models.RoleFrontend || len(allProjectServices) <= 1)
 
 	if shouldExposePort {
@@ -1449,6 +1453,28 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		hasExplicitRedisURL = true
 	}
 
+	// Identify all database and cache services in the project to avoid ambiguous automatic selection
+	var dbServices []*models.Service
+	var redisServices []*models.Service
+	for _, p := range allProjectServices {
+		pNameLower := strings.ToLower(p.Name)
+		pImageLower := strings.ToLower(p.Image)
+		isDB := strings.Contains(pNameLower, "postgres") || strings.Contains(pImageLower, "postgres") ||
+			strings.Contains(pNameLower, "mysql") || strings.Contains(pNameLower, "mariadb") || strings.Contains(pImageLower, "mysql") ||
+			strings.Contains(pNameLower, "mongo") || strings.Contains(pImageLower, "mongo") ||
+			pNameLower == "db" || pNameLower == "database"
+		if isDB {
+			dbServices = append(dbServices, p)
+		}
+		isCache := strings.Contains(pNameLower, "redis") || strings.Contains(pImageLower, "redis") ||
+			pNameLower == "cache" || pNameLower == "queue" || pNameLower == "valkey"
+		if isCache {
+			redisServices = append(redisServices, p)
+		}
+	}
+	isSingleDB := len(dbServices) == 1
+	isSingleRedis := len(redisServices) == 1
+
 	for _, peer := range allProjectServices {
 		peerIntPort := peer.InternalPort
 		if peerIntPort <= 0 {
@@ -1465,10 +1491,45 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		isMySQL := strings.Contains(peerNameLower, "mysql") || strings.Contains(peerNameLower, "mariadb") || strings.Contains(peerImageLower, "mysql")
 		isMongo := strings.Contains(peerNameLower, "mongo") || strings.Contains(peerImageLower, "mongo")
 
+		// Query target peer service's own configuration and secrets (not the consumer's environment!)
+		var peerEnvMap map[string]string
+		if e.secretService != nil {
+			if m, _, err := e.secretService.GetDecryptedEnvMap(execCtx, project.ID, &peer.ID, models.EnvScopeRuntime); err == nil && len(m) > 0 {
+				peerEnvMap = m
+			}
+		}
+		if peerEnvMap == nil {
+			peerEnvMap = make(map[string]string)
+		}
+
 		if isRedis {
-			redisURL := fmt.Sprintf("redis://%s:%d/0", peer.Name, peerIntPort)
+			redisPass := ""
+			redisUser := ""
+			if p, ok := peerEnvMap["REDIS_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
+				redisPass = p
+			}
+			if u, ok := peerEnvMap["REDIS_USER"]; ok && u != "" && u != "[REDACTED]" {
+				redisUser = u
+			}
+			redisURLObj := &url.URL{
+				Scheme: "redis",
+				Host:   fmt.Sprintf("%s:%d", peer.Name, peerIntPort),
+				Path:   "/0",
+			}
+			if redisPass != "" {
+				if redisUser != "" {
+					redisURLObj.User = url.UserPassword(redisUser, redisPass)
+				} else {
+					redisURLObj.User = url.UserPassword("", redisPass)
+				}
+				redactor.AddSecret(redisPass)
+			}
+			redisURL := redisURLObj.String()
+			redactor.AddSecret(redisURL)
+
 			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, redisURL))
-			if !hasExplicitRedisURL {
+			// Unambiguous selection: only set generic REDIS_URL if there is exactly 1 redis service and not explicitly overridden
+			if !hasExplicitRedisURL && isSingleRedis {
 				svcEnv = append(svcEnv, fmt.Sprintf("REDIS_URL=%s", redisURL))
 				hasExplicitRedisURL = true
 			}
@@ -1476,34 +1537,156 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			pgUser := "forgelab"
 			pgPass := "forgelab_dev_password"
 			pgDB := "forgelab"
-			if u, ok := runtimeEnvMap["POSTGRES_USER"]; ok && u != "" && u != "[REDACTED]" {
+			if u, ok := peerEnvMap["POSTGRES_USER"]; ok && u != "" && u != "[REDACTED]" {
 				pgUser = u
 			}
-			if p, ok := runtimeEnvMap["POSTGRES_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
+			if p, ok := peerEnvMap["POSTGRES_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
 				pgPass = p
 			}
-			if d, ok := runtimeEnvMap["POSTGRES_DB"]; ok && d != "" && d != "[REDACTED]" {
+			if d, ok := peerEnvMap["POSTGRES_DB"]; ok && d != "" && d != "[REDACTED]" {
 				pgDB = d
 			}
-			dbURL := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable", pgUser, pgPass, peer.Name, peerIntPort, pgDB)
+			// Use standard library url.UserPassword to guarantee RFC-compliant percent encoding of credentials
+			dbURLObj := &url.URL{
+				Scheme:   "postgres",
+				User:     url.UserPassword(pgUser, pgPass),
+				Host:     fmt.Sprintf("%s:%d", peer.Name, peerIntPort),
+				Path:     "/" + pgDB,
+				RawQuery: "sslmode=disable",
+			}
+			dbURL := dbURLObj.String()
+			redactor.AddSecret(pgPass)
+			redactor.AddSecret(dbURL)
+
 			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
-			if !hasExplicitDatabaseURL {
+			// Unambiguous selection: only set generic DATABASE_URL if there is exactly 1 database and not explicitly overridden
+			if !hasExplicitDatabaseURL && isSingleDB {
 				svcEnv = append(svcEnv, fmt.Sprintf("DATABASE_URL=%s", dbURL))
 				hasExplicitDatabaseURL = true
 			}
 		} else if isMySQL {
-			dbURL := fmt.Sprintf("mysql://root:root@%s:%d/", peer.Name, peerIntPort)
+			myUser := "root"
+			myPass := "root"
+			myDB := "forgelab"
+			if u, ok := peerEnvMap["MYSQL_USER"]; ok && u != "" && u != "[REDACTED]" {
+				myUser = u
+			}
+			if p, ok := peerEnvMap["MYSQL_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
+				myPass = p
+			} else if p, ok := peerEnvMap["MYSQL_ROOT_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
+				myPass = p
+			}
+			if d, ok := peerEnvMap["MYSQL_DATABASE"]; ok && d != "" && d != "[REDACTED]" {
+				myDB = d
+			}
+			dbURLObj := &url.URL{
+				Scheme: "mysql",
+				User:   url.UserPassword(myUser, myPass),
+				Host:   fmt.Sprintf("%s:%d", peer.Name, peerIntPort),
+				Path:   "/" + myDB,
+			}
+			dbURL := dbURLObj.String()
+			redactor.AddSecret(myPass)
+			redactor.AddSecret(dbURL)
 			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
+			if !hasExplicitDatabaseURL && isSingleDB {
+				svcEnv = append(svcEnv, fmt.Sprintf("DATABASE_URL=%s", dbURL))
+				hasExplicitDatabaseURL = true
+			}
 		} else if isMongo {
-			dbURL := fmt.Sprintf("mongodb://%s:%d", peer.Name, peerIntPort)
+			mUser := ""
+			mPass := ""
+			mDB := ""
+			if u, ok := peerEnvMap["MONGO_INITDB_ROOT_USERNAME"]; ok && u != "" && u != "[REDACTED]" {
+				mUser = u
+			}
+			if p, ok := peerEnvMap["MONGO_INITDB_ROOT_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
+				mPass = p
+			}
+			if d, ok := peerEnvMap["MONGO_INITDB_DATABASE"]; ok && d != "" && d != "[REDACTED]" {
+				mDB = d
+			}
+			dbURLObj := &url.URL{
+				Scheme: "mongodb",
+				Host:   fmt.Sprintf("%s:%d", peer.Name, peerIntPort),
+				Path:   "/" + mDB,
+			}
+			if mPass != "" {
+				if mUser != "" {
+					dbURLObj.User = url.UserPassword(mUser, mPass)
+				} else {
+					dbURLObj.User = url.UserPassword("", mPass)
+				}
+				redactor.AddSecret(mPass)
+			}
+			dbURL := dbURLObj.String()
+			redactor.AddSecret(dbURL)
 			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
+			if !hasExplicitDatabaseURL && isSingleDB {
+				svcEnv = append(svcEnv, fmt.Sprintf("DATABASE_URL=%s", dbURL))
+				hasExplicitDatabaseURL = true
+			}
 		} else {
 			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=http://%s:%d", upperName, peer.Name, peerIntPort))
 		}
 
 		if peer.Role == models.RoleBackend {
-			svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_URL=http://%s:%d", peer.Name, peerIntPort))
-			svcEnv = append(svcEnv, fmt.Sprintf("API_URL=http://%s:%d", peer.Name, peerIntPort))
+			svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_INTERNAL_URL=http://%s:%d", peer.Name, peerIntPort))
+			if service.Role == models.RoleFrontend {
+				// Browser-side frontend requests MUST NEVER depend on private Docker DNS names!
+				browserURL := ""
+				if peer.PreviewURL != nil && *peer.PreviewURL != "" {
+					browserURL = *peer.PreviewURL
+				} else if peer.CustomDomain != nil && *peer.CustomDomain != "" {
+					browserURL = fmt.Sprintf("https://%s", *peer.CustomDomain)
+				} else if peer.HostPort != nil && *peer.HostPort > 0 {
+					browserURL = fmt.Sprintf("http://localhost:%d", *peer.HostPort)
+				}
+
+				if browserURL != "" {
+					if _, ok := runtimeEnvMap["NEXT_PUBLIC_API_URL"]; !ok {
+						svcEnv = append(svcEnv, fmt.Sprintf("NEXT_PUBLIC_API_URL=%s", browserURL))
+					}
+					if _, ok := runtimeEnvMap["VITE_API_URL"]; !ok {
+						svcEnv = append(svcEnv, fmt.Sprintf("VITE_API_URL=%s", browserURL))
+					}
+					if _, ok := runtimeEnvMap["API_URL"]; !ok {
+						svcEnv = append(svcEnv, fmt.Sprintf("API_URL=%s", browserURL))
+					}
+				}
+				// Provide container-to-container backend URL for server-side rendering (SSR)
+				if _, ok := runtimeEnvMap["BACKEND_URL"]; !ok {
+					svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_URL=http://%s:%d", peer.Name, peerIntPort))
+				}
+			} else {
+				svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_URL=http://%s:%d", peer.Name, peerIntPort))
+				svcEnv = append(svcEnv, fmt.Sprintf("API_URL=http://%s:%d", peer.Name, peerIntPort))
+			}
+		}
+	}
+
+	// Parse deployment plan to obtain declared network configurations and aliases
+	var plan discovery.DeploymentPlan
+	hasPlan := false
+	if len(project.DeploymentPlan) > 0 && string(project.DeploymentPlan) != "{}" {
+		if err := json.Unmarshal(project.DeploymentPlan, &plan); err == nil {
+			hasPlan = true
+		}
+	}
+
+	netConfigMap := make(map[string]discovery.NetworkConfig)
+	if hasPlan {
+		for _, nc := range plan.NetworkConfigs {
+			netConfigMap[nc.Name] = nc
+		}
+	}
+
+	planAliasesMap := make(map[string]map[string][]string)
+	if hasPlan {
+		for _, ps := range plan.Services {
+			if len(ps.NetworkAliases) > 0 {
+				planAliasesMap[ps.Name] = ps.NetworkAliases
+			}
 		}
 	}
 
@@ -1517,50 +1700,66 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	var primaryNetworkName string
 	var secondaryNetworkNames []string
+	var primaryNetworkComposeKey string
+	secondaryNetworkComposeKeys := make(map[string]string)
 
 	if len(serviceNetworks) > 0 {
 		for i, net := range serviceNetworks {
-			projNet := fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
-			if err := e.EnsureNetwork(execCtx, projNet, map[string]string{
-				"forgelab.project_id": project.ID.String(),
-				"forgelab.network":    net,
-			}); err != nil {
-				reason := fmt.Sprintf("Failed to initialize service network '%s': %v", projNet, err)
+			nc, isDeclared := netConfigMap[net]
+			var dockerNetName string
+			opts := NetworkEnsureOptions{
+				Driver:   "bridge",
+				Internal: false,
+				External: false,
+				Labels: map[string]string{
+					"forgelab.project_id": project.ID.String(),
+					"forgelab.network":    net,
+				},
+			}
+			if isDeclared {
+				if nc.Driver != "" {
+					opts.Driver = nc.Driver
+				}
+				opts.Internal = nc.Internal
+				opts.External = nc.External
+				if nc.External {
+					dockerNetName = net
+				} else {
+					dockerNetName = fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
+				}
+			} else {
+				dockerNetName = fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
+			}
+
+			if err := e.EnsureNetworkWithOptions(execCtx, dockerNetName, opts); err != nil {
+				reason := fmt.Sprintf("Failed to initialize service network '%s': %v", dockerNetName, err)
 				emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
 				emitStatus(models.DeployStatusFailed, nil, &reason)
 				return errors.New(reason)
 			}
 			if i == 0 {
-				primaryNetworkName = projNet
+				primaryNetworkName = dockerNetName
+				primaryNetworkComposeKey = net
 			} else {
-				secondaryNetworkNames = append(secondaryNetworkNames, projNet)
+				secondaryNetworkNames = append(secondaryNetworkNames, dockerNetName)
+				secondaryNetworkComposeKeys[dockerNetName] = net
 			}
 		}
-	}
-
-	// Always ensure common project network is present so all services in the project can resolve each other via DNS aliases
-	commonProjectNet := fmt.Sprintf("forgelab-net-%s", project.ID.String())
-	if err := e.EnsureNetwork(execCtx, commonProjectNet, map[string]string{
-		"forgelab.project_id": project.ID.String(),
-	}); err != nil {
-		reason := fmt.Sprintf("Failed to initialize common project network '%s': %v", commonProjectNet, err)
-		emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
-		emitStatus(models.DeployStatusFailed, nil, &reason)
-		return errors.New(reason)
-	}
-	if primaryNetworkName == "" {
-		primaryNetworkName = commonProjectNet
 	} else {
-		foundCommon := false
-		for _, sn := range secondaryNetworkNames {
-			if sn == commonProjectNet {
-				foundCommon = true
-				break
-			}
+		// When no explicit service network definitions exist, use the isolated project network
+		commonProjectNet := fmt.Sprintf("forgelab-net-%s", project.ID.String())
+		if err := e.EnsureNetworkWithOptions(execCtx, commonProjectNet, NetworkEnsureOptions{
+			Driver: "bridge",
+			Labels: map[string]string{
+				"forgelab.project_id": project.ID.String(),
+			},
+		}); err != nil {
+			reason := fmt.Sprintf("Failed to initialize common project network '%s': %v", commonProjectNet, err)
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
 		}
-		if !foundCommon && primaryNetworkName != commonProjectNet {
-			secondaryNetworkNames = append(secondaryNetworkNames, commonProjectNet)
-		}
+		primaryNetworkName = commonProjectNet
 	}
 
 	containerName := fmt.Sprintf("forgelab-app-%s-%s", serviceDeploy.ID.String()[:8], service.Name)
@@ -1768,10 +1967,22 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		hostConfig.NetworkMode = container.NetworkMode(primaryNetworkName)
 	}
 
+	var primaryAliases []string
+	primaryAliases = append(primaryAliases, service.Name)
+	if primaryNetworkComposeKey != "" {
+		if svcAliases, ok := planAliasesMap[service.Name]; ok {
+			for _, a := range svcAliases[primaryNetworkComposeKey] {
+				if a != "" && a != service.Name {
+					primaryAliases = append(primaryAliases, a)
+				}
+			}
+		}
+	}
+
 	netConfig := &dockernetwork.NetworkingConfig{
 		EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
 			primaryNetworkName: {
-				Aliases: []string{service.Name},
+				Aliases: primaryAliases,
 			},
 		},
 	}
@@ -1821,10 +2032,37 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	// Connect to any secondary isolated project networks
 	for _, secNet := range secondaryNetworkNames {
 		if e.dockerClient != nil {
+			secComposeKey := secondaryNetworkComposeKeys[secNet]
+			var secAliases []string
+			secAliases = append(secAliases, service.Name)
+			if secComposeKey != "" {
+				if svcAliases, ok := planAliasesMap[service.Name]; ok {
+					for _, a := range svcAliases[secComposeKey] {
+						if a != "" && a != service.Name {
+							secAliases = append(secAliases, a)
+						}
+					}
+				}
+			}
+
 			if netConnErr := e.dockerClient.NetworkConnect(execCtx, secNet, resp.ID, &dockernetwork.EndpointSettings{
-				Aliases: []string{service.Name},
+				Aliases: secAliases,
 			}); netConnErr != nil {
-				slog.Warn("failed to connect secondary network", "network", secNet, "service", service.Name, "error", netConnErr)
+				if hostPort != nil {
+					e.portManager.ReleasePort(*hostPort)
+				}
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = e.dockerClient.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
+				cleanupCancel()
+				if stoppedPreviousForStateful && previousContainerID != nil && *previousContainerID != "" {
+					restartCtx, restartCancel := context.WithTimeout(context.Background(), 15*time.Second)
+					_ = e.dockerClient.ContainerStart(restartCtx, *previousContainerID, container.StartOptions{})
+					restartCancel()
+				}
+				reason := fmt.Sprintf("Failed to attach required network '%s' to service '%s': %v", secNet, service.Name, netConnErr)
+				emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
 			}
 		}
 	}
@@ -2017,21 +2255,27 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	// 6. Cleanup previous container for this service if different
 	if previousContainerID != nil && *previousContainerID != "" && *previousContainerID != containerID {
-		if !stoppedPreviousForStateful {
-			emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for service '%s'...", (*previousContainerID)[:12], service.Name))
-			if previousDeploymentID != nil {
-				e.StopLogCollector(*previousDeploymentID)
+		if serviceDeploy.DeploymentID == nil {
+			// Single service deployment: safe to clean up immediately upon promotion
+			if !stoppedPreviousForStateful {
+				emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for service '%s'...", (*previousContainerID)[:12], service.Name))
+				if previousDeploymentID != nil {
+					e.StopLogCollector(*previousDeploymentID)
+				}
+				e.StopContainerLogCollector(*previousContainerID)
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = e.dockerClient.ContainerStop(cleanupCtx, *previousContainerID, container.StopOptions{})
+				cleanupCancel()
+			} else {
+				e.StopContainerLogCollector(*previousContainerID)
 			}
-			e.StopContainerLogCollector(*previousContainerID)
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = e.dockerClient.ContainerStop(cleanupCtx, *previousContainerID, container.StopOptions{})
+			_ = e.dockerClient.ContainerRemove(cleanupCtx, *previousContainerID, container.RemoveOptions{Force: true})
 			cleanupCancel()
 		} else {
-			e.StopContainerLogCollector(*previousContainerID)
+			// Release deployment: preserve previous healthy container until full release promotion verification!
+			emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Preserving previous container %s for service '%s' until full release promotion verification.", (*previousContainerID)[:12], service.Name))
 		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = e.dockerClient.ContainerRemove(cleanupCtx, *previousContainerID, container.RemoveOptions{Force: true})
-		cleanupCancel()
 	}
 
 	// Update project port if this service is public or frontend
@@ -2198,9 +2442,26 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	}
 
 	// Proactively initialize common project mesh network and any declared service networks before executing DAG tiers
+	var plan discovery.DeploymentPlan
+	hasPlan := false
+	if len(project.DeploymentPlan) > 0 && string(project.DeploymentPlan) != "{}" {
+		if err := json.Unmarshal(project.DeploymentPlan, &plan); err == nil {
+			hasPlan = true
+		}
+	}
+	netConfigMap := make(map[string]discovery.NetworkConfig)
+	if hasPlan {
+		for _, nc := range plan.NetworkConfigs {
+			netConfigMap[nc.Name] = nc
+		}
+	}
+
 	commonProjectNet := fmt.Sprintf("forgelab-net-%s", project.ID.String())
-	if err := e.EnsureNetwork(execCtx, commonProjectNet, map[string]string{
-		"forgelab.project_id": project.ID.String(),
+	if err := e.EnsureNetworkWithOptions(execCtx, commonProjectNet, NetworkEnsureOptions{
+		Driver: "bridge",
+		Labels: map[string]string{
+			"forgelab.project_id": project.ID.String(),
+		},
 	}); err != nil {
 		reason := fmt.Sprintf("Failed to initialize project network mesh '%s': %v", commonProjectNet, err)
 		updateReleaseStatus(models.DeployStatusFailed, &reason)
@@ -2216,12 +2477,34 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 			sNets = svc.Networks
 		}
 		for _, net := range sNets {
-			projNet := fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
-			if err := e.EnsureNetwork(execCtx, projNet, map[string]string{
-				"forgelab.project_id": project.ID.String(),
-				"forgelab.network":    net,
-			}); err != nil {
-				reason := fmt.Sprintf("Failed to initialize service network '%s': %v", projNet, err)
+			nc, isDeclared := netConfigMap[net]
+			var dockerNetName string
+			opts := NetworkEnsureOptions{
+				Driver:   "bridge",
+				Internal: false,
+				External: false,
+				Labels: map[string]string{
+					"forgelab.project_id": project.ID.String(),
+					"forgelab.network":    net,
+				},
+			}
+			if isDeclared {
+				if nc.Driver != "" {
+					opts.Driver = nc.Driver
+				}
+				opts.Internal = nc.Internal
+				opts.External = nc.External
+				if nc.External {
+					dockerNetName = net
+				} else {
+					dockerNetName = fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
+				}
+			} else {
+				dockerNetName = fmt.Sprintf("forgelab-net-%s-%s", project.ID.String()[:8], net)
+			}
+
+			if err := e.EnsureNetworkWithOptions(execCtx, dockerNetName, opts); err != nil {
+				reason := fmt.Sprintf("Failed to initialize service network '%s': %v", dockerNetName, err)
 				updateReleaseStatus(models.DeployStatusFailed, &reason)
 				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
 				return errors.New(reason)
@@ -2239,7 +2522,13 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	maxConcurrent := 4
 	sem := make(chan struct{}, maxConcurrent)
 
-	tiers := buildServiceDeploymentTiers(svcDeploys)
+	tiers, err := buildServiceDeploymentTiers(svcDeploys)
+	if err != nil {
+		reason := fmt.Sprintf("Failed to compute validated DAG execution tiers: %v", err)
+		emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+		updateReleaseStatus(models.DeployStatusFailed, &reason)
+		return errors.New(reason)
+	}
 	emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("DAG execution plan computed: %d deployment tier(s).", len(tiers)))
 
 	failedServices := make(map[string]bool)
@@ -2377,6 +2666,17 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 	newProjectStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
 
 	if allHealthy && anyHealthy {
+		// Clean up preserved previous containers across services now that entire release is healthy
+		for _, sd := range svcDeploys {
+			if svc, ok := servicesMap[sd.ServiceName]; ok && svc.ContainerID != nil && *svc.ContainerID != "" && sd.ContainerID != nil && *svc.ContainerID != *sd.ContainerID {
+				prevCid := *svc.ContainerID
+				e.StopContainerLogCollector(prevCid)
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = e.dockerClient.ContainerStop(cleanupCtx, prevCid, container.StopOptions{})
+				_ = e.dockerClient.ContainerRemove(cleanupCtx, prevCid, container.RemoveOptions{Force: true})
+				cleanupCancel()
+			}
+		}
 		_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
 		updateReleaseStatus(models.DeployStatusRunning, nil)
 		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d successfully deployed all services!", deployment.DeployNumber))
@@ -2385,7 +2685,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		// Valid state transition: deployment status is Running (not partially_running!), while project status reflects partially_running
 		_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
 		updateReleaseStatus(models.DeployStatusRunning, nil)
-		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d finished with partial success (%s).", deployment.DeployNumber, strings.Join(errList, "; ")))
+		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d finished with partial success (%s). Only individual healthy services were updated; full release rollback is not claimed.", deployment.DeployNumber, strings.Join(errList, "; ")))
 		return nil
 	} else {
 		reason := fmt.Sprintf("All services failed deployment: %s", strings.Join(errList, "; "))

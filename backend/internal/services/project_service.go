@@ -227,6 +227,9 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		} else {
 			sourceType = models.SourceTypeGitHubPublic
 		}
+		if repoPath == "" && importedRecord.SnapshotPath != "" {
+			repoPath = importedRecord.SnapshotPath
+		}
 		if len(input.DeploymentPlan) == 0 || string(input.DeploymentPlan) == "{}" {
 			if len(importedRecord.DeploymentPlan) > 0 && string(importedRecord.DeploymentPlan) != "{}" {
 				input.DeploymentPlan = importedRecord.DeploymentPlan

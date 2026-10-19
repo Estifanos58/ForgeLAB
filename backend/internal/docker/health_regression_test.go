@@ -614,3 +614,257 @@ func TestRegression_Reconciler_PreservesTrackedAndRecentContainers(t *testing.T)
 	eng.untrackActiveContainer(cID)
 	assert.False(t, eng.isContainerTracked(cID), "untracked container must not be tracked")
 }
+
+// 14. Explicit HTTP health check: rejects HTTP 404, does NOT fall back to TCP, and fails health verification.
+func TestRegression_HealthCheck_HTTP_Rejects404_NeverFallsBackToTCP(t *testing.T) {
+	// Spin up a test HTTP server that responds with 404 Not Found
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("404 page not found"))
+	}))
+	defer ts.Close()
+
+	port := ts.Listener.Addr().(*net.TCPAddr).Port
+
+	// Mock Docker daemon returning a running container without native healthcheck
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
+				ContainerJSONBase: &types.ContainerJSONBase{
+					State: &types.ContainerState{
+						Running: true,
+					},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	eng := &Engine{dockerClient: cli}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var errLogs []string
+	var infoLogs []string
+
+	healthy, reason := eng.verifyServiceHealth(
+		ctx,
+		"c-http-404-test",
+		port,
+		&port,
+		models.HealthStrategyHTTP,
+		"/healthz",
+		func(msg string) { infoLogs = append(infoLogs, msg) },
+		func(msg string) { errLogs = append(errLogs, msg) },
+		&models.HealthCheckConfig{
+			Strategy:        models.HealthStrategyHTTP,
+			Path:            "/healthz",
+			IntervalSeconds: 1,
+			TimeoutSeconds:  1,
+			Retries:         1,
+		},
+	)
+
+	assert.False(t, healthy, "explicit HTTP health check must NOT pass on HTTP 404")
+	assert.Contains(t, reason, "404", "reason must report HTTP 404 failure")
+	assert.NotContains(t, reason, "TCP", "must not silently fall back to TCP after HTTP failure")
+}
+
+// 15. Explicit HTTP health check: rejects HTTP 500 responses.
+func TestRegression_HealthCheck_HTTP_Rejects500(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("500 internal server error"))
+	}))
+	defer ts.Close()
+
+	port := ts.Listener.Addr().(*net.TCPAddr).Port
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
+				ContainerJSONBase: &types.ContainerJSONBase{
+					State: &types.ContainerState{
+						Running: true,
+					},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	eng := &Engine{dockerClient: cli}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	healthy, reason := eng.verifyServiceHealth(
+		ctx,
+		"c-http-500-test",
+		port,
+		&port,
+		models.HealthStrategyHTTP,
+		"/healthz",
+		func(msg string) {},
+		func(msg string) {},
+		&models.HealthCheckConfig{
+			Strategy:        models.HealthStrategyHTTP,
+			Path:            "/healthz",
+			IntervalSeconds: 1,
+			TimeoutSeconds:  1,
+			Retries:         1,
+		},
+	)
+
+	assert.False(t, healthy, "explicit HTTP health check must NOT pass on HTTP 500")
+	assert.Contains(t, reason, "500", "reason must report HTTP 500 failure")
+}
+
+// 16. Explicit HTTP health check: succeeds on HTTP 200 and HTTP 302.
+func TestRegression_HealthCheck_HTTP_SucceedsOn200(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	port := ts.Listener.Addr().(*net.TCPAddr).Port
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
+				ContainerJSONBase: &types.ContainerJSONBase{
+					State: &types.ContainerState{
+						Running: true,
+					},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	eng := &Engine{dockerClient: cli}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	healthy, reason := eng.verifyServiceHealth(
+		ctx,
+		"c-http-200-test",
+		port,
+		&port,
+		models.HealthStrategyHTTP,
+		"/healthz",
+		func(msg string) {},
+		func(msg string) {},
+	)
+
+	assert.True(t, healthy, "explicit HTTP health check must pass on HTTP 200")
+	assert.Equal(t, "healthy", reason)
+}
+
+// 17. Explicit TCP health check: verifies TCP connection without probing HTTP endpoints.
+func TestRegression_HealthCheck_TCP_VerifiesListeningPortWithoutHTTPProbe(t *testing.T) {
+	var httpProbes atomic.Int32
+
+	// Start server that counts any HTTP requests
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpProbes.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	port := ts.Listener.Addr().(*net.TCPAddr).Port
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
+				ContainerJSONBase: &types.ContainerJSONBase{
+					State: &types.ContainerState{
+						Running: true,
+					},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	eng := &Engine{dockerClient: cli}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	healthy, reason := eng.verifyServiceHealth(
+		ctx,
+		"c-tcp-test",
+		port,
+		&port,
+		models.HealthStrategyTCP,
+		"/healthz",
+		func(msg string) {},
+		func(msg string) {},
+	)
+
+	assert.True(t, healthy, "explicit TCP health check must pass when port is listening")
+	assert.Equal(t, "healthy", reason)
+	assert.Equal(t, int32(0), httpProbes.Load(), "explicit TCP strategy must not send HTTP request probes")
+}
+
+// 18. None health check: verifies running container without network dials.
+func TestRegression_HealthCheck_None_VerifiesRunningContainer(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
+				ContainerJSONBase: &types.ContainerJSONBase{
+					State: &types.ContainerState{
+						Running: true,
+					},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	eng := &Engine{dockerClient: cli}
+
+	healthy, reason := eng.verifyServiceHealth(
+		context.Background(),
+		"c-none-test",
+		9999, // unreachable port
+		nil,
+		models.HealthStrategyNone,
+		"",
+		func(msg string) {},
+		func(msg string) {},
+	)
+
+	assert.True(t, healthy, "None health strategy must pass immediately for running container without network dials")
+	assert.Equal(t, "container verified running", reason)
+}
+

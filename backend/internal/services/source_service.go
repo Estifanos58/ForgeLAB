@@ -142,6 +142,17 @@ func (s *SourceService) SetEncryptor(enc *crypto.Encryptor) {
 	}
 }
 
+// DB returns the underlying pgxpool.Pool.
+func (s *SourceService) DB() *pgxpool.Pool {
+	return s.db
+}
+
+// SourcesDir returns the configured sources directory.
+func (s *SourceService) SourcesDir() string {
+	return s.sourcesDir
+}
+
+
 func (s *SourceService) getOrComputeAnalysis(sourceID uuid.UUID, dirPath string) *analyzer.AnalysisResult {
 	if val, ok := s.analysisCache.Load(sourceID); ok {
 		if res, ok := val.(*analyzer.AnalysisResult); ok && res != nil {

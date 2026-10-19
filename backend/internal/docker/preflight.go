@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/docker/client"
 
+	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
@@ -63,7 +64,6 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 	}
 
 	nameMap := make(map[string]*models.ServiceDeployment, len(opts.Deployments))
-	depGraph := make(map[string][]string, len(opts.Deployments))
 
 	// 1. Service uniqueness and index building
 	for _, sd := range opts.Deployments {
@@ -83,26 +83,25 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 			}
 		}
 		nameMap[lowerName] = sd
-		depGraph[sd.ServiceName] = sd.DependsOn
 	}
 
-	// 2. Dependency existence and self-dependency checks
-	for _, sd := range opts.Deployments {
-		for _, dep := range sd.DependsOn {
-			trimmedDep := strings.TrimSpace(dep)
-			if trimmedDep == "" {
-				continue
-			}
-			if strings.EqualFold(trimmedDep, sd.ServiceName) {
-				return &PreflightValidationError{
-					ServiceName: sd.ServiceName,
-					Field:       "depends_on",
-					Message:     "self-dependency is not allowed",
+	// 2 & 3. Authoritative dependency graph validation
+	if opts.IsServiceDeployment {
+		// Independent service deployment: verify dependencies exist in project and conditions are valid
+		for _, sd := range opts.Deployments {
+			for _, dep := range sd.DependsOn {
+				trimmedDep := strings.TrimSpace(dep)
+				if trimmedDep == "" {
+					continue
 				}
-			}
+				if strings.EqualFold(trimmedDep, sd.ServiceName) {
+					return &PreflightValidationError{
+						ServiceName: sd.ServiceName,
+						Field:       "depends_on",
+						Message:     "self-dependency is not allowed",
+					}
+				}
 
-			if opts.IsServiceDeployment {
-				// Independent service deployment: verify that every dependency exists in the project
 				inProject := false
 				if opts.ServicesMap != nil {
 					_, inProject = opts.ServicesMap[trimmedDep]
@@ -122,29 +121,58 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 						Message:     fmt.Sprintf("dependency '%s' does not exist in project", dep),
 					}
 				}
-			} else {
-				// Release deployment: verify that every dependency exists in the deployment plan
-				_, inPlan := nameMap[strings.ToLower(trimmedDep)]
-				if !inPlan {
-					return &PreflightValidationError{
-						ServiceName: sd.ServiceName,
-						Field:       "depends_on",
-						Message:     fmt.Sprintf("dependency '%s' does not exist in deployment plan", dep),
+
+				// Validate dependency condition
+				if sd.DependsOnConditions != nil {
+					if cond, ok := sd.DependsOnConditions[dep]; ok && cond != "" {
+						if !discovery.IsSupportedDependencyCondition(cond) {
+							return &PreflightValidationError{
+								ServiceName: sd.ServiceName,
+								Field:       "depends_on_conditions",
+								Message:     fmt.Sprintf("unsupported dependency condition '%s' for dependency '%s'", cond, dep),
+							}
+						}
+					}
+				}
+			}
+
+			// Validate any conditions in DependsOnConditions map
+			if sd.DependsOnConditions != nil {
+				for condService, cond := range sd.DependsOnConditions {
+					if !discovery.IsSupportedDependencyCondition(cond) {
+						return &PreflightValidationError{
+							ServiceName: sd.ServiceName,
+							Field:       "depends_on_conditions",
+							Message:     fmt.Sprintf("unsupported dependency condition '%s' for service '%s'", cond, condService),
+						}
 					}
 				}
 			}
 		}
-	}
-
-	// 3. Dependency cycle detection (DFS 3-color graph) - mandatory for release deployments
-	if !opts.IsServiceDeployment {
-		if cycle := detectDependencyCycle(depGraph); len(cycle) > 0 {
+	} else {
+		// Release deployment: use authoritative ValidateAndBuildDAG
+		nodes := make([]discovery.ServiceNode, len(opts.Deployments))
+		for i, sd := range opts.Deployments {
+			nodes[i] = discovery.ServiceNode{
+				Name:                sd.ServiceName,
+				DependsOn:           sd.DependsOn,
+				DependsOnConditions: sd.DependsOnConditions,
+			}
+		}
+		if _, _, err := discovery.ValidateAndBuildDAG(nodes); err != nil {
+			var svcName string
+			if dge, ok := err.(*discovery.DependencyGraphError); ok && dge.ServiceName != "" {
+				svcName = dge.ServiceName
+			}
 			return &PreflightValidationError{
-				Field:   "depends_on",
-				Message: fmt.Sprintf("dependency cycle detected: %s", strings.Join(cycle, " -> ")),
+				ServiceName: svcName,
+				Field:       "depends_on",
+				Message:     err.Error(),
+				Err:         err,
 			}
 		}
 	}
+
 
 	// 4. Service-specific preflight checks
 	for _, sd := range opts.Deployments {

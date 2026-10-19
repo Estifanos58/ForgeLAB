@@ -46,8 +46,10 @@ type RawComposeData struct {
 }
 
 type RawComposeNetwork struct {
-	Driver   string `yaml:"driver"`
-	Internal bool   `yaml:"internal"`
+	Driver   string      `yaml:"driver"`
+	Internal bool        `yaml:"internal"`
+	External interface{} `yaml:"external"`
+	Name     string      `yaml:"name"`
 }
 
 type RawComposeService struct {
@@ -128,10 +130,20 @@ func ParseComposeFile(filePath, repoRoot string) (*DiscoveredTopology, []Discove
 	// 1. Extract networks
 	var networks []NetworkConfig
 	for netName, netCfg := range raw.Networks {
+		isExt := false
+		if netCfg.External != nil {
+			switch ext := netCfg.External.(type) {
+			case bool:
+				isExt = ext
+			default:
+				isExt = true
+			}
+		}
 		networks = append(networks, NetworkConfig{
 			Name:     netName,
 			Driver:   netCfg.Driver,
 			Internal: netCfg.Internal,
+			External: isExt,
 		})
 	}
 	if len(networks) == 0 {
@@ -312,8 +324,8 @@ func parseComposeService(name string, raw RawComposeService, repoRoot, composeDi
 	// Parse volumes
 	volumes := parseVolumes(raw.Volumes, declaredVolumes, repoRoot, composeDir)
 
-	// Parse networks
-	networks := parseNetworks(raw.Networks)
+	// Parse networks and aliases
+	networks, networkAliases := parseServiceNetworks(raw.Networks)
 
 	// Parse environment & env_files (explicit environment overrides env_file)
 	explicitEnvVars := parseEnvironment(raw.Environment, name)
@@ -397,6 +409,7 @@ func parseComposeService(name string, raw RawComposeService, repoRoot, composeDi
 		DependsOnConditions: depConditions,
 		Volumes:             volumes,
 		Networks:            networks,
+		NetworkAliases:      networkAliases,
 		Environment:         envVars,
 		ResourceConfig:      resConfig,
 	}
@@ -816,40 +829,80 @@ func parseVolumes(vols []interface{}, declaredVolumes map[string]bool, repoRoot,
 	return mounts
 }
 
-func parseNetworks(nets interface{}) []string {
+func parseServiceNetworks(nets interface{}) ([]string, map[string][]string) {
 	var result []string
+	aliasesMap := make(map[string][]string)
 	if nets == nil {
-		return result
+		return result, aliasesMap
 	}
 	switch n := nets.(type) {
 	case string:
-		if strings.TrimSpace(n) != "" {
-			result = append(result, strings.TrimSpace(n))
+		clean := strings.TrimSpace(n)
+		if clean != "" {
+			result = append(result, clean)
 		}
 	case []interface{}:
 		for _, item := range n {
 			switch it := item.(type) {
 			case string:
-				if strings.TrimSpace(it) != "" {
-					result = append(result, strings.TrimSpace(it))
+				clean := strings.TrimSpace(it)
+				if clean != "" {
+					result = append(result, clean)
 				}
 			case map[string]interface{}:
-				for k := range it {
-					if strings.TrimSpace(k) != "" {
-						result = append(result, strings.TrimSpace(k))
+				for k, v := range it {
+					netName := strings.TrimSpace(k)
+					if netName != "" {
+						result = append(result, netName)
+						if vm, ok := v.(map[string]interface{}); ok {
+							if rawAliases, hasAliases := vm["aliases"]; hasAliases {
+								if aliasSlice, ok := rawAliases.([]interface{}); ok {
+									for _, a := range aliasSlice {
+										if aStr, ok := a.(string); ok && strings.TrimSpace(aStr) != "" {
+											aliasesMap[netName] = append(aliasesMap[netName], strings.TrimSpace(aStr))
+										}
+									}
+								}
+							}
+						}
 					}
 				}
 			}
 		}
 	case map[string]interface{}:
-		for k := range n {
-			if strings.TrimSpace(k) != "" {
-				result = append(result, strings.TrimSpace(k))
+		for k, v := range n {
+			netName := strings.TrimSpace(k)
+			if netName != "" {
+				result = append(result, netName)
+				if vm, ok := v.(map[string]interface{}); ok {
+					if rawAliases, hasAliases := vm["aliases"]; hasAliases {
+						if aliasSlice, ok := rawAliases.([]interface{}); ok {
+							for _, a := range aliasSlice {
+								if aStr, ok := a.(string); ok && strings.TrimSpace(aStr) != "" {
+									aliasesMap[netName] = append(aliasesMap[netName], strings.TrimSpace(aStr))
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 	}
 	sort.Strings(result)
-	return result
+	var dedup []string
+	seen := make(map[string]bool)
+	for _, name := range result {
+		if !seen[name] {
+			seen[name] = true
+			dedup = append(dedup, name)
+		}
+	}
+	return dedup, aliasesMap
+}
+
+func parseNetworks(nets interface{}) []string {
+	names, _ := parseServiceNetworks(nets)
+	return names
 }
 
 func parseEnvironment(env interface{}, serviceName string) []EnvironmentProvenance {
@@ -1051,61 +1104,16 @@ func discoverEnvFiles(repoRoot string) []string {
 
 // BuildDAG creates a dependency map and partitions services into ordered execution tiers.
 // Tier 0 has 0 dependencies, Tier 1 depends only on Tier 0, etc.
-// Returns an error if a cycle is detected.
+// Returns an error if a cycle, unknown service reference, or unsupported condition is detected.
 func BuildDAG(services []DiscoveredService) (map[string][]string, [][]string, error) {
-	depMap := make(map[string][]string)
-	serviceSet := make(map[string]bool)
-	for _, s := range services {
-		serviceSet[s.Name] = true
-		depMap[s.Name] = s.DependsOn
-	}
-
-	inDegree := make(map[string]int)
-	adj := make(map[string][]string)
-
-	for _, s := range services {
-		validDeps := make([]string, 0, len(s.DependsOn))
-		for _, dep := range s.DependsOn {
-			// Only consider dependencies that are actually among the declared services
-			if serviceSet[dep] && dep != s.Name {
-				validDeps = append(validDeps, dep)
-				adj[dep] = append(adj[dep], s.Name)
-			}
-		}
-		depMap[s.Name] = validDeps
-		inDegree[s.Name] = len(validDeps)
-	}
-
-	// Kahn's algorithm with tiering
-	var tiers [][]string
-	remaining := len(services)
-
-	for remaining > 0 {
-		var currentTier []string
-		for name, deg := range inDegree {
-			if deg == 0 {
-				currentTier = append(currentTier, name)
-			}
-		}
-
-		if len(currentTier) == 0 {
-			// Cycle detected
-			return depMap, nil, fmt.Errorf("cyclic service dependency detected in Compose definition")
-		}
-
-		sort.Strings(currentTier)
-		tiers = append(tiers, currentTier)
-
-		for _, name := range currentTier {
-			delete(inDegree, name)
-			remaining--
-			for _, neighbor := range adj[name] {
-				if _, ok := inDegree[neighbor]; ok {
-					inDegree[neighbor]--
-				}
-			}
+	nodes := make([]ServiceNode, len(services))
+	for i, s := range services {
+		nodes[i] = ServiceNode{
+			Name:                s.Name,
+			DependsOn:           s.DependsOn,
+			DependsOnConditions: s.DependsOnConditions,
 		}
 	}
-
-	return depMap, tiers, nil
+	return ValidateAndBuildDAG(nodes)
 }
+

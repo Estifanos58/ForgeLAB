@@ -42,7 +42,9 @@ type NetworkConfig struct {
 	Name     string `json:"name"`
 	Driver   string `json:"driver,omitempty"`
 	Internal bool   `json:"internal,omitempty"`
+	External bool   `json:"external,omitempty"`
 }
+
 
 // EnvironmentProvenance tracks the origin and conflict status of an environment variable
 type EnvironmentProvenance struct {
@@ -86,6 +88,7 @@ type DiscoveredService struct {
 	DependsOnConditions map[string]string       `json:"depends_on_conditions,omitempty"`
 	Volumes             []VolumeMountConfig     `json:"volumes"`
 	Networks            []string                `json:"networks,omitempty"`
+	NetworkAliases      map[string][]string     `json:"network_aliases,omitempty"`
 	Environment         []EnvironmentProvenance `json:"environment"`
 	ResourceConfig      models.ResourceConfig   `json:"resource_config"`
 	FilesCount          int                     `json:"files_count"`
@@ -151,6 +154,7 @@ type PlannedService struct {
 	DependsOnConditions map[string]string       `json:"depends_on_conditions,omitempty"`
 	Volumes             []VolumeMountConfig     `json:"volumes"`
 	Networks            []string                `json:"networks,omitempty"`
+	NetworkAliases      map[string][]string     `json:"network_aliases,omitempty"`
 	Environment         []EnvironmentProvenance `json:"environment"`
 	BuildCandidates     []models.BuildCandidate `json:"build_candidates,omitempty"`
 }
@@ -167,6 +171,7 @@ type DeploymentPlan struct {
 	Dependencies      map[string][]string     `json:"dependencies"`
 	ExecutionTiers    [][]string              `json:"execution_tiers"` // ordered stages for DAG execution
 	Networks          []string                `json:"networks"`
+	NetworkConfigs    []NetworkConfig         `json:"network_configs,omitempty"`
 	Volumes           []string                `json:"volumes"`
 	Environment       []EnvironmentProvenance `json:"environment"`
 	PublicEndpoints   []PlannedEndpoint       `json:"public_endpoints"`

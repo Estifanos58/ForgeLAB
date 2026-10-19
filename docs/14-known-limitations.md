@@ -190,7 +190,55 @@ These are identified codebase behaviors that require investigation and resolutio
   - Enforces archive security bounds: 100MB compressed, 100MB uncompressed, 10,000 files, 50MB single file, traversal and symlink guards.
   - Periodic background ticker prunes expired or abandoned import snapshots and database records after 24 hours.
 
+### 19. Authoritative Dependency Graph Validation & Silent Fallback Elimination (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/discovery/graph.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/graph.go), [`backend/internal/discovery/compose.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/compose.go), [`backend/internal/discovery/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/engine.go), [`backend/internal/docker/preflight.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/preflight.go), [`backend/internal/docker/engine_build.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:**
+  - Replaced disparate cycle checking and heuristic graph parsing with a single authoritative dependency-graph implementation (`ValidateAndBuildDAG`).
+  - Strict validation rejects cyclic service dependencies with explicit directed cycle paths (e.g. `svc-a -> svc-b -> svc-c -> svc-a`), self-dependencies, unknown service references, and unsupported dependency conditions before building images or creating containers.
+  - Plan generation (`GeneratePlan`) and release execution (`buildServiceDeploymentTiers`) fail closed immediately on graph errors without falling back to flawed tiers containing cyclic services.
+  - Generates deterministic tiers using Kahn's algorithm with alphabetical sorting within each tier, and deterministically honors `service_started`, `service_healthy`, and `service_completed_successfully` dependency conditions.
+
+### 20. Compose Network Isolation, Alias Preservation & Fatal Attachment Handling (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_lifecycle.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_lifecycle.go)
+- **Resolution:**
+  - Preserves declared Compose network configuration, including user-defined network membership, driver, `internal`, and supported `external` settings.
+  - When services declare explicit networks, they are isolated to those declared networks and are not attached to the common project bridge network (`forgelab-net-<projectID>`).
+  - Preserves default service-name DNS aliases and custom aliases across all networks to which the service belongs.
+  - Treats network creation failures or secondary network attachment failures as fatal deployment failures (fails closed, cleans up the container, restores the previous running container, and records failure diagnostics), never demoting network failures to non-fatal warnings.
+
+### 21. Target Database Credential Resolution, URL Encoding & Secret Redaction (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/logging/redactor.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/logging/redactor.go)
+- **Resolution:**
+  - Standardized connection string resolver derives target database credentials directly from the target database service's configuration and decrypted secrets (`secretService.GetDecryptedEnvMap`), not from the consuming service's environment.
+  - Encodes connection credentials using standard library `url.UserPassword` to safely percent-encode special characters.
+  - Disambiguates multiple infrastructure services: generic `DATABASE_URL` and `REDIS_URL` are only populated when exactly one corresponding infrastructure service exists. Multiple databases/caches provide explicit `<SERVICE>_URL`, `<SERVICE>_HOST`, `<SERVICE>_PORT` variables to prevent ambiguous automatic selection.
+  - Dynamically registers generated connection URLs and database passwords with the log redactor, guaranteeing zero plaintext secret exposure in plans, logs, API responses, or diagnostics.
+  - Resolves client-facing frontend variables (`NEXT_PUBLIC_API_URL`, `VITE_API_URL`, `API_URL`) to public URLs, custom domains, or host port bindings, never private Docker DNS names (`backend:8080`).
+
+### 22. Strict Health Check Status Gating & Readiness Diagnostics (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_health.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_health.go)
+- **Resolution:**
+  - Explicit HTTP health checks require HTTP 2xx or 3xx responses (status 200–399) and reject HTTP 404 and 5xx responses.
+  - HTTP health checks never silently fall back to TCP socket inspection upon HTTP failure.
+  - Keeps HTTP, TCP, Docker-native, Auto, and None health check strategies behaviorally distinct.
+  - Deployment status and diagnostics clearly distinguish process startup, listening ports, application readiness, and dependency connectivity.
+
+### 23. Release Promotion Container Preservation & Rollback Truthfulness (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:**
+  - In release deployments, previous healthy service containers are preserved throughout execution across all tiers and are only superseded/cleaned up after the full release meets promotion criteria.
+  - When partial failures occur (some services succeed while others fail), ForgeLAB accurately logs that individual services were updated and explicitly disclaims full release rollback, preventing misleading rollback claims.
+### 24. Unified Volume Mount Resolution Across Remote and Local Source Types (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/volume_resolver.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/volume_resolver.go), [`backend/internal/services/source_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/source_service.go), [`backend/internal/services/project_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/project_service.go)
+- **Defects Fixed:**
+  - Resolved preflight validation failure (`bind mount source directory '.' (resolved to '') does not exist or is not accessible from backend environment`) when deploying imported GitHub repositories and archive uploads.
+  - Unified `ResolveProjectSourcePaths` and `ResolveAndValidateVolumeMount` across all source origins (`local_directory`, `local_agent`, `local_upload`, `github`, and `github_public`).
+  - Remote GitHub imports and archive uploads locate their immutable snapshot directories (`/app/data/sources/imports/...` and `/app/data/sources/<id>`) via source metadata, database records, and repository paths.
+  - Implemented dynamic daemon host path translation (`translateBackendPathToDaemon` and `DetectAllBackendContainerMounts`) to translate container storage volume paths to host paths visible to the Docker daemon (`/var/lib/docker/volumes/...`).
+  - Permitted boundary-safe automatic directory creation for relative project subpaths (e.g. `./data`) during preflight while strictly maintaining path-escape rejections, restricted directory checks, and Docker socket mount bans.
+
 ---
+
 
 ## 3. Security Hardening Items (Deferred Backlog)
 

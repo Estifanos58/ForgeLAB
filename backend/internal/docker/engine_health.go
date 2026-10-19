@@ -375,8 +375,12 @@ func (e *Engine) verifyServiceHealth(
 			}
 		}
 
-		for _, target := range targets {
-			if healthStrategy != models.HealthStrategyTCP {
+		var lastHTTPStatus int
+		var lastProbeErr string
+
+		if healthStrategy == models.HealthStrategyHTTP {
+			// Explicit HTTP health check: MUST probe HTTP, MUST require 2xx or 3xx status, and MUST NOT fall back to TCP or socket inspection.
+			for _, target := range targets {
 				reqURL := fmt.Sprintf("http://%s%s", target, healthPath)
 				reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
 				req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
@@ -385,8 +389,45 @@ func (e *Engine) verifyServiceHealth(
 					if doErr == nil {
 						res.Body.Close()
 						reqCancel()
-						if res.StatusCode < 500 {
-							logFn(fmt.Sprintf("Health check passed via %s (HTTP %d) on attempt %d.", target, res.StatusCode, attempt))
+						lastHTTPStatus = res.StatusCode
+						if res.StatusCode >= 200 && res.StatusCode < 400 {
+							logFn(fmt.Sprintf("Application readiness verified: HTTP %s returned %d on attempt %d.", target, res.StatusCode, attempt))
+							return true, "healthy"
+						}
+						logFn(fmt.Sprintf("Application readiness check failed on %s: HTTP %d (expected 2xx/3xx status, attempt %d)... waiting", target, res.StatusCode, attempt))
+					} else {
+						reqCancel()
+						lastProbeErr = doErr.Error()
+					}
+				} else {
+					reqCancel()
+					lastProbeErr = reqErr.Error()
+				}
+			}
+		} else if healthStrategy == models.HealthStrategyTCP {
+			// Explicit TCP health check: MUST verify TCP connection, MUST NOT probe HTTP endpoints.
+			for _, target := range targets {
+				conn, tcpErr := net.DialTimeout("tcp", target, 1*time.Second)
+				if tcpErr == nil {
+					conn.Close()
+					logFn(fmt.Sprintf("Listening port verified: TCP connection established to %s (attempt %d).", target, attempt))
+					return true, "healthy"
+				}
+				lastProbeErr = tcpErr.Error()
+			}
+		} else {
+			// Auto / heuristic health check: try HTTP first, then TCP, then socket-level inspection.
+			for _, target := range targets {
+				reqURL := fmt.Sprintf("http://%s%s", target, healthPath)
+				reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
+				req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
+				if reqErr == nil {
+					res, doErr := httpClient.Do(req)
+					if doErr == nil {
+						res.Body.Close()
+						reqCancel()
+						if res.StatusCode >= 200 && res.StatusCode < 400 {
+							logFn(fmt.Sprintf("Application readiness verified: HTTP %s returned %d on attempt %d.", target, res.StatusCode, attempt))
 							return true, "healthy"
 						}
 					} else {
@@ -395,35 +436,35 @@ func (e *Engine) verifyServiceHealth(
 				} else {
 					reqCancel()
 				}
-			}
 
-			conn, tcpErr := net.DialTimeout("tcp", target, 1*time.Second)
-			if tcpErr == nil {
-				conn.Close()
-				logFn(fmt.Sprintf("TCP health check passed via %s on attempt %d.", target, attempt))
-				return true, "healthy"
-			}
-		}
-
-		// 6. Socket-level verification fallback: if external HTTP/TCP connection attempts failed (e.g. due to Docker network namespace isolation between backend container and target container), check whether the internal port is listening inside the container via docker exec
-		if cJSON.State.Running && !cJSON.State.Restarting && cJSON.State.Health == nil {
-			if internalPort > 0 {
-				listening, supported := e.isInternalPortListening(ctx, containerID, internalPort)
-				if listening {
-					logFn(fmt.Sprintf("Service port %d verified listening inside container (attempt %d).", internalPort, attempt))
+				conn, tcpErr := net.DialTimeout("tcp", target, 1*time.Second)
+				if tcpErr == nil {
+					conn.Close()
+					logFn(fmt.Sprintf("TCP health check passed via %s on attempt %d.", target, attempt))
 					return true, "healthy"
 				}
-				if supported {
-					if attempt == 1 || attempt%5 == 0 {
-						logFn(fmt.Sprintf("Service port %d not yet listening inside container (attempt %d)... waiting", internalPort, attempt))
+			}
+
+			// Socket-level verification fallback: if external HTTP/TCP connection attempts failed (e.g. due to Docker network namespace isolation between backend container and target container), check whether the internal port is listening inside the container via docker exec
+			if cJSON.State.Running && !cJSON.State.Restarting && cJSON.State.Health == nil {
+				if internalPort > 0 {
+					listening, supported := e.isInternalPortListening(ctx, containerID, internalPort)
+					if listening {
+						logFn(fmt.Sprintf("Listening port %d verified inside container (attempt %d).", internalPort, attempt))
+						return true, "healthy"
 					}
-				} else if attempt >= 8 && cJSON.RestartCount == 0 {
-					logFn(fmt.Sprintf("Service verified running stably (attempt %d).", attempt))
+					if supported {
+						if attempt == 1 || attempt%5 == 0 {
+							logFn(fmt.Sprintf("Service port %d not yet listening inside container (attempt %d)... waiting", internalPort, attempt))
+						}
+					} else if attempt >= 8 && cJSON.RestartCount == 0 {
+						logFn(fmt.Sprintf("Process startup verified: service container running stably without exits (attempt %d).", attempt))
+						return true, "healthy"
+					}
+				} else if attempt >= 6 && cJSON.RestartCount == 0 {
+					logFn(fmt.Sprintf("Process startup verified: service container running stably (attempt %d).", attempt))
 					return true, "healthy"
 				}
-			} else if attempt >= 6 && cJSON.RestartCount == 0 {
-				logFn(fmt.Sprintf("Service verified running stably (attempt %d).", attempt))
-				return true, "healthy"
 			}
 		}
 
@@ -433,12 +474,32 @@ func (e *Engine) verifyServiceHealth(
 				errLogFn("Health check cancelled: deployment context cancelled")
 				return false, "health check cancelled"
 			}
-			errLogFn(fmt.Sprintf("Health verification timed out after %v", expectedBudget))
-			return false, fmt.Sprintf("health check timed out after %v", expectedBudget)
+			var msg string
+			if healthStrategy == models.HealthStrategyHTTP && lastHTTPStatus > 0 {
+				msg = fmt.Sprintf("HTTP health verification failed: received HTTP %d on endpoint '%s' (expected 2xx/3xx status code)", lastHTTPStatus, healthPath)
+			} else if healthStrategy == models.HealthStrategyHTTP && lastProbeErr != "" {
+				msg = fmt.Sprintf("HTTP health verification failed: %s", lastProbeErr)
+			} else if healthStrategy == models.HealthStrategyTCP && lastProbeErr != "" {
+				msg = fmt.Sprintf("TCP health verification failed on port %d: %s", internalPort, lastProbeErr)
+			} else {
+				msg = fmt.Sprintf("Health verification timed out after %v", expectedBudget)
+			}
+			errLogFn(msg)
+			return false, msg
 		case <-time.After(pollInterval):
 			if time.Since(startTime) >= expectedBudget {
-				errLogFn(fmt.Sprintf("Health verification timed out after %v", expectedBudget))
-				return false, fmt.Sprintf("health check timed out after %v", expectedBudget)
+				var msg string
+				if healthStrategy == models.HealthStrategyHTTP && lastHTTPStatus > 0 {
+					msg = fmt.Sprintf("HTTP health verification failed: received HTTP %d on endpoint '%s' (expected 2xx/3xx status code)", lastHTTPStatus, healthPath)
+				} else if healthStrategy == models.HealthStrategyHTTP && lastProbeErr != "" {
+					msg = fmt.Sprintf("HTTP health verification failed: %s", lastProbeErr)
+				} else if healthStrategy == models.HealthStrategyTCP && lastProbeErr != "" {
+					msg = fmt.Sprintf("TCP health verification failed on port %d: %s", internalPort, lastProbeErr)
+				} else {
+					msg = fmt.Sprintf("Health verification timed out after %v", expectedBudget)
+				}
+				errLogFn(msg)
+				return false, msg
 			}
 			continue
 		}

@@ -88,8 +88,8 @@ func (h *DiscoveryHandler) GeneratePlan(w http.ResponseWriter, r *http.Request) 
 	var sourceRevision string
 
 	switch req.SourceType {
-	case models.SourceTypeGitHub:
-		if models.IsGuest(userID) {
+	case models.SourceTypeGitHub, models.SourceTypeGitHubPublic:
+		if req.SourceType == models.SourceTypeGitHub && models.IsGuest(userID) {
 			writeError(w, http.StatusForbidden, "registration required for GitHub deployments")
 			return
 		}

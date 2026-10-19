@@ -275,49 +275,23 @@ func joinContainerPath(base, rel string) string {
 	return filepath.Clean(filepath.Join(base, filepath.FromSlash(cleanRel)))
 }
 
-// DetectBackendContainerMount queries the Docker daemon to locate the host mount corresponding
-// to containerTarget (defaulting to /host-projects) on the running ForgeLAB backend container.
-func DetectBackendContainerMount(ctx context.Context, cli client.CommonAPIClient, containerTarget string) (*ContainerMountInfo, error) {
+// InspectBackendContainer inspects the running backend container JSON.
+func InspectBackendContainer(ctx context.Context, cli client.CommonAPIClient) (*types.ContainerJSON, error) {
 	if cli == nil {
 		return nil, errors.New("docker client is nil")
-	}
-
-	target := strings.TrimSpace(containerTarget)
-	if target == "" {
-		target = "/host-projects"
-	}
-	normTarget := normalizePathForComparison(target)
-
-	checkMounts := func(inspect types.ContainerJSON) *ContainerMountInfo {
-		for _, m := range inspect.Mounts {
-			normDest := normalizePathForComparison(m.Destination)
-			if normDest == normTarget || strings.EqualFold(filepath.ToSlash(m.Destination), filepath.ToSlash(target)) {
-				return &ContainerMountInfo{
-					ContainerID:     inspect.ID,
-					ContainerName:   inspect.Name,
-					DaemonSource:    m.Source,
-					ContainerTarget: m.Destination,
-				}
-			}
-		}
-		return nil
 	}
 
 	// 1. Try container hostname (Docker sets the container hostname to short container ID by default)
 	if hostname, err := os.Hostname(); err == nil && hostname != "" {
 		if inspect, err := cli.ContainerInspect(ctx, hostname); err == nil {
-			if info := checkMounts(inspect); info != nil {
-				return info, nil
-			}
+			return &inspect, nil
 		}
 	}
 
 	// 2. Try explicit container names defined by docker-compose.yml
 	for _, name := range []string{"forgelab-backend", "/forgelab-backend"} {
 		if inspect, err := cli.ContainerInspect(ctx, name); err == nil {
-			if info := checkMounts(inspect); info != nil {
-				return info, nil
-			}
+			return &inspect, nil
 		}
 	}
 
@@ -339,16 +313,115 @@ func DetectBackendContainerMount(ctx context.Context, cli client.CommonAPIClient
 			}
 			if isCandidate {
 				if inspect, err := cli.ContainerInspect(ctx, c.ID); err == nil {
-					if info := checkMounts(inspect); info != nil {
-						return info, nil
-					}
+					return &inspect, nil
 				}
 			}
 		}
 	}
 
+	return nil, errors.New("could not find running ForgeLAB backend container")
+}
+
+// DetectAllBackendContainerMounts queries the Docker daemon to return all volume/bind mounts
+// on the running ForgeLAB backend container.
+func DetectAllBackendContainerMounts(ctx context.Context, cli client.CommonAPIClient) ([]ContainerMountInfo, error) {
+	inspect, err := InspectBackendContainer(ctx, cli)
+	if err != nil {
+		return nil, err
+	}
+	var res []ContainerMountInfo
+	for _, m := range inspect.Mounts {
+		res = append(res, ContainerMountInfo{
+			ContainerID:     inspect.ID,
+			ContainerName:   inspect.Name,
+			DaemonSource:    m.Source,
+			ContainerTarget: m.Destination,
+		})
+	}
+	return res, nil
+}
+
+// DetectBackendContainerMount queries the Docker daemon to locate the host mount corresponding
+// to containerTarget (defaulting to /host-projects) on the running ForgeLAB backend container.
+func DetectBackendContainerMount(ctx context.Context, cli client.CommonAPIClient, containerTarget string) (*ContainerMountInfo, error) {
+	if cli == nil {
+		return nil, errors.New("docker client is nil")
+	}
+
+	target := strings.TrimSpace(containerTarget)
+	if target == "" {
+		target = "/host-projects"
+	}
+	normTarget := normalizePathForComparison(target)
+
+	inspect, err := InspectBackendContainer(ctx, cli)
+	if err != nil {
+		return nil, fmt.Errorf("could not find running ForgeLAB backend container mount for '%s': %w", target, err)
+	}
+
+	for _, m := range inspect.Mounts {
+		normDest := normalizePathForComparison(m.Destination)
+		if normDest == normTarget || strings.EqualFold(filepath.ToSlash(m.Destination), filepath.ToSlash(target)) {
+			return &ContainerMountInfo{
+				ContainerID:     inspect.ID,
+				ContainerName:   inspect.Name,
+				DaemonSource:    m.Source,
+				ContainerTarget: m.Destination,
+			}, nil
+		}
+	}
+
 	return nil, fmt.Errorf("could not find running ForgeLAB backend container mount for '%s'", target)
 }
+
+// translateBackendPathToDaemon translates a path accessible inside the backend container to the corresponding
+// path acceptable to the Docker daemon on the host.
+func translateBackendPathToDaemon(ctx context.Context, cli client.CommonAPIClient, backendPath string, pv *security.PathValidator) string {
+	cleanBackend := filepath.Clean(backendPath)
+	if cleanBackend == "" || cleanBackend == "." {
+		return cleanBackend
+	}
+
+	// 1. Try pathValidator if configured (e.g. /host-projects -> host root)
+	if pv != nil {
+		if hostRoot := pv.HostSourceRoot(); hostRoot != "" {
+			if h, err := pv.TranslateContainerToHost(cleanBackend); err == nil && h != "" {
+				daemonRoot := pv.DaemonSourceRoot()
+				if daemonRoot == "" {
+					daemonRoot = hostRoot
+				}
+				if daemonRoot != "" && hostRoot != "" {
+					if rel, ok := getRelativePathCrossPlatform(hostRoot, h); ok {
+						return joinHostPath(daemonRoot, rel)
+					}
+				}
+				return h
+			}
+		}
+	}
+
+	// 2. Query Docker backend container mounts if running in Docker
+	if cli != nil {
+		mounts, err := DetectAllBackendContainerMounts(ctx, cli)
+		if err == nil {
+			normBackend := normalizePathForComparison(cleanBackend)
+			for _, m := range mounts {
+				normDest := normalizePathForComparison(m.ContainerTarget)
+				if normBackend == normDest {
+					return m.DaemonSource
+				}
+				rel, rErr := filepath.Rel(m.ContainerTarget, cleanBackend)
+				if rErr == nil && !strings.HasPrefix(rel, "..") && rel != "." {
+					return joinHostPath(m.DaemonSource, rel)
+				}
+			}
+		}
+	}
+
+	// 3. Fallback: running directly on host or no container mount matches
+	return cleanBackend
+}
+
 
 // ResolveProjectSourcePaths determines the authoritative paths across the three namespaces:
 // 1. AgentPath: The canonical path reported by the local agent on the host
@@ -516,23 +589,95 @@ func ResolveProjectSourcePaths(
 		}, nil
 
 	case models.SourceTypeLocalUpload:
+		var uploadPath string
 		if sourceService != nil && project.SourceReference != "" {
 			if srcUUID, parseErr := uuid.Parse(project.SourceReference); parseErr == nil {
 				if p, pErr := sourceService.GetSourcePath(ctx, project.OwnerID, srcUUID); pErr == nil && p != "" {
-					cleanP := filepath.Clean(p)
-					return ProjectSourcePaths{
-						AgentPath:   cleanP,
-						BackendPath: cleanP,
-						DaemonPath:  cleanP,
-					}, nil
+					uploadPath = p
 				}
 			}
 		}
-		return ProjectSourcePaths{}, fmt.Errorf("source files for uploaded archive project '%s' are unavailable", project.Name)
+		if uploadPath == "" && project.SourceID != nil && sourceService != nil {
+			if p, pErr := sourceService.GetSourcePath(ctx, project.OwnerID, *project.SourceID); pErr == nil && p != "" {
+				uploadPath = p
+			}
+		}
+		if uploadPath == "" && project.RepositoryPath != "" {
+			if fi, err := os.Stat(project.RepositoryPath); err == nil && fi.IsDir() {
+				uploadPath = project.RepositoryPath
+			}
+		}
 
-	case models.SourceTypeGitHub:
-		// GitHub repos are cloned temporarily for builds and do not provide persistent runtime host directories
-		return ProjectSourcePaths{}, nil
+		if uploadPath == "" {
+			return ProjectSourcePaths{}, fmt.Errorf("source files for uploaded archive project '%s' are unavailable", project.Name)
+		}
+
+		cleanP := filepath.Clean(uploadPath)
+		daemonPath := translateBackendPathToDaemon(ctx, cli, cleanP, pathValidator)
+		return ProjectSourcePaths{
+			AgentPath:   cleanP,
+			BackendPath: cleanP,
+			DaemonPath:  daemonPath,
+		}, nil
+
+	case models.SourceTypeGitHub, models.SourceTypeGitHubPublic:
+		var snapshotPath string
+
+		// 1. Check if project.RepositoryPath is already populated and exists on disk
+		if project.RepositoryPath != "" {
+			if fi, err := os.Stat(project.RepositoryPath); err == nil && fi.IsDir() {
+				snapshotPath = project.RepositoryPath
+			}
+		}
+
+		// 2. Check source metadata via sourceService
+		if snapshotPath == "" && project.SourceID != nil && sourceService != nil {
+			if src, err := sourceService.GetSourceByID(ctx, *project.SourceID); err == nil && src != nil && src.Metadata != nil {
+				if snapVal, ok := src.Metadata["snapshot_path"].(string); ok && snapVal != "" {
+					if fi, err := os.Stat(snapVal); err == nil && fi.IsDir() {
+						snapshotPath = snapVal
+					}
+				}
+			}
+		}
+
+		// 3. Check repository_imports table if sourceService has DB pool
+		if snapshotPath == "" && sourceService != nil && sourceService.DB() != nil {
+			var dbSnap string
+			query := `SELECT snapshot_path FROM repository_imports WHERE snapshot_path != '' AND (id::text = $1 OR repository_full_name = $1 OR id::text = $2) ORDER BY updated_at DESC LIMIT 1`
+			ref := project.SourceReference
+			sourceIDStr := ""
+			if project.SourceID != nil {
+				sourceIDStr = project.SourceID.String()
+			}
+			if err := sourceService.DB().QueryRow(ctx, query, ref, sourceIDStr).Scan(&dbSnap); err == nil && dbSnap != "" {
+				if fi, err := os.Stat(dbSnap); err == nil && fi.IsDir() {
+					snapshotPath = dbSnap
+				}
+			}
+		}
+
+		// 4. Check fallback directory: sourcesDir/imports/<sourceID>
+		if snapshotPath == "" && project.SourceID != nil && sourceService != nil {
+			candidate := filepath.Join(sourceService.SourcesDir(), "imports", project.SourceID.String())
+			if fi, err := os.Stat(candidate); err == nil && fi.IsDir() {
+				snapshotPath = candidate
+			}
+		}
+
+		if snapshotPath == "" {
+			// Remote repository has no local snapshot materialized yet
+			return ProjectSourcePaths{}, nil
+		}
+
+		cleanSnap := filepath.Clean(snapshotPath)
+		daemonPath := translateBackendPathToDaemon(ctx, cli, cleanSnap, pathValidator)
+
+		return ProjectSourcePaths{
+			AgentPath:   cleanSnap,
+			BackendPath: cleanSnap,
+			DaemonPath:  daemonPath,
+		}, nil
 
 	default:
 		return ProjectSourcePaths{}, nil
@@ -591,22 +736,16 @@ func ResolveAndValidateVolumeMount(
 		return nil, errors.New("cannot resolve volume mount without project context")
 	}
 
-	// Reject relative mounts for source types that cannot safely provide persistent host paths
-	if isRelativePath(vol.Source) {
-		if project.SourceType == models.SourceTypeGitHub {
-			return nil, fmt.Errorf("relative bind mount '%s' is not supported for remote source type '%s'. Use a named volume or absolute host path.", vol.Source, project.SourceType)
-		}
-		if project.SourceType == models.SourceTypeLocalUpload {
-			return nil, fmt.Errorf("relative bind mount '%s' is not supported for temporary uploaded archive source type '%s'. Use a named volume or absolute host path.", vol.Source, project.SourceType)
-		}
-	}
-
 	paths, err := ResolveProjectSourcePaths(ctx, project, sourceService, pathValidator, dockerCli...)
 	if err != nil {
 		return nil, err
 	}
 
 	if isRelativePath(vol.Source) {
+		if paths.BackendPath == "" && paths.DaemonPath == "" && paths.AgentPath == "" {
+			return nil, fmt.Errorf("relative bind mount '%s' is not supported for project '%s': no local source root or repository snapshot is available", vol.Source, project.Name)
+		}
+
 		cleanRel := path.Clean(filepath.ToSlash(vol.Source))
 		cleanRel = strings.TrimPrefix(cleanRel, "./")
 		if cleanRel == "" || cleanRel == "/" {
@@ -667,6 +806,14 @@ func ResolveAndValidateVolumeMount(
 					accessible = true
 				}
 				_ = fi
+			} else if os.IsNotExist(sErr) && paths.BackendPath != "" {
+				// Safely auto-create relative subdirectories inside the project source root (e.g. ./data)
+				cleanBackendRoot := filepath.Clean(paths.BackendPath)
+				if relCheck, rErr := filepath.Rel(cleanBackendRoot, filepath.Clean(resolvedBackend)); rErr == nil && !strings.HasPrefix(relCheck, "..") && relCheck != ".." {
+					if mkErr := os.MkdirAll(resolvedBackend, 0755); mkErr == nil {
+						accessible = true
+					}
+				}
 			}
 		}
 
@@ -680,6 +827,12 @@ func ResolveAndValidateVolumeMount(
 					accessible = true
 				}
 				_ = fi
+			} else if os.IsNotExist(sErr) && paths.AgentPath != "" {
+				if relCheck, ok := getRelativePathCrossPlatform(paths.AgentPath, resolvedAgent); ok && !strings.HasPrefix(relCheck, "..") && relCheck != ".." {
+					if mkErr := os.MkdirAll(resolvedAgent, 0755); mkErr == nil {
+						accessible = true
+					}
+				}
 			}
 		}
 
@@ -709,6 +862,9 @@ func ResolveAndValidateVolumeMount(
 			targetPath := resolvedBackend
 			if targetPath == "" {
 				targetPath = resolvedDaemon
+			}
+			if targetPath == "" {
+				targetPath = resolvedAgent
 			}
 			return nil, fmt.Errorf("bind mount source directory '%s' (resolved to '%s') does not exist or is not accessible from backend environment", vol.Source, targetPath)
 		}

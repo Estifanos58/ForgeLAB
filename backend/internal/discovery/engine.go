@@ -759,6 +759,7 @@ func GeneratePlan(res *DiscoveryResult, opts PlanOptions) (*DeploymentPlan, erro
 			DependsOnConditions: s.DependsOnConditions,
 			Volumes:             s.Volumes,
 			Networks:            s.Networks,
+			NetworkAliases:      s.NetworkAliases,
 			Environment:         s.Environment,
 			BuildCandidates:     s.BuildCandidates,
 		}
@@ -768,14 +769,9 @@ func GeneratePlan(res *DiscoveryResult, opts PlanOptions) (*DeploymentPlan, erro
 	// 2. Compute DAG and execution tiers
 	depMap, tiers, err := BuildDAG(res.Services)
 	if err != nil {
-		// If cycle detected, create linear tiers
-		tiers = [][]string{}
-		var allNames []string
-		for _, s := range res.Services {
-			allNames = append(allNames, s.Name)
-		}
-		tiers = append(tiers, allNames)
+		return nil, fmt.Errorf("failed to validate service dependency graph: %w", err)
 	}
+
 
 	// 3. Compute endpoints
 	var publicEndpoints []PlannedEndpoint
@@ -889,6 +885,7 @@ func GeneratePlan(res *DiscoveryResult, opts PlanOptions) (*DeploymentPlan, erro
 		Dependencies:      depMap,
 		ExecutionTiers:    tiers,
 		Networks:          networks,
+		NetworkConfigs:    res.Topology.Networks,
 		Volumes:           volumes,
 		Environment:       allEnv,
 		PublicEndpoints:   publicEndpoints,

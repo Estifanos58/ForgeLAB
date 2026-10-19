@@ -1222,21 +1222,52 @@ func (e *Engine) pruneDanglingImages(ctx context.Context) error {
 // EnsureNetwork guarantees a Docker network exists with the given name and labels.
 // It handles race conditions (already exists / conflict) and performs automatic self-healing
 // pruning if the Docker daemon's IPAM default address pool is exhausted.
+// NetworkEnsureOptions specifies configuration parameters when ensuring a Docker network.
+type NetworkEnsureOptions struct {
+	Labels   map[string]string
+	Driver   string
+	Internal bool
+	External bool
+}
+
+// EnsureNetwork ensures a Docker network exists with standard bridge driver and provided labels.
 func (e *Engine) EnsureNetwork(ctx context.Context, networkName string, labels map[string]string) error {
+	return e.EnsureNetworkWithOptions(ctx, networkName, NetworkEnsureOptions{
+		Labels: labels,
+		Driver: "bridge",
+	})
+}
+
+// EnsureNetworkWithOptions creates or verifies a Docker network according to declared settings:
+// - If External is true: verifies the network already exists; fails if missing.
+// - If Internal is true: configures Docker bridge network with Internal: true (isolated from external traffic).
+// - Preserves project labels and handles pool exhaustion self-healing.
+func (e *Engine) EnsureNetworkWithOptions(ctx context.Context, networkName string, opts NetworkEnsureOptions) error {
 	if e.dockerClient == nil {
 		return nil
 	}
 
-	// 1. Fast check: already exists?
+	driver := opts.Driver
+	if driver == "" {
+		driver = "bridge"
+	}
+
+	// 1. Inspect check
 	_, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{})
 	if inspectErr == nil {
 		return nil
 	}
 
-	// 2. Attempt creation
+	// If external network is declared but does not exist in Docker daemon -> must fail!
+	if opts.External {
+		return fmt.Errorf("external network '%s' not found: %w", networkName, inspectErr)
+	}
+
+	// 2. Attempt creation with Driver, Internal, and Labels
 	createOpts := dockernetwork.CreateOptions{
-		Driver: "bridge",
-		Labels: labels,
+		Driver:   driver,
+		Internal: opts.Internal,
+		Labels:   opts.Labels,
 	}
 
 	_, err := e.dockerClient.NetworkCreate(ctx, networkName, createOpts)
@@ -1272,6 +1303,7 @@ func (e *Engine) EnsureNetwork(ctx context.Context, networkName string, labels m
 
 	return fmt.Errorf("failed to create network '%s': %w", networkName, err)
 }
+
 
 // PruneDanglingNetworks cleans up orphaned ForgeLAB bridge networks that have zero connected containers.
 func (e *Engine) PruneDanglingNetworks(ctx context.Context) error {
