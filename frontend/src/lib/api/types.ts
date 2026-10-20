@@ -709,3 +709,52 @@ export interface ProjectTopology {
   diagnostics: TopologyDiagnostic[];
 }
 
+export type TunnelState =
+  | 'not_shared'
+  | 'connecting'
+  | 'online'
+  | 'disconnected'
+  | 'expired'
+  | 'revoked'
+  | 'unavailable';
+
+export interface RouteMapping {
+  path_prefix: string;
+  service_id: string;
+  service_name?: string;
+  strip_prefix?: boolean;
+}
+
+export interface PublicShare {
+  id: string;
+  project_id: string;
+  owner_id: string;
+  share_token: string;
+  public_url: string;
+  public_host: string;
+  primary_service_id: string;
+  primary_service?: Service;
+  route_mappings: RouteMapping[];
+  status: 'active' | 'revoked' | 'expired';
+  revoked_at?: string | null;
+  expires_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateShareInput {
+  primary_service_id: string;
+  route_mappings?: RouteMapping[];
+  expires_in_hours?: number | null;
+}
+
+export interface ShareStatusResponse {
+  enabled: boolean;
+  configured: boolean;
+  share?: PublicShare | null;
+  tunnel_state: TunnelState;
+  gateway_url?: string;
+  reason?: string;
+}
+
+

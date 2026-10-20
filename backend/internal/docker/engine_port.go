@@ -33,3 +33,19 @@ func (e *Engine) GetPublicHost() string {
 	}
 	return "localhost"
 }
+
+// SetAppHostIP sets the host IP to bind application container ports to (defaults to 127.0.0.1 for local isolation).
+func (e *Engine) SetAppHostIP(ip string) {
+	trimmed := strings.TrimSpace(ip)
+	if trimmed != "" {
+		e.appHostIP = trimmed
+	}
+}
+
+// GetAppHostIP returns the configured host IP or "127.0.0.1".
+func (e *Engine) GetAppHostIP() string {
+	if e.appHostIP != "" {
+		return e.appHostIP
+	}
+	return "127.0.0.1"
+}

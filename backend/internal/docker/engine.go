@@ -90,6 +90,7 @@ type Engine struct {
 	cachedBuilderVer     atomic.Value            // stores types.BuilderVersion advertised by Docker daemon
 	startTime            time.Time               // instance boot timestamp for tracking interrupted deployments
 	publicHost           string                  // host name or IP used for browser-facing URLs
+	appHostIP            string                  // host IP binding for application ports (defaults to 127.0.0.1)
 	reconcileMu          sync.RWMutex
 	reconcileState       ReconciliationState
 }
@@ -1451,7 +1452,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		portBindings = nat.PortMap{
 			nat.Port(targetPortStr): []nat.PortBinding{
 				{
-					HostIP:   "0.0.0.0",
+					HostIP:   e.GetAppHostIP(),
 					HostPort: fmt.Sprintf("%d", allocated),
 				},
 			},
@@ -1887,7 +1888,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				newPort, allocErr := e.portManager.AllocatePort()
 				if allocErr == nil {
 					hostPort = &newPort
-					portBindings[nat.Port(targetPortStr)] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", newPort)}}
+					portBindings[nat.Port(targetPortStr)] = []nat.PortBinding{{HostIP: e.GetAppHostIP(), HostPort: fmt.Sprintf("%d", newPort)}}
 					hostConfig.PortBindings = portBindings
 					continue
 				}
@@ -1963,7 +1964,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				newPort, allocErr := e.portManager.AllocatePort()
 				if allocErr == nil {
 					hostPort = &newPort
-					portBindings[nat.Port(targetPortStr)] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", newPort)}}
+					portBindings[nat.Port(targetPortStr)] = []nat.PortBinding{{HostIP: e.GetAppHostIP(), HostPort: fmt.Sprintf("%d", newPort)}}
 					hostConfig.PortBindings = portBindings
 					continue
 				}
@@ -3166,7 +3167,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		PortBindings: nat.PortMap{
 			nat.Port(targetPortStr): []nat.PortBinding{
 				{
-					HostIP:   "0.0.0.0",
+					HostIP:   e.GetAppHostIP(),
 					HostPort: fmt.Sprintf("%d", allocatedPort),
 				},
 			},
@@ -3201,7 +3202,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 					allocatedPort = newPort
 					containerConfig.ExposedPorts = nat.PortSet{nat.Port(targetPortStr): struct{}{}}
 					hostConfig.PortBindings = nat.PortMap{
-						nat.Port(targetPortStr): []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", allocatedPort)}},
+						nat.Port(targetPortStr): []nat.PortBinding{{HostIP: e.GetAppHostIP(), HostPort: fmt.Sprintf("%d", allocatedPort)}},
 					}
 					continue
 				}
@@ -3225,7 +3226,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 					allocatedPort = newPort
 					containerConfig.ExposedPorts = nat.PortSet{nat.Port(targetPortStr): struct{}{}}
 					hostConfig.PortBindings = nat.PortMap{
-						nat.Port(targetPortStr): []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", allocatedPort)}},
+						nat.Port(targetPortStr): []nat.PortBinding{{HostIP: e.GetAppHostIP(), HostPort: fmt.Sprintf("%d", allocatedPort)}},
 					}
 					continue
 				}

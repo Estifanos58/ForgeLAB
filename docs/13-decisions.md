@@ -35,6 +35,7 @@
 | **DEC-013** | Streaming Source Ingestion, Staged Workspaces, and Asynchronous Processing Lifecycle | **ACTIVE** | 2026-09-27 |
 | **DEC-014** | Direct Local-Directory Deployment, Streaming Docker Build Context, and Early `.dockerignore` Pruning | **ACTIVE** | 2026-09-27 |
 | **DEC-015** | Authoritative DeploymentPlan, Secret-Safe Discovery, and Complete Compose Semantics | **ACTIVE** | 2026-10-05 |
+| **DEC-016** | Secure Public Project Sharing via Authenticated Outbound Yamux Tunnel & Public Gateway | **ACTIVE** | 2026-10-20 |
 
 ---
 
@@ -266,3 +267,20 @@
   6. **Production Runtime Candidates:** Separated detection from execution recommendations (`RecommendProductionExecution`), recommending production WSGI/ASGI servers (Gunicorn for Django/Flask, Puma for Rails, production flags for Laravel) instead of development servers.
 - **Current Implementation:** `backend/internal/discovery/`, `backend/internal/models/`, `backend/internal/docker/`, `backend/internal/services/`, `backend/internal/handlers/`, `frontend/src/lib/api/types.ts`.
 - **Rule for Future Agents:** Do not bypass `internal/discovery`. Never return plaintext secret values in discovery plans. Never re-resolve source revisions or re-run discovery during deployment execution.
+
+---
+
+## DEC-016: Secure Public Project Sharing via Authenticated Outbound Yamux Tunnel & Public Gateway
+
+- **Date:** 2026-10-20
+- **Status:** **ACTIVE**
+- **Decision:** Implemented secure public project sharing through an outbound authenticated Yamux multiplexed tunnel connected to a standalone public gateway:
+  1. **Outbound Multiplexed Tunnel Transport:** ForgeLAB initiates an outbound TLS connection from the user's host computer to a remote Public Gateway component (`cmd/gateway`). Multiplexed with `hashicorp/yamux`, the tunnel enables bi-directional HTTP requests, streaming responses, and WebSocket connections over a single long-lived TCP connection. The owner's machine requires zero inbound port forwarding, static IP allocation, or router reconfiguration.
+  2. **Public Gateway Component:** Standalone, internet-facing Go daemon (`backend/cmd/gateway/main.go`). It binds HTTPS/HTTP ingress listeners for visitor traffic, terminates TLS on wildcard share domains (e.g. `*.preview.example.com`), and enforces tunnel client authentication via shared secret token (`GATEWAY_AUTH_TOKEN`). When an incoming visitor arrives, it matches the subdomain token against active share registrations and opens an isolated Yamux virtual stream to the host installation.
+  3. **Local Request Router & Security Boundary:** The tunnel terminates locally in `internal/tunnel/local_router.go`. The router enforces strict path normalization, explicitly detects and blocks directory traversal attempts (`..` in raw URI or normalized path), and matches route prefixes (`/` -> primary frontend service, `/api/*` -> backend service) resolved authoritatively from ForgeLAB database records. Management ports (ForgeLAB API `:8080`, local agent `:4142`, Postgres `:5432`, Redis `:6379`, and Docker socket) are strictly blocked from tunnel routing.
+  4. **Host Port Binding Hardening:** Hardcoded Docker host bindings (`0.0.0.0`) across all container creation and release inspection workflows were replaced with `FORGELAB_APP_HOST_IP` (defaulting strictly to `127.0.0.1`). This preserves local preview functionality and local router reverse proxying while eliminating LAN/WAN bypass attacks that could directly target container host ports.
+  5. **Truthful Status & Graceful Failure:** If gateway infrastructure or DNS is not configured, ForgeLAB truthfully reports status as `unavailable` with actionable setup guidance. It never simulates active connections, never returns fake mock URLs, and fails closed.
+  6. **Reversible Migration & Cryptographic Share Tokens:** Public shares are stored in `public_shares` (migration `000020_add_public_shares`), keyed by 128-bit cryptographically secure random hexadecimal tokens (`crypto/rand`). Immediate revocation immediately deregisters routes at both local and gateway layers.
+- **Current Implementation:** `backend/cmd/gateway/`, `backend/internal/gateway/`, `backend/internal/tunnel/`, `backend/internal/services/share_service.go`, `backend/internal/handlers/share_handler.go`, `backend/internal/models/share.go`, `frontend/src/features/projects/share-modal.tsx`.
+- **Rule for Future Agents:** Never expose container host ports on `0.0.0.0` by default. Never allow public tunnel requests to target internal management planes or arbitrary ports. Always fail closed when gateway configuration is absent.
+

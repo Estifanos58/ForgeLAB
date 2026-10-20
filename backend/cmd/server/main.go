@@ -30,6 +30,7 @@ import (
 	"github.com/forgelab/backend/internal/ratelimit"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
+	"github.com/forgelab/backend/internal/tunnel"
 	ws "github.com/forgelab/backend/internal/websocket"
 )
 
@@ -183,6 +184,16 @@ func main() {
 	projectService.SetSecretService(secretService)
 	projectService.SetDeploymentService(deploymentService)
 
+	// Public Project Sharing Service
+	shareService := services.NewShareService(
+		pool,
+		projectService,
+		serviceService,
+		cfg.Share.Enabled,
+		cfg.Share.GatewayPublicURL,
+		cfg.Share.GatewayTunnelURL,
+	)
+
 	// Initialize WebSocket Hub
 	wsHub := ws.NewHub(jwtManager, projectService, deploymentService, redisClient, cfg.App.AllowedOriginsList()...)
 	wsHub.SetServiceDeploymentResolver(deploymentService)
@@ -206,10 +217,27 @@ func main() {
 	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
 	dockerEngine.SetMaxConcurrentBuilds(cfg.Docker.MaxConcurrentBuilds)
 	dockerEngine.SetPublicHost(cfg.App.PublicHostName())
+	if cfg.Share.AppHostIP != "" {
+		dockerEngine.SetAppHostIP(cfg.Share.AppHostIP)
+	}
 	if cfg.Docker.PruneFilterLabel != "" {
 		dockerEngine.SetPruneFilterLabel(cfg.Docker.PruneFilterLabel)
 	}
 	defer dockerEngine.StopAllLogCollectors()
+
+	// Initialize Public Sharing Tunnel & Local Router
+	dockerUpstreamResolver := tunnel.NewDockerUpstreamResolver(dockerCli)
+	localRouter := tunnel.NewLocalRouter(shareService, serviceService, dockerUpstreamResolver)
+	tunnelManager := tunnel.NewTunnelManager(tunnel.TunnelManagerConfig{
+		Enabled:          cfg.Share.Enabled,
+		GatewayTunnelURL: cfg.Share.GatewayTunnelURL,
+		GatewayAuthToken: cfg.Share.GatewayAuthToken,
+		TLSSkipVerify:    cfg.Share.TLSSkipVerify,
+		InstallationID:   cfg.Server.Host,
+	}, localRouter, shareService)
+	shareService.SetTunnelRegistrar(tunnelManager)
+	tunnelManager.Start(ctx)
+	defer tunnelManager.Stop()
 
 	// Initialize Redis deployment queue & worker
 	var deployQueue *queue.DeploymentQueue
@@ -390,6 +418,7 @@ func main() {
 	integrationHandler := handlers.NewIntegrationHandler(githubService, githubAppManager, repositoryImportService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
 	discoveryHandler := handlers.NewDiscoveryHandler(githubService, sourceService, pathValidator, secretService)
+	shareHandler := handlers.NewShareHandler(shareService, projectService)
 	healthHandler := handlers.NewHealthHandler(pool, redisClient, dockerCli)
 	healthHandler.SetSecurityContext(jwtManager, cfg.RateLimit.TrustedProxies)
 	healthHandler.SetQueueDiagnosticsProvider(deployQueue)
@@ -541,6 +570,11 @@ func main() {
 
 				// Project-level logs
 				r.Get("/{id}/logs", projectHandler.GetProjectLogs)
+
+				// Public Sharing
+				r.Get("/{id}/share", shareHandler.Get)
+				r.Post("/{id}/share", shareHandler.Create)
+				r.Delete("/{id}/share", shareHandler.Revoke)
 
 				// Deployments
 				r.With(deployThrottle).Post("/{id}/deployments", projectHandler.Deploy)

@@ -1,10 +1,11 @@
 'use client';
 
-import React from 'react';
+import React, { useState } from 'react';
 import { Project, Deployment } from '@/lib/api/types';
 import { Badge } from '@/components/ui/badge';
 import { LifecycleControls } from '@/features/deployments/lifecycle-controls';
-import { ExternalLink, Radio, Layers, Github, Folder, HardDrive, GitBranch } from 'lucide-react';
+import { ExternalLink, Radio, Layers, Github, Folder, HardDrive, GitBranch, Globe } from 'lucide-react';
+import { ShareModal } from './share-modal';
 
 interface ProjectHeaderProps {
   project: Project;
@@ -19,6 +20,7 @@ export function ProjectHeader({
   onError,
   onDeploymentCreated,
 }: ProjectHeaderProps) {
+  const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const services = project.services || [];
 
   // Determine the primary preview URL across running services.
@@ -116,6 +118,17 @@ export function ProjectHeader({
               <ExternalLink className="w-3 h-3" />
             </a>
           )}
+
+          {/* Share Preview Action */}
+          <button
+            type="button"
+            onClick={() => setIsShareModalOpen(true)}
+            className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded border border-indigo-500/30 bg-indigo-500/10 text-xs font-mono text-indigo-300 hover:text-indigo-200 hover:border-indigo-500/50 transition-colors shadow-sm cursor-pointer"
+            title="Share preview via secure outbound tunnel"
+          >
+            <Globe className="w-3 h-3 text-indigo-400" />
+            <span>Share Preview</span>
+          </button>
         </div>
 
         <div className="flex items-center gap-2.5 text-[11px] font-mono text-neutral-500 flex-wrap">
@@ -152,6 +165,13 @@ export function ProjectHeader({
         onActionComplete={onActionComplete}
         onError={onError}
         onDeploymentCreated={onDeploymentCreated}
+      />
+
+      {/* Public Share Modal */}
+      <ShareModal
+        isOpen={isShareModalOpen}
+        onClose={() => setIsShareModalOpen(false)}
+        project={project}
       />
     </div>
   );

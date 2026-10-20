@@ -94,6 +94,12 @@ services:
       FORGELAB_IN_DOCKER: "true"
       FORGELAB_AGENT_URL: ${FORGELAB_AGENT_URL:-http://host.docker.internal:4142}
       RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+      FORGELAB_SHARING_ENABLED: ${FORGELAB_SHARING_ENABLED:-false}
+      GATEWAY_TUNNEL_URL: ${GATEWAY_TUNNEL_URL:-}
+      GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-}
+      GATEWAY_AUTH_TOKEN: ${GATEWAY_AUTH_TOKEN:-}
+      GATEWAY_TLS_SKIP_VERIFY: ${GATEWAY_TLS_SKIP_VERIFY:-false}
+      FORGELAB_APP_HOST_IP: ${FORGELAB_APP_HOST_IP:-127.0.0.1}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - forgelab_builds:/app/data/builds

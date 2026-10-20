@@ -218,6 +218,7 @@ The status classifications strictly follow these definitions:
 | **Node.js Preflight Validation** | IMPLEMENTED | NOT RECORDED | Validates package manifests, build scripts, and presence of required Prisma schema files before starting Docker build with actionable diagnostics |
 | **Safe Shell Command Serialization** | IMPLEMENTED | NOT RECORDED | JSON array serialization for Dockerfile `CMD ["sh", "-c", ...]` escaping quotes, backslashes, and shell operators safely |
 | **Service Exposure Configuration & Isolation** | IMPLEMENTED | NOT RECORDED | Explicit `public_exposed` selection in UI/API; database and infrastructure services default to internal; volume traversal validation error propagation |
+| **Secure Public Project Sharing** | IMPLEMENTED | NOT RECORDED | Authenticated outbound Yamux tunnel to standalone public gateway (`cmd/gateway`), 128-bit cryptographic tokens, path traversal defense, frontend/backend route allowlists, container host port loopback hardening |
 | **WebSocket Compatibility & Deprecation Path** | IMPLEMENTED | NOT RECORDED | Validates `?token=` query fallback with scrubbed deprecation warning while preferring single-use tickets (`POST /api/ws/ticket`) and HttpOnly cookies |
 | **Automatic HTTPS & Reverse Proxy (Caddy)** | DEFERRED | — | Planned future roadmap item; local host port allocation and port mapping active |
 | **GitHub Push-to-Deploy & Webhook Pipeline** | DEFERRED | — | Planned future roadmap item; manual commit-pinned deployment active |

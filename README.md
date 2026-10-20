@@ -18,6 +18,7 @@ ForgeLAB is a single control-plane application deployment platform built in Go. 
 - **Build Strategy**: Direct build context streaming (`io.Pipe()`) without in-memory archive buffering, bounded 64KB log lines, automatic heuristic multi-stage container build generation & custom Dockerfile build strategy
 - **Host Port Range**: Dynamic port allocation in the range **`10000–60000`** with dynamic container internal port mapping
 - **Frontend**: Next.js 16.3.6 LTS + React 19 + TypeScript + Tailwind CSS (Operational developer console)
+- **Secure Public Sharing**: Authenticated outbound Yamux multiplexed tunnel connecting to a standalone public gateway (`cmd/gateway`) for public HTTPS links without inbound port forwarding
 - **Deployment Safety Invariant**: Failed releases never terminate or replace the previous running deployment.
 
 ---
@@ -110,6 +111,78 @@ For active development with local-source deployments, use **Workflow A**.
 
 ---
 
+## Secure Public Project Sharing & Outbound Gateway
+
+ForgeLAB enables users deploying applications on their own computers to share secure, public HTTPS links (e.g. `https://<token>.preview.example.com`) with anyone worldwide. The remote recipient interacts with the running frontend and backend seamlessly without requiring the owner to configure router port forwarding, DDNS, or static public IPs.
+
+### How It Works
+
+```text
+Visitor's Browser
+       │
+       ▼ (HTTPS :443)
+┌──────────────────────────────────────────────┐
+│  Public Gateway (cmd/gateway)                │  (Public Server: cloud VM / VPS)
+│  - Wildcard TLS (*.preview.example.com)      │
+│  - Matches subdomain to active share session  │
+└──────────────────────┬───────────────────────┘
+                       │
+                       │ Outbound Yamux Tunnel (TLS :8443)
+                       │ (Initiated from local computer)
+                       ▼
+┌──────────────────────────────────────────────┐
+│  ForgeLAB Host (cmd/server)                  │  (User's Local Computer)
+│  - TunnelManager maintains connection        │
+│  - LocalRouter validates routes & boundaries │
+│  - Blocks admin/management ports (:8080, etc)│
+└──────────────┬───────────────────────────────┘
+               │ Local Reverse Proxy (127.0.0.1)
+        ┌──────┴──────┐
+        ▼             ▼
+┌──────────────┐ ┌──────────────┐
+│ Frontend App │ │ Backend API  │  (Docker containers)
+│ (e.g. :10001)│ │ (e.g. :10002)│
+└──────────────┘ └──────────────┘
+```
+
+1. **Outbound Multiplexed Tunnel:** The local ForgeLAB installation establishes an outbound TLS connection to the remote Public Gateway. Because the connection is outbound, firewalls and NATs allow it automatically without incoming port forwarding.
+2. **Visitor Request Routing:** When a visitor visits `https://<share-token>.preview.example.com`, the gateway matches the share token against active registrations and multiplexes the request as a virtual stream over the existing tunnel.
+3. **Local Request Router:** The local router receives the stream, verifies route mappings (`/` -> frontend, `/api/*` -> backend), and proxies the request to the running container on loopback `127.0.0.1`.
+4. **WebSocket & Streaming Support:** HTTP chunked transfer, Server-Sent Events, and WebSocket upgrades are piped transparently end-to-end.
+
+### Deploying the Public Gateway (Server Setup)
+
+To enable public sharing for internet recipients:
+1. **Provision a Public Host:** Run the gateway binary on a server with a public IP (e.g., AWS EC2, DigitalOcean Droplet, Hetzner, GCP).
+2. **Configure DNS:** Create an A record for your gateway tunnel endpoint (e.g. `gateway.preview.example.com`) and a wildcard A record for shared previews (e.g. `*.preview.example.com`).
+3. **Configure TLS:** Obtain a wildcard TLS certificate (e.g., via Let's Encrypt / Certbot DNS-01 challenge).
+4. **Run Public Gateway:**
+   ```bash
+   cd backend
+   GATEWAY_INGRESS_PORT=443 \
+   GATEWAY_TUNNEL_PORT=8443 \
+   GATEWAY_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem \
+   GATEWAY_TLS_KEY=/etc/letsencrypt/live/example.com/privkey.pem \
+   GATEWAY_BASE_DOMAIN=preview.example.com \
+   GATEWAY_AUTH_TOKEN="your-secure-gateway-token" \
+   go run cmd/gateway/main.go
+   ```
+
+### Enabling Sharing on Local ForgeLAB
+
+In your local `.env`:
+```env
+FORGELAB_SHARING_ENABLED=true
+GATEWAY_TUNNEL_URL=gateway.preview.example.com:8443
+GATEWAY_PUBLIC_URL=https://preview.example.com
+GATEWAY_AUTH_TOKEN=your-secure-gateway-token
+FORGELAB_APP_HOST_IP=127.0.0.1
+```
+
+If the gateway is not configured or offline, ForgeLAB truthfully reports sharing as `unavailable` with actionable troubleshooting messages rather than simulating a connection.
+
+---
+
 ## Repository Structure
 
 ```text
@@ -135,6 +208,7 @@ ForgeLAB/
 ├── backend/                 # Go control-plane application
 │   ├── cmd/server/          # API server & embedded deployment worker entrypoint
 │   ├── cmd/agent/           # Local agent CLI for streaming local host source trees
+│   ├── cmd/gateway/         # Standalone public gateway daemon for public preview sharing
 │   ├── cmd/migrate/         # SQL migration CLI tool
 │   ├── Dockerfile           # Multi-stage Go backend Dockerfile
 │   ├── internal/            # Core business logic & services
@@ -143,6 +217,7 @@ ForgeLAB/
 │   │   ├── crypto/          # AES-256-GCM encryption for secrets
 │   │   ├── database/        # PostgreSQL connection pool (pgx)
 │   │   ├── docker/          # Docker Engine build, container runner & trust boundary
+│   │   ├── gateway/         # Public gateway proxy, TLS ingress & stream multiplexing
 │   │   ├── handlers/        # REST HTTP request handlers (including /health & /ready)
 │   │   ├── logging/         # Log persistence & secret redactor
 │   │   ├── middleware/      # Auth, CORS, logger, & JSON middleware
@@ -151,7 +226,8 @@ ForgeLAB/
 │   │   ├── queue/           # Redis worker queue with lease ownership safety
 │   │   ├── ratelimit/       # Sliding-window rate limiting with in-memory fallback
 │   │   ├── security/        # Host path validator & boundary defense
-│   │   ├── services/        # User, Project, Service, Deployment, & Secret services
+│   │   ├── services/        # User, Project, Service, Deployment, Share & Secret services
+│   │   ├── tunnel/          # Outbound Yamux tunnel client, local router & upstream resolver
 │   │   └── websocket/       # WebSocket Hub, rate limiter, & Redis PubSub
 │   └── migrations/          # PostgreSQL schema migrations
 ├── frontend/                # Next.js 16.3.6 LTS + React 19 + TypeScript web application

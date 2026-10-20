@@ -28,6 +28,22 @@ type Config struct {
 	GitHub     OAuthConfig
 	GitHubApp  GitHubAppConfig
 	RateLimit  RateLimitConfig
+	Share      ShareConfig
+}
+
+// ShareConfig holds settings for outbound public tunnel and sharing.
+type ShareConfig struct {
+	Enabled          bool
+	GatewayTunnelURL string
+	GatewayPublicURL string
+	GatewayAuthToken string
+	TLSSkipVerify    bool
+	AppHostIP        string
+}
+
+// IsConfigured returns true if the gateway tunnel URL and auth token are configured.
+func (s ShareConfig) IsConfigured() bool {
+	return s.Enabled && strings.TrimSpace(s.GatewayTunnelURL) != "" && strings.TrimSpace(s.GatewayAuthToken) != ""
 }
 
 // RateLimitConfig holds throttling limits for sensitive API endpoints and WebSockets.
@@ -310,6 +326,14 @@ func Load() (*Config, error) {
 				}
 			}
 		}
+		if getEnv("FORGELAB_SHARING_ENABLED", "false") == "true" {
+			if strings.TrimSpace(getEnv("GATEWAY_TUNNEL_URL", "")) == "" {
+				return nil, fmt.Errorf("%s configuration error: GATEWAY_TUNNEL_URL must be configured when FORGELAB_SHARING_ENABLED is true", envMode)
+			}
+			if strings.TrimSpace(getEnv("GATEWAY_AUTH_TOKEN", "")) == "" {
+				return nil, fmt.Errorf("%s configuration error: GATEWAY_AUTH_TOKEN must be configured when FORGELAB_SHARING_ENABLED is true", envMode)
+			}
+		}
 	}
 
 	cfg := &Config{
@@ -395,6 +419,14 @@ func Load() (*Config, error) {
 			WSConnLimit:         parseIntEnv("RATE_LIMIT_WS_CONN_PER_MINUTE", 120),
 			WSSubscriptionLimit: parseIntEnv("RATE_LIMIT_WS_SUB_PER_MINUTE", 120),
 			TrustedProxies:      trustedProxies,
+		},
+		Share: ShareConfig{
+			Enabled:          getEnv("FORGELAB_SHARING_ENABLED", "false") == "true",
+			GatewayTunnelURL: getEnv("GATEWAY_TUNNEL_URL", ""),
+			GatewayPublicURL: strings.TrimRight(getEnv("GATEWAY_PUBLIC_URL", ""), "/"),
+			GatewayAuthToken: getEnv("GATEWAY_AUTH_TOKEN", ""),
+			TLSSkipVerify:    getEnv("GATEWAY_TLS_SKIP_VERIFY", "false") == "true",
+			AppHostIP:        getEnv("FORGELAB_APP_HOST_IP", "127.0.0.1"),
 		},
 	}
 

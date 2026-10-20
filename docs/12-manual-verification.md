@@ -98,6 +98,7 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Node.js Preflight Validation** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Validates package manifests, build scripts, and presence of required Prisma schema files before starting Docker build with actionable diagnostics |
 | **Safe Shell Command Serialization** | IMPLEMENTED | NOT RECORDED | — | — | — | — | JSON array serialization for Dockerfile `CMD ["sh", "-c", ...]` escaping quotes, backslashes, and shell operators safely |
 | **Service Exposure Configuration & Isolation** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Explicit `public_exposed` selection in UI/API; database and infrastructure services default to internal; volume traversal validation error propagation |
+| **Secure Public Project Sharing** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests outbound Yamux tunnel, public gateway ingress, path traversal defense, frontend/backend routing, loopback port binding, and immediate revocation |
 | **WebSocket Compatibility & Deprecation Path** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Validates `?token=` query fallback with scrubbed deprecation warning while preferring single-use tickets (`POST /api/ws/ticket`) and HttpOnly cookies |
 
 ---
@@ -1794,3 +1795,85 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Date:** —
 - **Environment:** —
 - **Notes:** —
+
+---
+
+### 38. Secure Public Project Sharing & Outbound Tunnel
+
+#### Test Procedure 38.1 — Unconfigured Gateway Graceful Failure
+1. Ensure `FORGELAB_SHARING_ENABLED=false` or `GATEWAY_TUNNEL_URL` is unset in `.env`.
+2. Open ForgeLAB at `http://localhost:3000` and navigate to a deployed project.
+3. Click the **Share Preview** button in the project header.
+4. Verify the modal opens and displays:
+   - Status badge: `Unavailable`
+   - Actionable alert explaining that public sharing is not configured on this installation, with clear instructions on which `.env` variables (`FORGELAB_SHARING_ENABLED`, `GATEWAY_*`) to configure.
+   - The "Create Public Share" button is disabled.
+5. Verify the backend did not panic, and no fake or simulated share URL is generated.
+
+#### Test Procedure 38.2 — Share Creation & Token Unpredictability
+1. In development, configure `FORGELAB_SHARING_ENABLED=true`, `GATEWAY_TUNNEL_URL=localhost:8443`, `GATEWAY_PUBLIC_URL=https://preview.example.com`, and `GATEWAY_AUTH_TOKEN=test-token`.
+2. Deploy a two-service application (frontend on port 3000, backend API on port 8080).
+3. Open **Share Preview** modal:
+   - Select the frontend service as the primary service.
+   - Configure `/` -> frontend service and `/api` -> backend service.
+   - Select expiration (e.g. 24 hours).
+   - Click **Create Public Link**.
+4. Verify response:
+   - Share token is a 32-character hexadecimal string generated via `crypto/rand` (128-bit entropy).
+   - Generated URL matches `https://<share-token>.preview.example.com`.
+   - Copy button correctly copies the link to the clipboard with visual checkmark confirmation.
+5. Inspect PostgreSQL database:
+   - Query `SELECT * FROM public_shares WHERE project_id = '<id>';`
+   - Confirm record exists with `status = 'active'`, correct route mappings in JSONB, and valid `expires_at`.
+
+#### Test Procedure 38.3 — Cross-Network Visitor Access (Physical Internet Test)
+> **Note on Prerequisites:** This physical cross-network test requires a live public gateway deployed on an internet-reachable server with a wildcard DNS record (e.g. `*.preview.yourdomain.com`) and a valid wildcard TLS certificate. If internet infrastructure is not yet provisioned, mark this test as `BLOCKED: Awaiting Public Gateway & DNS Provisioning` rather than claiming verified.
+
+1. **Gateway Deployment:**
+   - On a cloud VM, start `backend/cmd/gateway/main.go` with `GATEWAY_INGRESS_PORT=443`, `GATEWAY_TUNNEL_PORT=8443`, valid TLS certificates, and `GATEWAY_AUTH_TOKEN`.
+2. **Local ForgeLAB Connection:**
+   - On the owner's laptop/workstation (behind standard home/office NAT), start ForgeLAB with `GATEWAY_TUNNEL_URL=<gateway-ip>:8443`.
+   - Verify tunnel manager successfully establishes the outbound TLS Yamux session and registers active shares.
+3. **External Client Test:**
+   - Disconnect a mobile phone or secondary laptop from the local WiFi network (use cellular data hotspot).
+   - In the mobile browser, navigate to `https://<share-token>.preview.yourdomain.com`.
+4. **End-to-End Application Verification:**
+   - Verify the frontend UI renders correctly without mixed-content warnings.
+   - Trigger an application action that calls `/api/*` (e.g., logging in or submitting a form in the deployed app).
+   - Verify the request travels through the public gateway -> outbound tunnel -> local router -> local backend container -> local database, and returns a valid response to the mobile browser.
+   - Verify WebSocket connections (if used by the deployed application) upgrade cleanly and stream bidirectional data.
+
+#### Test Procedure 38.4 — Immediate Revocation & Expiration Invariant
+1. While the remote visitor is browsing the shared application:
+2. On the owner's computer, click **Revoke Link Immediately** in the ForgeLAB Share Preview modal.
+3. Confirm revocation prompt.
+4. Verify local state immediately transitions: status changes to `Revoked`, public URL card disappears, and a notification confirms revocation.
+5. On the remote visitor's browser, refresh the page:
+   - Verify the public gateway returns HTTP 404 Not Found or HTTP 410 Gone.
+   - Verify traffic is completely blocked at both the public gateway and the local router.
+6. Verify local application preservation:
+   - Open the local preview URL (`http://localhost:<host_port>`).
+   - Confirm the deployed application is still running healthy and unaffected by the revocation.
+
+#### Test Procedure 38.5 — Security Boundary Defense & Port Isolation
+1. **Directory Traversal Attack:**
+   - Send HTTP requests targeting the share token with traversal sequences:
+     `curl -k "https://<share-token>.preview.example.com/api/../../etc/passwd"`
+     `curl -k "https://<share-token>.preview.example.com/../"`
+   - Verify the local router rejects the request with HTTP `400 Bad Request` (`path traversal sequences ('..') are strictly forbidden`).
+2. **Management Plane Port Shielding:**
+   - Attempt to access ForgeLAB management API, local agent (:4142), Postgres (:5432), or Redis (:6379) through the tunnel.
+   - Verify all management ports are strictly blocked from routing.
+3. **Local Container Host Port Binding:**
+   - Check Docker container port bindings: `docker inspect <container_id> --format '{{json .NetworkSettings.Ports}}'`.
+   - Verify `HostIp` is `127.0.0.1` (not `0.0.0.0`).
+   - From another device on the same local LAN, attempt to connect directly to `http://<laptop-lan-ip>:<host_port>`.
+   - Verify the connection is refused, confirming local containers cannot be reached directly without passing through ForgeLAB.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+

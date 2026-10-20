@@ -193,7 +193,7 @@ All user application containers created by ForgeLAB enforce these constraints:
 | **No Privileged Mode** | ENFORCED | `Privileged: false` strictly enforced via `ValidateAndBuildSecureHostConfig` |
 | **No-New-Privileges** | ENFORCED | `SecurityOpt: ["no-new-privileges:true"]` enforced on all deployed containers |
 | **Capability Dropping** | ENFORCED | `CapDrop: ["ALL"]` enforced to prevent kernel privilege escalation |
-| **No Host Network** | ENFORCED | Host networking rejected; binds container port to dynamic host port on `0.0.0.0` |
+| **No Host Network** | ENFORCED | Host networking rejected; binds container port to dynamic host port on loopback `127.0.0.1` by default via `FORGELAB_APP_HOST_IP` (eliminating direct LAN/WAN bypass) |
 | **No Docker Socket Mount** | ENFORCED | `/var/run/docker.sock` and named pipes are strictly rejected with security violation |
 | **No Host Root/Sensitive Mounts** | ENFORCED | User containers cannot mount `/proc`, `/sys`, `/dev`, `/etc`, `/root`, or host roots |
 | **Restart Policy (Docker Engine)** | ENFORCED | `RestartPolicy: unless-stopped` (Docker daemon restarts container on crash) |
@@ -288,5 +288,39 @@ ForgeLAB supports registration-free local deployments for self-hosted and single
      1. With the ForgeLAB server running, delete all guest projects via the ForgeLAB UI or API (`DELETE /api/projects/{id}`). This triggers the engine's clean shutdown, container removal, port deallocation, and volume pruning.
      2. Verify no guest projects remain: `SELECT COUNT(*) FROM projects WHERE owner_id = '00000000-0000-0000-0000-000000000001';`
      3. Apply database migration rollback: `migrate -path backend/migrations -database "$DATABASE_URL" down 1`.
+
+---
+
+## 10. Public Project Sharing & Outbound Gateway Trust Boundaries
+
+ForgeLAB’s public sharing feature enables users to share locally deployed projects over the internet without compromising control-plane integrity, exposing private network topology, or allowing arbitrary host access:
+
+1. **Architectural Separation of Ingress Gateway (`cmd/gateway`):**
+   - The public gateway runs on an internet-facing host isolated from the ForgeLAB control plane.
+   - It possesses **zero** access to the host Docker daemon, PostgreSQL, Redis, or local source files.
+   - It cannot initiate arbitrary outbound connections into internal networks; it can only multiplex visitor requests across authenticated tunnels established outbound by ForgeLAB instances.
+   - The gateway rejects requests with invalid hostnames, missing share headers, or unregistered subdomains.
+
+2. **Authenticated Outbound Multiplexed Tunnel:**
+   - The tunnel connection is initiated strictly **outbound** from the local ForgeLAB server to the public gateway over TLS (`GATEWAY_TUNNEL_URL`).
+   - The owner's machine requires **no inbound port forwarding**, no static public IP, and no firewall holes.
+   - Connection handshake requires a shared cryptographic secret (`GATEWAY_AUTH_TOKEN`). Connections presenting invalid tokens are dropped immediately.
+   - Using `yamux`, visitor requests are multiplexed as isolated virtual streams over the single authenticated TCP connection.
+
+3. **Local Request Router & Security Defense-in-Depth (`internal/tunnel/local_router.go`):**
+   - **Path Traversal Defense:** Both the raw `RequestURI` and normalized `URL.Path` are inspected before route evaluation. Any path containing `..` or attempting directory traversal outside allowed service boundaries is immediately rejected with HTTP `400 Bad Request`.
+   - **Management Plane Protection:** The router maintains a hardcoded exclusion list of sensitive ports and paths. It strictly refuses to proxy requests to the ForgeLAB API (`:8080`), local source agent (`:4142`), PostgreSQL (`:5432`), Redis (`:6379`), or the Docker socket.
+   - **Authoritative Route Allowlists:** The local router resolves target services solely from authoritative ForgeLAB database records (`public_shares` and `services`). Visitors and gateway headers cannot specify arbitrary target IP addresses, internal hostnames, or ports.
+   - **Service State & Ownership Verification:** Traffic is only routed if the target service is in a verified `running` state and belongs to the project associated with the share token.
+
+4. **Container Host Port Loopback Binding:**
+   - Deployed application container host ports bind to `127.0.0.1` by default via `FORGELAB_APP_HOST_IP`.
+   - This eliminates LAN/WAN bypass attacks where an attacker on the same local network attempts to reach deployed containers directly on their raw host ports (`10000–60000`), forcing all external traffic through the authenticated tunnel and local router.
+
+5. **Immediate Revocation & Expiration Invariant:**
+   - Revoking a share immediately marks the database record as `revoked`, deregisters the route from the local tunnel router, and sends an explicit deregistration frame to the public gateway.
+   - Expired shares are rejected with HTTP `410 Gone` or `404 Not Found` without touching application containers.
+   - Revocation never alters running container state, does not trigger rebuilds, and does not affect local preview URLs.
+
 
 

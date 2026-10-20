@@ -25,9 +25,10 @@ These are deliberate scoping decisions for the current platform release. They ar
    - Archive uploads use Go's streaming `MultipartReader` into staged workspaces (`.uploads/<source_id>`) with asynchronous status polling via `GET /api/sources/{id}`.
    - Resumable/chunked multi-part upload protocols (such as tus.io) and multi-part pause/resume are explicitly deferred to post-MVP.
    - Arbitrary unauthenticated git clone URLs remain rejected for security reasons.
-2. **Dynamic Direct Host Port Mapping:**
-   - Deployed containers are exposed directly on dynamically allocated host ports (`10000–60000`).
-   - There is no unified reverse proxy (e.g. Caddy/Nginx) providing virtual host routing, subdomains (e.g. `project-slug.localhost`), or SSL termination.
+2. **Dynamic Direct Host Port Mapping & Loopback Security:**
+   - Deployed containers are bound to dynamically allocated host ports (`10000–60000`) on loopback `127.0.0.1` by default via `FORGELAB_APP_HOST_IP`.
+   - Direct LAN/WAN exposure of container host ports is disabled by default to prevent attackers from bypassing authentication or access controls.
+   - For public external access, ForgeLAB provides the Secure Public Project Sharing architecture using an authenticated outbound Yamux tunnel to a public gateway (`cmd/gateway`).
 3. **Single Control-Plane Deployment Worker:**
    - The deployment worker runs as an in-process goroutine in the Go backend (`backend/cmd/server/main.go`).
    - Multi-node worker clusters or separate worker containers are deferred.
@@ -44,6 +45,11 @@ These are deliberate scoping decisions for the current platform release. They ar
 7. **REST Pre-Fetch & WebSocket Sequence Replay (`RESOLVED IN ARCHITECTURE`):**
    - Historical logs are fetched via REST endpoints (`GET /api/projects/:id/logs` or `GET /api/projects/:id/deployments/:did/logs`) with subquery-based recent log ordering (`ORDER BY id DESC LIMIT N` wrapped in `ORDER BY id ASC`).
    - On WebSocket reconnection, clients transmit `last_sequence` with their subscription frame, triggering the backend WebSocket Hub to stream missing historical logs from PostgreSQL before live events, preventing gaps or duplicates.
+8. **Public Project Sharing & Outbound Gateway Infrastructure Reality:**
+   - Internet access for remote visitors requires a publicly reachable gateway (`cmd/gateway`), a public IP or domain name with wildcard DNS (`*.preview.yourdomain.com`), and a valid wildcard TLS certificate.
+   - ForgeLAB implements the standalone gateway software, authenticated outbound tunnel client (`internal/tunnel`), and local routing layer, but does not pretend or simulate that internet infrastructure has been provisioned when it has not.
+   - If gateway configuration (`GATEWAY_TUNNEL_URL`, `GATEWAY_AUTH_TOKEN`) is absent or the gateway is offline, sharing reports `unavailable` with actionable setup guidance.
+   - Applications with hardcoded localhost URLs in compiled frontend client code (e.g. client-side fetch calls to `http://localhost:8080` rather than relative `/api/*` paths or configured environment variables like `NEXT_PUBLIC_API_URL`) require configuring relative routes or rebuilding the project, because ForgeLAB does not mutate compiled client JavaScript binaries after build.
 
 ---
 

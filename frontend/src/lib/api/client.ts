@@ -4,6 +4,7 @@ import {
   AuthModeResponse,
   AuthResponse,
   CreateProjectInput,
+  CreateShareInput,
   Deployment,
   DeploymentLog,
   DetectionResult,
@@ -19,10 +20,12 @@ import {
   LogQueryOptions,
   Project,
   ProjectTopology,
+  PublicShare,
   RepositoryImport,
   Service,
   ServiceDeployment,
   SetEnvInput,
+  ShareStatusResponse,
   SourceUploadResult,
   StartImportInput,
   UpdateProjectInput,
@@ -325,6 +328,23 @@ export const api = {
     async getTopology(id: string): Promise<ProjectTopology> {
       return apiFetch<ProjectTopology>(`/api/projects/${id}/topology`);
     },
+
+    async getShare(projectId: string): Promise<ShareStatusResponse> {
+      return apiFetch<ShareStatusResponse>(`/api/projects/${projectId}/share`);
+    },
+
+    async createShare(projectId: string, input: CreateShareInput): Promise<{ message: string; share: PublicShare }> {
+      return apiFetch<{ message: string; share: PublicShare }>(`/api/projects/${projectId}/share`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    },
+
+    async revokeShare(projectId: string): Promise<{ message: string }> {
+      return apiFetch<{ message: string }>(`/api/projects/${projectId}/share`, {
+        method: 'DELETE',
+      });
+    },
   },
 
   services: {
@@ -386,6 +406,23 @@ export const api = {
       return apiFetch<Service>(`/api/projects/${projectId}/services/${serviceId}/resources`, {
         method: 'PATCH',
         body: JSON.stringify(input),
+      });
+    },
+
+    async getShare(projectId: string): Promise<ShareStatusResponse> {
+      return apiFetch<ShareStatusResponse>(`/api/projects/${projectId}/share`);
+    },
+
+    async createShare(projectId: string, input: CreateShareInput): Promise<PublicShare> {
+      return apiFetch<PublicShare>(`/api/projects/${projectId}/share`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    },
+
+    async revokeShare(projectId: string): Promise<{ message: string }> {
+      return apiFetch<{ message: string }>(`/api/projects/${projectId}/share`, {
+        method: 'DELETE',
       });
     },
   },

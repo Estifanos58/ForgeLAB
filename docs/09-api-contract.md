@@ -810,6 +810,139 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ---
 
+## 5. Public Project Sharing (`/api/projects/{id}/share`)
+
+### `GET /api/projects/{id}/share`
+Retrieves public sharing configuration, outbound tunnel health, and active share details for a project.
+
+- **Authentication:** Required (User JWT or isolated Guest Session)
+- **Rate Limit:** 60 requests/minute
+- **Success Response (`200 OK`):**
+  ```json
+  {
+    "configured": true,
+    "tunnel_state": "online",
+    "share": {
+      "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "project_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "owner_id": "1fa85f64-5717-4562-b3fc-2c963f66afa1",
+      "share_token": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "public_url": "https://a1b2c3d4e5f60718293a4b5c6d7e8f90.preview.example.com",
+      "public_host": "a1b2c3d4e5f60718293a4b5c6d7e8f90.preview.example.com",
+      "primary_service_id": "service-uuid-1",
+      "route_mappings": [
+        {
+          "path_prefix": "/",
+          "service_id": "service-uuid-1",
+          "service_name": "frontend"
+        },
+        {
+          "path_prefix": "/api",
+          "service_id": "service-uuid-2",
+          "service_name": "backend"
+        }
+      ],
+      "status": "active",
+      "expires_at": "2026-10-21T18:00:00Z",
+      "created_at": "2026-10-20T18:00:00Z",
+      "updated_at": "2026-10-20T18:00:00Z"
+    },
+    "available_services": [
+      {
+        "id": "service-uuid-1",
+        "name": "frontend",
+        "role": "frontend",
+        "status": "running",
+        "host_port": 10041
+      },
+      {
+        "id": "service-uuid-2",
+        "name": "backend",
+        "role": "backend",
+        "status": "running",
+        "host_port": 10042
+      }
+    ]
+  }
+  ```
+- **Unconfigured Response (`200 OK`):**
+  When public sharing or the outbound gateway is unconfigured (`FORGELAB_SHARING_ENABLED=false` or missing `GATEWAY_*`), the endpoint returns `configured: false` with actionable configuration guidance:
+  ```json
+  {
+    "configured": false,
+    "tunnel_state": "unavailable",
+    "message": "Public project sharing is not enabled on this ForgeLAB installation. Configure FORGELAB_SHARING_ENABLED=true and GATEWAY_* settings to enable outbound preview links."
+  }
+  ```
+- **Error Responses:**
+  - `401 Unauthorized`: Not authenticated and guest mode disabled.
+  - `403 Forbidden`: User does not own the project.
+  - `404 Not Found`: Project not found.
+
+### `POST /api/projects/{id}/share`
+Creates a new public share or updates route mappings for an existing active share. Generates a 128-bit cryptographically secure token and registers the routes over the outbound tunnel.
+
+- **Authentication:** Required (User JWT or isolated Guest Session)
+- **Rate Limit:** 30 requests/minute
+- **Request Body:**
+  ```json
+  {
+    "primary_service_id": "service-uuid-1",
+    "expires_in_hours": 24,
+    "route_mappings": [
+      {
+        "path_prefix": "/",
+        "service_id": "service-uuid-1"
+      },
+      {
+        "path_prefix": "/api",
+        "service_id": "service-uuid-2"
+      }
+    ]
+  }
+  ```
+- **Validation Rules:**
+  - `primary_service_id` is required, must belong to the project, and the service must be currently `running`.
+  - Every `route_mappings` entry must specify a non-empty `path_prefix` starting with `/` without path traversal (`..`).
+  - Target service IDs must belong to the project.
+  - An automatic `/` mapping to `primary_service_id` is added if omitted.
+- **Success Response (`201 Created`):**
+  ```json
+  {
+    "message": "Public share created successfully",
+    "share": {
+      "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "project_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "share_token": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "public_url": "https://a1b2c3d4e5f60718293a4b5c6d7e8f90.preview.example.com",
+      "public_host": "a1b2c3d4e5f60718293a4b5c6d7e8f90.preview.example.com",
+      "status": "active"
+    }
+  }
+  ```
+- **Error Responses:**
+  - `400 Bad Request`: Invalid payload, unserviceable prefix, or target service not running.
+  - `403 Forbidden`: Project or service not owned by user.
+  - `404 Not Found`: Project or target service does not exist.
+  - `503 Service Unavailable`: Public sharing or gateway tunnel is not configured or offline.
+
+### `DELETE /api/projects/{id}/share`
+Immediately revokes the active public share for the project, deregistering the routes from both the local router and the public gateway.
+
+- **Authentication:** Required (User JWT or isolated Guest Session)
+- **Success Response (`200 OK`):**
+  ```json
+  {
+    "message": "Public share revoked successfully"
+  }
+  ```
+- **Error Responses:**
+  - `401 Unauthorized`: Not authenticated.
+  - `403 Forbidden`: User does not own the project.
+  - `404 Not Found`: No active share found for the project.
+
+---
+
 ## 6. Environment Variables & Secrets (`/api/projects/{id}/env`)
 
 ### `GET /api/projects/{id}/env`
