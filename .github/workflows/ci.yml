@@ -21,11 +21,6 @@ jobs:
           check-latest: true
           cache-dependency-path: backend/go.sum
 
-      - name: Diagnose Go formatter diff for topology test
-        run: |
-          cd backend
-          gofmt -d internal/docker/topology_test.go
-
       - name: Check Formatting (gofmt)
         run: |
           cd backend
