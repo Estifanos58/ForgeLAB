@@ -249,8 +249,8 @@ func TestGenerateDockerfile_Node_ResilientInstall(t *testing.T) {
 
 func TestGenerateDockerfile_CopiesSourceBeforePackageLifecycleScripts(t *testing.T) {
 	tests := []struct {
-		runtime      string
-		packageMgr   string
+		runtime       string
+		packageMgr    string
 		installMarker string
 	}{
 		{runtime: "nextjs", packageMgr: "npm", installMarker: "npm ci || npm install"},
