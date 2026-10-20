@@ -1652,6 +1652,34 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Environment:** —
 - **Notes:** —
 
+---
 
+## 31. Generated Node.js Builds with Source-Dependent Install Lifecycle Scripts (Prisma)
 
+**Purpose:** Verify that ForgeLAB's generated Dockerfile makes repository source files available before package-manager installation invokes lifecycle scripts such as `postinstall: prisma generate`.
 
+**Prerequisites:**
+- Run ForgeLAB from the PR branch containing the generated Dockerfile ordering fix, or from a release that includes it.
+- Use a GitHub-imported Next.js repository whose root contains `package.json`, `prisma/schema.prisma`, and `prisma.config.ts`, such as `Estifanos58/Event_Management_System`.
+- Ensure the selected service's root/build context points to the directory containing those files.
+
+**Procedure:**
+1. Re-import or create a fresh project from the target GitHub repository so the immutable source snapshot contains the intended commit. Confirm the diagnostic context reports the correct `root_dir` and `build_context`.
+2. Trigger a deployment with the generated/automatic build strategy. Follow the live build logs from build-context preparation through dependency installation and application compilation.
+3. Inspect the generated Docker build steps. In the dependency stage, the application-source `COPY . .` must occur **before** the package-manager installation `RUN` command. The context must not exclude the Prisma schema/config files.
+4. Confirm that the `postinstall` command can resolve `prisma/schema.prisma` and that installation proceeds to `npm run build` without the “Could not find Prisma Schema” error.
+5. Confirm the image build completes, the new container starts, the service passes its configured health check, and the service becomes `RUNNING`. Confirm a failed attempt still preserves the previous healthy release.
+6. If the error changes to a missing `DATABASE_URL`, treat that as a separate application build-configuration issue: Prisma config may read environment variables during generation even though generation does not itself connect to the database. Supply a non-secret build-time value where appropriate or make the application's Prisma configuration compatible with generation without production credentials; never bake production database credentials into an image layer.
+7. Repeat with a plain Next.js app that has no Prisma dependency and with a Node app using a different package manager, to confirm the source-ordering change does not regress ordinary projects.
+
+**Expected Result:**
+- Source-dependent installation lifecycle scripts can access the repository files they require.
+- Dependency installation and the framework build complete, followed by container startup and successful health checking.
+- Build logs identify the failing stage and preserve the original package-manager/Prisma error rather than reporting only a generic deployment failure.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated CI validates generated Dockerfile ordering but does not replace this physical Docker deployment check.
