@@ -454,8 +454,9 @@ WORKDIR /app
 ENV CI=true
 ENV HUSKY=0
 COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
-RUN %s
+# Install lifecycle scripts may need application source (for example, Prisma schema/config).
 COPY . .
+RUN %s
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN %s
 
@@ -474,8 +475,9 @@ WORKDIR /app
 ENV CI=true
 ENV HUSKY=0
 COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
-RUN %s
+# Install lifecycle scripts may need application source (for example, Prisma schema/config).
 COPY . .
+RUN %s
 RUN %s
 
 FROM node:22-alpine AS runner
@@ -494,8 +496,9 @@ WORKDIR /app
 ENV CI=true
 ENV HUSKY=0
 COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
-%sRUN %s
+# Install lifecycle scripts may need application source (for example, Prisma schema/config).
 COPY . .
+%sRUN %s
 ENV PORT=%d
 EXPOSE %d
 CMD ["sh", "-c", "%s"]
