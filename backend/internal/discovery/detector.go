@@ -3,6 +3,7 @@ package discovery
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -399,8 +400,243 @@ func DetectTechnology(files map[string][]byte) (runtime, framework, pkgManager s
 	return
 }
 
+// PrismaStagingInfo contains information about detected Prisma schema and configuration files.
+type PrismaStagingInfo struct {
+	HasPrisma       bool   `json:"has_prisma"`
+	SchemaPath      string `json:"schema_path,omitempty"`
+	ConfigPath      string `json:"config_path,omitempty"`
+	HasCustomSchema bool   `json:"has_custom_schema,omitempty"`
+}
+
+// DockerfileOptions provides fine-grained controls for generating Dockerfiles.
+type DockerfileOptions struct {
+	Runtime        string
+	Port           int
+	StartCmd       string
+	PackageManager string
+	Prisma         *PrismaStagingInfo
+	BuildArgs      []string
+}
+
+// FormatShellCMD formats a shell start command into a valid JSON-serialized CMD instruction.
+func FormatShellCMD(cmd string) string {
+	b, err := json.Marshal([]string{"sh", "-c", cmd})
+	if err != nil {
+		return fmt.Sprintf("CMD [\"sh\", \"-c\", %q]", cmd)
+	}
+	return fmt.Sprintf("CMD %s", string(b))
+}
+
+// DetectPrismaFromFiles inspects a virtual files map for Prisma schema and configuration files.
+func DetectPrismaFromFiles(files map[string][]byte) *PrismaStagingInfo {
+	info := &PrismaStagingInfo{}
+	if files == nil {
+		return info
+	}
+
+	var customSchema string
+	hasPrismaRef := false
+	if pkgRaw, ok := files["package.json"]; ok {
+		var pkg struct {
+			Scripts         map[string]string `json:"scripts"`
+			Dependencies    map[string]string `json:"dependencies"`
+			DevDependencies map[string]string `json:"devDependencies"`
+			Prisma          any               `json:"prisma"`
+		}
+		if json.Unmarshal(pkgRaw, &pkg) == nil {
+			if pkg.Prisma != nil {
+				switch v := pkg.Prisma.(type) {
+				case string:
+					customSchema = v
+				case map[string]any:
+					if s, ok := v["schema"].(string); ok {
+						customSchema = s
+					}
+				}
+			}
+			for _, s := range pkg.Scripts {
+				if strings.Contains(s, "prisma") {
+					hasPrismaRef = true
+					break
+				}
+			}
+			if !hasPrismaRef {
+				if _, ok := pkg.Dependencies["@prisma/client"]; ok {
+					hasPrismaRef = true
+				} else if _, ok := pkg.Dependencies["prisma"]; ok {
+					hasPrismaRef = true
+				} else if _, ok := pkg.DevDependencies["@prisma/client"]; ok {
+					hasPrismaRef = true
+				} else if _, ok := pkg.DevDependencies["prisma"]; ok {
+					hasPrismaRef = true
+				}
+			}
+		}
+	}
+
+	// 1. Check custom schema path if declared in package.json
+	if customSchema != "" {
+		cleanCustom := filepath.Clean(customSchema)
+		if _, ok := files[cleanCustom]; ok {
+			info.SchemaPath = cleanCustom
+			info.HasCustomSchema = true
+			info.HasPrisma = true
+		}
+	}
+
+	// 2. Check standard schema paths
+	if info.SchemaPath == "" {
+		if _, ok := files["prisma/schema.prisma"]; ok {
+			info.SchemaPath = "prisma"
+			info.HasPrisma = true
+		} else if _, ok := files["schema.prisma"]; ok {
+			info.SchemaPath = "schema.prisma"
+			info.HasPrisma = true
+		} else {
+			for f := range files {
+				if strings.HasSuffix(strings.ToLower(f), ".prisma") {
+					dir := filepath.Dir(f)
+					if dir == "prisma" || strings.HasPrefix(dir, "prisma/") {
+						info.SchemaPath = "prisma"
+					} else {
+						info.SchemaPath = f
+					}
+					info.HasPrisma = true
+					break
+				}
+			}
+		}
+	}
+
+	// 3. Check config files
+	configFiles := []string{"prisma.config.ts", "prisma.config.js", "prisma.config.mjs", "prisma.config.cjs"}
+	for _, cf := range configFiles {
+		if _, ok := files[cf]; ok {
+			info.ConfigPath = cf
+			info.HasPrisma = true
+			break
+		}
+	}
+
+	if hasPrismaRef && (info.SchemaPath != "" || info.ConfigPath != "") {
+		info.HasPrisma = true
+	}
+
+	return info
+}
+
+// DetectPrismaFromDir inspects a filesystem directory for Prisma schema and configuration files.
+func DetectPrismaFromDir(dir string) (*PrismaStagingInfo, error) {
+	if dir == "" {
+		return nil, nil
+	}
+	info := &PrismaStagingInfo{}
+
+	var customSchema string
+	hasPrismaRef := false
+	pkgPath := filepath.Join(dir, "package.json")
+	if data, err := os.ReadFile(pkgPath); err == nil {
+		var pkg struct {
+			Scripts         map[string]string `json:"scripts"`
+			Dependencies    map[string]string `json:"dependencies"`
+			DevDependencies map[string]string `json:"devDependencies"`
+			Prisma          any               `json:"prisma"`
+		}
+		if json.Unmarshal(data, &pkg) == nil {
+			if pkg.Prisma != nil {
+				switch v := pkg.Prisma.(type) {
+				case string:
+					customSchema = v
+				case map[string]any:
+					if s, ok := v["schema"].(string); ok {
+						customSchema = s
+					}
+				}
+			}
+			for _, s := range pkg.Scripts {
+				if strings.Contains(s, "prisma") {
+					hasPrismaRef = true
+					break
+				}
+			}
+			if !hasPrismaRef {
+				if _, ok := pkg.Dependencies["@prisma/client"]; ok {
+					hasPrismaRef = true
+				} else if _, ok := pkg.Dependencies["prisma"]; ok {
+					hasPrismaRef = true
+				} else if _, ok := pkg.DevDependencies["@prisma/client"]; ok {
+					hasPrismaRef = true
+				} else if _, ok := pkg.DevDependencies["prisma"]; ok {
+					hasPrismaRef = true
+				}
+			}
+		}
+	}
+
+	// 1. Check custom schema path
+	if customSchema != "" {
+		cleanCustom := filepath.Clean(customSchema)
+		if st, err := os.Stat(filepath.Join(dir, cleanCustom)); err == nil && !st.IsDir() {
+			info.SchemaPath = cleanCustom
+			info.HasCustomSchema = true
+			info.HasPrisma = true
+		}
+	}
+
+	// 2. Check standard schema paths
+	if info.SchemaPath == "" {
+		if st, err := os.Stat(filepath.Join(dir, "prisma", "schema.prisma")); err == nil && !st.IsDir() {
+			info.SchemaPath = "prisma"
+			info.HasPrisma = true
+		} else if st, err := os.Stat(filepath.Join(dir, "schema.prisma")); err == nil && !st.IsDir() {
+			info.SchemaPath = "schema.prisma"
+			info.HasPrisma = true
+		} else if st, err := os.Stat(filepath.Join(dir, "prisma")); err == nil && st.IsDir() {
+			hasPrismaFile := false
+			_ = filepath.Walk(filepath.Join(dir, "prisma"), func(p string, fi os.FileInfo, err error) error {
+				if err == nil && !fi.IsDir() && strings.HasSuffix(strings.ToLower(fi.Name()), ".prisma") {
+					hasPrismaFile = true
+					return filepath.SkipAll
+				}
+				return nil
+			})
+			if hasPrismaFile {
+				info.SchemaPath = "prisma"
+				info.HasPrisma = true
+			}
+		}
+	}
+
+	// 3. Check config paths
+	configCandidates := []string{"prisma.config.ts", "prisma.config.js", "prisma.config.mjs", "prisma.config.cjs"}
+	for _, cf := range configCandidates {
+		if st, err := os.Stat(filepath.Join(dir, cf)); err == nil && !st.IsDir() {
+			info.ConfigPath = cf
+			info.HasPrisma = true
+			break
+		}
+	}
+
+	if hasPrismaRef && (info.SchemaPath != "" || info.ConfigPath != "") {
+		info.HasPrisma = true
+	}
+
+	return info, nil
+}
+
 // GenerateDockerfile produces an optimized multi-stage Dockerfile based on runtime, port, commands, and package manager
 func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) string {
+	return GenerateDockerfileWithOptions(DockerfileOptions{
+		Runtime:        runtime,
+		Port:           port,
+		StartCmd:       startCmd,
+		PackageManager: pkgManager,
+	})
+}
+
+// GenerateDockerfileWithOptions produces an optimized multi-stage Dockerfile with optional Prisma staging and environment handling
+func GenerateDockerfileWithOptions(opts DockerfileOptions) string {
+	port := opts.Port
 	if port <= 0 {
 		port = 8080
 	}
@@ -412,21 +648,21 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 	builderImage := "node:22-alpine"
 	runnerImage := "node:22-alpine"
 
-	switch pkgManager {
+	switch opts.PackageManager {
 	case "pnpm":
-		installCmd = "corepack enable && pnpm config set fetch-retries 5 && pnpm config set fetch-retry-maxtimeout 180000 && (pnpm install --frozen-lockfile --dangerously-allow-all-builds 2>/dev/null || pnpm install --frozen-lockfile 2>/dev/null || pnpm install)"
+		installCmd = "corepack enable && pnpm config set fetch-retries 5 && pnpm config set fetch-retry-maxtimeout 180000 && (pnpm install --frozen-lockfile --dangerously-allow-all-builds || pnpm install --frozen-lockfile || pnpm install)"
 		runBuildCmd = "pnpm run build"
 		runStartCmd = "pnpm start"
 		runnerSetup = "RUN corepack enable\n"
 	case "yarn":
-		installCmd = "corepack enable && (yarn config set network-timeout 300000 2>/dev/null || true) && (yarn install --immutable 2>/dev/null || yarn install --frozen-lockfile 2>/dev/null || yarn install)"
+		installCmd = "corepack enable && (yarn config set network-timeout 300000 || true) && (yarn install --immutable || yarn install --frozen-lockfile || yarn install)"
 		runBuildCmd = "yarn build"
 		runStartCmd = "yarn start"
 		runnerSetup = "RUN corepack enable\n"
 	case "bun":
 		builderImage = "oven/bun:1-alpine"
 		runnerImage = "oven/bun:1-alpine"
-		installCmd = "bun install --frozen-lockfile 2>/dev/null || bun install"
+		installCmd = "bun install --frozen-lockfile || bun install"
 		runBuildCmd = "bun run build"
 		runStartCmd = "bun run start"
 	case "npm":
@@ -435,11 +671,54 @@ func GenerateDockerfile(runtime string, port int, startCmd, pkgManager string) s
 		runStartCmd = "npm start"
 	}
 
-	if startCmd != "" {
-		runStartCmd = startCmd
+	if opts.StartCmd != "" {
+		runStartCmd = opts.StartCmd
 	}
 
-	switch runtime {
+	var prismaStagingBuilder string
+	var prismaEnvPrefix string
+	if opts.Prisma != nil && opts.Prisma.HasPrisma {
+		var lines []string
+		if opts.Prisma.SchemaPath != "" {
+			if strings.HasSuffix(opts.Prisma.SchemaPath, "/") || opts.Prisma.SchemaPath == "prisma" {
+				lines = append(lines, fmt.Sprintf("COPY %s ./%s/", opts.Prisma.SchemaPath, opts.Prisma.SchemaPath))
+			} else {
+				lines = append(lines, fmt.Sprintf("COPY %s ./%s", opts.Prisma.SchemaPath, opts.Prisma.SchemaPath))
+			}
+		}
+		if opts.Prisma.ConfigPath != "" {
+			lines = append(lines, fmt.Sprintf("COPY %s ./", opts.Prisma.ConfigPath))
+		}
+		if len(lines) > 0 {
+			prismaStagingBuilder = strings.Join(lines, "\n") + "\n"
+		}
+		prismaEnvPrefix = `export DATABASE_URL="${DATABASE_URL:-postgresql://placeholder:placeholder@localhost:5432/placeholder}" && export DIRECT_URL="${DIRECT_URL:-$DATABASE_URL}" && export SHADOW_DATABASE_URL="${SHADOW_DATABASE_URL:-$DATABASE_URL}" && `
+	}
+
+	var argLines []string
+	if opts.Prisma != nil && opts.Prisma.HasPrisma {
+		argLines = append(argLines, "ARG DATABASE_URL", "ARG DIRECT_URL", "ARG SHADOW_DATABASE_URL")
+	}
+	seenArgs := make(map[string]bool)
+	for _, a := range argLines {
+		parts := strings.Fields(a)
+		if len(parts) >= 2 {
+			seenArgs[parts[1]] = true
+		}
+	}
+	for _, ba := range opts.BuildArgs {
+		trimmed := strings.TrimSpace(ba)
+		if trimmed != "" && !seenArgs[trimmed] {
+			seenArgs[trimmed] = true
+			argLines = append(argLines, fmt.Sprintf("ARG %s", trimmed))
+		}
+	}
+	var builderArgDeclarations string
+	if len(argLines) > 0 {
+		builderArgDeclarations = strings.Join(argLines, "\n") + "\n"
+	}
+
+	switch opts.Runtime {
 	case "static":
 		return fmt.Sprintf(`FROM nginx:alpine
 WORKDIR /usr/share/nginx/html
@@ -453,11 +732,12 @@ CMD ["nginx", "-g", "daemon off;"]
 WORKDIR /app
 ENV CI=true
 ENV HUSKY=0
-COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
-RUN %s
+%sCOPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
+%sRUN %s%s
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN %s
+ENV SKIP_ENV_VALIDATION=1
+RUN %s%s && rm -rf .next/cache
 
 FROM %s AS runner
 WORKDIR /app
@@ -465,18 +745,18 @@ ENV NODE_ENV=production
 ENV PORT=%d
 COPY --from=builder /app ./
 %sEXPOSE %d
-CMD ["sh", "-c", "%s"]
-`, builderImage, installCmd, runBuildCmd, runnerImage, port, runnerSetup, port, runStartCmd)
+%s
+`, builderImage, builderArgDeclarations, prismaStagingBuilder, prismaEnvPrefix, installCmd, prismaEnvPrefix, runBuildCmd, runnerImage, port, runnerSetup, port, FormatShellCMD(runStartCmd))
 
 	case "react-vite", "vue-vite", "svelte-vite":
 		return fmt.Sprintf(`FROM %s AS builder
 WORKDIR /app
 ENV CI=true
 ENV HUSKY=0
-COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
-RUN %s
+%sCOPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
+%sRUN %s%s
 COPY . .
-RUN %s
+RUN %s%s
 
 FROM node:22-alpine AS runner
 WORKDIR /app
@@ -485,7 +765,7 @@ COPY --from=builder /app/dist ./dist
 ENV PORT=%d
 EXPOSE %d
 CMD ["serve", "-s", "dist", "-l", "%d"]
-`, builderImage, installCmd, runBuildCmd, port, port, port)
+`, builderImage, builderArgDeclarations, prismaStagingBuilder, prismaEnvPrefix, installCmd, prismaEnvPrefix, runBuildCmd, port, port, port)
 
 	case "nodejs", "express", "fastify", "nestjs":
 		cmd := runStartCmd
@@ -493,13 +773,13 @@ CMD ["serve", "-s", "dist", "-l", "%d"]
 WORKDIR /app
 ENV CI=true
 ENV HUSKY=0
-COPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
-%sRUN %s
+%sCOPY package*.json npm-shrinkwrap.json* pnpm-lock.yaml* yarn.lock* bun.lock* ./
+%s%sRUN %s%s
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["sh", "-c", "%s"]
-`, builderImage, runnerSetup, installCmd, port, port, cmd)
+%s
+`, builderImage, builderArgDeclarations, runnerSetup, prismaStagingBuilder, prismaEnvPrefix, installCmd, port, port, FormatShellCMD(cmd))
 
 	case "python-fastapi":
 		return fmt.Sprintf(`FROM python:3.11-slim
@@ -515,8 +795,8 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "%d"]
 
 	case "python-flask":
 		cmd := fmt.Sprintf("gunicorn --bind 0.0.0.0:%d --workers 2 app:app", port)
-		if startCmd != "" {
-			cmd = startCmd
+		if opts.StartCmd != "" {
+			cmd = opts.StartCmd
 		}
 		return fmt.Sprintf(`FROM python:3.11-slim
 WORKDIR /app
@@ -526,13 +806,13 @@ RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["sh", "-c", "%s"]
-`, port, port, cmd)
+%s
+`, port, port, FormatShellCMD(cmd))
 
 	case "python-django":
 		cmd := fmt.Sprintf("gunicorn --bind 0.0.0.0:%d --workers 2 wsgi:application", port)
-		if startCmd != "" {
-			cmd = startCmd
+		if opts.StartCmd != "" {
+			cmd = opts.StartCmd
 		}
 		return fmt.Sprintf(`FROM python:3.11-slim
 WORKDIR /app
@@ -542,13 +822,13 @@ RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["sh", "-c", "%s"]
-`, port, port, cmd)
+%s
+`, port, port, FormatShellCMD(cmd))
 
 	case "python":
 		cmd := "python main.py"
-		if startCmd != "" {
-			cmd = startCmd
+		if opts.StartCmd != "" {
+			cmd = opts.StartCmd
 		}
 		return fmt.Sprintf(`FROM python:3.11-slim
 WORKDIR /app
@@ -557,8 +837,8 @@ RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["sh", "-c", "%s"]
-`, port, port, cmd)
+%s
+`, port, port, FormatShellCMD(cmd))
 
 	case "go":
 		return fmt.Sprintf(`FROM golang:1.22-alpine AS builder
@@ -577,7 +857,7 @@ CMD ["/app/server"]
 `, port, port)
 
 	case "java":
-		if pkgManager == "gradle" {
+		if opts.PackageManager == "gradle" {
 			return fmt.Sprintf(`FROM gradle:8.5-jdk17-alpine AS builder
 WORKDIR /app
 COPY build.gradle* settings.gradle* gradlew* ./
@@ -629,8 +909,8 @@ CMD ["/app/server"]
 
 	case "php":
 		cmd := fmt.Sprintf("php -d variables_order=EGPCS -S 0.0.0.0:%d -t public", port)
-		if startCmd != "" {
-			cmd = startCmd
+		if opts.StartCmd != "" {
+			cmd = opts.StartCmd
 		}
 		return fmt.Sprintf(`FROM php:8.2-cli-alpine
 WORKDIR /app
@@ -639,13 +919,13 @@ RUN if [ -f composer.json ]; then curl -sS https://getcomposer.org/installer | p
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["sh", "-c", "%s"]
-`, port, port, cmd)
+%s
+`, port, port, FormatShellCMD(cmd))
 
 	case "ruby":
 		cmd := fmt.Sprintf("bundle exec puma -C config/puma.rb -b tcp://0.0.0.0:%d", port)
-		if startCmd != "" {
-			cmd = startCmd
+		if opts.StartCmd != "" {
+			cmd = opts.StartCmd
 		}
 		return fmt.Sprintf(`FROM ruby:3.2-alpine
 RUN apk add --no-cache build-base
@@ -655,8 +935,8 @@ RUN bundle install --without development test
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["sh", "-c", "%s"]
-`, port, port, cmd)
+%s
+`, port, port, FormatShellCMD(cmd))
 
 	case "dotnet":
 		return fmt.Sprintf(`FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
@@ -680,8 +960,8 @@ WORKDIR /app
 COPY . .
 ENV PORT=%d
 EXPOSE %d
-CMD ["sh", "-c", "echo 'Application started on port %d' && sleep infinity"]
-`, port, port, port)
+%s
+`, port, port, FormatShellCMD(fmt.Sprintf("echo 'Application started on port %d' && sleep infinity", port)))
 	}
 }
 

@@ -1,6 +1,8 @@
 package security
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -39,4 +41,22 @@ func SanitizeServiceVolumes(volumes []models.VolumeMountConfig) ([]models.Volume
 		safe = []models.VolumeMountConfig{}
 	}
 	return safe, stripped
+}
+
+// ValidateAndSanitizeServiceVolumes validates the integrity of volume definitions
+// and strips forbidden host Docker socket mounts.
+func ValidateAndSanitizeServiceVolumes(volumes []models.VolumeMountConfig) ([]models.VolumeMountConfig, bool, error) {
+	if len(volumes) == 0 {
+		return []models.VolumeMountConfig{}, false, nil
+	}
+	for _, v := range volumes {
+		if strings.TrimSpace(v.Target) == "" {
+			return nil, false, errors.New("volume target path cannot be empty")
+		}
+		if strings.Contains(v.Target, "..") {
+			return nil, false, fmt.Errorf("volume target path %q cannot contain parent directory traversal '..'", v.Target)
+		}
+	}
+	safe, stripped := SanitizeServiceVolumes(volumes)
+	return safe, stripped, nil
 }

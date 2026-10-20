@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -897,6 +898,18 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				val := v
 				buildArgsMap[k] = &val
 			}
+			for k, v := range secretBuildVars {
+				val := v
+				buildArgsMap[k] = &val
+			}
+			if service.RuntimeType == "nextjs" {
+				for k, v := range runtimeEnvMap {
+					if _, exists := buildArgsMap[k]; !exists {
+						val := v
+						buildArgsMap[k] = &val
+					}
+				}
+			}
 			strat := service.BuildStrategy
 			if strat == "" {
 				strat = serviceDeploy.BuildStrategy
@@ -1238,7 +1251,41 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 						pkgManager = "npm"
 					}
 				}
-				generatedContent := detector.GenerateDockerfile(service.RuntimeType, intPort, service.StartCommand, pkgManager)
+				var prismaInfo *discovery.PrismaStagingInfo
+				if svcContextDir != "" {
+					prismaInfo, _ = detector.DetectPrismaFromDir(svcContextDir)
+				}
+				seenArgKeys := make(map[string]bool)
+				var buildArgKeys []string
+				for k := range normalBuildArgs {
+					if !seenArgKeys[k] {
+						seenArgKeys[k] = true
+						buildArgKeys = append(buildArgKeys, k)
+					}
+				}
+				for k := range secretBuildVars {
+					if !seenArgKeys[k] {
+						seenArgKeys[k] = true
+						buildArgKeys = append(buildArgKeys, k)
+					}
+				}
+				if service.RuntimeType == "nextjs" {
+					for k := range runtimeEnvMap {
+						if !seenArgKeys[k] {
+							seenArgKeys[k] = true
+							buildArgKeys = append(buildArgKeys, k)
+						}
+					}
+				}
+				sort.Strings(buildArgKeys)
+				generatedContent := detector.GenerateDockerfileWithOptions(discovery.DockerfileOptions{
+					Runtime:        service.RuntimeType,
+					Port:           intPort,
+					StartCmd:       service.StartCommand,
+					PackageManager: pkgManager,
+					Prisma:         prismaInfo,
+					BuildArgs:      buildArgKeys,
+				})
 				virtualFiles = map[string][]byte{
 					"Dockerfile.forgelab": []byte(generatedContent),
 				}
@@ -1284,11 +1331,20 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			val := v
 			buildArgs[k] = &val
 		}
-		if len(buildArgs) > 0 {
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d non-secret build arguments (build secrets isolated from BuildArgs/image history).", len(buildArgs)))
+		for k, v := range secretBuildVars {
+			val := v
+			buildArgs[k] = &val
 		}
-		if len(secretBuildVars) > 0 {
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Isolated %d build secrets from Docker BuildArgs and image history.", len(secretBuildVars)))
+		if service.RuntimeType == "nextjs" {
+			for k, v := range runtimeEnvMap {
+				if _, exists := buildArgs[k]; !exists {
+					val := v
+					buildArgs[k] = &val
+				}
+			}
+		}
+		if len(buildArgs) > 0 {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d build argument(s) into builder stage.", len(buildArgs)))
 		}
 
 		buildLabels := map[string]string{
@@ -2600,8 +2656,14 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 
 	var normalBuildArgs map[string]string
 	var secretBuildVars map[string]string
+	var runtimeEnvMap map[string]string
 
 	if e.secretService != nil {
+		if len(deployment.EnvSnapshot) > 0 {
+			runtimeEnvMap, _, _ = e.secretService.GetEnvMapFromSnapshot(deployment.EnvSnapshot, models.EnvScopeRuntime)
+		} else {
+			runtimeEnvMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeRuntime)
+		}
 		normalArgs, secretVars, allSecrets, err := e.secretService.GetBuildVariables(ctx, project.ID, nil, deployment.EnvSnapshot)
 		if err == nil {
 			normalBuildArgs = normalArgs
@@ -2876,7 +2938,41 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 						pkgManager = "npm"
 					}
 				}
-				dockerfileContent := detector.GenerateDockerfile(deployment.RuntimeType, port, startCmd, pkgManager)
+				var prismaInfo *discovery.PrismaStagingInfo
+				if buildContextDir != "" {
+					prismaInfo, _ = detector.DetectPrismaFromDir(buildContextDir)
+				}
+				seenArgKeys := make(map[string]bool)
+				var buildArgKeys []string
+				for k := range normalBuildArgs {
+					if !seenArgKeys[k] {
+						seenArgKeys[k] = true
+						buildArgKeys = append(buildArgKeys, k)
+					}
+				}
+				for k := range secretBuildVars {
+					if !seenArgKeys[k] {
+						seenArgKeys[k] = true
+						buildArgKeys = append(buildArgKeys, k)
+					}
+				}
+				if deployment.RuntimeType == "nextjs" {
+					for k := range runtimeEnvMap {
+						if !seenArgKeys[k] {
+							seenArgKeys[k] = true
+							buildArgKeys = append(buildArgKeys, k)
+						}
+					}
+				}
+				sort.Strings(buildArgKeys)
+				dockerfileContent := detector.GenerateDockerfileWithOptions(discovery.DockerfileOptions{
+					Runtime:        deployment.RuntimeType,
+					Port:           port,
+					StartCmd:       startCmd,
+					PackageManager: pkgManager,
+					Prisma:         prismaInfo,
+					BuildArgs:      buildArgKeys,
+				})
 				relDockerPath = "Dockerfile.forgelab"
 				virtualFiles = map[string][]byte{
 					"Dockerfile.forgelab": []byte(dockerfileContent),
@@ -2922,11 +3018,20 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			val := v
 			buildArgs[k] = &val
 		}
-		if len(buildArgs) > 0 {
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d non-secret build arguments (build secrets isolated from BuildArgs/image history).", len(buildArgs)))
+		for k, v := range secretBuildVars {
+			val := v
+			buildArgs[k] = &val
 		}
-		if len(secretBuildVars) > 0 {
-			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Isolated %d build secrets from Docker BuildArgs and image history.", len(secretBuildVars)))
+		if deployment.RuntimeType == "nextjs" {
+			for k, v := range runtimeEnvMap {
+				if _, exists := buildArgs[k]; !exists {
+					val := v
+					buildArgs[k] = &val
+				}
+			}
+		}
+		if len(buildArgs) > 0 {
+			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d build argument(s) into builder stage.", len(buildArgs)))
 		}
 
 		buildOpts := types.ImageBuildOptions{

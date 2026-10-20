@@ -173,13 +173,41 @@ export function useDeploymentWS({
       }
     }
 
-    function connect() {
+    async function fetchTicket(): Promise<string | null> {
+      try {
+        const ticketUrl =
+          process.env.NEXT_PUBLIC_BACKEND_PORT && typeof window !== 'undefined' && window.location.port === '3000'
+            ? `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_PORT}/api/ws/ticket`
+            : '/api/ws/ticket';
+        const res = await fetch(ticketUrl, {
+          method: 'POST',
+          credentials: 'include',
+        });
+        if (res.ok) {
+          const data = await res.json();
+          return data.ticket || null;
+        }
+      } catch {
+        // Fallback to cookie / guest session if ticket endpoint is unreachable
+      }
+      return null;
+    }
+
+    async function connect() {
       if (isDisposed) return;
 
       cleanupCurrentSocket();
       setConnectionState((prev) => (prev === 'offline' ? 'connecting' : 'reconnecting'));
 
-      const wsUrl = getWebSocketUrl();
+      let wsUrl = getWebSocketUrl();
+      const ticket = await fetchTicket();
+      if (ticket && !isDisposed) {
+        const sep = wsUrl.includes('?') ? '&' : '?';
+        wsUrl = `${wsUrl}${sep}ticket=${encodeURIComponent(ticket)}`;
+      }
+
+      if (isDisposed) return;
+
       if (process.env.NODE_ENV === 'development') {
         console.log(`[ForgeLAB WS] connecting to ${wsUrl}`);
       }

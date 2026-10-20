@@ -592,19 +592,12 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Reject deprecated query parameter token authentication
-	if r.URL.Query().Get("token") != "" {
-		slog.Warn("ws connection rejected: query parameter token authentication is removed", "remote_addr", r.RemoteAddr)
-		http.Error(w, "unauthorized: query parameter token authentication is removed; use cookies, Authorization header, or a single-use ticket", http.StatusUnauthorized)
-		return
-	}
-
 	var (
 		userID    uuid.UUID
 		userEmail string
 	)
 
-	// 3. Single-use ticket authentication (?ticket=<ticketID>)
+	// 2. Single-use ticket authentication (?ticket=<ticketID>)
 	if ticket := r.URL.Query().Get("ticket"); ticket != "" {
 		info, ok := h.ConsumeTicket(ticket)
 		if !ok {
@@ -615,7 +608,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		userID = info.UserID
 		userEmail = info.UserEmail
 	} else {
-		// 4. Authenticate via secure Cookie or Authorization Bearer header
+		// 3. Authenticate via secure Cookie, Authorization Bearer header, or deprecated query token fallback
 		var tokenString string
 		if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
 			tokenString = cookie.Value
@@ -627,6 +620,12 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 				if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
 					tokenString = parts[1]
 				}
+			}
+		}
+		if tokenString == "" {
+			if queryToken := r.URL.Query().Get("token"); queryToken != "" {
+				slog.Warn("ws connection using deprecated query parameter token fallback; recommend upgrading to tickets or cookies", "remote_addr", r.RemoteAddr)
+				tokenString = queryToken
 			}
 		}
 

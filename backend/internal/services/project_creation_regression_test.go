@@ -222,7 +222,7 @@ func TestProjectCreation_WithComposeSemanticsRegression(t *testing.T) {
 				HealthCheckConfig: expectedHealthCheck,
 				RuntimeType:       "generic",
 				InternalPort:      8080,
-				PublicExposed:     false,
+				PublicExposed:     func() *bool { b := false; return &b }(),
 			},
 		},
 	}

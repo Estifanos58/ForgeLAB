@@ -58,7 +58,7 @@ func TestClassifyDockerBuildError(t *testing.T) {
 		{
 			name:     "application compilation error",
 			err:      errors.New("The command '/bin/sh -c npm run build' returned a non-zero code: 1"),
-			expected: CategoryGeneric,
+			expected: CategoryApplicationBuild,
 		},
 	}
 

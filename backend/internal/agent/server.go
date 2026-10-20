@@ -1347,7 +1347,17 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 					}
 				}
 			}
-			dockerfileContent := detector.GenerateDockerfile(genRuntime, genPort, genStartCmd, genPkgManager)
+			var prismaInfo *discovery.PrismaStagingInfo
+			if evalServiceDir != "" {
+				prismaInfo, _ = detector.DetectPrismaFromDir(evalServiceDir)
+			}
+			dockerfileContent := detector.GenerateDockerfileWithOptions(discovery.DockerfileOptions{
+				Runtime:        genRuntime,
+				Port:           genPort,
+				StartCmd:       genStartCmd,
+				PackageManager: genPkgManager,
+				Prisma:         prismaInfo,
+			})
 			virtualFiles["Dockerfile.forgelab"] = []byte(dockerfileContent)
 			expectedDockerfile = "Dockerfile.forgelab"
 		} else {

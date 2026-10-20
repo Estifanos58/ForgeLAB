@@ -142,3 +142,13 @@ func GenerateDockerfile(runtime string, port int, startCmd string, pkgManager ..
 	}
 	return discovery.GenerateDockerfile(runtime, port, startCmd, pm)
 }
+
+// GenerateDockerfileWithOptions produces a Dockerfile with advanced options such as Prisma staging.
+func GenerateDockerfileWithOptions(opts discovery.DockerfileOptions) string {
+	return discovery.GenerateDockerfileWithOptions(opts)
+}
+
+// DetectPrismaFromDir forwards to discovery.DetectPrismaFromDir.
+func DetectPrismaFromDir(dir string) (*discovery.PrismaStagingInfo, error) {
+	return discovery.DetectPrismaFromDir(dir)
+}

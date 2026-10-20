@@ -495,7 +495,11 @@ func (s *SecretService) GetBuildVariables(ctx context.Context, projectID uuid.UU
 			if entry.IsSecret {
 				allSecretValues = append(allSecretValues, entry.Value)
 			}
-			if entry.Scope != models.EnvScopeBoth && entry.Scope != models.EnvScopeBuild {
+			isFrontendPublic := strings.HasPrefix(entry.Key, "NEXT_PUBLIC_") ||
+				strings.HasPrefix(entry.Key, "VITE_") ||
+				strings.HasPrefix(entry.Key, "REACT_APP_") ||
+				strings.HasPrefix(entry.Key, "PUBLIC_")
+			if entry.Scope != models.EnvScopeBoth && entry.Scope != models.EnvScopeBuild && !isFrontendPublic {
 				continue
 			}
 			if entry.IsSecret {
@@ -539,7 +543,11 @@ func (s *SecretService) GetBuildVariables(ctx context.Context, projectID uuid.UU
 		if isSecret {
 			allSecretValues = append(allSecretValues, val)
 		}
-		if scope != models.EnvScopeBoth && scope != models.EnvScopeBuild {
+		isFrontendPublic := strings.HasPrefix(key, "NEXT_PUBLIC_") ||
+			strings.HasPrefix(key, "VITE_") ||
+			strings.HasPrefix(key, "REACT_APP_") ||
+			strings.HasPrefix(key, "PUBLIC_")
+		if scope != models.EnvScopeBoth && scope != models.EnvScopeBuild && !isFrontendPublic {
 			continue
 		}
 		if isSecret {

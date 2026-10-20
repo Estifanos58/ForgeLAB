@@ -68,6 +68,11 @@ func ClassifyDockerBuildError(err error) DockerErrorCategory {
 		return CategoryContextCancelled
 	}
 
+	// Application build failure inside container
+	if strings.Contains(msg, "returned a non-zero code") || strings.Contains(msg, "exit code:") {
+		return CategoryApplicationBuild
+	}
+
 	return CategoryGeneric
 }
 
@@ -88,7 +93,7 @@ func (e *Engine) formatDockerDiagnostic(ctx context.Context, origErr error, cat 
 		sb.WriteString("Docker daemon is unreachable. Verify Docker Desktop or the Docker service is actively running.\n\n")
 	case CategoryApplicationBuild:
 		sb.WriteString("Application build failed inside Docker container (RUN instruction exited with non-zero status).\n")
-		sb.WriteString("Review compiler, bundler, or package manager output above for missing dependencies or syntax errors.\n\n")
+		sb.WriteString("Review the compiler, bundler, or application output above. If your application validates environment variables during build (e.g. Next.js page generation), ensure all required variables are configured in the service's Environment Variables tab.\n\n")
 	case CategoryContextCancelled:
 		sb.WriteString("Docker build was cancelled or timed out before completion.\n")
 		sb.WriteString("Verify whether the deployment was cancelled by the user, superseded by a newer deployment, or exceeded maximum build duration.\n\n")

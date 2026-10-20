@@ -231,6 +231,70 @@ func (e *Engine) GetProjectTopology(ctx context.Context, projectID uuid.UUID) (*
 					})
 				}
 			}
+
+			isRedis := strings.Contains(depLower, "redis") || strings.Contains(depImage, "redis") ||
+				strings.Contains(depLower, "valkey") || strings.Contains(depImage, "valkey")
+			if isRedis {
+				hasRedisURL := false
+				for k := range peerEnvMap {
+					kUpper := strings.ToUpper(k)
+					if strings.Contains(kUpper, "REDIS_URL") || strings.Contains(kUpper, "REDIS_HOST") ||
+						strings.Contains(kUpper, strings.ToUpper(depSvc.Name)+"_URL") {
+						hasRedisURL = true
+						break
+					}
+				}
+				if !hasRedisURL && s.Role != models.RoleFrontend {
+					diagnostics = append(diagnostics, TopologyDiagnostic{
+						Severity:    "info",
+						Category:    "env_var",
+						ServiceName: s.Name,
+						Title:       fmt.Sprintf("Redis Connection Variable For '%s'", depSvc.Name),
+						Message:     fmt.Sprintf("Service '%s' connects to Redis '%s' at internal hostname '%s:%d'.", s.Name, depSvc.Name, depSvc.Name, depSvc.InternalPort),
+						Action:      fmt.Sprintf("ForgeLAB provides internal DNS '%s' on port %d; ensure '%s' reads REDIS_URL (e.g. redis://%s:%d).", depSvc.Name, depSvc.InternalPort, s.Name, depSvc.Name, depSvc.InternalPort),
+					})
+				}
+			}
+
+			// Check network connectivity: if services declare explicit custom networks, ensure they share at least one
+			if len(s.Networks) > 0 && len(depSvc.Networks) > 0 {
+				sharedNet := false
+				for _, netA := range s.Networks {
+					for _, netB := range depSvc.Networks {
+						if netA == netB {
+							sharedNet = true
+							break
+						}
+					}
+					if sharedNet {
+						break
+					}
+				}
+				if !sharedNet {
+					diagnostics = append(diagnostics, TopologyDiagnostic{
+						Severity:    "error",
+						Category:    "network",
+						ServiceName: s.Name,
+						Title:       fmt.Sprintf("Network Isolation Collision with '%s'", depSvc.Name),
+						Message:     fmt.Sprintf("Service '%s' depends on '%s', but they do not share any common network (%v vs %v).", s.Name, depSvc.Name, s.Networks, depSvc.Networks),
+						Action:      fmt.Sprintf("Add a common network to both '%s' and '%s' to allow internal DNS and TCP communication.", s.Name, depSvc.Name),
+					})
+				}
+			}
+
+			// Check dependency readiness condition: if service_healthy is requested, verify upstream has health checks
+			if cond, ok := s.DependsOnConditions[depName]; ok && cond == "service_healthy" {
+				if depSvc.HealthStrategy == "none" || (!depSvc.HealthCheckEnabled && depSvc.HealthStrategy == "") {
+					diagnostics = append(diagnostics, TopologyDiagnostic{
+						Severity:    "warning",
+						Category:    "dependency",
+						ServiceName: s.Name,
+						Title:       fmt.Sprintf("Health Check Missing for Condition on '%s'", depSvc.Name),
+						Message:     fmt.Sprintf("Service '%s' requires '%s' to be healthy ('service_healthy'), but '%s' has health checks disabled or set to 'none'.", s.Name, depSvc.Name, depSvc.Name),
+						Action:      fmt.Sprintf("Configure a valid health check strategy for service '%s' so readiness can be verified.", depSvc.Name),
+					})
+				}
+			}
 		}
 	}
 

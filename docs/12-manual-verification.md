@@ -94,6 +94,11 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Deployment Failure Safety Invariant** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Failed deployments or enqueue errors never destroy healthy running release; startup reconciliation authoritativeness checked on `/ready` |
 | **Live-Preview URL Suppression** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Stopped, failed, or unreachable services strictly suppress live preview URLs across services, deployments, and projects |
 | **Service Connection Diagnostics & Topology** | IMPLEMENTED | NOT RECORDED | — | — | — | — | `GET /api/projects/{id}/topology` & frontend tab: DAG execution tiers, endpoints, network badges, and actionable connection diagnostics |
+| **Selective Prisma Staging & Lifecycle Builds** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Automated Dockerfile staging copies `prisma/` and config before dependency install; scopes placeholder DATABASE_URL to RUN; prunes `.next/cache` in builder |
+| **Node.js Preflight Validation** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Validates package manifests, build scripts, and presence of required Prisma schema files before starting Docker build with actionable diagnostics |
+| **Safe Shell Command Serialization** | IMPLEMENTED | NOT RECORDED | — | — | — | — | JSON array serialization for Dockerfile `CMD ["sh", "-c", ...]` escaping quotes, backslashes, and shell operators safely |
+| **Service Exposure Configuration & Isolation** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Explicit `public_exposed` selection in UI/API; database and infrastructure services default to internal; volume traversal validation error propagation |
+| **WebSocket Compatibility & Deprecation Path** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Validates `?token=` query fallback with scrubbed deprecation warning while preferring single-use tickets (`POST /api/ws/ticket`) and HttpOnly cookies |
 
 ---
 
@@ -1652,6 +1657,140 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Environment:** —
 - **Notes:** —
 
+---
 
+### 33. Safe Node.js/Next.js Lifecycle Build — Prisma Selective Staging
 
+#### Test Procedure 33.1 — Event_Management_System Deployment
+1. Ensure ForgeLAB is running in your normal development environment:
+   - Backend: Go backend running with PostgreSQL and Redis accessible.
+   - Frontend: Next.js frontend running on `http://localhost:3000`.
+2. Navigate to the ForgeLAB dashboard and click **New Project**.
+3. Select **GitHub** tab (or import snapshot for `Estifanos58/Event_Management_System`).
+4. In the Project Creation Modal / Service Review:
+   - Confirm ForgeLAB detects Next.js runtime.
+   - Confirm the selected service root contains `prisma/schema.prisma` and `prisma.config.ts`.
+5. Trigger project deployment:
+   - Observe the live build logs streamed via WebSocket.
+   - Verify the builder stage emits:
+     - `COPY package.json ...`
+     - `COPY prisma ./prisma/` (and `COPY prisma.config.ts ./` if present)
+     - `RUN DATABASE_URL=... npm ci`
+     - Dependency installation runs `postinstall: prisma generate`.
+   - Verify that Prisma Client generates successfully without the `schema.prisma not found` error.
+   - Verify that Next.js compilation (`next build`) runs and `.next/cache` is removed from the builder image.
+6. Verify the container starts, passes its configured health check, and reaches `RUNNING` status.
+7. Verify that zero database credentials or secrets were printed to build logs or baked into image layers.
 
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 34. Build Preflight Validation & Actionable Diagnostics
+
+#### Test Procedure 34.1 — Missing Prisma Schema Preflight Diagnostic
+1. Prepare a test project repository or branch that specifies `"postinstall": "prisma generate"` in `package.json` but where `prisma/schema.prisma` has been deleted or moved to an undeclared location.
+2. Attempt to create and deploy the project.
+3. Verify that preflight validation fails **before** invoking Docker Engine:
+   - The deployment immediately transitions to `FAILED` with an actionable error.
+   - Diagnostic error clearly states: `package.json invokes 'prisma generate', but Prisma schema was not found at expected path: prisma/schema.prisma`.
+   - Zero orphaned Docker build contexts or builder cache layers are created.
+
+#### Test Procedure 34.2 — Standard Next.js Application (No Prisma)
+1. Deploy a standard Next.js application that does not use Prisma (e.g. standard `create-next-app`).
+2. Verify that the generated Dockerfile contains **zero** `COPY prisma` instructions.
+3. Verify that dependency installation (`npm ci`), `next build`, and container execution succeed without warning or error.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 35. Service Exposure Controls & Isolation Defaults
+
+#### Test Procedure 35.1 — UI Exposure Toggle & Safe Defaults
+1. Open the **New Project** modal and import a multi-service project (e.g. frontend + backend API + postgres + redis).
+2. In the **Deployment Plan Review** step:
+   - Verify that the frontend service defaults to `Public: :<port>` (emerald badge).
+   - Verify that `postgres` and `redis` infrastructure services default to `Internal: <name>:<port>` (neutral badge).
+3. Click the exposure button on the frontend service:
+   - Verify it toggles to `Internal: frontend:3000 (Click to expose Publicly)`.
+4. Click the exposure button on the backend service:
+   - Verify it toggles to `Public: :8080 (Click to make Internal)`.
+5. Deploy the project and verify:
+   - Host ports are allocated and preview URLs generated only for explicitly public services.
+   - Internal database and cache services are bound only to the private Docker network and cannot be reached directly from host ports.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 36. Multi-Service Inter-Service Communication & Dependency Health
+
+#### Test Procedure 36.1 — Full-Stack Multi-Service Deployment (Postgres, Redis, API, Frontend)
+1. Deploy a multi-service project containing:
+   - `postgres` (infrastructure)
+   - `redis` (infrastructure)
+   - `api` (backend depending on postgres and redis with `condition: service_healthy`)
+   - `frontend` (web service depending on api)
+2. Verify deployment tier execution:
+   - Tier 0 (`postgres`, `redis`) start and pass health checks.
+   - Tier 1 (`api`) starts only after Tier 0 dependencies report healthy.
+   - Tier 2 (`frontend`) starts after `api` is ready.
+3. Test container-to-container connectivity:
+   - Exec into the `api` container and verify DNS resolution: `getent hosts postgres` and `getent hosts redis` return container IPs on the project network.
+   - Verify the `api` successfully executes SQL queries against `postgres` using `$DATABASE_URL` and connects to `redis` using `$REDIS_URL`.
+4. Stop or pause the `postgres` container:
+   - Check the **Topology & Diagnostics** tab in ForgeLAB and verify the system reports `Upstream Dependency Failed` for dependent services.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 37. WebSocket Ticket Authentication & Compatibility Fallback
+
+#### Test Procedure 37.1 — Frontend Ticket Authentication
+1. Open browser developer tools on `http://localhost:3000/projects/<id>`.
+2. Inspect the Network tab for WebSocket traffic:
+   - Verify the frontend initiates `POST /api/ws/ticket` before establishing the WebSocket connection.
+   - Verify the WebSocket URL connects using `GET /api/ws?ticket=<uuid>`.
+   - Verify connection succeeds (HTTP 101 Switching Protocols) and logs stream live.
+3. Attempt to reconnect using the same ticket UUID again:
+   - Verify the ticket is single-use and the second connection attempt is rejected with HTTP 401.
+
+#### Test Procedure 37.2 — Legacy Query-Token Compatibility
+1. Mint or obtain a valid user JWT access token.
+2. Using a tool like `wscat` or `websocat`, connect directly with query string token:
+   `wscat -c "ws://localhost:8080/api/ws?token=<valid_jwt>"`
+3. Verify connection succeeds (HTTP 101).
+4. Inspect the backend log output and confirm:
+   - A deprecation notice is logged: `[WARN] websocket: query parameter '?token=' authentication is deprecated, use short-lived tickets (POST /api/ws/ticket) or cookies`.
+   - The token value itself is strictly redacted/absent from the log line.
+5. Connect with an invalid token `?token=invalid.jwt.signature`:
+   - Verify connection is rejected with HTTP 401 Unauthorized.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —

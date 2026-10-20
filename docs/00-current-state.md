@@ -87,11 +87,22 @@ ForgeLAB is a single control-plane, self-hosted application deployment platform.
 - **Port Allocation & Conflict Retries:** Dynamic host port allocation in the range **`10000–60000`** managed by `internal/network/PortManager`. Includes automatic conflict detection and retry logic (up to 3 retries): if the Docker daemon reports that an allocated port is already bound on the host, the port is marked as used, a new port is allocated, and container creation/start is transparently re-attempted. Container reconciliation (`ReconcileDaemonContainers`) tracks ports from containers across `running`, `restarting`, `created`, and `paused` states, preventing collisions during service transitions.
 - **Remote Hostname & Browser URLs:** Configurable public host (`FORGELAB_PUBLIC_HOST` or `PUBLIC_HOST`, falling back to host from `FRONTEND_URL`), preventing remote deployments from erroneously generating `localhost` browser URLs.
 - **Build Reproducibility:** Release deployments and service deployments pin immutable source revisions (40-character commit SHAs for GitHub, or deterministic content-based fingerprints `fp_...` for local directories). If files inside a local directory drift from the reviewed deployment revision before build execution, the build fails closed with an explicit error (`source content changed since deployment was created`) rather than silently building unreviewed code.
-- **WebSocket Security Hardening:**
-  - Token query parameters (`?token=<jwt>`) are strictly rejected with `401 Unauthorized`.
+- **WebSocket Security & Backward Compatibility:**
   - Single-use ticket mechanism (`POST /api/ws/ticket`) issues 60-second tickets consumed via `GET /api/ws?ticket=<uuid>`.
   - Accepts HttpOnly cookies (`forgelab_access_token`) and `Authorization: Bearer <token>` headers.
+  - Backward compatibility query parameter fallback (`?token=<jwt>`) validates valid tokens while emitting a scrubbed deprecation warning, preventing abrupt breakage of older or external clients.
   - Strict WebSocket origin validation (`CheckOrigin`) enforced across all connection requests.
+- **Safe Node.js/Next.js Lifecycle Staging & Preflight Validation:**
+  - Automated Dockerfile generator selectively stages `prisma/` directories and Prisma configuration files (`prisma.config.ts`, custom schema locations) *before* dependency installation runs (`RUN npm ci`), preventing `postinstall: prisma generate` failures without universal pre-copy of entire source tree.
+  - Generates zero unnecessary `COPY` instructions for non-Prisma projects.
+  - Scopes ephemeral `DATABASE_URL` placeholder exclusively to build-time `RUN` instructions without baking credentials into image layers or `ENV`.
+  - Prunes `.next/cache` in the builder stage to minimize runtime image size while preserving generated Prisma client and runtime assets.
+  - Preflight validates `package.json`, build scripts, and confirms presence of declared Prisma schema files before starting Docker build, returning actionable diagnostics on missing files.
+  - Encodes container start commands using proper JSON serialization (`sh -c <cmd>`), ensuring quotes, backslashes, and shell operators execute reliably.
+- **Service Exposure Control & Volume Sanitization:**
+  - Project creation UI and backend API provide explicit `public_exposed` selection per service (`*bool`), distinguishing frontend web access from private backend/worker services.
+  - Backward compatibility: older API requests omitting `public_exposed` preserve heuristic defaults, while infrastructure and database services never default to publicly exposed.
+  - Volume sanitization strictly propagates directory traversal (`..`) and empty target errors instead of silently discarding them, while stripping forbidden Docker socket mounts.
 - **Diagnostics Access Restrictions:**
   - Public `/ready` health probe returns dependency health while omitting/redacting detailed internal structures (`queue`, `build_queue`, `log_collectors`) for unauthenticated external callers.
   - `/health/queue` and `/health/logs` require trusted internal loopback access or valid authentication, returning `401 Unauthorized` to external unauthenticated callers.
@@ -203,6 +214,11 @@ The status classifications strictly follow these definitions:
 | **Bounded Discovery & Leak-Free Build Context** | IMPLEMENTED | NOT RECORDED | `DiscoverWithContext` with 50k file / 500MB bounds, context cancellation, symlink directory escape validation, progress logging every 1,000 files, and leak-free `defer os.Remove` of temporary build archives |
 | **Runtime Accuracy & Preview URL Suppression** | IMPLEMENTED | NOT RECORDED | Stopped, failed, or unreachable services strictly suppress live preview URLs across ServiceService, DeploymentService, and ProjectService; Docker state reconciled on restart |
 | **Service Connection Diagnostics & Topology Graph** | IMPLEMENTED | NOT RECORDED | `GET /api/projects/{id}/topology` and frontend tab: visualizes DAG execution tiers, service connection endpoints, network badges, and actionable diagnostics for port collisions, missing dependencies, failed upstreams, and database connection strings |
+| **Selective Prisma Staging & Lifecycle Builds** | IMPLEMENTED | NOT RECORDED | Automated Dockerfile staging copies `prisma/` and config before dependency install; scopes placeholder DATABASE_URL to RUN; prunes `.next/cache` in builder |
+| **Node.js Preflight Validation** | IMPLEMENTED | NOT RECORDED | Validates package manifests, build scripts, and presence of required Prisma schema files before starting Docker build with actionable diagnostics |
+| **Safe Shell Command Serialization** | IMPLEMENTED | NOT RECORDED | JSON array serialization for Dockerfile `CMD ["sh", "-c", ...]` escaping quotes, backslashes, and shell operators safely |
+| **Service Exposure Configuration & Isolation** | IMPLEMENTED | NOT RECORDED | Explicit `public_exposed` selection in UI/API; database and infrastructure services default to internal; volume traversal validation error propagation |
+| **WebSocket Compatibility & Deprecation Path** | IMPLEMENTED | NOT RECORDED | Validates `?token=` query fallback with scrubbed deprecation warning while preferring single-use tickets (`POST /api/ws/ticket`) and HttpOnly cookies |
 | **Automatic HTTPS & Reverse Proxy (Caddy)** | DEFERRED | — | Planned future roadmap item; local host port allocation and port mapping active |
 | **GitHub Push-to-Deploy & Webhook Pipeline** | DEFERRED | — | Planned future roadmap item; manual commit-pinned deployment active |
 | **Pull-Request Preview Environments** | DEFERRED | — | Planned future roadmap item; project and service deployment pipelines active |

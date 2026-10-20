@@ -140,9 +140,8 @@ function mapDefinitionToConfigurable(def: ServiceDefinition, idx: number): Confi
   const pkgManager = def.package_manager || def.build_system || 'generic';
   const strategy = (def.build_strategy as any) || (def.selected_build_strategy as any) || (defaultCandidate?.strategy === 'dockerfile' ? 'dockerfile' : 'auto');
 
-  const isFrontend = def.role === 'frontend' || (def.name && def.name.toLowerCase().includes('frontend'));
-  const isApplication = !def.classification || def.classification === 'application';
-  const defaultPublicExposed = def.public_exposed !== undefined ? def.public_exposed : (isFrontend || isApplication);
+  const isFrontend = def.role === 'frontend' || Boolean(def.name && def.name.toLowerCase().includes('frontend'));
+  const defaultPublicExposed = def.public_exposed !== undefined ? Boolean(def.public_exposed) : isFrontend;
 
   return {
     id: def.id || `svc-${idx}-${Date.now()}`,
@@ -1328,8 +1327,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       const servicesPayload: any[] = configuredServices.map((svc) => {
         const planned = deploymentPlan?.services.find((ps) => ps.name === svc.name);
         const isFrontend = svc.role === 'frontend' || (svc.name && svc.name.toLowerCase().includes('frontend'));
-        const isApp = !svc.classification || svc.classification === 'application';
-        const isPublic = planned?.public_exposed ?? svc.public_exposed ?? (isFrontend || isApp);
+        const isPublic = planned?.public_exposed ?? svc.public_exposed ?? isFrontend;
 
         return {
           name: svc.name.trim(),
@@ -3403,7 +3401,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             </div>
 
             <div className="space-y-2">
-              {deploymentPlan.services.map((svc) => (
+              {deploymentPlan.services.map((svc, idx) => (
                 <div
                   key={svc.name}
                   className="p-3.5 rounded-lg bg-surface border border-surface-border space-y-2.5 text-xs"
@@ -3430,13 +3428,45 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
                     <div className="flex items-center gap-2 text-[11px]">
                       {svc.public_exposed ? (
-                        <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
-                          Public: :{svc.host_port || svc.internal_port} &rarr; :{svc.internal_port}
-                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDeploymentPlan((prev) =>
+                              prev
+                                ? {
+                                    ...prev,
+                                    services: prev.services.map((s, i) =>
+                                      i === idx ? { ...s, public_exposed: false } : s
+                                    ),
+                                  }
+                                : prev
+                            );
+                          }}
+                          className="px-2 py-0.5 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/20 font-mono transition-colors cursor-pointer"
+                          title="Click to toggle to Internal service (not exposed to internet)"
+                        >
+                          Public: :{svc.host_port || svc.internal_port} &rarr; :{svc.internal_port} (Click to make Internal)
+                        </button>
                       ) : (
-                        <span className="px-2 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
-                          Internal: {svc.name}:{svc.internal_port}
-                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDeploymentPlan((prev) =>
+                              prev
+                                ? {
+                                    ...prev,
+                                    services: prev.services.map((s, i) =>
+                                      i === idx ? { ...s, public_exposed: true } : s
+                                    ),
+                                  }
+                                : prev
+                            );
+                          }}
+                          className="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 font-mono transition-colors cursor-pointer"
+                          title="Click to toggle to Public service (exposed with preview URL)"
+                        >
+                          Internal: {svc.name}:{svc.internal_port} (Click to expose Publicly)
+                        </button>
                       )}
                     </div>
                   </div>

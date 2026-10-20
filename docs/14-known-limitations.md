@@ -285,14 +285,26 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Location:** [`backend/internal/docker/engine_topology.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_topology.go), [`backend/internal/handlers/project_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/project_handler.go), [`frontend/src/features/projects/topology-section.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/features/projects/topology-section.tsx), [`frontend/src/app/(app)/projects/[id]/page.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/app/(app)/projects/[id]/page.tsx)
 - **Resolution:** Implemented `GET /api/projects/{id}/topology` reusing existing DAG discovery and plan architecture. Exposes DAG execution tiers, service nodes (internal DNS, ports, host ports, networks, readiness), and actionable connection diagnostics (port collisions, missing dependencies, failed upstreams, database connection strings). Added interactive `Topology & Diagnostics` tab in the frontend project view.
 
+### 37. Node.js/Next.js Lifecycle Build Staging & Prisma Generation (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/discovery/detector.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/detector.go), [`backend/internal/detector/detector.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/detector/detector.go), [`backend/internal/docker/preflight.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/preflight.go)
+- **Resolution:** When Next.js or Node.js services declare lifecycle scripts requiring Prisma (e.g. `postinstall: prisma generate`), the automatic Dockerfile generator selectively stages `prisma/` and config files (`prisma.config.ts`, or custom paths from `package.json`) before dependency installation (`RUN npm ci`). Ephemeral placeholder `DATABASE_URL` is scoped to build commands without baking credentials into images. Unrelated projects emit zero extra COPY steps. In addition, preflight checks validate manifest integrity and schema presence, surfacing actionable diagnostics before Docker build starts. Container start commands use JSON-serialized `CMD ["sh", "-c", ...]` escaping quotes and shell metacharacters.
+
+### 38. Safe Multi-Service Exposure Controls & Volume Sanitization (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/project_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/project_service.go), [`backend/internal/security/volume_security.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/security/volume_security.go), [`frontend/src/components/dashboard/create-project-modal.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/components/dashboard/create-project-modal.tsx)
+- **Resolution:** Added explicit `public_exposed` selection per service in the project creation modal and API (`*bool`). Legacy and older API requests that omit the flag preserve backward-compatible heuristic defaults while ensuring database/infrastructure services never default to public exposure. Volume sanitization strictly validates volume targets and parent escapes (`..`), propagating errors rather than silently continuing, while safely removing forbidden Docker socket mounts.
+
+### 39. WebSocket Authentication Compatibility & Deprecation Path (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/websocket/hub.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/websocket/hub.go), [`frontend/src/lib/websocket/use-deployment-ws.ts`](file:///home/estif/Projects/ForgeLAB/frontend/src/lib/websocket/use-deployment-ws.ts)
+- **Resolution:** The frontend uses short-lived single-use tickets (`POST /api/ws/ticket`) and HttpOnly cookies. To prevent abrupt breakage of external or legacy clients still using `?token=`, the backend validates query-string tokens and emits a scrubbed deprecation warning, providing a smooth migration window while keeping credentials off logs.
+
 ---
 
 ## 3. Security Hardening Items (Deferred Backlog)
 
 1. **`localStorage` Token Storage (`RESOLVED IN ARCHITECTURE`):**
    - Authentication is backend-owned using `HttpOnly`, `Secure`, `SameSite=Lax` cookies (`forgelab_access_token` and `forgelab_refresh_token`). Client-side token storage in `localStorage` has been completely eliminated.
-2. **WebSocket Query String Token (`RESOLVED IN ARCHITECTURE`):**
-   - Query string JWT authentication (`?token=...`) has been eliminated and is strictly rejected with `401 Unauthorized`. WebSocket connections authenticate via HttpOnly cookies, `Authorization` headers, or short-lived single-use tickets (`POST /api/ws/ticket`).
+2. **WebSocket Query String Token (`MIGRATION IN PROGRESS / RESOLVED IN ARCHITECTURE`):**
+   - Single-use ticket authentication (`POST /api/ws/ticket`) and HttpOnly cookies are standard in the web UI. Query token authentication (`?token=...`) is deprecated and logs scrubbed warnings; full rejection can be scheduled once all external clients are migrated.
 3. **Permissive WebSocket CORS / Origin Check (`RESOLVED IN ARCHITECTURE`):**
    - Strict origin validation is enforced across all WebSocket upgrades, matching against configured frontend URLs (`CORS_ALLOWED_ORIGINS` and `FRONTEND_URL`) or same-origin host headers.
 4. **Backend Docker Socket Trust (Inherent Architectural Boundary):**

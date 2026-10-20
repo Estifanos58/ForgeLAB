@@ -4,7 +4,7 @@ import React from 'react';
 import { Project, Deployment } from '@/lib/api/types';
 import { Badge } from '@/components/ui/badge';
 import { LifecycleControls } from '@/features/deployments/lifecycle-controls';
-import { ExternalLink, Radio, Layers, Github, Folder, HardDrive } from 'lucide-react';
+import { ExternalLink, Radio, Layers, Github, Folder, HardDrive, GitBranch } from 'lucide-react';
 
 interface ProjectHeaderProps {
   project: Project;
@@ -125,6 +125,15 @@ export function ProjectHeader({
             {getSourceIcon()}
             <span className="truncate max-w-xs">{getSourceLabel()}</span>
           </span>
+          {project.branch && (
+            <>
+              <span>•</span>
+              <span className="inline-flex items-center gap-1 text-neutral-400" title={`Git Branch: ${project.branch}`}>
+                <GitBranch className="w-3 h-3 text-neutral-500" />
+                <span>{project.branch}</span>
+              </span>
+            </>
+          )}
           {services.length > 0 && (
             <>
               <span>•</span>

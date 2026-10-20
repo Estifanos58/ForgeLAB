@@ -104,7 +104,7 @@ type CreateServiceInput struct {
 	BuildContext        string                     `json:"build_context"`
 	InternalPort        int                        `json:"internal_port"`
 	HostPort            *int                       `json:"host_port"`
-	PublicExposed       bool                       `json:"public_exposed"`
+	PublicExposed       *bool                      `json:"public_exposed"`
 	HealthStrategy      string                     `json:"health_strategy"`
 	HealthCheckPath     *string                    `json:"health_check_path"`
 	HealthCheckConfig   *models.HealthCheckConfig  `json:"healthcheck_config,omitempty"`
@@ -549,9 +549,24 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				svcClassification = models.ClassificationApplication
 			}
 
-			isPublic := svcIn.PublicExposed
-			if !isPublic && (svcRole == models.RoleFrontend || strings.Contains(strings.ToLower(svcRole), "web") || strings.Contains(strings.ToLower(svcName), "frontend") || (len(input.Services) == 1 && svcClassification == models.ClassificationApplication)) {
-				isPublic = true
+			var isPublic bool
+			if svcIn.PublicExposed != nil {
+				isPublic = *svcIn.PublicExposed
+			} else {
+				// Backward compatibility for older API clients omitting public_exposed:
+				// Never expose infrastructure/databases by default; expose web frontends or single apps.
+				if svcClassification == models.ClassificationInfrastructure || strings.Contains(strings.ToLower(svcRole), "db") || strings.Contains(strings.ToLower(svcRole), "database") || strings.Contains(strings.ToLower(svcName), "postgres") || strings.Contains(strings.ToLower(svcName), "redis") {
+					isPublic = false
+				} else if svcRole == models.RoleFrontend || strings.Contains(strings.ToLower(svcRole), "web") || strings.Contains(strings.ToLower(svcName), "frontend") || (len(input.Services) == 1 && svcClassification == models.ClassificationApplication) {
+					isPublic = true
+				} else {
+					isPublic = false
+				}
+			}
+
+			sanitizedVolumes, _, err := security.ValidateAndSanitizeServiceVolumes(svcIn.Volumes)
+			if err != nil {
+				return nil, fmt.Errorf("%w: invalid volume configuration for service %q: %v", ErrValidationFailed, svcName, err)
 			}
 
 			svc := &models.Service{
@@ -564,7 +579,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				Image:               strings.TrimSpace(svcIn.Image),
 				DependsOn:           svcIn.DependsOn,
 				DependsOnConditions: svcIn.DependsOnConditions,
-				Volumes:             func() []models.VolumeMountConfig { v, _ := security.SanitizeServiceVolumes(svcIn.Volumes); return v }(),
+				Volumes:             sanitizedVolumes,
 				Networks:            svcIn.Networks,
 				HealthCheckConfig:   svcIn.HealthCheckConfig,
 				SourcePath:          svcSourcePath,

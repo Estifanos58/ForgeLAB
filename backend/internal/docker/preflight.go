@@ -2,7 +2,10 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -248,7 +251,153 @@ func ValidateDeploymentPreflight(ctx context.Context, opts PreflightOptions) err
 			}
 		}
 
-		// C. Port validation
+		// C. Auto strategy validation for Node.js / Next.js services
+		if (buildStrategy == models.BuildStrategyAuto || buildStrategy == "") && classification != models.ClassificationInfrastructure {
+			rt := sd.RuntimeType
+			if rt == "" && svc != nil {
+				rt = svc.RuntimeType
+			}
+			isNode := strings.HasPrefix(rt, "next") || strings.HasPrefix(rt, "node") || strings.Contains(rt, "vite") || rt == "express" || rt == "fastify" || rt == "nestjs" || rt == "react" || rt == "vue" || rt == "svelte"
+
+			if isNode && opts.Project != nil && opts.Project.SourceType != models.SourceTypeLocalAgent && opts.Project.RepositoryPath != "" && opts.PathValidator != nil {
+				sourcePath := ""
+				buildCtx := sd.BuildContext
+				if svc != nil {
+					sourcePath = svc.SourcePath
+					if buildCtx == "" {
+						buildCtx = svc.BuildContext
+					}
+				}
+				svcDir, _, err := opts.PathValidator.ValidateServiceBuildPaths(
+					opts.Project.RepositoryPath,
+					sourcePath,
+					buildCtx,
+					"",
+					true,
+				)
+				if err != nil {
+					return &PreflightValidationError{
+						ServiceName: sd.ServiceName,
+						Field:       "service_root",
+						Message:     fmt.Sprintf("Service directory validation failed: %v", err),
+					}
+				}
+
+				pkgPath := filepath.Join(svcDir, "package.json")
+				pkgBytes, err := os.ReadFile(pkgPath)
+				if err != nil {
+					if os.IsNotExist(err) {
+						return &PreflightValidationError{
+							ServiceName: sd.ServiceName,
+							Field:       "package.json",
+							Message:     fmt.Sprintf("package.json not found in service directory %q. Verify that the service root directory is set correctly.", sourcePath),
+						}
+					}
+					return &PreflightValidationError{
+						ServiceName: sd.ServiceName,
+						Field:       "package.json",
+						Message:     fmt.Sprintf("failed to read package.json in service directory: %v", err),
+					}
+				}
+
+				var pkg struct {
+					Scripts         map[string]string `json:"scripts"`
+					Dependencies    map[string]string `json:"dependencies"`
+					DevDependencies map[string]string `json:"devDependencies"`
+					Prisma          any               `json:"prisma"`
+				}
+				if err := json.Unmarshal(pkgBytes, &pkg); err != nil {
+					return &PreflightValidationError{
+						ServiceName: sd.ServiceName,
+						Field:       "package.json",
+						Message:     fmt.Sprintf("invalid JSON in package.json: %v", err),
+					}
+				}
+
+				// Check required scripts for Next.js
+				if rt == "nextjs" {
+					if _, hasBuild := pkg.Scripts["build"]; !hasBuild {
+						return &PreflightValidationError{
+							ServiceName: sd.ServiceName,
+							Field:       "scripts",
+							Message:     "Next.js service requires a 'build' script in package.json (e.g. \"build\": \"next build\").",
+						}
+					}
+				}
+
+				// Check Prisma schema presence when Prisma lifecycle script is configured
+				hasPrismaScript := false
+				var prismaCmd string
+				for scriptName, scriptCmd := range pkg.Scripts {
+					if (scriptName == "postinstall" || scriptName == "preinstall" || scriptName == "build") && strings.Contains(scriptCmd, "prisma") {
+						hasPrismaScript = true
+						prismaCmd = scriptCmd
+						break
+					}
+				}
+
+				if hasPrismaScript {
+					var customSchema string
+					if pkg.Prisma != nil {
+						switch v := pkg.Prisma.(type) {
+						case string:
+							customSchema = v
+						case map[string]any:
+							if s, ok := v["schema"].(string); ok {
+								customSchema = s
+							}
+						}
+					}
+
+					schemaFound := false
+					var checkedPaths []string
+					if customSchema != "" {
+						customPath := filepath.Join(svcDir, filepath.Clean(customSchema))
+						checkedPaths = append(checkedPaths, customSchema)
+						if st, err := os.Stat(customPath); err == nil && !st.IsDir() {
+							schemaFound = true
+						}
+					}
+					if !schemaFound {
+						std1 := filepath.Join(svcDir, "prisma", "schema.prisma")
+						checkedPaths = append(checkedPaths, "prisma/schema.prisma")
+						if st, err := os.Stat(std1); err == nil && !st.IsDir() {
+							schemaFound = true
+						}
+					}
+					if !schemaFound {
+						std2 := filepath.Join(svcDir, "schema.prisma")
+						checkedPaths = append(checkedPaths, "schema.prisma")
+						if st, err := os.Stat(std2); err == nil && !st.IsDir() {
+							schemaFound = true
+						}
+					}
+					if !schemaFound {
+						prismaDir := filepath.Join(svcDir, "prisma")
+						checkedPaths = append(checkedPaths, "prisma/*.prisma")
+						if st, err := os.Stat(prismaDir); err == nil && st.IsDir() {
+							_ = filepath.Walk(prismaDir, func(p string, fi os.FileInfo, err error) error {
+								if err == nil && !fi.IsDir() && strings.HasSuffix(strings.ToLower(fi.Name()), ".prisma") {
+									schemaFound = true
+									return filepath.SkipAll
+								}
+								return nil
+							})
+						}
+					}
+
+					if !schemaFound {
+						return &PreflightValidationError{
+							ServiceName: sd.ServiceName,
+							Field:       "prisma",
+							Message:     fmt.Sprintf("Prisma lifecycle script detected (%q), but no Prisma schema found at checked paths: %s. Ensure your schema file is committed to the repository and not excluded by .dockerignore.", prismaCmd, strings.Join(checkedPaths, ", ")),
+						}
+					}
+				}
+			}
+		}
+
+		// D. Port validation
 		intPort := sd.InternalPort
 		if intPort <= 0 && svc != nil {
 			intPort = svc.InternalPort

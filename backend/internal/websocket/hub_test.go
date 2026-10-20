@@ -1095,8 +1095,9 @@ func TestWebSocketLogEventsNotDroppedOnBurst(t *testing.T) {
 	}
 }
 
-// TestWebSocket_QueryTokenRejected verifies that query parameter JWT (?token=...) is strictly rejected with 401.
-func TestWebSocket_QueryTokenRejected(t *testing.T) {
+// TestWebSocket_QueryTokenFallback verifies that query parameter JWT (?token=...) is supported as a fallback,
+// while invalid tokens are strictly rejected with 401.
+func TestWebSocket_QueryTokenFallback(t *testing.T) {
 	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
 	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000")
 	defer hub.cancel()
@@ -1106,15 +1107,24 @@ func TestWebSocket_QueryTokenRejected(t *testing.T) {
 
 	userID := uuid.New()
 	token, _ := jwtManager.GenerateAccessToken(userID, "user@example.com")
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
-
 	header := http.Header{"Origin": []string{"http://localhost:3000"}}
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
-	if err == nil {
-		t.Fatalf("expected query parameter token connection to be rejected, but dial succeeded")
+
+	// 1. Valid token in query string should succeed via fallback
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("expected query parameter token fallback connection to succeed, got err: %v, resp: %v", err, resp)
 	}
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 Unauthorized for query parameter token, got: %v", resp)
+	_ = conn.Close()
+
+	// 2. Invalid token in query string should be rejected with 401
+	badURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=invalid-jwt-token"
+	_, badResp, badErr := websocket.DefaultDialer.Dial(badURL, header)
+	if badErr == nil {
+		t.Fatalf("expected invalid query parameter token connection to be rejected, but dial succeeded")
+	}
+	if badResp == nil || badResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for invalid query parameter token, got: %v", badResp)
 	}
 }
 
