@@ -122,4 +122,3 @@ func TestEngine_GetProjectTopology(t *testing.T) {
 		assert.Equal(t, "dependency", resp.Diagnostics[0].Category)
 	})
 }
-
