@@ -160,6 +160,12 @@ ForgeLAB treats all source code and filesystem paths as untrusted input across a
 - **Encrypted Token Handling:** Tokens are decrypted in-memory only when communicating with `api.github.com` and are never logged or exposed to the client.
 - **Tarball Extraction Isolation:** Remote tarballs are unpacked using the same path-traversal safeguards and size limits into isolated source directories.
 
+### 4. Local Agent Connected Source (`source_type: "local_agent"`)
+- **Unauthenticated Identity Verification Probe:** The control plane never sends bearer credentials or session tokens to unverified fallback endpoints. When communicating with a local agent candidate (whether running natively on the host at `127.0.0.1:8081` or via Docker bridge at `host.docker.internal:8081`), the control plane first issues an unauthenticated identity verification probe (`POST /api/agent/verify-identity` or `GET /api/agent/status` with `X-Expected-Agent-ID`). Only endpoints that affirmatively match the expected agent identity are sent bearer session credentials.
+- **Short-Lived & Revocable Credentials:** Agent session tokens default to a 15-minute TTL (configurable via `FORGELAB_AGENT_SESSION_TTL`, reduced from legacy 30 minutes). Tokens can be revoked explicitly via `POST /api/sources/agent/session/revoke`, and all active agent sessions bound to a source workspace are automatically revoked when the source workspace is deleted (`DELETE /api/sources/{id}`).
+- **Scrubbing & Encryption:** Unauthenticated agent status checks scrub `agent_id` and active session counts. Session serialization scrubs host filesystem paths. Raw session tokens are encrypted at rest with AES-256-GCM and never exposed over WebSocket events, logs, or unredacted REST responses.
+- **Supported Environments:** Preserves both host-run agent workflows and containerized Docker development environments safely.
+
 ---
 
 ## 4. Secret Management & Log Redaction
@@ -232,24 +238,25 @@ ForgeLAB strictly validates project ownership and cross-project isolation across
 
 ## 9. Registration-Free Local Deployments & Shared Guest Workspace
 
-ForgeLAB supports registration-free local deployments for self-hosted and single-user installations while preserving strict security boundaries for registered users and GitHub integrations:
+ForgeLAB supports registration-free local deployments for self-hosted and single-user installations while maintaining strict tenant isolation between anonymous browser visitors and registered users:
 
-1. **Single Installation-Level Guest Identity:**
-   - Unauthenticated local deployments belong to a single, installation-level internal guest owner record (`models.GuestUserID = uuid.MustParse("00000000-0000-0000-0000-000000000001")`, email `guest@forgelab.local`).
-   - The record is ensured in PostgreSQL during database migration (`000017_add_guest_identity.up.sql`) and verified idempotently during server startup (`userService.EnsureGuestUser`).
-   - No per-visitor guest accounts, guest sessions, guest JWT tokens, or guest cookies are created or stored.
-   - User registration and login explicitly reject `guest@forgelab.local` and `models.IsGuest(userID)`.
+1. **Isolated Anonymous Browser Sessions & Safe Local Fallback:**
+   - **Anonymous Browser Isolation:** Anonymous users accessing ForgeLAB via a browser are isolated from one another. On their initial request, the server assigns an isolated guest UUID and sets a secure HttpOnly cookie (`forgelab_guest_session`) and response header (`X-Guest-Session`). A dedicated guest user record (`guest-<uuid>@forgelab.local`) is automatically provisioned in PostgreSQL via `userService.EnsureGuestUserWithID`. Anonymous browser visitors cannot view, modify, or access each other's projects, source uploads, deployment logs, or secrets.
+   - **Registration-Free Local Usage:** To preserve frictionless registration-free workflows for local CLI tools (`curl`), automated local scripts, and in-memory test harnesses originating from loopback without browser headers, requests without an existing guest session cookie safely resolve to the installation-level guest identity (`models.GuestUserID = uuid.MustParse("00000000-0000-0000-0000-000000000001")`, email `guest@forgelab.local`).
+   - User registration and login explicitly reject `guest@forgelab.local`, any `@forgelab.local` domain address, and `models.IsGuest(userID)`.
 
-2. **Zero-Token Identity Resolution & Middleware:**
-   - Endpoints supporting local deployment (`/api/sources/*`, `/api/discovery/plan`, `/api/projects/*`, and `/api/ws`) use `middleware.AuthOrGuestMiddleware`.
+2. **Guest Identity Resolution & Middleware (`AuthOrGuestMiddleware`):**
+   - Endpoints supporting local deployment (`/api/sources/*`, `/api/discovery/plan`, `/api/projects/*`, `/api/ws`, and `/api/ws/ticket`) use `middleware.AuthOrGuestMiddleware`.
    - If an authenticated JWT token is present, the registered user's ID is injected into the request context.
-   - If unauthenticated and `FORGELAB_ALLOW_GUEST_MODE=true` (or running in local development `isDev`), `models.GuestUserID` and `IsGuestKey=true` are injected into context.
+   - If unauthenticated and `FORGELAB_ALLOW_GUEST_MODE=true` (or running in local development `isDev`), `ResolveGuestSession` determines the isolated guest UUID (from cookie/header for browsers/remote clients, or `models.GuestUserID` for local CLI), ensures the user record exists in PostgreSQL, and injects the guest UUID into context with `IsGuestKey=true`.
    - If unauthenticated and guest mode is disabled, the middleware rejects the request with `401 Unauthorized`.
+   - For state-changing operations (`POST`, `PUT`, `PATCH`, `DELETE`), incoming `Origin` and `Referer` headers are strictly validated against `allowedOrigins` to prevent unauthorized cross-origin mutations.
 
-3. **Tenant Isolation:**
+3. **Multi-Tenant & Guest Isolation:**
    - Multi-tenant isolation is maintained through existing `owner_id` constraints across `projects`, `services`, `deployments`, `sources`, and `environment_variables`.
-   - Guest requests can never view, mutate, deploy, or delete resources owned by registered users.
+   - Anonymous browser sessions cannot view, mutate, deploy, or delete resources owned by other anonymous sessions or registered users.
    - Registered users cannot view or mutate guest-owned projects.
+   - WebSocket tickets and log streams (`POST /api/ws/ticket`) verify project ownership against the specific caller's guest session ID, preventing unauthorized log sniffing across anonymous sessions.
 
 4. **GitHub Features are Registration-Only:**
    - All GitHub OAuth, repository listing, branch inspection, detection, and personal access token endpoints (`/api/integrations/github/*`) remain strictly behind `middleware.AuthMiddleware` requiring valid user JWT tokens.

@@ -671,3 +671,41 @@ export interface GeneratePlanResponse {
   plan: DeploymentPlan;
 }
 
+export interface TopologyServiceNode {
+  id: string;
+  name: string;
+  role: string;
+  classification: string;
+  status: string;
+  internal_hostname: string;
+  internal_port: number;
+  host_port?: number;
+  preview_url?: string;
+  network_name: string;
+  network_aliases: string[];
+  container_id?: string;
+  health_strategy: string;
+  health_check_path: string;
+  depends_on: string[];
+  depends_on_conditions?: Record<string, string>;
+  tier: number;
+}
+
+export interface TopologyDiagnostic {
+  severity: 'error' | 'warning' | 'info';
+  category: 'dns' | 'network' | 'port' | 'env_var' | 'dependency';
+  service_name?: string;
+  title: string;
+  message: string;
+  action: string;
+}
+
+export interface ProjectTopology {
+  project_id: string;
+  project_name: string;
+  network_name: string;
+  tiers: string[][];
+  services: TopologyServiceNode[];
+  diagnostics: TopologyDiagnostic[];
+}
+

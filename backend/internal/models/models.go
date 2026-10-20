@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,11 +15,49 @@ import (
 var (
 	GuestUserID    = uuid.MustParse("00000000-0000-0000-0000-000000000001")
 	GuestUserEmail = "guest@forgelab.local"
+
+	guestIDsMu sync.RWMutex
+	guestIDs   = map[uuid.UUID]bool{
+		GuestUserID: true,
+	}
 )
 
-// IsGuest checks if the given user ID matches the shared guest identity.
+// RegisterGuestID registers an isolated guest user ID so it is recognized by IsGuest.
+func RegisterGuestID(id uuid.UUID) {
+	if id == uuid.Nil {
+		return
+	}
+	guestIDsMu.Lock()
+	defer guestIDsMu.Unlock()
+	guestIDs[id] = true
+}
+
+// IsGuest checks if the given user ID matches the shared or an isolated guest identity.
 func IsGuest(userID uuid.UUID) bool {
-	return userID == GuestUserID
+	if userID == GuestUserID {
+		return true
+	}
+	guestIDsMu.RLock()
+	defer guestIDsMu.RUnlock()
+	return guestIDs[userID]
+}
+
+// HasGuestID checks if the given user ID has been registered in memory as a guest.
+func HasGuestID(id uuid.UUID) bool {
+	if id == GuestUserID {
+		return true
+	}
+	guestIDsMu.RLock()
+	defer guestIDsMu.RUnlock()
+	return guestIDs[id]
+}
+
+// MakeGuestUserEmail returns the standardized email for a guest user ID.
+func MakeGuestUserEmail(id uuid.UUID) string {
+	if id == GuestUserID {
+		return GuestUserEmail
+	}
+	return fmt.Sprintf("guest-%s@forgelab.local", id.String())
 }
 
 // User represents a ForgeLab user account.

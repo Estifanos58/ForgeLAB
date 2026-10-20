@@ -50,6 +50,14 @@ type activeExecEntry struct {
 	done      chan struct{}
 }
 
+// ReconciliationState represents the operational reconciliation status between Docker daemon and database.
+type ReconciliationState struct {
+	Status         string     `json:"status"` // "pending", "completed", "failed", "unreachable"
+	LastReconciled *time.Time `json:"last_reconciled,omitempty"`
+	LastError      string     `json:"last_error,omitempty"`
+	Authoritative  bool       `json:"authoritative"`
+}
+
 type Engine struct {
 	clientMu             sync.Mutex // synchronizes streaming transport wrapping and client updates
 	dockerClient         *client.Client
@@ -81,6 +89,8 @@ type Engine struct {
 	cachedBuilderVer     atomic.Value            // stores types.BuilderVersion advertised by Docker daemon
 	startTime            time.Time               // instance boot timestamp for tracking interrupted deployments
 	publicHost           string                  // host name or IP used for browser-facing URLs
+	reconcileMu          sync.RWMutex
+	reconcileState       ReconciliationState
 }
 
 func (e *Engine) trackActiveContainer(id string) {
@@ -155,7 +165,26 @@ func NewEngine(
 		activeExecs:         make(map[uuid.UUID]*activeExecEntry),
 		collectorRegistry:   NewLogCollectorRegistry(),
 		startTime:           time.Now(),
+		reconcileState: ReconciliationState{
+			Status:        "pending",
+			Authoritative: false,
+		},
 	}
+}
+
+// GetReconciliationState returns the current reconciliation status and authoritativeness.
+func (e *Engine) GetReconciliationState() ReconciliationState {
+	e.reconcileMu.RLock()
+	defer e.reconcileMu.RUnlock()
+	return e.reconcileState
+}
+
+// IsReconciliationAuthoritative returns whether Docker engine and container state
+// have been successfully reconciled and are authoritative.
+func (e *Engine) IsReconciliationAuthoritative() bool {
+	e.reconcileMu.RLock()
+	defer e.reconcileMu.RUnlock()
+	return e.reconcileState.Authoritative
 }
 
 func (e *Engine) getCollectorRegistry() *LogCollectorRegistry {
@@ -1006,8 +1035,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 			baseURL := resolveAgentBaseURL()
 			agentToken := ""
+			expectedAgentID := ""
 			if e.sourceService != nil {
 				if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
+					if src, sErr := e.sourceService.GetSource(execCtx, srcUUID, project.OwnerID); sErr == nil && src != nil {
+						expectedAgentID = src.AgentID
+					}
 					tok, err := e.sourceService.GetDecryptedAgentToken(execCtx, project.OwnerID, srcUUID)
 					if err != nil {
 						reason := fmt.Sprintf("Local agent authorization failed: %v", err)
@@ -1048,25 +1081,14 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				}
 			}
 
-			candidateBases := make([]string, 0, 8)
-			if baseURL != "" {
-				candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
-			}
-			for _, cb := range agent.ResolveCandidateBaseURLs() {
-				found := false
-				for _, c := range candidateBases {
-					if c == cb {
-						found = true
-						break
-					}
-				}
-				if !found {
-					candidateBases = append(candidateBases, cb)
-				}
+			verifiedBase, verifyErr := agent.ResolveAndVerifyAgentBaseURL(execCtx, baseURL, expectedAgentID)
+			if verifyErr != nil {
+				reason := fmt.Sprintf("Local agent identity verification failed: %v", verifyErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
 			}
 
-			var resp *http.Response
-			var httpErr error
 			agentStreamClient := &http.Client{
 				Transport: &http.Transport{
 					DialContext: (&net.Dialer{
@@ -1077,33 +1099,22 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					ResponseHeaderTimeout: 15 * time.Second,
 				},
 			}
-			for _, candBase := range candidateBases {
-				agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?%s",
-					candBase,
-					project.SourceReference,
-					agentQuery.Encode(),
-				)
-				req, reqErr := http.NewRequestWithContext(execCtx, http.MethodGet, agentURL, nil)
-				if reqErr != nil {
-					continue
-				}
-				req.Header.Set("Authorization", "Bearer "+agentToken)
-				req.Header.Set("X-Agent-Session-Token", agentToken)
-				r, err := agentStreamClient.Do(req)
-				if err == nil {
-					resp = r
-					httpErr = nil
-					if r.StatusCode == http.StatusOK {
-						break
-					}
-					if r.StatusCode == http.StatusUnauthorized || r.StatusCode == http.StatusForbidden || r.StatusCode == http.StatusNotFound {
-						break
-					}
-					_ = r.Body.Close()
-				} else {
-					httpErr = err
-				}
+
+			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?%s",
+				verifiedBase,
+				project.SourceReference,
+				agentQuery.Encode(),
+			)
+			req, reqErr := http.NewRequestWithContext(execCtx, http.MethodGet, agentURL, nil)
+			if reqErr != nil {
+				reason := fmt.Sprintf("Failed to create agent stream request: %v", reqErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
 			}
+			req.Header.Set("Authorization", "Bearer "+agentToken)
+			req.Header.Set("X-Agent-Session-Token", agentToken)
+			resp, httpErr := agentStreamClient.Do(req)
 
 			if httpErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
 				reason := "Failed to stream source from local agent"
@@ -1261,6 +1272,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				emitStatus(models.DeployStatusFailed, nil, &reason)
 				return errors.New(reason)
 			}
+			defer func() {
+				_ = archFile.Close()
+				_ = os.Remove(archFile.Name())
+			}()
 			tarArchive = archFile
 		}
 
@@ -1454,218 +1469,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		hasExplicitRedisURL = true
 	}
 
-	// Identify all database and cache services in the project to avoid ambiguous automatic selection
-	var dbServices []*models.Service
-	var redisServices []*models.Service
-	for _, p := range allProjectServices {
-		pNameLower := strings.ToLower(p.Name)
-		pImageLower := strings.ToLower(p.Image)
-		isDB := strings.Contains(pNameLower, "postgres") || strings.Contains(pImageLower, "postgres") ||
-			strings.Contains(pNameLower, "mysql") || strings.Contains(pNameLower, "mariadb") || strings.Contains(pImageLower, "mysql") ||
-			strings.Contains(pNameLower, "mongo") || strings.Contains(pImageLower, "mongo") ||
-			pNameLower == "db" || pNameLower == "database"
-		if isDB {
-			dbServices = append(dbServices, p)
-		}
-		isCache := strings.Contains(pNameLower, "redis") || strings.Contains(pImageLower, "redis") ||
-			pNameLower == "cache" || pNameLower == "queue" || pNameLower == "valkey"
-		if isCache {
-			redisServices = append(redisServices, p)
-		}
-	}
-	isSingleDB := len(dbServices) == 1
-	isSingleRedis := len(redisServices) == 1
-
-	for _, peer := range allProjectServices {
-		peerIntPort := peer.InternalPort
-		if peerIntPort <= 0 {
-			peerIntPort = 8080
-		}
-		upperName := strings.ToUpper(strings.ReplaceAll(peer.Name, "-", "_"))
-		svcEnv = append(svcEnv, fmt.Sprintf("%s_HOST=%s", upperName, peer.Name))
-		svcEnv = append(svcEnv, fmt.Sprintf("%s_PORT=%d", upperName, peerIntPort))
-
-		peerNameLower := strings.ToLower(peer.Name)
-		peerImageLower := strings.ToLower(peer.Image)
-		isPostgres := strings.Contains(peerNameLower, "postgres") || strings.Contains(peerImageLower, "postgres")
-		isRedis := strings.Contains(peerNameLower, "redis") || strings.Contains(peerImageLower, "redis")
-		isMySQL := strings.Contains(peerNameLower, "mysql") || strings.Contains(peerNameLower, "mariadb") || strings.Contains(peerImageLower, "mysql")
-		isMongo := strings.Contains(peerNameLower, "mongo") || strings.Contains(peerImageLower, "mongo")
-
-		// Query target peer service's own configuration and secrets (not the consumer's environment!)
-		var peerEnvMap map[string]string
-		if e.secretService != nil {
-			if m, _, err := e.secretService.GetDecryptedEnvMap(execCtx, project.ID, &peer.ID, models.EnvScopeRuntime); err == nil && len(m) > 0 {
-				peerEnvMap = m
-			}
-		}
-		if peerEnvMap == nil {
-			peerEnvMap = make(map[string]string)
-		}
-
-		if isRedis {
-			redisPass := ""
-			redisUser := ""
-			if p, ok := peerEnvMap["REDIS_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
-				redisPass = p
-			}
-			if u, ok := peerEnvMap["REDIS_USER"]; ok && u != "" && u != "[REDACTED]" {
-				redisUser = u
-			}
-			redisURLObj := &url.URL{
-				Scheme: "redis",
-				Host:   fmt.Sprintf("%s:%d", peer.Name, peerIntPort),
-				Path:   "/0",
-			}
-			if redisPass != "" {
-				if redisUser != "" {
-					redisURLObj.User = url.UserPassword(redisUser, redisPass)
-				} else {
-					redisURLObj.User = url.UserPassword("", redisPass)
-				}
-				redactor.AddSecret(redisPass)
-			}
-			redisURL := redisURLObj.String()
-			redactor.AddSecret(redisURL)
-
-			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, redisURL))
-			// Unambiguous selection: only set generic REDIS_URL if there is exactly 1 redis service and not explicitly overridden
-			if !hasExplicitRedisURL && isSingleRedis {
-				svcEnv = append(svcEnv, fmt.Sprintf("REDIS_URL=%s", redisURL))
-				hasExplicitRedisURL = true
-			}
-		} else if isPostgres {
-			pgUser := "forgelab"
-			pgPass := "forgelab_dev_password"
-			pgDB := "forgelab"
-			if u, ok := peerEnvMap["POSTGRES_USER"]; ok && u != "" && u != "[REDACTED]" {
-				pgUser = u
-			}
-			if p, ok := peerEnvMap["POSTGRES_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
-				pgPass = p
-			}
-			if d, ok := peerEnvMap["POSTGRES_DB"]; ok && d != "" && d != "[REDACTED]" {
-				pgDB = d
-			}
-			// Use standard library url.UserPassword to guarantee RFC-compliant percent encoding of credentials
-			dbURLObj := &url.URL{
-				Scheme:   "postgres",
-				User:     url.UserPassword(pgUser, pgPass),
-				Host:     fmt.Sprintf("%s:%d", peer.Name, peerIntPort),
-				Path:     "/" + pgDB,
-				RawQuery: "sslmode=disable",
-			}
-			dbURL := dbURLObj.String()
-			redactor.AddSecret(pgPass)
-			redactor.AddSecret(dbURL)
-
-			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
-			// Unambiguous selection: only set generic DATABASE_URL if there is exactly 1 database and not explicitly overridden
-			if !hasExplicitDatabaseURL && isSingleDB {
-				svcEnv = append(svcEnv, fmt.Sprintf("DATABASE_URL=%s", dbURL))
-				hasExplicitDatabaseURL = true
-			}
-		} else if isMySQL {
-			myUser := "root"
-			myPass := "root"
-			myDB := "forgelab"
-			if u, ok := peerEnvMap["MYSQL_USER"]; ok && u != "" && u != "[REDACTED]" {
-				myUser = u
-			}
-			if p, ok := peerEnvMap["MYSQL_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
-				myPass = p
-			} else if p, ok := peerEnvMap["MYSQL_ROOT_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
-				myPass = p
-			}
-			if d, ok := peerEnvMap["MYSQL_DATABASE"]; ok && d != "" && d != "[REDACTED]" {
-				myDB = d
-			}
-			dbURLObj := &url.URL{
-				Scheme: "mysql",
-				User:   url.UserPassword(myUser, myPass),
-				Host:   fmt.Sprintf("%s:%d", peer.Name, peerIntPort),
-				Path:   "/" + myDB,
-			}
-			dbURL := dbURLObj.String()
-			redactor.AddSecret(myPass)
-			redactor.AddSecret(dbURL)
-			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
-			if !hasExplicitDatabaseURL && isSingleDB {
-				svcEnv = append(svcEnv, fmt.Sprintf("DATABASE_URL=%s", dbURL))
-				hasExplicitDatabaseURL = true
-			}
-		} else if isMongo {
-			mUser := ""
-			mPass := ""
-			mDB := ""
-			if u, ok := peerEnvMap["MONGO_INITDB_ROOT_USERNAME"]; ok && u != "" && u != "[REDACTED]" {
-				mUser = u
-			}
-			if p, ok := peerEnvMap["MONGO_INITDB_ROOT_PASSWORD"]; ok && p != "" && p != "[REDACTED]" {
-				mPass = p
-			}
-			if d, ok := peerEnvMap["MONGO_INITDB_DATABASE"]; ok && d != "" && d != "[REDACTED]" {
-				mDB = d
-			}
-			dbURLObj := &url.URL{
-				Scheme: "mongodb",
-				Host:   fmt.Sprintf("%s:%d", peer.Name, peerIntPort),
-				Path:   "/" + mDB,
-			}
-			if mPass != "" {
-				if mUser != "" {
-					dbURLObj.User = url.UserPassword(mUser, mPass)
-				} else {
-					dbURLObj.User = url.UserPassword("", mPass)
-				}
-				redactor.AddSecret(mPass)
-			}
-			dbURL := dbURLObj.String()
-			redactor.AddSecret(dbURL)
-			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=%s", upperName, dbURL))
-			if !hasExplicitDatabaseURL && isSingleDB {
-				svcEnv = append(svcEnv, fmt.Sprintf("DATABASE_URL=%s", dbURL))
-				hasExplicitDatabaseURL = true
-			}
-		} else {
-			svcEnv = append(svcEnv, fmt.Sprintf("%s_URL=http://%s:%d", upperName, peer.Name, peerIntPort))
-		}
-
-		if peer.Role == models.RoleBackend {
-			svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_INTERNAL_URL=http://%s:%d", peer.Name, peerIntPort))
-			if service.Role == models.RoleFrontend {
-				// Browser-side frontend requests MUST NEVER depend on private Docker DNS names!
-				browserURL := ""
-				if peer.PreviewURL != nil && *peer.PreviewURL != "" {
-					browserURL = *peer.PreviewURL
-				} else if peer.CustomDomain != nil && *peer.CustomDomain != "" {
-					browserURL = fmt.Sprintf("https://%s", *peer.CustomDomain)
-				} else if peer.HostPort != nil && *peer.HostPort > 0 {
-					host := e.GetPublicHost()
-					browserURL = fmt.Sprintf("http://%s:%d", host, *peer.HostPort)
-				}
-
-				if browserURL != "" {
-					if _, ok := runtimeEnvMap["NEXT_PUBLIC_API_URL"]; !ok {
-						svcEnv = append(svcEnv, fmt.Sprintf("NEXT_PUBLIC_API_URL=%s", browserURL))
-					}
-					if _, ok := runtimeEnvMap["VITE_API_URL"]; !ok {
-						svcEnv = append(svcEnv, fmt.Sprintf("VITE_API_URL=%s", browserURL))
-					}
-					if _, ok := runtimeEnvMap["API_URL"]; !ok {
-						svcEnv = append(svcEnv, fmt.Sprintf("API_URL=%s", browserURL))
-					}
-				}
-				// Provide container-to-container backend URL for server-side rendering (SSR)
-				if _, ok := runtimeEnvMap["BACKEND_URL"]; !ok {
-					svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_URL=http://%s:%d", peer.Name, peerIntPort))
-				}
-			} else {
-				svcEnv = append(svcEnv, fmt.Sprintf("BACKEND_URL=http://%s:%d", peer.Name, peerIntPort))
-				svcEnv = append(svcEnv, fmt.Sprintf("API_URL=http://%s:%d", peer.Name, peerIntPort))
-			}
-		}
-	}
+	interSvcEnv := e.resolveInterServiceConnectionEnv(execCtx, project, service, allProjectServices, runtimeEnvMap, redactor, hasExplicitDatabaseURL, hasExplicitRedisURL)
+	svcEnv = append(svcEnv, interSvcEnv...)
 
 	// Parse deployment plan to obtain declared network configurations and aliases
 	var plan discovery.DeploymentPlan
@@ -2928,8 +2733,12 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			}
 			baseURL := resolveAgentBaseURL()
 			agentToken := ""
+			expectedAgentID := ""
 			if e.sourceService != nil {
 				if srcUUID, err := uuid.Parse(project.SourceReference); err == nil {
+					if src, sErr := e.sourceService.GetSource(ctx, project.OwnerID, srcUUID); sErr == nil && src != nil {
+						expectedAgentID = src.AgentID
+					}
 					tok, _ := e.sourceService.GetDecryptedAgentToken(ctx, project.OwnerID, srcUUID)
 					agentToken = tok
 				}
@@ -2952,25 +2761,14 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				pkgManager = "npm"
 			}
 
-			candidateBases := make([]string, 0, 8)
-			if baseURL != "" {
-				candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
-			}
-			for _, cb := range agent.ResolveCandidateBaseURLs() {
-				found := false
-				for _, c := range candidateBases {
-					if c == cb {
-						found = true
-						break
-					}
-				}
-				if !found {
-					candidateBases = append(candidateBases, cb)
-				}
+			verifiedBase, verifyErr := agent.ResolveAndVerifyAgentBaseURL(ctx, baseURL, expectedAgentID)
+			if verifyErr != nil {
+				reason := fmt.Sprintf("Local agent identity verification failed: %v", verifyErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
 			}
 
-			var resp *http.Response
-			var httpErr error
 			agentStreamClient := &http.Client{
 				Transport: &http.Transport{
 					DialContext: (&net.Dialer{
@@ -2981,37 +2779,26 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 					ResponseHeaderTimeout: 15 * time.Second,
 				},
 			}
-			for _, candBase := range candidateBases {
-				agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s&package_manager=%s",
-					candBase,
-					project.SourceReference,
-					url.QueryEscape(cleanRelPath),
-					url.QueryEscape(deployment.RuntimeType),
-					deployment.InternalPort,
-					url.QueryEscape(deployment.StartCommand),
-					url.QueryEscape(pkgManager),
-				)
-				req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-				if reqErr != nil {
-					continue
-				}
-				req.Header.Set("Authorization", "Bearer "+agentToken)
-				req.Header.Set("X-Agent-Session-Token", agentToken)
-				r, err := agentStreamClient.Do(req)
-				if err == nil {
-					resp = r
-					httpErr = nil
-					if r.StatusCode == http.StatusOK {
-						break
-					}
-					if r.StatusCode == http.StatusUnauthorized || r.StatusCode == http.StatusForbidden || r.StatusCode == http.StatusNotFound {
-						break
-					}
-					_ = r.Body.Close()
-				} else {
-					httpErr = err
-				}
+
+			agentURL := fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=%s&runtime=%s&port=%d&start_cmd=%s&package_manager=%s",
+				verifiedBase,
+				project.SourceReference,
+				url.QueryEscape(cleanRelPath),
+				url.QueryEscape(deployment.RuntimeType),
+				deployment.InternalPort,
+				url.QueryEscape(deployment.StartCommand),
+				url.QueryEscape(pkgManager),
+			)
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+			if reqErr != nil {
+				reason := fmt.Sprintf("Failed to create agent stream request: %v", reqErr)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
 			}
+			req.Header.Set("Authorization", "Bearer "+agentToken)
+			req.Header.Set("X-Agent-Session-Token", agentToken)
+			resp, httpErr := agentStreamClient.Do(req)
 
 			if httpErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
 				reason := "Failed to stream source from local agent"
@@ -3123,6 +2910,10 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				updateStatus(models.DeployStatusFailed, &reason)
 				return errors.New(reason)
 			}
+			defer func() {
+				_ = archFile.Close()
+				_ = os.Remove(archFile.Name())
+			}()
 			tarStream = archFile
 		}
 

@@ -89,8 +89,11 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Diagnostics Access Control** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Redacts queue & log collectors on `/ready` for external callers; restricts `/health/queue` & `/health/logs` |
 | **Host Port Conflict Retries** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Automatic conflict detection, port manager re-allocation, and 3x retry on daemon collision |
 | **Build Reproducibility Fingerprinting** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Verifies local directory content fingerprint against pinned revision; fails closed on drift |
-
-
+| **Local Agent Identity Verification Probe** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Probes candidate agent endpoint before sending bearer credentials; short-lived 15m TTL tokens; explicit & workspace-delete revocation |
+| **Isolated Guest Browser Sessions** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Isolated cookie/header session per browser guest (`guest-<uuid>@forgelab.local`); safe loopback CLI fallback (`GuestUserID`) |
+| **Deployment Failure Safety Invariant** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Failed deployments or enqueue errors never destroy healthy running release; startup reconciliation authoritativeness checked on `/ready` |
+| **Live-Preview URL Suppression** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Stopped, failed, or unreachable services strictly suppress live preview URLs across services, deployments, and projects |
+| **Service Connection Diagnostics & Topology** | IMPLEMENTED | NOT RECORDED | — | — | — | — | `GET /api/projects/{id}/topology` & frontend tab: DAG execution tiers, endpoints, network badges, and actionable connection diagnostics |
 
 ---
 
@@ -1511,6 +1514,144 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Date:** —
 - **Environment:** —
 - **Notes:** —
+
+---
+
+### 28. Local Agent Identity Verification Probe & Short-Lived Credential Revocation
+
+#### Test Procedure 28.1 — Identity Verification Before Session Token Delivery
+1. Start the local agent daemon: `go run cmd/agent/main.go`.
+2. Inspect the registered agent ID (e.g. `laptop-macos` or auto-generated UUID).
+3. Attempt an unauthenticated verification probe with a spoofed/mismatched agent ID:
+   ```bash
+   curl -s -X POST http://127.0.0.1:8081/api/agent/verify-identity \
+     -H "Content-Type: application/json" \
+     -d '{"expected_agent_id":"wrong-agent-id"}'
+   ```
+4. Verify response returns `{"verified":false,"agent_id":""}` with HTTP 200 or 404.
+5. Probe with the correct `expected_agent_id`:
+   ```bash
+   curl -s -X POST http://127.0.0.1:8081/api/agent/verify-identity \
+     -H "Content-Type: application/json" \
+     -d '{"expected_agent_id":"<correct-id>"}'
+   ```
+6. Verify response returns `{"verified":true,"agent_id":"<correct-id>"}`.
+7. Trigger an agent-backed project deployment and verify in backend logs that the control plane probes identity and confirms identity before transmitting any bearer credentials or session tokens to candidate fallback URLs (`127.0.0.1:8081` or `host.docker.internal:8081`).
+8. Explicitly revoke the session token via:
+   ```bash
+   curl -s -X POST http://localhost:8080/api/sources/agent/session/revoke \
+     -H "Content-Type: application/json" \
+     -d '{"token":"<session-token>"}'
+   ```
+9. Verify that subsequent agent context requests with that token return `401 Unauthorized`.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 29. Anonymous Guest Browser Session Isolation & Registration-Free Local Usage
+
+#### Test Procedure 29.1 — Browser Guest Cookie Isolation
+1. Open an Incognito / Private browsing window (Session A) and visit `http://localhost:3000`.
+2. As a guest (unauthenticated), create a project `Guest Project A` and upload a sample application.
+3. Inspect browser developer tools > Application > Cookies and verify `forgelab_guest_session` is present with a UUID value.
+4. Open a second distinct browser or separate private window (Session B) and visit `http://localhost:3000`.
+5. Verify `Guest Project A` does NOT appear in the project list for Session B.
+6. Verify Session B receives its own distinct `forgelab_guest_session` cookie.
+7. Attempt to fetch `Guest Project A` directly via API from Session B:
+   ```bash
+   curl -s http://localhost:8080/api/projects/<project-A-id> \
+     -H "Cookie: forgelab_guest_session=<session-B-uuid>"
+   ```
+8. Verify the server returns `403 Forbidden` or `404 Not Found`.
+
+#### Test Procedure 29.2 — Local Loopback CLI Fallback
+1. Run a loopback CLI curl request without cookies:
+   ```bash
+   curl -s http://localhost:8080/api/projects
+   ```
+2. Verify the request succeeds without authentication, resolving to `models.GuestUserID` (`00000000-0000-0000-0000-000000000001`).
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 30. Deployment State Machine & Healthy Release Preservation Invariant
+
+#### Test Procedure 30.1 — Failed Deployment Leaves Prior Release Active
+1. Deploy a working service (e.g. `express-app`) and verify it reaches `RUNNING` on an allocated host port (e.g. `10025`).
+2. Verify the live application is reachable at `http://localhost:10025`.
+3. Introduce an intentional build or healthcheck failure (e.g. broken start command, failing healthcheck path `/fail-now`, or non-listening port).
+4. Trigger a new deployment of the project or service.
+5. Observe the deployment transition through `BUILDING` → `STARTING` → `HEALTH_CHECKING` → `FAILED`.
+6. Inspect the running containers via `docker ps`.
+7. Verify that the previous healthy container is STILL running and was NOT killed or removed during or after the failed deployment.
+8. Query `GET /api/projects/{id}` and verify project status remains `running` (derived via `CalculateProjectStatus` from active healthy services), not erroneously overwritten to `failed`.
+9. Send an HTTP request to `http://localhost:10025` and confirm the previous healthy release responds with zero downtime.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 31. Runtime Accuracy — Live-Preview URL Suppression
+
+#### Test Procedure 31.1 — Preview URL Omission for Non-Running Containers
+1. Deploy a project with a frontend service and verify the preview URL appears in the project header and services list when `status == "running"`.
+2. Stop the service or project using `POST /api/projects/{id}/stop` or `POST /api/projects/{id}/services/{serviceId}/stop`.
+3. Verify that `GET /api/projects/{id}` and `GET /api/projects/{id}/services` return `preview_url: null`.
+4. Check the frontend UI and verify the "Live Preview" / external URL link is hidden or disabled, displaying the stopped state accurately without misleading click-throughs.
+5. Start the project again and verify the preview URL is re-populated once the container is confirmed healthy and running.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
+---
+
+### 32. Service Connection Diagnostics & Topology View
+
+#### Test Procedure 32.1 — Topology Tab Inspection and Diagnostics
+1. Deploy a multi-service Compose project (e.g. `db` postgres infrastructure, `backend` API depending on `db`, and `frontend` depending on `backend`).
+2. Navigate to the project page in the web UI and click the **Topology & Diagnostics** tab.
+3. Verify that:
+   - **Execution Tiers** are rendered sequentially: Tier 0 (`db`), Tier 1 (`backend`), Tier 2 (`frontend`).
+   - Each service node displays its internal DNS hostname (e.g. `db:5432`, `backend:8080`), host port (if exposed), network badge (`forgelab-net-<id>`), and health check strategy.
+   - Dependency relationships (`depends_on`) are visually listed on each node.
+4. Stop or fail the `db` service container manually via Docker CLI: `docker stop <db-container-id>`.
+5. Refresh or re-inspect the Topology tab:
+   - Verify that an actionable diagnostic card appears:
+     - **Severity:** Error
+     - **Category:** `dependency`
+     - **Title:** `Upstream Dependency Failed`
+     - **Message:** Indicates that dependent services require `db` which is currently not running.
+     - **Action:** Directs operator to check database container logs.
+6. Verify `GET /api/projects/{id}/topology` returns this complete topology payload as defined in the API contract.
+
+#### Verification Record
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** —
+
 
 
 

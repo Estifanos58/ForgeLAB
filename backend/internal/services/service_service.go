@@ -338,7 +338,7 @@ func populateServicePreviewURL(svc *models.Service) {
 	if svc == nil {
 		return
 	}
-	if svc.PublicExposed && svc.HostPort != nil && *svc.HostPort > 0 {
+	if svc.PublicExposed && svc.HostPort != nil && *svc.HostPort > 0 && svc.Status == models.ServiceStatusRunning {
 		host := os.Getenv("FORGELAB_PUBLIC_HOST")
 		if host == "" {
 			host = os.Getenv("PUBLIC_HOST")
@@ -348,6 +348,8 @@ func populateServicePreviewURL(svc *models.Service) {
 		}
 		url := fmt.Sprintf("http://%s:%d", host, *svc.HostPort)
 		svc.PreviewURL = &url
+	} else {
+		svc.PreviewURL = nil
 	}
 }
 

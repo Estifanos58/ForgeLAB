@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,7 @@ var (
 )
 
 const (
-	DefaultSessionTTL = 30 * time.Minute
+	DefaultSessionTTL = 15 * time.Minute
 )
 
 // AgentSession represents a short-lived authenticated link between a user, agent, and source
@@ -137,10 +138,64 @@ func (sm *SessionManager) ExpireSession(token string) bool {
 	return false
 }
 
+// RevokeSession explicitly revokes and removes a session by token immediately.
+func (sm *SessionManager) RevokeSession(token string) bool {
+	cleanToken := strings.TrimSpace(token)
+	if cleanToken == "" {
+		return false
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if id, ok := sm.tokens[cleanToken]; ok {
+		delete(sm.tokens, cleanToken)
+		delete(sm.sessions, id)
+		return true
+	}
+	return false
+}
+
+// RevokeSessionByID explicitly revokes and removes a session by session ID immediately.
+func (sm *SessionManager) RevokeSessionByID(sessionID uuid.UUID) bool {
+	if sessionID == uuid.Nil {
+		return false
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sess, ok := sm.sessions[sessionID]; ok {
+		delete(sm.tokens, sess.Token)
+		delete(sm.sessions, sessionID)
+		return true
+	}
+	return false
+}
+
+// RevokeSourceSessions explicitly revokes all active sessions bound to the specified source ID.
+func (sm *SessionManager) RevokeSourceSessions(sourceID uuid.UUID) int {
+	if sourceID == uuid.Nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	revoked := 0
+	for id, sess := range sm.sessions {
+		if sess.SourceID != nil && *sess.SourceID == sourceID {
+			delete(sm.tokens, sess.Token)
+			delete(sm.sessions, id)
+			revoked++
+		}
+	}
+	return revoked
+}
+
 // CreateSession generates a new cryptographically secure token and session for a user and agent
 func (sm *SessionManager) CreateSession(userID uuid.UUID, agentID string, ttl time.Duration) (*AgentSession, error) {
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
+	}
+	if envTTL := os.Getenv("FORGELAB_AGENT_SESSION_TTL"); envTTL != "" {
+		if parsedTTL, err := time.ParseDuration(envTTL); err == nil && parsedTTL > 0 {
+			ttl = parsedTTL
+		}
 	}
 
 	b := make([]byte, 32)

@@ -18,6 +18,7 @@ import {
   LocalPathValidationResult,
   LogQueryOptions,
   Project,
+  ProjectTopology,
   RepositoryImport,
   Service,
   ServiceDeployment,
@@ -319,6 +320,10 @@ export const api = {
 
     async getProjectLogs(projectId: string, options?: LogQueryOptions): Promise<DeploymentLog[]> {
       return apiFetch<DeploymentLog[]>(`/api/projects/${projectId}/logs${buildLogQuery(options)}`);
+    },
+
+    async getTopology(id: string): Promise<ProjectTopology> {
+      return apiFetch<ProjectTopology>(`/api/projects/${id}/topology`);
     },
   },
 

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -33,6 +34,11 @@ type LogCollectorDiagnosticsProvider interface {
 	GetLogCollectorDiagnostics() docker.LogCollectorDiagnostics
 }
 
+type ReconciliationStateProvider interface {
+	GetReconciliationState() docker.ReconciliationState
+	IsReconciliationAuthoritative() bool
+}
+
 type DependencyStatus struct {
 	Status    string `json:"status"`               // "up" or "down"
 	LatencyMs *int64 `json:"latency_ms,omitempty"` // round-trip ping time
@@ -40,23 +46,25 @@ type DependencyStatus struct {
 }
 
 type ReadinessResponse struct {
-	Status        string                          `json:"status"` // "ready" or "not_ready"
-	Timestamp     string                          `json:"timestamp"`
-	Dependencies  map[string]DependencyStatus     `json:"dependencies"`
-	Queue         *queue.QueueDiagnostics         `json:"queue,omitempty"`
-	BuildQueue    interface{}                     `json:"build_queue,omitempty"`
-	LogCollectors *docker.LogCollectorDiagnostics `json:"log_collectors,omitempty"`
+	Status         string                          `json:"status"` // "ready" or "not_ready"
+	Timestamp      string                          `json:"timestamp"`
+	Dependencies   map[string]DependencyStatus     `json:"dependencies"`
+	Queue          *queue.QueueDiagnostics         `json:"queue,omitempty"`
+	BuildQueue     interface{}                     `json:"build_queue,omitempty"`
+	LogCollectors  *docker.LogCollectorDiagnostics `json:"log_collectors,omitempty"`
+	Reconciliation *docker.ReconciliationState     `json:"reconciliation,omitempty"`
 }
 
 type HealthHandler struct {
-	db                   *pgxpool.Pool
-	redisClient          *redis.Client
-	dockerClient         *client.Client
-	queueProvider        QueueDiagnosticsProvider
-	buildQueueProvider   BuildQueueDiagnosticsProvider
-	logCollectorProvider LogCollectorDiagnosticsProvider
-	jwtManager           *auth.JWTManager
-	trustedProxies       []string
+	db                     *pgxpool.Pool
+	redisClient            *redis.Client
+	dockerClient           *client.Client
+	queueProvider          QueueDiagnosticsProvider
+	buildQueueProvider     BuildQueueDiagnosticsProvider
+	logCollectorProvider   LogCollectorDiagnosticsProvider
+	reconciliationProvider ReconciliationStateProvider
+	jwtManager             *auth.JWTManager
+	trustedProxies         []string
 }
 
 func NewHealthHandler(db *pgxpool.Pool, redisClient *redis.Client, dockerClient *client.Client) *HealthHandler {
@@ -123,6 +131,10 @@ func (h *HealthHandler) SetBuildQueueDiagnosticsProvider(provider BuildQueueDiag
 
 func (h *HealthHandler) SetLogCollectorDiagnosticsProvider(provider LogCollectorDiagnosticsProvider) {
 	h.logCollectorProvider = provider
+}
+
+func (h *HealthHandler) SetReconciliationProvider(provider ReconciliationStateProvider) {
+	h.reconciliationProvider = provider
 }
 
 // Liveness handles GET /health (lightweight liveness probe)
@@ -232,6 +244,27 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 
+	var recState *docker.ReconciliationState
+	if h.reconciliationProvider != nil {
+		s := h.reconciliationProvider.GetReconciliationState()
+		recState = &s
+		dep := DependencyStatus{}
+		if s.Authoritative {
+			dep.Status = "up"
+		} else {
+			dep.Status = "down"
+			if s.LastError != "" {
+				dep.Error = s.LastError
+			} else {
+				dep.Error = fmt.Sprintf("reconciliation status: %s (non-authoritative)", s.Status)
+			}
+			allReady = false
+		}
+		mu.Lock()
+		deps["reconciliation"] = dep
+		mu.Unlock()
+	}
+
 	authorized := h.isAuthorizedForDiagnostics(r)
 
 	var queueDiag *queue.QueueDiagnostics
@@ -260,12 +293,13 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := ReadinessResponse{
-		Status:        overallStatus,
-		Timestamp:     time.Now().UTC().Format(time.RFC3339),
-		Dependencies:  deps,
-		Queue:         queueDiag,
-		BuildQueue:    buildDiag,
-		LogCollectors: logDiag,
+		Status:         overallStatus,
+		Timestamp:      time.Now().UTC().Format(time.RFC3339),
+		Dependencies:   deps,
+		Queue:          queueDiag,
+		BuildQueue:     buildDiag,
+		LogCollectors:  logDiag,
+		Reconciliation: recState,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

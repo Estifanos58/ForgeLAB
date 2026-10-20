@@ -319,4 +319,76 @@ func TestAuthOrGuestMiddleware_OriginSecurity(t *testing.T) {
 			t.Fatalf("expected response body to contain 'refresh required', got: %s", rec.Body.String())
 		}
 	})
+
+	t.Run("Guest_BrowserSession_AssignsUniqueGuestIDAndSetsCookie", func(t *testing.T) {
+		var capturedID uuid.UUID
+		recordHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedID, _ = middleware.GetUserID(r.Context())
+			w.WriteHeader(http.StatusOK)
+		})
+		testMw := middleware.AuthOrGuestMiddleware(jwtManager, true, allowedOrigins...)(recordHandler)
+
+		// Simulated browser request 1 without cookie
+		req1 := httptest.NewRequest("GET", "/api/projects", nil)
+		req1.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)")
+		rec1 := httptest.NewRecorder()
+		testMw.ServeHTTP(rec1, req1)
+
+		if rec1.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec1.Code)
+		}
+		if capturedID == uuid.Nil || capturedID == uuid.MustParse("00000000-0000-0000-0000-000000000001") {
+			t.Fatalf("expected fresh unique guest UUID for browser, got %v", capturedID)
+		}
+		guestCookie1 := rec1.Result().Cookies()
+		var foundCookie *http.Cookie
+		for _, c := range guestCookie1 {
+			if c.Name == "forgelab_guest_session" {
+				foundCookie = c
+				break
+			}
+		}
+		if foundCookie == nil {
+			t.Fatalf("expected forgelab_guest_session cookie to be set")
+		}
+		if foundCookie.Value != capturedID.String() {
+			t.Fatalf("cookie value %s does not match captured guest ID %s", foundCookie.Value, capturedID.String())
+		}
+
+		// Simulated browser request 2 (different browser)
+		var capturedID2 uuid.UUID
+		recordHandler2 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedID2, _ = middleware.GetUserID(r.Context())
+			w.WriteHeader(http.StatusOK)
+		})
+		testMw2 := middleware.AuthOrGuestMiddleware(jwtManager, true, allowedOrigins...)(recordHandler2)
+
+		req2 := httptest.NewRequest("GET", "/api/projects", nil)
+		req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+		rec2 := httptest.NewRecorder()
+		testMw2.ServeHTTP(rec2, req2)
+
+		if capturedID2 == capturedID {
+			t.Fatalf("two different guest browser sessions must have isolated guest IDs! Both had %v", capturedID)
+		}
+	})
+
+	t.Run("Guest_LoopbackCLIRequest_PreservesRegistrationFreeLocalUsage", func(t *testing.T) {
+		var capturedID uuid.UUID
+		recordHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedID, _ = middleware.GetUserID(r.Context())
+			w.WriteHeader(http.StatusOK)
+		})
+		testMw := middleware.AuthOrGuestMiddleware(jwtManager, true, allowedOrigins...)(recordHandler)
+
+		req := httptest.NewRequest("GET", "/api/projects", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("User-Agent", "curl/8.5.0")
+		rec := httptest.NewRecorder()
+		testMw.ServeHTTP(rec, req)
+
+		if capturedID != uuid.MustParse("00000000-0000-0000-0000-000000000001") {
+			t.Fatalf("expected local CLI curl request to default to GuestUserID, got %v", capturedID)
+		}
+	})
 }

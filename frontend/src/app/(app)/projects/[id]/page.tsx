@@ -13,12 +13,14 @@ import { ServicesSection } from '@/features/projects/services-section';
 import { LogsSection } from '@/features/projects/logs-section';
 import { DeploymentHistory } from '@/features/deployments/deployment-history';
 import { EnvManager } from '@/features/deployments/env-manager';
+import { TopologySection } from '@/features/projects/topology-section';
 import { useDeploymentWS } from '@/lib/websocket/use-deployment-ws';
 import {
   Sliders,
   Terminal,
   History,
   Lock,
+  Network,
   ArrowLeft,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
@@ -73,7 +75,7 @@ function derivePrimaryPreviewUrl(project: Project | null): string | null {
   return null;
 }
 
-type TabType = 'overview' | 'deployments' | 'logs' | 'env';
+type TabType = 'overview' | 'deployments' | 'logs' | 'env' | 'topology';
 
 export default function ProjectPage({ params }: ProjectPageProps) {
   const routeParams = useParams();
@@ -654,6 +656,20 @@ export default function ProjectPage({ params }: ProjectPageProps) {
             <Lock className="w-3.5 h-3.5" />
             <span>Environment</span>
           </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('topology')}
+            className={cn(
+              'px-3 py-2 border-b-2 flex items-center gap-1.5 transition-colors -mb-px',
+              activeTab === 'topology'
+                ? 'border-white text-white'
+                : 'border-transparent text-neutral-400 hover:text-neutral-200'
+            )}
+          >
+            <Network className="w-3.5 h-3.5" />
+            <span>Topology & Diagnostics</span>
+          </button>
         </div>
 
         {/* Tab 1: Overview */}
@@ -778,6 +794,11 @@ export default function ProjectPage({ params }: ProjectPageProps) {
           <div className="flex-1 min-h-0 h-full overflow-y-auto max-w-4xl pr-2">
             <EnvManager projectId={project.id} services={services} />
           </div>
+        )}
+
+        {/* Tab 5: Service Topology & Connection Diagnostics */}
+        {activeTab === 'topology' && (
+          <TopologySection projectId={project.id} />
         )}
       </main>
     </div>

@@ -237,6 +237,7 @@ func (s *AgentServer) Router() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/agent/status", s.handleStatus)
+	mux.HandleFunc("/api/agent/verify-identity", s.handleVerifyIdentity)
 	mux.HandleFunc("/api/agent/select-folder", s.requireAuth(s.handleSelectFolder))
 	mux.HandleFunc("/api/agent/select-path", s.requireAuth(s.handleSelectPath))
 	mux.HandleFunc("/api/agent/sources/", s.requireSourceAuth(s.handleSourcesRoutes))
@@ -655,15 +656,28 @@ func (s *AgentServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !authenticated {
+		expectedID := strings.TrimSpace(r.Header.Get("X-Expected-Agent-ID"))
+		if expectedID == "" {
+			expectedID = strings.TrimSpace(r.URL.Query().Get("expected_agent_id"))
+		}
+
+		verifiedAgentID := ""
+		idVerified := false
+		if expectedID != "" && expectedID == s.agentID {
+			verifiedAgentID = s.agentID
+			idVerified = true
+		}
+
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"status":           "online",
-			"version":          s.version,
-			"commit":           s.commitSHA,
-			"os":               runtime.GOOS,
-			"arch":             runtime.GOARCH,
-			"docker_available": dockerAvailable,
-			"agent_id":         "",
-			"active_sessions":  0,
+			"status":            "online",
+			"version":           s.version,
+			"commit":            s.commitSHA,
+			"os":                runtime.GOOS,
+			"arch":              runtime.GOARCH,
+			"docker_available":  dockerAvailable,
+			"agent_id":          verifiedAgentID,
+			"agent_id_verified": idVerified,
+			"active_sessions":   0,
 		})
 		return
 	}
@@ -682,6 +696,54 @@ func (s *AgentServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"docker_available": dockerAvailable,
 		"active_sessions":  sessionCount,
 	})
+}
+
+// handleVerifyIdentity allows the backend to verify the agent's identity without exposing credentials.
+func (s *AgentServer) handleVerifyIdentity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		AgentID string `json:"agent_id"`
+		Nonce   string `json:"nonce,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"verified": false,
+			"error":    "invalid JSON payload",
+		})
+		return
+	}
+
+	reqID := strings.TrimSpace(req.AgentID)
+	if reqID == "" || reqID != s.agentID {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{
+			"verified": false,
+			"error":    "agent ID mismatch",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"verified": true,
+		"agent_id": s.agentID,
+		"version":  s.version,
+		"commit":   s.commitSHA,
+	})
+}
+
+// RevokeSession explicitly revokes and cleans up a session in the agent server.
+func (s *AgentServer) RevokeSession(sourceID uuid.UUID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.sessions[sourceID]; exists {
+		delete(s.sessions, sourceID)
+		DeleteLocalSourceSession(sourceID)
+		return true
+	}
+	return false
 }
 
 // handleSelectFolder opens the native OS directory chooser dialog

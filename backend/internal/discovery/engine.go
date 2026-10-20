@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,6 +69,14 @@ type PlanOptions struct {
 
 // Discover inspects a local repository workspace and produces an authoritative DiscoveryResult.
 func Discover(repoRoot string) (*DiscoveryResult, error) {
+	return DiscoverWithContext(context.Background(), repoRoot)
+}
+
+// DiscoverWithContext inspects a local repository workspace with context cancellation and bounded resource consumption.
+func DiscoverWithContext(ctx context.Context, repoRoot string) (*DiscoveryResult, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	cleanRoot := filepath.Clean(repoRoot)
 	info, err := os.Stat(cleanRoot)
 	if err != nil {
@@ -84,6 +93,9 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 
 	// 1. Check for Docker Compose definition first
 	if composePath, found := FindComposeFile(cleanRoot); found {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		topology, services, err := ParseComposeFile(composePath, cleanRoot)
 		if err != nil {
 			return nil, fmt.Errorf("malformed compose file '%s': %w", filepath.Base(composePath), err)
@@ -94,6 +106,9 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 
 		// For services with build contexts, enrich with technology detection
 		for i := range services {
+			if ctx != nil && ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if services[i].BuildStrategy != "image" && services[i].BuildContext != "" {
 				bDir := filepath.Join(cleanRoot, filepath.FromSlash(services[i].BuildContext))
 				if files, err := readDirectoryManifests(bDir); err == nil && len(files) > 0 {
@@ -128,8 +143,8 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 
 		depMap, _, _ := BuildDAG(services)
 
-		totalFiles, totalBytes := quickStatScan(cleanRoot)
-		fp, _ := ComputeLightweightDirectoryFingerprint(cleanRoot)
+		totalFiles, totalBytes := quickStatScan(ctx, cleanRoot)
+		fp, _ := ComputeDirectoryContentFingerprintWithContext(ctx, cleanRoot)
 		var warnings []string
 		if topology != nil && len(topology.Warnings) > 0 {
 			warnings = append(warnings, topology.Warnings...)
@@ -152,6 +167,9 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 	var services []DiscoveredService
 
 	for _, relPath := range servicePaths {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		svcDir := filepath.Join(cleanRoot, filepath.FromSlash(relPath))
 		svc, err := inspectServiceDirectory(cleanRoot, svcDir, relPath)
 		if err == nil && svc != nil {
@@ -188,14 +206,14 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 	envFiles := discoverEnvFiles(cleanRoot)
 	rootEnvVars := scanEnvFileProvenance(cleanRoot, envFiles)
 
-	totalFiles, totalBytes := quickStatScan(cleanRoot)
+	totalFiles, totalBytes := quickStatScan(ctx, cleanRoot)
 
 	depMap := make(map[string][]string)
 	for _, s := range services {
 		depMap[s.Name] = s.DependsOn
 	}
 
-	fp, _ := ComputeLightweightDirectoryFingerprint(cleanRoot)
+	fp, _ := ComputeDirectoryContentFingerprintWithContext(ctx, cleanRoot)
 	return &DiscoveryResult{
 		RepositoryName: repoName,
 		Topology: DiscoveredTopology{
@@ -212,16 +230,50 @@ func Discover(repoRoot string) (*DiscoveryResult, error) {
 	}, nil
 }
 
-func quickStatScan(cleanRoot string) (totalFiles int, totalBytes int64) {
+func quickStatScan(ctx context.Context, cleanRoot string) (totalFiles int, totalBytes int64) {
+	canonicalRoot, err := filepath.EvalSymlinks(cleanRoot)
+	if err != nil {
+		canonicalRoot = cleanRoot
+	}
+
+	const (
+		maxFilesScan = 50000
+		maxBytesScan = 500 * 1024 * 1024 // 500 MB
+	)
+
 	_ = filepath.WalkDir(cleanRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if totalFiles >= maxFilesScan || totalBytes >= maxBytesScan {
+			return filepath.SkipAll
+		}
 		if d.IsDir() {
-			if IsPrunedDir(d.Name()) {
+			if path != cleanRoot && IsPrunedDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		// Handle symlink escape protection
+		if d.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return nil
+			}
+			resolved := target
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(filepath.Dir(path), target)
+			}
+			if real, err := filepath.EvalSymlinks(resolved); err == nil {
+				resolved = real
+			}
+			rel, err := filepath.Rel(canonicalRoot, resolved)
+			if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+				return nil // skip symlink pointing outside workspace
+			}
 		}
 		if !IsSecretFile(d.Name()) {
 			totalFiles++

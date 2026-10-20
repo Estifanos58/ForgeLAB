@@ -197,6 +197,17 @@ The status classifications strictly follow these definitions:
 | **WebSocket Event Replay Service** | IMPLEMENTED | NOT RECORDED | Replay from PostgreSQL on WebSocket subscription when `last_sequence > 0` across project and deployment channels |
 | **Log Filtering & Bounded Cursor Pagination** | IMPLEMENTED | NOT RECORDED | All Logs / Deployment / Production filters, All Services aggregation, subquery-based recent log retrieval, bounded 2000-entry frontend memory |
 | **Multi-Node Workers** | NOT IMPLEMENTED | — | In-process embedded worker active; multi-node deferred |
+| **Local Agent Identity Verification Probe** | IMPLEMENTED | NOT RECORDED | Probes candidate agent endpoint identity (`/api/agent/verify-identity`) before sending bearer credentials; prevents token transmission to unverified fallbacks; short-lived 15m TTL tokens; explicit and workspace-delete revocation |
+| **Isolated Guest Browser Sessions** | IMPLEMENTED | NOT RECORDED | Cookie/header-based isolated guest identity (`guest-<uuid>@forgelab.local`) prevents anonymous browser users from accessing one another's projects, logs, or secrets; preserves registration-free loopback CLI usage (`GuestUserID`) |
+| **Deployment Reliability & Release Invariants** | IMPLEMENTED | NOT RECORDED | Failed deployments or enqueue failures never destroy healthy running releases; status computed via `CalculateProjectStatus`; startup reconciliation authoritativeness gated on `/ready` (503 when non-authoritative) |
+| **Bounded Discovery & Leak-Free Build Context** | IMPLEMENTED | NOT RECORDED | `DiscoverWithContext` with 50k file / 500MB bounds, context cancellation, symlink directory escape validation, progress logging every 1,000 files, and leak-free `defer os.Remove` of temporary build archives |
+| **Runtime Accuracy & Preview URL Suppression** | IMPLEMENTED | NOT RECORDED | Stopped, failed, or unreachable services strictly suppress live preview URLs across ServiceService, DeploymentService, and ProjectService; Docker state reconciled on restart |
+| **Service Connection Diagnostics & Topology Graph** | IMPLEMENTED | NOT RECORDED | `GET /api/projects/{id}/topology` and frontend tab: visualizes DAG execution tiers, service connection endpoints, network badges, and actionable diagnostics for port collisions, missing dependencies, failed upstreams, and database connection strings |
+| **Automatic HTTPS & Reverse Proxy (Caddy)** | DEFERRED | — | Planned future roadmap item; local host port allocation and port mapping active |
+| **GitHub Push-to-Deploy & Webhook Pipeline** | DEFERRED | — | Planned future roadmap item; manual commit-pinned deployment active |
+| **Pull-Request Preview Environments** | DEFERRED | — | Planned future roadmap item; project and service deployment pipelines active |
+| **Full Observability Infrastructure (APM/OTel)** | DEFERRED | — | Planned future roadmap item; bounded container log streaming and `/health/*` diagnostics active |
+
 
 ---
 

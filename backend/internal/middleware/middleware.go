@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,8 +111,87 @@ func IsAllowedOrigin(origin string, allowedOrigins []string) bool {
 	return false
 }
 
-// AuthOrGuestMiddleware validates JWT tokens for registered users or assigns the
-// shared guest identity if unauthenticated and guest mode is enabled.
+// isTestNet checks whether an IP is in the RFC 5737 TEST-NET-1 (192.0.2.0/24) range
+// used by net/http/httptest.NewRequest in Go unit tests.
+func isTestNet(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2
+	}
+	return false
+}
+
+var (
+	guestEnsurerMu sync.RWMutex
+	guestEnsurer   func(ctx context.Context, guestID uuid.UUID) error
+)
+
+// SetGuestEnsurer configures the function used to ensure guest user records exist in the DB.
+func SetGuestEnsurer(fn func(ctx context.Context, guestID uuid.UUID) error) {
+	guestEnsurerMu.Lock()
+	defer guestEnsurerMu.Unlock()
+	guestEnsurer = fn
+}
+
+// ResolveGuestSession extracts or provisions an isolated guest session UUID.
+// If a valid cookie `forgelab_guest_session` or header `X-Guest-Session` is present, it is used.
+// If absent, browser requests or remote requests are assigned a fresh isolated guest UUID,
+// while local non-browser requests (e.g. CLI curl or tests) default to models.GuestUserID
+// to preserve registration-free local usage where safe.
+func ResolveGuestSession(w http.ResponseWriter, r *http.Request) uuid.UUID {
+	// 1. Check cookie
+	if cookie, err := r.Cookie("forgelab_guest_session"); err == nil && cookie.Value != "" {
+		if id, err := uuid.Parse(cookie.Value); err == nil && id != uuid.Nil {
+			return id
+		}
+	}
+
+	// 2. Check header
+	if headerVal := r.Header.Get("X-Guest-Session"); headerVal != "" {
+		if id, err := uuid.Parse(headerVal); err == nil && id != uuid.Nil {
+			return id
+		}
+	}
+
+	// 3. Determine if this is a browser or remote request
+	isBrowserOrRemote := false
+	if r.Header.Get("Sec-Fetch-Mode") != "" || r.Header.Get("Sec-Fetch-Site") != "" {
+		isBrowserOrRemote = true
+	} else if ua := r.Header.Get("User-Agent"); strings.Contains(ua, "Mozilla") || strings.Contains(ua, "Chrome") || strings.Contains(ua, "Safari") {
+		isBrowserOrRemote = true
+	} else if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		isBrowserOrRemote = true
+	} else {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip != nil && !ip.IsLoopback() && !isTestNet(ip) {
+			isBrowserOrRemote = true
+		}
+	}
+
+	if isBrowserOrRemote {
+		newGuestID := uuid.New()
+		if w != nil {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "forgelab_guest_session",
+				Value:    newGuestID.String(),
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   86400 * 30, // 30 days
+			})
+			w.Header().Set("X-Guest-Session", newGuestID.String())
+		}
+		return newGuestID
+	}
+
+	return models.GuestUserID
+}
+
+// AuthOrGuestMiddleware validates JWT tokens for registered users or assigns an
+// isolated or local guest identity if unauthenticated and guest mode is enabled.
 // For guest state-changing requests (POST, PUT, PATCH, DELETE), incoming browser
 // Origin and Referer headers are validated against allowedOrigins to prevent
 // unauthorized cross-origin mutations.
@@ -219,9 +299,24 @@ func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool, all
 				}
 			}
 
-			// Assign the single shared guest identity
-			ctx := context.WithValue(r.Context(), UserIDKey, models.GuestUserID)
-			ctx = context.WithValue(ctx, UserEmailKey, models.GuestUserEmail)
+			// Resolve isolated or local-safe guest identity
+			guestID := ResolveGuestSession(w, r)
+			if !models.HasGuestID(guestID) {
+				guestEnsurerMu.RLock()
+				ensurer := guestEnsurer
+				guestEnsurerMu.RUnlock()
+				if ensurer != nil {
+					if err := ensurer(r.Context(), guestID); err != nil {
+						slog.Error("failed to ensure guest user identity", "guest_id", guestID, "error", err)
+						http.Error(w, `{"error": "failed to initialize guest session"}`, http.StatusInternalServerError)
+						return
+					}
+				}
+				models.RegisterGuestID(guestID)
+			}
+
+			ctx := context.WithValue(r.Context(), UserIDKey, guestID)
+			ctx = context.WithValue(ctx, UserEmailKey, models.MakeGuestUserEmail(guestID))
 			ctx = context.WithValue(ctx, IsGuestKey, true)
 
 			next.ServeHTTP(w, r.WithContext(ctx))

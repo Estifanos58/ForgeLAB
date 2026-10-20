@@ -400,3 +400,63 @@ func TestHealthHandler_DiagnosticsRestrictedForExternalCallers(t *testing.T) {
 		t.Errorf("expected 200 OK for authenticated user on /health/queue, got %d", recAuthQueue.Code)
 	}
 }
+
+type mockReconciliationProvider struct {
+	state docker.ReconciliationState
+}
+
+func (m *mockReconciliationProvider) GetReconciliationState() docker.ReconciliationState {
+	return m.state
+}
+
+func (m *mockReconciliationProvider) IsReconciliationAuthoritative() bool {
+	return m.state.Authoritative
+}
+
+func TestHealthHandler_Readiness_WithReconciliationDiagnostics(t *testing.T) {
+	// Case 1: reconciliation pending -> non-authoritative -> not_ready
+	h := NewHealthHandler(nil, nil, nil)
+	h.SetReconciliationProvider(&mockReconciliationProvider{
+		state: docker.ReconciliationState{
+			Status:        "pending",
+			Authoritative: false,
+		},
+	})
+
+	req := httptest.NewRequest("GET", "/ready", nil)
+	rec := httptest.NewRecorder()
+	h.Readiness(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for non-authoritative reconciliation, got %d", rec.Code)
+	}
+
+	var resp ReadinessResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	if resp.Dependencies["reconciliation"].Status != "down" {
+		t.Errorf("expected reconciliation status to be down, got %s", resp.Dependencies["reconciliation"].Status)
+	}
+
+	// Case 2: authoritative completed reconciliation
+	now := time.Now().UTC()
+	h2 := NewHealthHandler(nil, nil, nil)
+	h2.SetReconciliationProvider(&mockReconciliationProvider{
+		state: docker.ReconciliationState{
+			Status:         "completed",
+			LastReconciled: &now,
+			Authoritative:  true,
+		},
+	})
+	rec2 := httptest.NewRecorder()
+	h2.Readiness(rec2, req)
+	var resp2 ReadinessResponse
+	_ = json.Unmarshal(rec2.Body.Bytes(), &resp2)
+	if resp2.Dependencies["reconciliation"].Status != "up" {
+		t.Errorf("expected reconciliation status to be up, got %s", resp2.Dependencies["reconciliation"].Status)
+	}
+	if resp2.Reconciliation == nil || !resp2.Reconciliation.Authoritative {
+		t.Errorf("expected authoritative reconciliation in response")
+	}
+}

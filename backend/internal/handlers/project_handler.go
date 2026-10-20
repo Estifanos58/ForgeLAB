@@ -141,6 +141,49 @@ func (h *ProjectHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, project)
 }
 
+// GetTopology handles GET /api/projects/{id}/topology
+func (h *ProjectHandler) GetTopology(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	// Verify project access
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	if h.dockerEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "execution engine unavailable")
+		return
+	}
+
+	topology, err := h.dockerEngine.GetProjectTopology(r.Context(), projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to build project topology: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, topology)
+}
+
 // Update handles PATCH /api/projects/{id}
 func (h *ProjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 	userID, ok := getUserIDFromContext(r)
@@ -264,8 +307,7 @@ func (h *ProjectHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	if h.deployQueue != nil {
 		if err := h.deployQueue.EnqueueDeployment(r.Context(), deployment.ID); err != nil {
 			reason := "failed to enqueue deployment job: " + err.Error()
-			_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), deployment.ID, models.DeployStatusFailed, &reason)
-			_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
+			h.handleEnqueueFailure(r.Context(), projectID, deployment.ID, reason)
 			writeError(w, http.StatusServiceUnavailable, "deployment queue unavailable: "+err.Error())
 			return
 		}
@@ -275,13 +317,23 @@ func (h *ProjectHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		}()
 	} else {
 		reason := "no functioning deployment queue or execution engine available"
-		_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), deployment.ID, models.DeployStatusFailed, &reason)
-		_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
+		h.handleEnqueueFailure(r.Context(), projectID, deployment.ID, reason)
 		writeError(w, http.StatusServiceUnavailable, reason)
 		return
 	}
 
 	writeJSON(w, http.StatusCreated, deployment)
+}
+
+func (h *ProjectHandler) handleEnqueueFailure(ctx context.Context, projectID uuid.UUID, deploymentID uuid.UUID, failureReason string) {
+	_ = h.deploymentService.UpdateDeploymentStatus(ctx, deploymentID, models.DeployStatusFailed, &failureReason)
+	// A failed deployment attempt must never destroy the previous healthy release.
+	proj, err := h.projectService.GetProjectByIDWithoutOwnership(ctx, projectID)
+	if err == nil && proj != nil && proj.CurrentDeploymentID != nil && len(proj.Services) > 0 {
+		_ = h.projectService.UpdateProjectStatus(ctx, projectID, services.CalculateProjectStatus(proj.Services))
+	} else {
+		_ = h.projectService.UpdateProjectStatus(ctx, projectID, models.ProjectStatusFailed)
+	}
 }
 
 // Stop handles POST /api/projects/{id}/stop
@@ -443,8 +495,7 @@ func (h *ProjectHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	if h.deployQueue != nil {
 		if err := h.deployQueue.EnqueueDeployment(r.Context(), newDeploy.ID); err != nil {
 			reason := "failed to enqueue rollback deployment: " + err.Error()
-			_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), newDeploy.ID, models.DeployStatusFailed, &reason)
-			_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
+			h.handleEnqueueFailure(r.Context(), projectID, newDeploy.ID, reason)
 			writeError(w, http.StatusServiceUnavailable, "deployment queue unavailable: "+err.Error())
 			return
 		}
@@ -454,8 +505,7 @@ func (h *ProjectHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		}()
 	} else {
 		reason := "no functioning deployment queue or execution engine available"
-		_ = h.deploymentService.UpdateDeploymentStatus(r.Context(), newDeploy.ID, models.DeployStatusFailed, &reason)
-		_ = h.projectService.UpdateProjectStatus(r.Context(), projectID, models.ProjectStatusFailed)
+		h.handleEnqueueFailure(r.Context(), projectID, newDeploy.ID, reason)
 		writeError(w, http.StatusServiceUnavailable, reason)
 		return
 	}

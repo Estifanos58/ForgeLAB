@@ -55,6 +55,7 @@ func setupGuestTestRouter(
 	sourceService := services.NewSourceService(pool, tempSourcesDir, encryptor)
 	userService := services.NewUserService(pool, jwtManager)
 	require.NoError(t, userService.EnsureGuestUser(context.Background()))
+	middleware.SetGuestEnsurer(userService.EnsureGuestUserWithID)
 
 	serviceService := services.NewServiceService(pool)
 	projectService := services.NewProjectService(pool, nil, sourceService, nil)

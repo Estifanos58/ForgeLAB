@@ -82,6 +82,10 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 		canonicalContextDir = filepath.Clean(opts.BuildContextDir)
 	}
 
+	if opts.EmitLog != nil {
+		opts.EmitLog("build", "system", fmt.Sprintf("Preparing build context archive from %s...", filepath.Base(opts.BuildContextDir)))
+	}
+
 	tw := tar.NewWriter(w)
 
 	// 1. Write virtual files first (e.g. Dockerfile.forgelab)
@@ -290,6 +294,10 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 				return fmt.Errorf("tar payload size mismatch for %s: declared %d bytes, wrote %d bytes", slashRelPath, expectedSize, written)
 			}
 
+			if opts.EmitLog != nil && filesCount%1000 == 0 {
+				opts.EmitLog("build", "system", fmt.Sprintf("Archiving build context: %d files (%.1f MB) processed...", filesCount, float64(bytesCount)/(1024*1024)))
+			}
+
 			return nil
 		})
 
@@ -300,6 +308,10 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 
 	if err := tw.Close(); err != nil {
 		return filesCount, bytesCount, fmt.Errorf("failed to finalize tar archive (tar.Writer.Close): %w", err)
+	}
+
+	if opts.EmitLog != nil {
+		opts.EmitLog("build", "system", fmt.Sprintf("Build context archive prepared: %d files, %.2f MB total.", filesCount, float64(bytesCount)/(1024*1024)))
 	}
 
 	return filesCount, bytesCount, nil

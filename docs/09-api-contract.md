@@ -37,9 +37,10 @@
 - Access tokens expire after 15 minutes (`JWT_ACCESS_TOKEN_EXPIRY`).
 - Refresh tokens expire after 7 days (`JWT_REFRESH_TOKEN_EXPIRY`) and use atomic single-use rotation.
 
-### Registration-Free Guest Workspace (Local Deployments)
-- When `FORGELAB_ALLOW_GUEST_MODE=true` (or in local development `isDev`), unauthenticated requests to local deployment endpoints (`/api/sources/*`, `/api/discovery/plan`, `/api/projects/*`, and `/api/ws`) use `middleware.AuthOrGuestMiddleware` and resolve to the single internal guest identity `00000000-0000-0000-0000-000000000001` (`guest@forgelab.local`).
-- No guest tokens, cookies, or sessions are issued to anonymous visitors.
+### Registration-Free Guest Workspace & Isolated Guest Sessions (Local Deployments)
+- When `FORGELAB_ALLOW_GUEST_MODE=true` (or in local development `isDev`), unauthenticated requests to local deployment endpoints (`/api/sources/*`, `/api/discovery/plan`, `/api/projects/*`, and `/api/ws`) use `middleware.AuthOrGuestMiddleware`.
+- **Browser Isolation:** Anonymous browser visitors are issued an isolated guest UUID and given a secure HttpOnly cookie `forgelab_guest_session` and header `X-Guest-Session`. The corresponding user record (`guest-<uuid>@forgelab.local`) is automatically provisioned in PostgreSQL. This guarantees anonymous browser users cannot access one another's projects, sources, logs, or secrets.
+- **Local CLI Usage:** Local non-browser requests (e.g. `curl` or automated local scripts originating on loopback without browser session headers) resolve to the safe installation-level guest identity `00000000-0000-0000-0000-000000000001` (`guest@forgelab.local`), preserving frictionless local CLI workflows.
 - All GitHub integrations (`/api/integrations/github/*`) and `source_type: "github"` strictly require registered accounts and reject guest requests with `401 Unauthorized` or `403 Forbidden`.
 - `GET /api/auth/mode` returns installation guest mode configuration (`allow_guest_mode`, `guest_user_id`).
 
@@ -742,6 +743,73 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ---
 
+### `GET /api/projects/{id}/topology`
+- **Authentication:** Supported (Bearer JWT or Guest session)
+- **Authorization:** Checks project ownership.
+- **Description:** Returns the authoritative service connection topology and actionable diagnostics graph for the project. Reuses ForgeLAB's existing discovery and deployment-plan DAG architecture.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "project_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "project_name": "ecommerce-stack",
+    "network_name": "forgelab-net-3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "tiers": [
+      ["db", "redis"],
+      ["backend"],
+      ["frontend"]
+    ],
+    "services": [
+      {
+        "id": "e4b3e8c9-...",
+        "name": "db",
+        "role": "other",
+        "classification": "infrastructure",
+        "status": "running",
+        "internal_hostname": "db",
+        "internal_port": 5432,
+        "network_name": "forgelab-net-3fa85f64-...",
+        "network_aliases": ["db"],
+        "health_strategy": "none",
+        "health_check_path": "/",
+        "depends_on": [],
+        "tier": 0
+      },
+      {
+        "id": "f5c4d9e0-...",
+        "name": "backend",
+        "role": "backend",
+        "classification": "application",
+        "status": "running",
+        "internal_hostname": "backend",
+        "internal_port": 8080,
+        "host_port": 10042,
+        "network_name": "forgelab-net-3fa85f64-...",
+        "network_aliases": ["backend"],
+        "health_strategy": "http",
+        "health_check_path": "/health",
+        "depends_on": ["db", "redis"],
+        "tier": 1
+      }
+    ],
+    "diagnostics": [
+      {
+        "severity": "info",
+        "category": "dns",
+        "service_name": "backend",
+        "title": "Internal Service DNS Available",
+        "message": "Service reachable internally on forgelab-net-... at backend:8080",
+        "action": "Use backend:8080 or BACKEND_URL for inter-service communication within the project network"
+      }
+    ]
+  }
+  ```
+- **Error Responses:**
+  - `401 Unauthorized`: Not authenticated and guest mode disabled.
+  - `403 Forbidden`: User does not own the project.
+  - `404 Not Found`: Project does not exist.
+
+---
+
 ## 6. Environment Variables & Secrets (`/api/projects/{id}/env`)
 
 ### `GET /api/projects/{id}/env`
@@ -1212,6 +1280,49 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
     "expires_at": "2026-10-01T14:00:00Z"
   }
   ```
+
+---
+
+### `POST /api/sources/agent/session/revoke`
+- **Authentication:** Supported (Bearer JWT or Guest session)
+- **Purpose:** Revokes an active agent session immediately by token, session ID, or bound source workspace ID.
+- **Request Body:**
+  ```json
+  {
+    "token": "sess_tok_991823ab",
+    "session_id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+    "source_id": "2b3c4d5e-6f7a-8b9c-0d1e-2f3a4b5c6d7e"
+  }
+  ```
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "revoked": true,
+    "message": "agent session revoked"
+  }
+  ```
+
+---
+
+### Local Agent Daemon: `POST /api/agent/verify-identity`
+- **Daemon URL:** `http://localhost:8081` (or `host.docker.internal:8081`)
+- **Authentication:** None (Preflight identity verification probe)
+- **Purpose:** Allows the ForgeLAB control plane to verify candidate agent endpoint identity before transmitting any bearer credentials or session tokens.
+- **Request Body:**
+  ```json
+  {
+    "expected_agent_id": "laptop-macos"
+  }
+  ```
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "verified": true,
+    "agent_id": "laptop-macos",
+    "agent_name": "My MacBook Pro"
+  }
+  ```
+- **Failure Response:** `200 OK` with `verified: false` or `404 Not Found`.
 
 ---
 

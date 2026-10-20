@@ -820,11 +820,25 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 // 3. Syncs active host port allocations with the in-memory port manager.
 func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 	if e.dockerClient == nil {
+		e.reconcileMu.Lock()
+		e.reconcileState = ReconciliationState{
+			Status:        "unreachable",
+			LastError:     "docker client not initialized",
+			Authoritative: false,
+		}
+		e.reconcileMu.Unlock()
 		return nil
 	}
 
 	containers, err := e.dockerClient.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
+		e.reconcileMu.Lock()
+		e.reconcileState = ReconciliationState{
+			Status:        "failed",
+			LastError:     err.Error(),
+			Authoritative: false,
+		}
+		e.reconcileMu.Unlock()
 		return fmt.Errorf("failed to list docker containers for reconciliation: %w", err)
 	}
 
@@ -1128,6 +1142,15 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 
 	// 5. Prune orphaned ForgeLAB networks with zero connected containers
 	_ = e.PruneDanglingNetworks(ctx)
+
+	now := time.Now().UTC()
+	e.reconcileMu.Lock()
+	e.reconcileState = ReconciliationState{
+		Status:         "completed",
+		LastReconciled: &now,
+		Authoritative:  true,
+	}
+	e.reconcileMu.Unlock()
 
 	return nil
 }

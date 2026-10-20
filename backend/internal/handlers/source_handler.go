@@ -214,7 +214,45 @@ func (h *SourceHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Revoke active agent sessions associated with this source workspace
+	agent.GetGlobalSessionManager().RevokeSourceSessions(sourceID)
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "source workspace deleted successfully"})
+}
+
+// RevokeAgentSession handles POST /api/sources/agent/session/revoke
+func (h *SourceHandler) RevokeAgentSession(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token     string `json:"token"`
+		SessionID string `json:"session_id"`
+		SourceID  string `json:"source_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	sm := agent.GetGlobalSessionManager()
+	revoked := false
+
+	if req.Token != "" {
+		revoked = sm.RevokeSession(req.Token) || revoked
+	}
+	if req.SessionID != "" {
+		if sID, err := uuid.Parse(req.SessionID); err == nil {
+			revoked = sm.RevokeSessionByID(sID) || revoked
+		}
+	}
+	if req.SourceID != "" {
+		if srcID, err := uuid.Parse(req.SourceID); err == nil {
+			count := sm.RevokeSourceSessions(srcID)
+			if count > 0 {
+				revoked = true
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"revoked": revoked,
+		"message": "agent session revoked",
+	})
 }
 
 // ValidateLocalPathRequest defines payload for POST /api/sources/local/validate

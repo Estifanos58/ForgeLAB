@@ -261,6 +261,30 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Location:** [`backend/internal/config/config.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/config/config.go), [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/cmd/server/main.go`](file:///home/estif/Projects/ForgeLAB/backend/cmd/server/main.go)
 - **Resolution:** Configured `PublicHost` via `FORGELAB_PUBLIC_HOST` or `PUBLIC_HOST` (falling back to host from `FRONTEND_URL`), preventing remote deployments from erroneously generating `localhost` browser URLs.
 
+### 31. Local Agent Endpoint Identity Verification & Token Revocability (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/agent/server.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/agent/server.go), [`backend/internal/agent/client.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/agent/client.go), [`backend/internal/agent/session.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/agent/session.go), [`backend/internal/handlers/source_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/source_handler.go)
+- **Resolution:** Added preflight unauthenticated identity verification probes (`POST /api/agent/verify-identity` and `GET /api/agent/status` with `X-Expected-Agent-ID`). The control plane verifies endpoint identity BEFORE transmitting bearer credentials, preventing session tokens from ever being sent to unverified fallback endpoints. Tokens default to a short 15-minute TTL (`FORGELAB_AGENT_SESSION_TTL`), support explicit revocation via `POST /api/sources/agent/session/revoke`, and are automatically revoked upon source workspace deletion.
+
+### 32. Isolated Anonymous Browser Sessions & Safe Local Fallback (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/middleware/middleware.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/middleware/middleware.go), [`backend/internal/services/user_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/user_service.go), [`backend/internal/websocket/hub.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/websocket/hub.go)
+- **Resolution:** Anonymous browser users are assigned an isolated guest UUID and cookie (`forgelab_guest_session`) / header (`X-Guest-Session`) with provisioned database records (`guest-<uuid>@forgelab.local`), preventing anonymous users from accessing one another's projects, logs, or secrets. Local non-browser loopback requests (`curl`, scripts, test harnesses) resolve safely to `models.GuestUserID`, preserving registration-free local CLI workflows.
+
+### 33. Deployment Reliability & Non-Destructive Failure Invariant (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/handlers/project_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/project_handler.go), [`backend/internal/docker/engine_lifecycle.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_lifecycle.go), [`backend/internal/handlers/health_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/health_handler.go)
+- **Resolution:** Enqueue failures never claim successful queueing (properly failing deployment record with HTTP 500 error). If an active release is running, enqueue or deployment failures derive project status via `CalculateProjectStatus` rather than destroying the healthy release. Startup daemon container reconciliation authoritativeness is tracked and exposed via `/ready` (returning 503 if reconciliation is unavailable or failed).
+
+### 34. Bounded Discovery & Leak-Free Build Context Tar Cleanup (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/discovery/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/engine.go), [`backend/internal/tararchive/tararchive.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/tararchive/tararchive.go), [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:** `DiscoverWithContext` enforces context cancellation, 50,000 file and 500 MB bounds, and verifies that directory traversal and symlinks do not escape the canonical project root. Archive creation logs progress every 1,000 files, and build context `.tar` files are cleaned up reliably via `defer os.Remove` in all build code paths.
+
+### 35. Live-Preview URL Suppression for Non-Running Containers (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/service_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/service_service.go), [`backend/internal/services/deployment_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/deployment_service.go)
+- **Resolution:** Stopped, failed, or unreachable services strictly set `preview_url = nil` across ServiceService, DeploymentService, and ProjectService, preventing misleading preview links from displaying in the UI for non-running containers.
+
+### 36. Authoritative Service Connection Diagnostics & DAG Topology View (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_topology.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_topology.go), [`backend/internal/handlers/project_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/project_handler.go), [`frontend/src/features/projects/topology-section.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/features/projects/topology-section.tsx), [`frontend/src/app/(app)/projects/[id]/page.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/app/(app)/projects/[id]/page.tsx)
+- **Resolution:** Implemented `GET /api/projects/{id}/topology` reusing existing DAG discovery and plan architecture. Exposes DAG execution tiers, service nodes (internal DNS, ports, host ports, networks, readiness), and actionable connection diagnostics (port collisions, missing dependencies, failed upstreams, database connection strings). Added interactive `Topology & Diagnostics` tab in the frontend project view.
+
 ---
 
 ## 3. Security Hardening Items (Deferred Backlog)
@@ -279,15 +303,22 @@ These are identified codebase behaviors that require investigation and resolutio
 
 ---
 
-## 4. Future Platform Capabilities (Explicitly Post-MVP)
+## 4. Prioritized Future Platform Capabilities (Explicitly Post-MVP Roadmap)
 
-Do not implement these capabilities during current MVP verification:
+Do not implement these capabilities during current MVP verification; they are prioritized roadmap items for future passes:
 
-- **Continuous Self-Healing / Auto-Rollback:** Automated crash-loop recovery and automatic rollback upon runtime failure (continuous health inspection is implemented).
-- **Automated Webhooks:** Push-to-deploy triggers from GitHub.
-- **Caddy Reverse Proxy:** Automatic subdomain routing (`<slug>.forgelab.local`) and Let's Encrypt TLS.
-- **Zero-Downtime Deployments:** Blue/green traffic switching.
-- **OpenTelemetry:** Distributed tracing and container metrics export.
-- **Role-Based Access Control (RBAC):** Organization-level user permissions.
-- **ForgeLAB CLI:** Command-line tooling (`forge deploy`).
-- **Distributed Multi-Node Workers:** Offloading Docker builds to external runner nodes.
+1. **Caddy Reverse Proxy & Automatic HTTPS:**
+   - Automatic subdomain routing (`<slug>.forgelab.local`) and Let's Encrypt / local ACME TLS certificate automation. Currently, dynamic host port allocation (`10000–60000`) and loopback bindings provide direct service access.
+2. **GitHub Push-to-Deploy & Webhook Automation:**
+   - Automated deployment triggers on `git push` to tracked branches with HMAC-SHA256 signature verification. Currently, manual immutable commit-pinned deployments (`source_type: "github"`) are active.
+3. **Pull-Request Preview Environments:**
+   - Ephemeral preview environments automatically created and torn down on GitHub pull requests. Currently, project and service deployments are managed per-project.
+4. **Distributed Multi-Node Orchestration:**
+   - Offloading Docker builds and container scheduling to external runner nodes or worker clusters. Currently, a single-node Docker daemon with an embedded background worker queue is active.
+5. **Full Observability Infrastructure (APM & OpenTelemetry):**
+   - Distributed request tracing, metrics scraping, Prometheus exporters, and external APM integrations. Currently, container log streaming, bounded log retention, and `/health/*` deep diagnostics are active.
+6. **Continuous Self-Healing / Auto-Rollback:**
+   - Automated crash-loop recovery and automatic rollback upon runtime failure (continuous health inspection is implemented).
+7. **Role-Based Access Control (RBAC):**
+   - Organization-level user permissions and team workspaces (single-owner per-project model active).
+

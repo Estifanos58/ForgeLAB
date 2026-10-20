@@ -169,6 +169,7 @@ func main() {
 			slog.Error("failed to ensure guest user identity during startup", "error", err)
 			os.Exit(1)
 		}
+		middleware.SetGuestEnsurer(userService.EnsureGuestUserWithID)
 		slog.Info("ensured shared guest user identity in database", "guest_user_id", models.GuestUserID)
 	}
 	serviceService := services.NewServiceService(pool)
@@ -394,6 +395,7 @@ func main() {
 	healthHandler.SetQueueDiagnosticsProvider(deployQueue)
 	healthHandler.SetBuildQueueDiagnosticsProvider(dockerEngine)
 	healthHandler.SetLogCollectorDiagnosticsProvider(dockerEngine)
+	healthHandler.SetReconciliationProvider(dockerEngine)
 
 	// Setup router
 	r := chi.NewRouter()
@@ -490,6 +492,7 @@ func main() {
 			r.Route("/sources", func(r chi.Router) {
 				r.With(sourceThrottle).Post("/upload", sourceHandler.Upload)
 				r.Post("/agent/session", sourceHandler.CreateAgentSession)
+				r.Post("/agent/session/revoke", sourceHandler.RevokeAgentSession)
 				r.Post("/agent/register", sourceHandler.RegisterAgentSource)
 				r.With(sourceThrottle).Post("/local/validate", sourceHandler.ValidateLocalPath)
 				r.Get("/local/validate/{sessionId}", sourceHandler.GetLocalValidationStatus)
@@ -507,6 +510,7 @@ func main() {
 				r.Post("/", projectHandler.Create)
 				r.Get("/", projectHandler.List)
 				r.Get("/{id}", projectHandler.Get)
+				r.Get("/{id}/topology", projectHandler.GetTopology)
 				r.Patch("/{id}", projectHandler.Update)
 				r.Delete("/{id}", projectHandler.Delete)
 

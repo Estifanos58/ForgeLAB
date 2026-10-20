@@ -1802,9 +1802,11 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 		sd.DependsOnConditions = map[string]string{}
 	}
 
-	if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 {
+	if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 && sd.Status == models.DeployStatusRunning {
 		url := fmt.Sprintf("http://%s:%d", resolvePublicHost(), *sd.HostPort)
 		sd.PreviewURL = &url
+	} else {
+		sd.PreviewURL = nil
 	}
 
 	return sd, nil
@@ -1887,9 +1889,11 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 		if sd.DependsOnConditions == nil {
 			sd.DependsOnConditions = map[string]string{}
 		}
-		if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 {
+		if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 && sd.Status == models.DeployStatusRunning {
 			url := fmt.Sprintf("http://%s:%d", publicHost, *sd.HostPort)
 			sd.PreviewURL = &url
+		} else {
+			sd.PreviewURL = nil
 		}
 		list = append(list, sd)
 	}
@@ -2322,9 +2326,11 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 		if sd.DependsOnConditions == nil {
 			sd.DependsOnConditions = map[string]string{}
 		}
-		if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 {
+		if publicExposed && sd.HostPort != nil && *sd.HostPort > 0 && sd.Status == models.DeployStatusRunning {
 			url := fmt.Sprintf("http://%s:%d", publicHost, *sd.HostPort)
 			sd.PreviewURL = &url
+		} else {
+			sd.PreviewURL = nil
 		}
 		list = append(list, sd)
 	}

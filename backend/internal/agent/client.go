@@ -147,6 +147,102 @@ func ResolveBaseURL() string {
 	return "http://127.0.0.1:4142"
 }
 
+// VerifyAgentEndpoint probes a candidate URL to confirm it is an authentic ForgeLAB agent.
+// If expectedAgentID is non-empty, it verifies that the agent matches the expected identity.
+// Crucially, this verification is performed WITHOUT sending any session credentials.
+func VerifyAgentEndpoint(ctx context.Context, baseURL string, expectedAgentID string) (bool, error) {
+	cleanBase := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if cleanBase == "" {
+		return false, errors.New("empty agent base URL")
+	}
+
+	probeURL := cleanBase + "/api/agent/status"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return false, err
+	}
+	if expectedAgentID != "" {
+		req.Header.Set("X-Expected-Agent-ID", expectedAgentID)
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("agent status probe returned %d", resp.StatusCode)
+	}
+
+	var statusResp struct {
+		Status          string `json:"status"`
+		AgentID         string `json:"agent_id"`
+		AgentIDVerified bool   `json:"agent_id_verified"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&statusResp); err != nil {
+		return false, fmt.Errorf("invalid agent status response: %w", err)
+	}
+
+	if statusResp.Status != "online" {
+		return false, fmt.Errorf("agent status is %q, expected 'online'", statusResp.Status)
+	}
+
+	if expectedAgentID != "" {
+		if statusResp.AgentIDVerified || statusResp.AgentID == expectedAgentID {
+			return true, nil
+		}
+		return false, fmt.Errorf("agent ID mismatch: endpoint reported %q, expected %q", statusResp.AgentID, expectedAgentID)
+	}
+
+	return true, nil
+}
+
+// ResolveAndVerifyAgentBaseURL discovers and verifies the authentic agent endpoint without sending credentials.
+func ResolveAndVerifyAgentBaseURL(ctx context.Context, preferredBaseURL string, expectedAgentID string) (string, error) {
+	candidateBases := make([]string, 0, 8)
+	add := func(u string) {
+		trimmed := strings.TrimRight(strings.TrimSpace(u), "/")
+		if trimmed == "" {
+			return
+		}
+		if !strings.HasPrefix(trimmed, "http://") && !strings.HasPrefix(trimmed, "https://") {
+			trimmed = "http://" + trimmed
+		}
+		for _, c := range candidateBases {
+			if c == trimmed {
+				return
+			}
+		}
+		candidateBases = append(candidateBases, trimmed)
+	}
+
+	if preferredBaseURL != "" {
+		add(preferredBaseURL)
+	}
+	if u := os.Getenv("FORGELAB_AGENT_URL"); u != "" {
+		add(u)
+	}
+	if h := os.Getenv("FORGELAB_AGENT_HOST"); h != "" {
+		add(h)
+	}
+	for _, c := range ResolveCandidateBaseURLs() {
+		add(c)
+	}
+
+	for _, cand := range candidateBases {
+		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		verified, err := VerifyAgentEndpoint(probeCtx, cand, expectedAgentID)
+		cancel()
+		if err == nil && verified {
+			return cand, nil
+		}
+	}
+
+	return "", fmt.Errorf("no verified local agent found matching expected agent ID %q", expectedAgentID)
+}
+
 // FetchSourceDiscovery contacts the running local agent and retrieves the authoritative DiscoveryResult for a source.
 func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUID, token string) (*discovery.DiscoveryResult, error) {
 	// 0. Check in-memory local source session first if available in the same runtime
@@ -159,45 +255,24 @@ func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUI
 		}
 	}
 
-	candidateBases := make([]string, 0, 8)
-	if baseURL != "" {
-		candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
-	}
-	resolved := strings.TrimRight(ResolveBaseURL(), "/")
-	if resolved != "" {
-		found := false
-		for _, cb := range candidateBases {
-			if cb == resolved {
-				found = true
-				break
+	// 1. Verify endpoint first without credentials
+	verifiedBase, err := ResolveAndVerifyAgentBaseURL(ctx, baseURL, "")
+	if err != nil {
+		// Final fallback: check in-memory global registry once more
+		if sess, ok := LookupLocalSourceSession(sourceID); ok && sess != nil {
+			if sess.Discovery != nil {
+				return sess.Discovery, nil
 			}
 		}
-		if !found {
-			candidateBases = append(candidateBases, resolved)
-		}
-	}
-	for _, c := range ResolveCandidateBaseURLs() {
-		found := false
-		for _, cb := range candidateBases {
-			if cb == c {
-				found = true
-				break
-			}
-		}
-		if !found {
-			candidateBases = append(candidateBases, c)
-		}
+		return nil, ErrAgentSessionUnavailable
 	}
 
 	client := &http.Client{Timeout: 8 * time.Second}
 
-	for _, cleanBase := range candidateBases {
-		// 1. Try GET /api/agent/sources/{source_id}
-		agentURL := fmt.Sprintf("%s/api/agent/sources/%s", cleanBase, sourceID.String())
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-		if err != nil {
-			continue
-		}
+	// 2. Try GET /api/agent/sources/{source_id} ONLY against verified endpoint
+	agentURL := fmt.Sprintf("%s/api/agent/sources/%s", verifiedBase, sourceID.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+	if err == nil {
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 			req.Header.Set("X-Agent-Session-Token", token)
@@ -227,23 +302,23 @@ func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUI
 				}
 			}
 		}
+	}
 
-		// 2. Try dedicated endpoint GET /api/agent/sources/{source_id}/discovery
-		discURL := fmt.Sprintf("%s/api/agent/sources/%s/discovery", cleanBase, sourceID.String())
-		reqDisc, err := http.NewRequestWithContext(ctx, http.MethodGet, discURL, nil)
+	// 3. Try dedicated endpoint GET /api/agent/sources/{source_id}/discovery ONLY against verified endpoint
+	discURL := fmt.Sprintf("%s/api/agent/sources/%s/discovery", verifiedBase, sourceID.String())
+	reqDisc, err := http.NewRequestWithContext(ctx, http.MethodGet, discURL, nil)
+	if err == nil {
+		if token != "" {
+			reqDisc.Header.Set("Authorization", "Bearer "+token)
+			reqDisc.Header.Set("X-Agent-Session-Token", token)
+		}
+		respDisc, err := client.Do(reqDisc)
 		if err == nil {
-			if token != "" {
-				reqDisc.Header.Set("Authorization", "Bearer "+token)
-				reqDisc.Header.Set("X-Agent-Session-Token", token)
-			}
-			respDisc, err := client.Do(reqDisc)
-			if err == nil {
-				defer respDisc.Body.Close()
-				if respDisc.StatusCode == http.StatusOK {
-					var directDisc discovery.DiscoveryResult
-					if err := json.NewDecoder(respDisc.Body).Decode(&directDisc); err == nil {
-						return &directDisc, nil
-					}
+			defer respDisc.Body.Close()
+			if respDisc.StatusCode == http.StatusOK {
+				var directDisc discovery.DiscoveryResult
+				if err := json.NewDecoder(respDisc.Body).Decode(&directDisc); err == nil {
+					return &directDisc, nil
 				}
 			}
 		}
@@ -261,95 +336,69 @@ func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUI
 
 // FetchSourcePath contacts the running local agent and retrieves the authoritative local source path for a source.
 func FetchSourcePath(ctx context.Context, baseURL string, sourceID uuid.UUID, token string) (string, error) {
-	candidateBases := make([]string, 0, 8)
-	if baseURL != "" {
-		candidateBases = append(candidateBases, strings.TrimRight(baseURL, "/"))
-	}
-	resolved := strings.TrimRight(ResolveBaseURL(), "/")
-	if resolved != "" {
-		found := false
-		for _, cb := range candidateBases {
-			if cb == resolved {
-				found = true
-				break
-			}
-		}
-		if !found {
-			candidateBases = append(candidateBases, resolved)
-		}
-	}
-	for _, c := range ResolveCandidateBaseURLs() {
-		found := false
-		for _, cb := range candidateBases {
-			if cb == c {
-				found = true
-				break
-			}
-		}
-		if !found {
-			candidateBases = append(candidateBases, c)
-		}
+	// Verify endpoint first without credentials
+	verifiedBase, err := ResolveAndVerifyAgentBaseURL(ctx, baseURL, "")
+	if err != nil {
+		return "", ErrAgentSessionUnavailable
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	for _, cleanBase := range candidateBases {
-		// 1. Try GET /api/agent/sources/{source_id}
-		agentURL := fmt.Sprintf("%s/api/agent/sources/%s", cleanBase, sourceID.String())
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
-		if err == nil {
-			if token != "" {
-				req.Header.Set("Authorization", "Bearer "+token)
-				req.Header.Set("X-Agent-Session-Token", token)
-			}
+	// 1. Try GET /api/agent/sources/{source_id} ONLY against verified endpoint
+	agentURL := fmt.Sprintf("%s/api/agent/sources/%s", verifiedBase, sourceID.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, agentURL, nil)
+	if err == nil {
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("X-Agent-Session-Token", token)
+		}
 
-			resp, err := client.Do(req)
-			if err == nil {
-				defer resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					var sessionResp struct {
-						SourcePath    string                 `json:"source_path"`
-						CanonicalPath string                 `json:"canonical_path"`
-						Source        map[string]interface{} `json:"source"`
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var sessionResp struct {
+					SourcePath    string                 `json:"source_path"`
+					CanonicalPath string                 `json:"canonical_path"`
+					Source        map[string]interface{} `json:"source"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&sessionResp); err == nil {
+					if sessionResp.SourcePath != "" {
+						return sessionResp.SourcePath, nil
 					}
-					if err := json.NewDecoder(resp.Body).Decode(&sessionResp); err == nil {
-						if sessionResp.SourcePath != "" {
-							return sessionResp.SourcePath, nil
+					if sessionResp.CanonicalPath != "" {
+						return sessionResp.CanonicalPath, nil
+					}
+					if sessionResp.Source != nil {
+						if sp, ok := sessionResp.Source["source_path"].(string); ok && sp != "" {
+							return sp, nil
 						}
-						if sessionResp.CanonicalPath != "" {
-							return sessionResp.CanonicalPath, nil
-						}
-						if sessionResp.Source != nil {
-							if sp, ok := sessionResp.Source["source_path"].(string); ok && sp != "" {
-								return sp, nil
-							}
-							if cp, ok := sessionResp.Source["canonical_path"].(string); ok && cp != "" {
-								return cp, nil
-							}
+						if cp, ok := sessionResp.Source["canonical_path"].(string); ok && cp != "" {
+							return cp, nil
 						}
 					}
 				}
 			}
 		}
+	}
 
-		// 2. Try GET /api/agent/sources/{source_id}/path
-		pathURL := fmt.Sprintf("%s/api/agent/sources/%s/path", cleanBase, sourceID.String())
-		reqPath, err := http.NewRequestWithContext(ctx, http.MethodGet, pathURL, nil)
+	// 2. Try GET /api/agent/sources/{source_id}/path ONLY against verified endpoint
+	pathURL := fmt.Sprintf("%s/api/agent/sources/%s/path", verifiedBase, sourceID.String())
+	reqPath, err := http.NewRequestWithContext(ctx, http.MethodGet, pathURL, nil)
+	if err == nil {
+		if token != "" {
+			reqPath.Header.Set("Authorization", "Bearer "+token)
+			reqPath.Header.Set("X-Agent-Session-Token", token)
+		}
+		respPath, err := client.Do(reqPath)
 		if err == nil {
-			if token != "" {
-				reqPath.Header.Set("Authorization", "Bearer "+token)
-				reqPath.Header.Set("X-Agent-Session-Token", token)
-			}
-			respPath, err := client.Do(reqPath)
-			if err == nil {
-				defer respPath.Body.Close()
-				if respPath.StatusCode == http.StatusOK {
-					var pathResp struct {
-						SourcePath string `json:"source_path"`
-					}
-					if err := json.NewDecoder(respPath.Body).Decode(&pathResp); err == nil && pathResp.SourcePath != "" {
-						return pathResp.SourcePath, nil
-					}
+			defer respPath.Body.Close()
+			if respPath.StatusCode == http.StatusOK {
+				var pathResp struct {
+					SourcePath string `json:"source_path"`
+				}
+				if err := json.NewDecoder(respPath.Body).Decode(&pathResp); err == nil && pathResp.SourcePath != "" {
+					return pathResp.SourcePath, nil
 				}
 			}
 		}

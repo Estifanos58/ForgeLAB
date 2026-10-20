@@ -61,16 +61,23 @@ type AuthTokens struct {
 
 // EnsureGuestUser ensures the single shared guest user record exists in the database.
 func (s *UserService) EnsureGuestUser(ctx context.Context) error {
-	if s.db == nil {
+	return s.EnsureGuestUserWithID(ctx, models.GuestUserID)
+}
+
+// EnsureGuestUserWithID ensures a specific guest user record exists in the database.
+func (s *UserService) EnsureGuestUserWithID(ctx context.Context, guestID uuid.UUID) error {
+	if s.db == nil || guestID == uuid.Nil {
 		return nil
 	}
+	models.RegisterGuestID(guestID)
+	email := models.MakeGuestUserEmail(guestID)
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO users (id, email, password_hash, display_name, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, NOW(), NOW())
 		ON CONFLICT (id) DO UPDATE SET updated_at = NOW()
-	`, models.GuestUserID, models.GuestUserEmail, "$2a$12$disabled.guest.account.cannot.login.directly.hash", "Guest")
+	`, guestID, email, "$2a$12$disabled.guest.account.cannot.login.directly.hash", "Guest")
 	if err != nil {
-		return fmt.Errorf("failed to ensure guest user identity: %w", err)
+		return fmt.Errorf("failed to ensure guest user identity %s: %w", guestID, err)
 	}
 	return nil
 }
@@ -78,7 +85,7 @@ func (s *UserService) EnsureGuestUser(ctx context.Context) error {
 // Register creates a new user account.
 func (s *UserService) Register(ctx context.Context, input RegisterInput) (*models.User, *AuthTokens, error) {
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
-	if input.Email == models.GuestUserEmail {
+	if input.Email == models.GuestUserEmail || strings.HasSuffix(input.Email, "@forgelab.local") {
 		return nil, nil, ErrUserExists
 	}
 

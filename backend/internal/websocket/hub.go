@@ -315,8 +315,9 @@ func (h *Hub) CreateTicketHandler(w http.ResponseWriter, r *http.Request) {
 		allowGuest := h.allowGuestMode
 		h.mu.RUnlock()
 		if allowGuest {
-			userID = models.GuestUserID
-			userEmail = models.GuestUserEmail
+			guestID := middleware.ResolveGuestSession(w, r)
+			userID = guestID
+			userEmail = models.MakeGuestUserEmail(guestID)
 		} else {
 			http.Error(w, `{"error": "unauthorized"}`, http.StatusUnauthorized)
 			return
@@ -663,8 +664,9 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			userID = models.GuestUserID
-			userEmail = models.GuestUserEmail
+			guestID := middleware.ResolveGuestSession(w, r)
+			userID = guestID
+			userEmail = models.MakeGuestUserEmail(guestID)
 		}
 	}
 
