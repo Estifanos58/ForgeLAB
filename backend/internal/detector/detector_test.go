@@ -246,3 +246,37 @@ func TestGenerateDockerfile_Node_ResilientInstall(t *testing.T) {
 		t.Fatalf("expected resilient 'npm ci || npm install' fallback in express Dockerfile, got: %s", dfExpress)
 	}
 }
+
+func TestGenerateDockerfile_CopiesSourceBeforePackageLifecycleScripts(t *testing.T) {
+	tests := []struct {
+		runtime      string
+		packageMgr   string
+		installMarker string
+	}{
+		{runtime: "nextjs", packageMgr: "npm", installMarker: "npm ci || npm install"},
+		{runtime: "react-vite", packageMgr: "npm", installMarker: "npm ci || npm install"},
+		{runtime: "nodejs", packageMgr: "pnpm", installMarker: "pnpm install"},
+		{runtime: "nodejs", packageMgr: "yarn", installMarker: "yarn install"},
+		{runtime: "nodejs", packageMgr: "bun", installMarker: "bun install"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.runtime+"/"+tt.packageMgr, func(t *testing.T) {
+			df := GenerateDockerfile(tt.runtime, 3000, "", tt.packageMgr)
+			sourceCopy := strings.Index(df, "COPY . .")
+			install := strings.Index(df, tt.installMarker)
+			if sourceCopy < 0 {
+				t.Fatalf("generated Dockerfile for %s/%s must copy source", tt.runtime, tt.packageMgr)
+			}
+			if install < 0 {
+				t.Fatalf("generated Dockerfile for %s/%s is missing install command %q", tt.runtime, tt.packageMgr, tt.installMarker)
+			}
+			if sourceCopy > install {
+				t.Fatalf("generated Dockerfile for %s/%s installs dependencies before copying source; lifecycle scripts may require project files:\n%s", tt.runtime, tt.packageMgr, df)
+			}
+			if strings.Count(df, "COPY . .") != 1 {
+				t.Fatalf("generated Dockerfile for %s/%s should copy source exactly once, got:\n%s", tt.runtime, tt.packageMgr, df)
+			}
+		})
+	}
+}
