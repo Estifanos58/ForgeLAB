@@ -96,7 +96,8 @@ func AuthMiddleware(jwtManager *auth.JWTManager) func(http.Handler) http.Handler
 	}
 }
 
-// IsAllowedOrigin checks whether a given origin is in the allowed origins list.
+// IsAllowedOrigin checks whether a given origin is in the allowed origins list,
+// or matches a trycloudflare.com preview tunnel domain.
 func IsAllowedOrigin(origin string, allowedOrigins []string) bool {
 	if origin == "" {
 		return false
@@ -105,6 +106,12 @@ func IsAllowedOrigin(origin string, allowedOrigins []string) bool {
 	for _, o := range allowedOrigins {
 		normAllowed := strings.TrimRight(strings.ToLower(strings.TrimSpace(o)), "/")
 		if normAllowed == "*" || normAllowed == normOrigin {
+			return true
+		}
+	}
+	if u, err := url.Parse(normOrigin); err == nil {
+		host := u.Hostname()
+		if strings.HasSuffix(host, ".trycloudflare.com") {
 			return true
 		}
 	}
@@ -255,7 +262,16 @@ func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool, all
 			if isStateChanging {
 				origin := r.Header.Get("Origin")
 				if origin != "" {
-					if !IsAllowedOrigin(origin, allowedOrigins) {
+					allowed := IsAllowedOrigin(origin, allowedOrigins)
+					if !allowed {
+						if u, err := url.Parse(origin); err == nil {
+							fwdHost := r.Header.Get("X-Forwarded-Host")
+							if fwdHost != "" && strings.EqualFold(u.Hostname(), fwdHost) {
+								allowed = true
+							}
+						}
+					}
+					if !allowed {
 						slog.Warn("untrusted origin rejected for guest mutation",
 							"origin", origin,
 							"method", r.Method,
@@ -272,7 +288,14 @@ func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool, all
 						u, err := url.Parse(referer)
 						if err == nil && u.Host != "" {
 							refOrigin := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
-							if !IsAllowedOrigin(refOrigin, allowedOrigins) {
+							allowed := IsAllowedOrigin(refOrigin, allowedOrigins)
+							if !allowed {
+								fwdHost := r.Header.Get("X-Forwarded-Host")
+								if fwdHost != "" && strings.EqualFold(u.Hostname(), fwdHost) {
+									allowed = true
+								}
+							}
+							if !allowed {
 								slog.Warn("untrusted referer rejected for guest mutation",
 									"referer", referer,
 									"method", r.Method,
@@ -399,7 +422,17 @@ func CORS(allowedOriginsInputs ...string) func(http.Handler) http.Handler {
 			origin := r.Header.Get("Origin")
 			if origin != "" {
 				normOrigin := strings.TrimRight(strings.ToLower(strings.TrimSpace(origin)), "/")
-				if allowedOrigins[normOrigin] || allowedOrigins["*"] {
+				isAllowed := allowedOrigins[normOrigin] || allowedOrigins["*"]
+				if !isAllowed {
+					if u, err := url.Parse(normOrigin); err == nil {
+						host := u.Hostname()
+						fwdHost := r.Header.Get("X-Forwarded-Host")
+						if strings.HasSuffix(host, ".trycloudflare.com") || (fwdHost != "" && strings.EqualFold(host, fwdHost)) {
+							isAllowed = true
+						}
+					}
+				}
+				if isAllowed {
 					w.Header().Set("Access-Control-Allow-Origin", origin)
 					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 					w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Cookie, X-Requested-With")

@@ -264,4 +264,15 @@ func TestShareScopedRouter_Execution(t *testing.T) {
 		router.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
+
+	t.Run("Blocks internal management plane ports", func(t *testing.T) {
+		assert.True(t, router.isForbiddenUpstream("http://127.0.0.1:8080/api/projects"))
+		assert.True(t, router.isForbiddenUpstream("http://localhost:5432"))
+		assert.True(t, router.isForbiddenUpstream("http://127.0.0.1:6379"))
+		assert.True(t, router.isForbiddenUpstream("http://127.0.0.1:4142/api/agent/status"))
+		assert.True(t, router.isForbiddenUpstream("http://forgelab-backend:8080/api/projects"))
+		assert.False(t, router.isForbiddenUpstream("http://127.0.0.1:10001"))
+		assert.False(t, router.isForbiddenUpstream("http://172.19.0.5:8080"))
+		assert.False(t, router.isForbiddenUpstream("http://10.0.1.25:8080"))
+	})
 }

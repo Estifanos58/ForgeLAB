@@ -11,7 +11,7 @@ import { OAuthButtons } from '@/components/auth/oauth-buttons';
 import { Terminal } from 'lucide-react';
 
 export function RegisterForm() {
-  const { register, error: authError, clearError } = useAuth();
+  const { register, error: authError, clearError, allowGuestMode } = useAuth();
   const searchParams = useSearchParams();
   const urlError = searchParams.get('error');
 
@@ -121,12 +121,22 @@ export function RegisterForm() {
         </Button>
       </form>
 
-      {/* Footer link */}
-      <div className="mt-5 pt-4 border-t border-surface-border text-center text-xs text-neutral-400">
-        Already have an account?{' '}
-        <Link href="/login" className="text-white hover:underline underline-offset-2 font-medium">
-          Sign in
-        </Link>
+      {/* Footer links */}
+      <div className="mt-5 pt-4 border-t border-surface-border text-center space-y-2 text-xs text-neutral-400">
+        <div>
+          Already have an account?{' '}
+          <Link href="/login" className="text-white hover:underline underline-offset-2 font-medium">
+            Sign in
+          </Link>
+        </div>
+        {allowGuestMode && (
+          <div>
+            Don&apos;t want to register?{' '}
+            <Link href="/dashboard?deploy=true" className="text-emerald-400 hover:underline underline-offset-2 font-medium">
+              Deploy as Guest
+            </Link>
+          </div>
+        )}
       </div>
     </div>
   );
