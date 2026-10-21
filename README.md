@@ -111,75 +111,126 @@ For active development with local-source deployments, use **Workflow A**.
 
 ---
 
-## Secure Public Project Sharing & Outbound Gateway
+## Secure Public Project Sharing
 
-ForgeLAB enables users deploying applications on their own computers to share secure, public HTTPS links (e.g. `https://<token>.preview.example.com`) with anyone worldwide. The remote recipient interacts with the running frontend and backend seamlessly without requiring the owner to configure router port forwarding, DDNS, or static public IPs.
+ForgeLAB enables users deploying applications on their own computers to share secure, public HTTPS links with anyone worldwide—without purchasing a domain, configuring DNS, opening firewall ports, or having a public IP address.
 
-### How It Works
+ForgeLAB supports two sharing providers:
+1. **Cloudflare Quick Tunnels (`cloudflare`, default):** Domainless, zero-configuration sharing providing an instant `https://<random>.trycloudflare.com` HTTPS URL directly to the running application.
+2. **Self-Hosted Public Gateway (`gateway`, optional):** Advanced provider for organizations with their own domain, public server, wildcard DNS, and TLS certificates.
+
+---
+
+### Provider 1: Cloudflare Quick Tunnels (Default / Domainless)
+
+Cloudflare Quick Tunnels use Cloudflare's free, anonymous tunnel service (`trycloudflare.com`). No domain or Cloudflare account is required.
+
+```text
+Visitor's Browser (Anywhere on Internet)
+       │
+       ▼ (HTTPS :443)
+┌──────────────────────────────────────────────┐
+│  Cloudflare Edge (trycloudflare.com)         │  (Cloudflare Global Anycast)
+└──────────────────────┬───────────────────────┘
+                       │
+                       │ Outbound Tunnel Connection (QUIC/HTTP2)
+                       │ (Initiated from local computer by cloudflared)
+                       ▼
+┌──────────────────────────────────────────────┐
+│  cloudflared Child Process                   │  (Managed by ForgeLAB)
+└──────────────────────┬───────────────────────┘
+                       │ Loopback HTTP (:random_port)
+                       ▼
+┌──────────────────────────────────────────────┐
+│  Share-Scoped Router (backend/internal/tunnel)│ (Bound to 127.0.0.1:0)
+│  - Longest-prefix route matching (/api -> backend, / -> frontend)
+│  - Strict path traversal defense (rejects '..' and '%2e%2e')
+│  - Blocks ForgeLAB management (:8080) and infra ports (:5432, :6379, :4142)
+│  - Bidirectional WebSocket proxying
+└──────────────┬───────────────────────────────┘
+               │ Local Reverse Proxy (127.0.0.1)
+        ┌──────┴──────┐
+        ▼             ▼
+┌──────────────┐ ┌──────────────┐
+│ Frontend App │ │ Backend API  │  (Docker containers on 127.0.0.1:host_port)
+└──────────────┘ └──────────────┘
+```
+
+#### Prerequisites
+Install `cloudflared` on the host running ForgeLAB:
+- **macOS:** `brew install cloudflared`
+- **Linux (Debian/Ubuntu):**
+  ```bash
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+  echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+  sudo apt-get update && sudo apt-get install -y cloudflared
+  ```
+- **Linux (Arch):** `sudo pacman -S cloudflared`
+- **Windows:** `winget install --id Cloudflare.cloudflared`
+
+#### Configuration (`.env`)
+```env
+FORGELAB_SHARING_ENABLED=true
+FORGELAB_SHARING_PROVIDER=cloudflare
+FORGELAB_CLOUDFLARED_PATH=cloudflared
+FORGELAB_APP_HOST_IP=127.0.0.1
+```
+
+#### Quick Tunnel Characteristics & Limitations
+- **Ephemeral URLs:** Every time a share is revoked and recreated, Cloudflare assigns a new random `*.trycloudflare.com` hostname.
+- **Development & Testing:** Intended for previews, staging demonstrations, and pair debugging, not long-term production hosting.
+- **Protocols Supported:** HTTP/1.1, HTTP/2, and WebSockets (full duplex).
+- **Unsupported:** Server-Sent Events (SSE) responses are buffered by Cloudflare Quick Tunnels and may not stream in real-time.
+- **Config Conflicts:** If you already have a `~/.cloudflared/config.yml` configured for named tunnels, Quick Tunnels may report a conflict. ForgeLAB detects this and reports actionable guidance.
+
+---
+
+### Provider 2: Self-Hosted Public Gateway (Optional / Advanced)
+
+For deployments with private infrastructure and custom domains (e.g. `*.preview.yourdomain.com`).
 
 ```text
 Visitor's Browser
        │
        ▼ (HTTPS :443)
 ┌──────────────────────────────────────────────┐
-│  Public Gateway (cmd/gateway)                │  (Public Server: cloud VM / VPS)
-│  - Wildcard TLS (*.preview.example.com)      │
-│  - Matches subdomain to active share session  │
+│  Public Gateway (cmd/gateway)                │  (Public Server / VPS)
+│  - Wildcard TLS (*.preview.yourdomain.com)   │
+│  - Authenticated Yamux multiplexer           │
 └──────────────────────┬───────────────────────┘
-                       │
                        │ Outbound Yamux Tunnel (TLS :8443)
-                       │ (Initiated from local computer)
                        ▼
 ┌──────────────────────────────────────────────┐
 │  ForgeLAB Host (cmd/server)                  │  (User's Local Computer)
 │  - TunnelManager maintains connection        │
-│  - LocalRouter validates routes & boundaries │
-│  - Blocks admin/management ports (:8080, etc)│
-└──────────────┬───────────────────────────────┘
-               │ Local Reverse Proxy (127.0.0.1)
-        ┌──────┴──────┐
-        ▼             ▼
-┌──────────────┐ ┌──────────────┐
-│ Frontend App │ │ Backend API  │  (Docker containers)
-│ (e.g. :10001)│ │ (e.g. :10002)│
-└──────────────┘ └──────────────┘
+│  - Bounded 5s registration acknowledgments   │
+│  - Isolated share routing & port shielding   │
+└──────────────────────────────────────────────┘
 ```
 
-1. **Outbound Multiplexed Tunnel:** The local ForgeLAB installation establishes an outbound TLS connection to the remote Public Gateway. Because the connection is outbound, firewalls and NATs allow it automatically without incoming port forwarding.
-2. **Visitor Request Routing:** When a visitor visits `https://<share-token>.preview.example.com`, the gateway matches the share token against active registrations and multiplexes the request as a virtual stream over the existing tunnel.
-3. **Local Request Router:** The local router receives the stream, verifies route mappings (`/` -> frontend, `/api/*` -> backend), and proxies the request to the running container on loopback `127.0.0.1`.
-4. **WebSocket & Streaming Support:** HTTP chunked transfer, Server-Sent Events, and WebSocket upgrades are piped transparently end-to-end.
+#### Gateway Server Setup
+```bash
+cd backend
+GATEWAY_HTTPS_ADDR=":443" \
+GATEWAY_TUNNEL_PORT=8443 \
+GATEWAY_TLS_CERT=/etc/letsencrypt/live/yourdomain.com/fullchain.pem \
+GATEWAY_TLS_KEY=/etc/letsencrypt/live/yourdomain.com/privkey.pem \
+GATEWAY_BASE_DOMAIN=preview.yourdomain.com \
+GATEWAY_AUTH_SECRET="your-strong-cryptographic-secret" \
+go run cmd/gateway/main.go
+```
 
-### Deploying the Public Gateway (Server Setup)
-
-To enable public sharing for internet recipients:
-1. **Provision a Public Host:** Run the gateway binary on a server with a public IP (e.g., AWS EC2, DigitalOcean Droplet, Hetzner, GCP).
-2. **Configure DNS:** Create an A record for your gateway tunnel endpoint (e.g. `gateway.preview.example.com`) and a wildcard A record for shared previews (e.g. `*.preview.example.com`).
-3. **Configure TLS:** Obtain a wildcard TLS certificate (e.g., via Let's Encrypt / Certbot DNS-01 challenge).
-4. **Run Public Gateway:**
-   ```bash
-   cd backend
-   GATEWAY_INGRESS_PORT=443 \
-   GATEWAY_TUNNEL_PORT=8443 \
-   GATEWAY_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem \
-   GATEWAY_TLS_KEY=/etc/letsencrypt/live/example.com/privkey.pem \
-   GATEWAY_BASE_DOMAIN=preview.example.com \
-   GATEWAY_AUTH_TOKEN="your-secure-gateway-token" \
-   go run cmd/gateway/main.go
-   ```
-
-### Enabling Sharing on Local ForgeLAB
-
-In your local `.env`:
+#### Local ForgeLAB Configuration (`.env`)
 ```env
 FORGELAB_SHARING_ENABLED=true
-GATEWAY_TUNNEL_URL=gateway.preview.example.com:8443
-GATEWAY_PUBLIC_URL=https://preview.example.com
-GATEWAY_AUTH_TOKEN=your-secure-gateway-token
+FORGELAB_SHARING_PROVIDER=gateway
+GATEWAY_TUNNEL_URL=gateway.preview.yourdomain.com:8443
+GATEWAY_PUBLIC_URL=https://preview.yourdomain.com
+GATEWAY_AUTH_TOKEN=your-strong-cryptographic-secret
 FORGELAB_APP_HOST_IP=127.0.0.1
 ```
 
-If the gateway is not configured or offline, ForgeLAB truthfully reports sharing as `unavailable` with actionable troubleshooting messages rather than simulating a connection.
+If the gateway is unconfigured or offline, ForgeLAB truthfully reports sharing as `unavailable` with actionable troubleshooting messages rather than simulating a connection.
 
 ---
 

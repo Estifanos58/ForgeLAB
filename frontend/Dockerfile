@@ -10,7 +10,11 @@ RUN for i in 1 2 3 4 5; do \
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm config set fetch-retries 5 && \
+    npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 180000 && \
+    (npm ci || npm install)
+
 
 # Stage 2: Build the Next.js application
 FROM base AS builder

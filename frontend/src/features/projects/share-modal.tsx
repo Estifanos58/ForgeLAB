@@ -13,13 +13,14 @@ import {
   Check,
   ExternalLink,
   ShieldCheck,
-  ShieldAlert,
   Clock,
   Trash2,
-  Radio,
   ArrowRight,
   Layers,
   AlertTriangle,
+  RefreshCw,
+  Terminal,
+  Zap,
 } from 'lucide-react';
 
 interface ShareModalProps {
@@ -28,10 +29,42 @@ interface ShareModalProps {
   project: Project;
 }
 
+function CodeBlock({ label, code }: { label: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between">
+        <span className="text-neutral-400 font-sans text-xs">{label}</span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="inline-flex items-center gap-1 text-[11px] font-sans px-2 py-0.5 rounded bg-surface hover:bg-surface-hover text-emerald-400 hover:text-emerald-300 border border-surface-border transition-colors cursor-pointer"
+        >
+          {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+          <span>{copied ? 'Copied!' : 'Copy'}</span>
+        </button>
+      </div>
+      <pre className="p-2.5 rounded bg-surface border border-surface-border text-neutral-200 overflow-x-auto whitespace-pre font-mono text-[11px] select-all">
+        {code}
+      </pre>
+    </div>
+  );
+}
+
 export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
   const [loading, setLoading] = useState(true);
+  const [isChecking, setIsChecking] = useState(false);
   const [statusData, setStatusData] = useState<ShareStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const hasLoadedRef = React.useRef(false);
 
   // Form states for creating a new share
   const [primaryServiceId, setPrimaryServiceId] = useState<string>('');
@@ -45,45 +78,60 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
   const services = project.services || [];
   const runningServices = services.filter((s) => s.status === 'running');
 
-  // Load share status
-  const loadStatus = useCallback(async () => {
+  // Load share status without tearing down UI on background refreshes
+  const loadStatus = useCallback(async (isManualRefresh = false) => {
     try {
-      setLoading(true);
+      if (!hasLoadedRef.current) {
+        setLoading(true);
+      } else {
+        setIsChecking(true);
+      }
       setError(null);
       const data = await api.projects.getShare(project.id);
       setStatusData(data);
+      hasLoadedRef.current = true;
 
-      // Pre-select default services if creating
+      // Pre-select default services if creating and not yet selected
       if (!data.share || data.share.status !== 'active') {
-        const frontendSvc = services.find(
+        const currentServices = project.services || [];
+        const frontendSvc = currentServices.find(
           (s) => s.role === 'frontend' || s.name.toLowerCase().includes('front') || s.name.toLowerCase().includes('web')
         );
-        const backendSvc = services.find(
+        const backendSvc = currentServices.find(
           (s) => s.role === 'backend' || s.name.toLowerCase().includes('back') || s.name.toLowerCase().includes('api')
         );
 
-        if (frontendSvc) {
-          setPrimaryServiceId(frontendSvc.id);
-        } else if (services.length > 0) {
-          setPrimaryServiceId(services[0].id);
-        }
+        setPrimaryServiceId((prev) => {
+          if (prev) return prev;
+          if (frontendSvc) return frontendSvc.id;
+          if (currentServices.length > 0) return currentServices[0].id;
+          return '';
+        });
 
-        if (backendSvc && frontendSvc && backendSvc.id !== frontendSvc.id) {
-          setBackendServiceId(backendSvc.id);
-        }
+        setBackendServiceId((prev) => {
+          if (prev) return prev;
+          if (backendSvc && frontendSvc && backendSvc.id !== frontendSvc.id) {
+            return backendSvc.id;
+          }
+          return '';
+        });
       }
     } catch (err: any) {
       setError(err?.message || 'Failed to load public share status');
     } finally {
       setLoading(false);
+      setIsChecking(false);
     }
-  }, [project.id, services]);
+  }, [project.id]);
 
   useEffect(() => {
     if (isOpen) {
       loadStatus();
+    } else {
+      hasLoadedRef.current = false;
+      setStatusData(null);
     }
-  }, [isOpen, loadStatus]);
+  }, [isOpen, project.id, loadStatus]);
 
   const handleCopy = () => {
     if (!statusData?.share?.public_url) return;
@@ -124,7 +172,7 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
       };
 
       await api.projects.createShare(project.id, input);
-      await loadStatus();
+      await loadStatus(true);
     } catch (err: any) {
       setError(err?.message || 'Failed to create public share');
     } finally {
@@ -137,7 +185,7 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
       setIsRevoking(true);
       setError(null);
       await api.projects.revokeShare(project.id);
-      await loadStatus();
+      await loadStatus(true);
     } catch (err: any) {
       setError(err?.message || 'Failed to revoke public share');
     } finally {
@@ -146,13 +194,14 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
   };
 
   const isShareActive = statusData?.share && statusData.share.status === 'active';
+  const isCloudflare = statusData?.provider !== 'gateway';
 
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
       title="Share Public Preview"
-      description="Expose your running application securely through an outbound tunnel without port forwarding."
+      description="Expose your running application securely over the internet without domain purchase or port forwarding."
       maxWidth="lg"
     >
       <div className="space-y-4">
@@ -165,40 +214,84 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
         {loading ? (
           <div className="py-12 flex flex-col items-center justify-center space-y-3">
             <Spinner size="md" />
-            <p className="text-xs text-neutral-400 font-mono">Inspecting share gateway & tunnel status...</p>
+            <p className="text-xs text-neutral-400 font-mono">Inspecting share provider & tunnel readiness...</p>
           </div>
-        ) : statusData?.tunnel_state === 'unavailable' ? (
+        ) : statusData?.tunnel_state === 'unavailable' || statusData?.tunnel_state === 'failed' ? (
+          /* Prerequisites Missing / Unavailable View */
           <div className="space-y-4 py-2">
             <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 space-y-2.5">
               <div className="flex items-center gap-2 text-amber-400 text-sm font-semibold">
                 <AlertTriangle className="w-4 h-4 shrink-0" />
-                <span>Public Gateway Unavailable</span>
+                <span>{isCloudflare ? 'Cloudflare Quick Tunnel Setup Required' : 'Public Gateway Unavailable'}</span>
               </div>
               <p className="text-xs text-neutral-300 leading-relaxed">
-                {statusData.reason ||
-                  'Public sharing requires a configured internet gateway. Configure FORGELAB_SHARING_ENABLED=true and GATEWAY_TUNNEL_URL in your ForgeLAB installation environment to enable this feature.'}
+                {statusData?.reason ||
+                  (isCloudflare
+                    ? 'cloudflared executable is required for domainless sharing but was not found in PATH.'
+                    : 'Public sharing requires a configured internet gateway. Configure FORGELAB_SHARING_ENABLED=true and GATEWAY_TUNNEL_URL in your ForgeLAB installation environment.')}
               </p>
             </div>
 
-            <div className="rounded-lg border border-surface-border bg-surface-elevated p-4 space-y-2 text-xs text-neutral-400">
-              <h4 className="font-semibold text-white">How to configure public sharing:</h4>
-              <ol className="list-decimal list-inside space-y-1 pl-1">
-                <li>Deploy the ForgeLAB gateway binary (<code className="text-neutral-200">cmd/gateway</code>) on a publicly reachable server.</li>
-                <li>Configure wildcard DNS (<code className="text-neutral-200">*.preview.your-domain.com</code>) pointing to your gateway.</li>
-                <li>Set <code className="text-neutral-200">GATEWAY_TUNNEL_URL</code> and <code className="text-neutral-200">GATEWAY_AUTH_TOKEN</code> in ForgeLAB's <code className="text-neutral-200">.env</code>.</li>
-              </ol>
-            </div>
+            {isCloudflare ? (
+              <div className="rounded-lg border border-surface-border bg-surface-elevated p-4 space-y-3 text-xs">
+                <div className="flex items-center gap-1.5 text-white font-semibold">
+                  <Terminal className="w-4 h-4 text-emerald-400" />
+                  <span>How to install cloudflared:</span>
+                </div>
 
-            <div className="flex justify-end pt-2">
+                <div className="space-y-3">
+                  <CodeBlock
+                    label="Debian / Ubuntu / Linux Mint (.deb package):"
+                    code="curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb && sudo dpkg -i cloudflared.deb && rm cloudflared.deb"
+                  />
+
+                  <CodeBlock
+                    label="Windows (PowerShell / Winget):"
+                    code="winget install --id Cloudflare.cloudflared"
+                  />
+
+                  <CodeBlock
+                    label="macOS (Homebrew):"
+                    code="brew install cloudflared"
+                  />
+                </div>
+
+                <p className="text-[11px] text-neutral-400 pt-1">
+                  After running the command in your terminal, click <strong>Check Again</strong> below to detect cloudflared without restarting ForgeLAB.
+                </p>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-surface-border bg-surface-elevated p-4 space-y-2 text-xs text-neutral-400">
+                <h4 className="font-semibold text-white">How to configure custom public gateway:</h4>
+                <ol className="list-decimal list-inside space-y-1 pl-1">
+                  <li>Deploy the ForgeLAB gateway binary (<code className="text-neutral-200">cmd/gateway</code>) on a publicly reachable server.</li>
+                  <li>Configure wildcard DNS (<code className="text-neutral-200">*.preview.your-domain.com</code>) pointing to your gateway.</li>
+                  <li>Set <code className="text-neutral-200">GATEWAY_TUNNEL_URL</code> and <code className="text-neutral-200">GATEWAY_AUTH_TOKEN</code> in ForgeLAB's <code className="text-neutral-200">.env</code>.</li>
+                </ol>
+              </div>
+            )}
+
+            <div className="flex justify-between items-center pt-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => loadStatus(true)}
+                disabled={isChecking}
+                className="flex items-center gap-1.5"
+              >
+                <RefreshCw className={isChecking ? 'w-3.5 h-3.5 animate-spin text-emerald-400' : 'w-3.5 h-3.5'} />
+                <span>{isChecking ? 'Checking...' : 'Check Again'}</span>
+              </Button>
               <Button variant="secondary" onClick={onClose}>
                 Close
               </Button>
             </div>
           </div>
         ) : isShareActive && statusData.share ? (
+
           /* Active Share View */
           <div className="space-y-4 py-1">
-            {/* Tunnel State Badge */}
+            {/* Provider and Tunnel State Badges */}
             <div className="flex items-center justify-between p-3 rounded-lg border border-surface-border bg-surface-elevated">
               <div className="flex items-center gap-2">
                 {statusData.tunnel_state === 'online' ? (
@@ -209,10 +302,10 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
                     </span>
                     <span className="text-xs font-medium text-emerald-400">Tunnel Online</span>
                   </>
-                ) : statusData.tunnel_state === 'connecting' ? (
+                ) : statusData.tunnel_state === 'connecting' || statusData.tunnel_state === 'starting_tunnel' ? (
                   <>
                     <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
-                    <span className="text-xs font-medium text-amber-400">Tunnel Connecting...</span>
+                    <span className="text-xs font-medium text-amber-400">Tunnel Starting...</span>
                   </>
                 ) : (
                   <>
@@ -221,9 +314,14 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
                   </>
                 )}
               </div>
-              <div className="text-[11px] font-mono text-neutral-400 flex items-center gap-1">
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                <span>TLS Encrypted Relay</span>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-surface border border-surface-border text-neutral-300">
+                  {statusData.share.provider === 'gateway' ? 'Custom Gateway' : 'Cloudflare Quick Tunnel'}
+                </span>
+                <div className="text-[11px] font-mono text-neutral-400 flex items-center gap-1">
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Encrypted</span>
+                </div>
               </div>
             </div>
 
@@ -312,6 +410,24 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
               </Alert>
             )}
 
+            {/* Active Provider Banner */}
+            <div className="p-3 rounded-lg border border-surface-border bg-surface-elevated text-xs space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="text-neutral-300 font-semibold flex items-center gap-1.5">
+                  <Zap className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Sharing Provider:</span>
+                </span>
+                <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                  {isCloudflare ? 'Cloudflare Quick Tunnel (Domainless)' : 'Custom Gateway'}
+                </span>
+              </div>
+              <p className="text-[11px] text-neutral-400 leading-relaxed">
+                {isCloudflare
+                  ? 'Generates a random https://*.trycloudflare.com HTTPS URL without domain registration, DNS configuration, or port forwarding. Best for temporary demos and development.'
+                  : 'Routes traffic outbound through your self-hosted public gateway.'}
+              </p>
+            </div>
+
             {/* Primary Frontend Service Selection */}
             <div className="space-y-1.5">
               <label htmlFor="primary-service" className="text-xs font-medium text-neutral-300">
@@ -397,16 +513,15 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
               </select>
             </div>
 
-            {/* Information Notice */}
-            <div className="rounded-lg border border-surface-border bg-surface p-3 text-[11px] text-neutral-400 space-y-1">
-              <div className="flex items-center gap-1.5 text-neutral-300 font-medium">
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Zero Port Forwarding Required</span>
+            {/* Quick Tunnel Caveat Notice */}
+            {isCloudflare && (
+              <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-[11px] text-neutral-400 space-y-1">
+                <span className="text-amber-400 font-medium block">Quick Tunnel Limitations</span>
+                <p>
+                  Quick Tunnels are ephemeral and receive a new randomly assigned URL when recreated. They enforce concurrent connection limits, have no SLA, and do not support Server-Sent Events (SSE).
+                </p>
               </div>
-              <p>
-                ForgeLAB maintains an authenticated outbound tunnel to your configured public gateway. The recipient opens a public HTTPS link and interacts directly with your local running container.
-              </p>
-            </div>
+            )}
 
             {/* Actions */}
             <div className="flex items-center justify-end gap-2 pt-3 border-t border-surface-border">

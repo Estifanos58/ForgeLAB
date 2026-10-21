@@ -711,12 +711,15 @@ export interface ProjectTopology {
 
 export type TunnelState =
   | 'not_shared'
+  | 'checking_prerequisites'
+  | 'starting_tunnel'
   | 'connecting'
   | 'online'
   | 'disconnected'
   | 'expired'
   | 'revoked'
-  | 'unavailable';
+  | 'unavailable'
+  | 'failed';
 
 export interface RouteMapping {
   path_prefix: string;
@@ -735,6 +738,8 @@ export interface PublicShare {
   primary_service_id: string;
   primary_service?: Service;
   route_mappings: RouteMapping[];
+  provider?: 'cloudflare' | 'gateway';
+  local_port?: number | null;
   status: 'active' | 'revoked' | 'expired';
   revoked_at?: string | null;
   expires_at?: string | null;
@@ -751,10 +756,12 @@ export interface CreateShareInput {
 export interface ShareStatusResponse {
   enabled: boolean;
   configured: boolean;
+  provider: 'cloudflare' | 'gateway';
   share?: PublicShare | null;
   tunnel_state: TunnelState;
   gateway_url?: string;
   reason?: string;
+  install_guide?: string;
 }
 
 

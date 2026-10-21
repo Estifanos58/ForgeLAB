@@ -748,6 +748,9 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 				strings.HasPrefix(n.Name, projShortPrefix)
 
 			if isProjectNet {
+				if myHost := os.Getenv("HOSTNAME"); myHost != "" {
+					_ = e.dockerClient.NetworkDisconnect(ctx, n.ID, myHost, true)
+				}
 				remErr := e.dockerClient.NetworkRemove(ctx, n.ID)
 				if remErr != nil && !client.IsErrNotFound(remErr) {
 					slog.Error("failed to remove project network", "network_id", n.ID, "name", n.Name, "error", remErr)

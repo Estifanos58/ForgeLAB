@@ -45,11 +45,12 @@ These are deliberate scoping decisions for the current platform release. They ar
 7. **REST Pre-Fetch & WebSocket Sequence Replay (`RESOLVED IN ARCHITECTURE`):**
    - Historical logs are fetched via REST endpoints (`GET /api/projects/:id/logs` or `GET /api/projects/:id/deployments/:did/logs`) with subquery-based recent log ordering (`ORDER BY id DESC LIMIT N` wrapped in `ORDER BY id ASC`).
    - On WebSocket reconnection, clients transmit `last_sequence` with their subscription frame, triggering the backend WebSocket Hub to stream missing historical logs from PostgreSQL before live events, preventing gaps or duplicates.
-8. **Public Project Sharing & Outbound Gateway Infrastructure Reality:**
-   - Internet access for remote visitors requires a publicly reachable gateway (`cmd/gateway`), a public IP or domain name with wildcard DNS (`*.preview.yourdomain.com`), and a valid wildcard TLS certificate.
-   - ForgeLAB implements the standalone gateway software, authenticated outbound tunnel client (`internal/tunnel`), and local routing layer, but does not pretend or simulate that internet infrastructure has been provisioned when it has not.
-   - If gateway configuration (`GATEWAY_TUNNEL_URL`, `GATEWAY_AUTH_TOKEN`) is absent or the gateway is offline, sharing reports `unavailable` with actionable setup guidance.
-   - Applications with hardcoded localhost URLs in compiled frontend client code (e.g. client-side fetch calls to `http://localhost:8080` rather than relative `/api/*` paths or configured environment variables like `NEXT_PUBLIC_API_URL`) require configuring relative routes or rebuilding the project, because ForgeLAB does not mutate compiled client JavaScript binaries after build.
+8. **Public Project Sharing & Outbound Tunnel Architecture:**
+   - **Default Domainless Sharing (Cloudflare Quick Tunnels):** Enables users to share applications via `https://<random>.trycloudflare.com` without owning a domain, configuring DNS, opening firewall ports, or registering for Cloudflare.
+     - *Quick Tunnel Boundaries:* Ephemeral URLs (a new random URL is generated every time a share is created); shared rate limits and concurrent-connection ceilings on Cloudflare's free edge tier; Server-Sent Events (SSE) buffering (not recommended for SSE; WebSockets and standard HTTP request/response are fully supported).
+     - *Local Machine Prerequisite:* Requires `cloudflared` installed on the host. If missing, ForgeLAB gracefully reports `unavailable` with actionable package manager install commands.
+   - **Self-Hosted Public Gateway (Optional / Advanced):** For organizations with their own domain and public server, the standalone gateway (`cmd/gateway`) provides authenticated multiplexed previews (`*.preview.yourdomain.com`). Handshake authentication uses constant-time secret comparison and bounded 5s registration acknowledgments.
+   - **Hardcoded Localhost in Client Bundles:** Applications with hardcoded localhost URLs in compiled frontend JavaScript (e.g. client-side `fetch("http://localhost:8080/api")`) cannot be reconfigured dynamically at runtime. Client-side code should use relative paths (e.g. `/api/*`) or standard build-time environment variables (`NEXT_PUBLIC_API_URL`).
 
 ---
 
@@ -299,9 +300,15 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Location:** [`backend/internal/services/project_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/project_service.go), [`backend/internal/security/volume_security.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/security/volume_security.go), [`frontend/src/components/dashboard/create-project-modal.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/components/dashboard/create-project-modal.tsx)
 - **Resolution:** Added explicit `public_exposed` selection per service in the project creation modal and API (`*bool`). Legacy and older API requests that omit the flag preserve backward-compatible heuristic defaults while ensuring database/infrastructure services never default to public exposure. Volume sanitization strictly validates volume targets and parent escapes (`..`), propagating errors rather than silently continuing, while safely removing forbidden Docker socket mounts.
 
-### 39. WebSocket Authentication Compatibility & Deprecation Path (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/websocket/hub.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/websocket/hub.go), [`frontend/src/lib/websocket/use-deployment-ws.ts`](file:///home/estif/Projects/ForgeLAB/frontend/src/lib/websocket/use-deployment-ws.ts)
-- **Resolution:** The frontend uses short-lived single-use tickets (`POST /api/ws/ticket`) and HttpOnly cookies. To prevent abrupt breakage of external or legacy clients still using `?token=`, the backend validates query-string tokens and emits a scrubbed deprecation warning, providing a smooth migration window while keeping credentials off logs.
+### 40. Domainless Public Sharing via Cloudflare Quick Tunnels & Gateway Hardening (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/tunnel/`](file:///home/estif/Projects/ForgeLAB/backend/internal/tunnel/), [`backend/internal/gateway/`](file:///home/estif/Projects/ForgeLAB/backend/internal/gateway/), [`backend/internal/services/share_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/share_service.go), [`frontend/src/features/projects/share-modal.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/features/projects/share-modal.tsx)
+- **Resolution:**
+  1. *Provider Abstraction:* Created `ShareProvider` interface implemented by `CloudflareProvider` (default domainless) and `GatewayProvider` (advanced self-hosted).
+  2. *Cloudflare Quick Tunnel Integration:* Supervised child process management with safe argv slices (`exec.CommandContext`), zero shell interpolation, output line scanning with strict regex (`^https://[a-zA-Z0-9-]+\.trycloudflare\.com$`), pre-existing config conflict detection, bounded memory buffers, and graceful SIGTERM/SIGKILL termination.
+  3. *Share-Scoped Local Router:* Ephemeral listener bound to `127.0.0.1:0`. Longest-prefix matching route dispatcher (`/api/*` prioritised over `/`), strict path traversal prevention (`..` and `%2e%2e`), management plane port shielding (:8080, :4142, :5432, :6379, Docker socket), and bidirectional WebSocket hijacking proxy.
+  4. *Stale Share Reconciliation:* Server startup scans for and revokes orphaned ephemeral shares via `ReconcileStaleShares`, ensuring dead processes are never falsely displayed as online.
+  5. *Gateway Security & Handshake Hardening:* Constant-time secret comparison with `crypto/subtle.ConstantTimeCompare`, startup non-empty secret enforcement, per-session route isolation preventing cross-tenant route hijacking, and bounded 5s synchronous registration acknowledgments.
+  6. *Truthful Frontend Experience:* Truthful states (`not_shared`, `checking_prerequisites`, `starting_tunnel`, `connecting`, `online`, `disconnected`, `unavailable`, `expired`, `revoked`, `failed`), missing prerequisite copyable install guide, and Quick Tunnel caveats notice.
 
 ---
 

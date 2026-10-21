@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -60,8 +61,13 @@ func NewServer(cfg Config) *Server {
 	}
 }
 
-// Start begins listening for both tunnel connections and public visitor HTTP traffic.
+// Start begins listening for both tunnel connections and public visitor HTTP/HTTPS traffic.
 func (s *Server) Start(ctx context.Context) error {
+	// Strict check: refuse to start without an explicitly configured, non-empty authentication secret
+	if strings.TrimSpace(s.config.AuthSecret) == "" {
+		return errors.New("gateway configuration error: GATEWAY_AUTH_SECRET is required and must not be empty")
+	}
+
 	// 1. Start Tunnel Listener
 	tunnelListener, err := s.createTunnelListener()
 	if err != nil {
@@ -72,7 +78,31 @@ func (s *Server) Start(ctx context.Context) error {
 	slog.Info("gateway tunnel listener ready", "addr", s.config.TunnelAddr, "base_domain", s.config.BaseDomain)
 	go s.serveTunnelConnections(ctx, tunnelListener)
 
-	// 2. Start HTTP Ingress Listener
+	// 2. Start optional HTTPS Ingress Listener if configured
+	if s.config.HTTPSAddr != "" && s.config.TLSCertPath != "" && s.config.TLSKeyPath != "" {
+		httpsServer := &http.Server{
+			Addr:              s.config.HTTPSAddr,
+			Handler:           s.HTTPHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = httpsServer.Shutdown(shutdownCtx)
+		}()
+
+		go func() {
+			slog.Info("gateway public https ingress ready", "addr", s.config.HTTPSAddr)
+			if err := httpsServer.ListenAndServeTLS(s.config.TLSCertPath, s.config.TLSKeyPath); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("gateway https server error", "error", err)
+			}
+		}()
+	}
+
+	// 3. Start HTTP Ingress Listener
 	httpServer := &http.Server{
 		Addr:              s.config.HTTPAddr,
 		Handler:           s.HTTPHandler(),
@@ -143,9 +173,9 @@ func (s *Server) handleTunnelConnection(ctx context.Context, conn net.Conn) {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	// 2. Authenticate token
-	if s.config.AuthSecret != "" && req.AuthToken != s.config.AuthSecret {
-		slog.Warn("gateway authentication failed: invalid auth token", "remote", conn.RemoteAddr().String())
+	// 2. Authenticate token using constant-time comparison
+	if s.config.AuthSecret == "" || subtle.ConstantTimeCompare([]byte(req.AuthToken), []byte(s.config.AuthSecret)) != 1 {
+		slog.Warn("gateway authentication failed: invalid or missing auth token", "remote", conn.RemoteAddr().String())
 		resp := tunnel.HandshakeResponse{
 			Status: tunnel.StatusError,
 			Error:  "invalid or unauthorized auth_token",
@@ -208,45 +238,89 @@ func (s *Server) handleTunnelConnection(ctx context.Context, conn net.Conn) {
 		switch msg.Action {
 		case tunnel.ControlActionRegister:
 			if msg.ShareToken != "" && validShareTokenRegex.MatchString(msg.ShareToken) {
-				s.registerShare(msg.ShareToken, session)
-				slog.Info("registered public share route", "share_token", msg.ShareToken)
-				ack, _ := json.Marshal(tunnel.ControlResponse{Status: tunnel.StatusSuccess, ShareToken: msg.ShareToken})
+				if regErr := s.registerShare(msg.ShareToken, session); regErr != nil {
+					slog.Warn("rejected share registration", "share_token", msg.ShareToken, "error", regErr)
+					ack, _ := json.Marshal(tunnel.ControlResponse{
+						Status:     tunnel.StatusError,
+						ShareToken: msg.ShareToken,
+						Error:      regErr.Error(),
+					})
+					ack = append(ack, '\n')
+					_, _ = controlStream.Write(ack)
+				} else {
+					slog.Info("registered public share route", "share_token", msg.ShareToken)
+					ack, _ := json.Marshal(tunnel.ControlResponse{
+						Status:     tunnel.StatusSuccess,
+						ShareToken: msg.ShareToken,
+					})
+					ack = append(ack, '\n')
+					_, _ = controlStream.Write(ack)
+				}
+			} else {
+				ack, _ := json.Marshal(tunnel.ControlResponse{
+					Status:     tunnel.StatusError,
+					ShareToken: msg.ShareToken,
+					Error:      "invalid or malformed share_token",
+				})
 				ack = append(ack, '\n')
 				_, _ = controlStream.Write(ack)
 			}
 		case tunnel.ControlActionDeregister:
 			if msg.ShareToken != "" {
-				s.deregisterShare(msg.ShareToken)
-				slog.Info("deregistered public share route", "share_token", msg.ShareToken)
-				ack, _ := json.Marshal(tunnel.ControlResponse{Status: tunnel.StatusSuccess, ShareToken: msg.ShareToken})
-				ack = append(ack, '\n')
-				_, _ = controlStream.Write(ack)
+				if deregErr := s.deregisterShare(msg.ShareToken, session); deregErr != nil {
+					slog.Warn("rejected share deregistration", "share_token", msg.ShareToken, "error", deregErr)
+					ack, _ := json.Marshal(tunnel.ControlResponse{
+						Status:     tunnel.StatusError,
+						ShareToken: msg.ShareToken,
+						Error:      deregErr.Error(),
+					})
+					ack = append(ack, '\n')
+					_, _ = controlStream.Write(ack)
+				} else {
+					slog.Info("deregistered public share route", "share_token", msg.ShareToken)
+					ack, _ := json.Marshal(tunnel.ControlResponse{
+						Status:     tunnel.StatusSuccess,
+						ShareToken: msg.ShareToken,
+					})
+					ack = append(ack, '\n')
+					_, _ = controlStream.Write(ack)
+				}
 			}
 		}
 	}
 }
 
-func (s *Server) registerShare(token string, session *yamux.Session) {
+func (s *Server) registerShare(token string, session *yamux.Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Prevent token hijacking: if token already registered to another active session, reject
+	if existing, exists := s.routes[token]; exists && existing != session && !existing.IsClosed() {
+		return fmt.Errorf("share token %q is already active on another session", token)
+	}
 
 	s.routes[token] = session
 	if s.sessionShares[session] == nil {
 		s.sessionShares[session] = make(map[string]bool)
 	}
 	s.sessionShares[session][token] = true
+	return nil
 }
 
-func (s *Server) deregisterShare(token string) {
+func (s *Server) deregisterShare(token string, session *yamux.Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if sess, ok := s.routes[token]; ok {
+		if sess != session {
+			return fmt.Errorf("unauthorized: share token %q belongs to another session", token)
+		}
 		delete(s.routes, token)
 		if s.sessionShares[sess] != nil {
 			delete(s.sessionShares[sess], token)
 		}
 	}
+	return nil
 }
 
 func (s *Server) unregisterSession(session *yamux.Session) {

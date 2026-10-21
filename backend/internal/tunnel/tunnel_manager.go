@@ -47,6 +47,9 @@ type TunnelManager struct {
 	stopped       bool
 	lastError     error
 	connectedAt   *time.Time
+
+	ackMu       sync.Mutex
+	pendingAcks map[string]chan ControlResponse
 }
 
 // NewTunnelManager creates a new TunnelManager.
@@ -66,6 +69,7 @@ func NewTunnelManager(
 		tokenProvider: tokenProvider,
 		state:         initialState,
 		activeTokens:  make(map[string]bool),
+		pendingAcks:   make(map[string]chan ControlResponse),
 	}
 }
 
@@ -96,15 +100,30 @@ func (tm *TunnelManager) Stop() {
 	tm.mu.Unlock()
 }
 
-// RegisterShare registers a newly created share with the gateway.
+// RegisterShare registers a newly created share with the gateway and waits for acknowledgment.
 func (tm *TunnelManager) RegisterShare(shareToken string) error {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
+	tm.mu.RLock()
+	stream := tm.controlStream
+	connected := tm.session != nil && !tm.session.IsClosed() && stream != nil
+	tm.mu.RUnlock()
 
-	tm.activeTokens[shareToken] = true
-	if tm.controlStream == nil {
-		return nil // Stored locally; will be registered upon connection
+	if !connected {
+		return errors.New("cannot register share: outbound tunnel to public gateway is not connected")
 	}
+
+	ackCh := make(chan ControlResponse, 1)
+	tm.ackMu.Lock()
+	if tm.pendingAcks == nil {
+		tm.pendingAcks = make(map[string]chan ControlResponse)
+	}
+	tm.pendingAcks[shareToken] = ackCh
+	tm.ackMu.Unlock()
+
+	defer func() {
+		tm.ackMu.Lock()
+		delete(tm.pendingAcks, shareToken)
+		tm.ackMu.Unlock()
+	}()
 
 	msg := ControlMessage{
 		Action:     ControlActionRegister,
@@ -113,19 +132,57 @@ func (tm *TunnelManager) RegisterShare(shareToken string) error {
 	}
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
+
+	tm.mu.Lock()
+	if tm.controlStream == nil {
+		tm.mu.Unlock()
+		return errors.New("tunnel control stream disconnected during registration")
+	}
 	_, err := tm.controlStream.Write(data)
-	return err
+	tm.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("failed to send registration message to gateway: %w", err)
+	}
+
+	// Bounded timeout waiting for gateway acknowledgment
+	select {
+	case resp := <-ackCh:
+		if resp.Status != StatusSuccess {
+			return fmt.Errorf("gateway registration rejected: %s", resp.Error)
+		}
+		tm.mu.Lock()
+		tm.activeTokens[shareToken] = true
+		tm.mu.Unlock()
+		return nil
+	case <-time.After(5 * time.Second):
+		return errors.New("timed out waiting for gateway registration acknowledgment")
+	}
 }
 
 // DeregisterShare unregisters a revoked or expired share from the gateway.
 func (tm *TunnelManager) DeregisterShare(shareToken string) error {
 	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
 	delete(tm.activeTokens, shareToken)
-	if tm.controlStream == nil {
+	stream := tm.controlStream
+	tm.mu.Unlock()
+
+	if stream == nil {
 		return nil
 	}
+
+	ackCh := make(chan ControlResponse, 1)
+	tm.ackMu.Lock()
+	if tm.pendingAcks == nil {
+		tm.pendingAcks = make(map[string]chan ControlResponse)
+	}
+	tm.pendingAcks[shareToken] = ackCh
+	tm.ackMu.Unlock()
+
+	defer func() {
+		tm.ackMu.Lock()
+		delete(tm.pendingAcks, shareToken)
+		tm.ackMu.Unlock()
+	}()
 
 	msg := ControlMessage{
 		Action:     ControlActionDeregister,
@@ -134,8 +191,24 @@ func (tm *TunnelManager) DeregisterShare(shareToken string) error {
 	}
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
+
+	tm.mu.Lock()
+	if tm.controlStream == nil {
+		tm.mu.Unlock()
+		return nil
+	}
 	_, err := tm.controlStream.Write(data)
-	return err
+	tm.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-ackCh:
+		return nil
+	case <-time.After(3 * time.Second):
+		return nil // best-effort deregistration ack
+	}
 }
 
 // IsConnected returns true if the tunnel has an active Yamux session.
@@ -330,8 +403,27 @@ func (tm *TunnelManager) connectAndServe(ctx context.Context) error {
 		for {
 			var resp ControlResponse
 			if err := dec.Decode(&resp); err != nil {
+				// Signal any pending acks that the control stream closed
+				tm.ackMu.Lock()
+				for token, ch := range tm.pendingAcks {
+					select {
+					case ch <- ControlResponse{Status: StatusError, ShareToken: token, Error: "control stream disconnected"}:
+					default:
+					}
+				}
+				tm.ackMu.Unlock()
 				return
 			}
+
+			// Route response to pending waiter
+			tm.ackMu.Lock()
+			if ch, ok := tm.pendingAcks[resp.ShareToken]; ok {
+				select {
+				case ch <- resp:
+				default:
+				}
+			}
+			tm.ackMu.Unlock()
 		}
 	}()
 

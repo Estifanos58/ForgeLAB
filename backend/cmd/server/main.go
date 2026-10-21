@@ -225,19 +225,43 @@ func main() {
 	}
 	defer dockerEngine.StopAllLogCollectors()
 
-	// Initialize Public Sharing Tunnel & Local Router
+	// Initialize Public Sharing Provider & Local Router
 	dockerUpstreamResolver := tunnel.NewDockerUpstreamResolver(dockerCli)
-	localRouter := tunnel.NewLocalRouter(shareService, serviceService, dockerUpstreamResolver)
-	tunnelManager := tunnel.NewTunnelManager(tunnel.TunnelManagerConfig{
-		Enabled:          cfg.Share.Enabled,
-		GatewayTunnelURL: cfg.Share.GatewayTunnelURL,
-		GatewayAuthToken: cfg.Share.GatewayAuthToken,
-		TLSSkipVerify:    cfg.Share.TLSSkipVerify,
-		InstallationID:   cfg.Server.Host,
-	}, localRouter, shareService)
-	shareService.SetTunnelRegistrar(tunnelManager)
-	tunnelManager.Start(ctx)
-	defer tunnelManager.Stop()
+	shareService.SetUpstreamResolver(dockerUpstreamResolver)
+
+	if cfg.Share.Provider == models.ProviderGateway {
+		localRouter := tunnel.NewLocalRouter(shareService, serviceService, dockerUpstreamResolver)
+		tunnelManager := tunnel.NewTunnelManager(tunnel.TunnelManagerConfig{
+			Enabled:          cfg.Share.Enabled,
+			GatewayTunnelURL: cfg.Share.GatewayTunnelURL,
+			GatewayAuthToken: cfg.Share.GatewayAuthToken,
+			TLSSkipVerify:    cfg.Share.TLSSkipVerify,
+			InstallationID:   cfg.Server.Host,
+		}, localRouter, shareService)
+		gatewayProvider := tunnel.NewGatewayProvider(
+			tunnelManager,
+			cfg.Share.Enabled,
+			cfg.Share.GatewayPublicURL,
+			cfg.Share.GatewayTunnelURL,
+			cfg.Share.GatewayAuthToken,
+		)
+		shareService.SetProvider(gatewayProvider)
+		shareService.SetTunnelRegistrar(tunnelManager)
+		tunnelManager.Start(ctx)
+		defer tunnelManager.Stop()
+	} else {
+		// Default provider: Cloudflare Quick Tunnels (domainless sharing)
+		cfProvider := tunnel.NewCloudflareProvider(cfg.Share.Enabled, cfg.Share.CloudflaredPath)
+		shareService.SetProvider(cfProvider)
+	}
+	defer func() {
+		_ = shareService.Close()
+	}()
+
+	// Reconcile stale shares from prior runs (e.g. terminated cloudflared processes)
+	if err := shareService.ReconcileStaleShares(ctx); err != nil {
+		slog.Warn("failed to reconcile stale public shares on startup", "error", err)
+	}
 
 	// Initialize Redis deployment queue & worker
 	var deployQueue *queue.DeploymentQueue

@@ -1,0 +1,2 @@
+ALTER TABLE public_shares ADD COLUMN IF NOT EXISTS provider VARCHAR(32) NOT NULL DEFAULT 'cloudflare';
+ALTER TABLE public_shares ADD COLUMN IF NOT EXISTS local_port INT;

@@ -34,6 +34,8 @@ type Config struct {
 // ShareConfig holds settings for outbound public tunnel and sharing.
 type ShareConfig struct {
 	Enabled          bool
+	Provider         string // "cloudflare" (default) or "gateway"
+	CloudflaredPath  string // path to cloudflared executable (default "cloudflared")
 	GatewayTunnelURL string
 	GatewayPublicURL string
 	GatewayAuthToken string
@@ -41,9 +43,16 @@ type ShareConfig struct {
 	AppHostIP        string
 }
 
-// IsConfigured returns true if the gateway tunnel URL and auth token are configured.
+// IsConfigured returns true if the public sharing feature is configured for the selected provider.
 func (s ShareConfig) IsConfigured() bool {
-	return s.Enabled && strings.TrimSpace(s.GatewayTunnelURL) != "" && strings.TrimSpace(s.GatewayAuthToken) != ""
+	if !s.Enabled {
+		return false
+	}
+	if s.Provider == "gateway" {
+		return strings.TrimSpace(s.GatewayTunnelURL) != "" && strings.TrimSpace(s.GatewayAuthToken) != ""
+	}
+	// For Cloudflare Quick Tunnels, no domain, DNS, or credentials are required.
+	return true
 }
 
 // RateLimitConfig holds throttling limits for sensitive API endpoints and WebSockets.
@@ -420,14 +429,35 @@ func Load() (*Config, error) {
 			WSSubscriptionLimit: parseIntEnv("RATE_LIMIT_WS_SUB_PER_MINUTE", 120),
 			TrustedProxies:      trustedProxies,
 		},
-		Share: ShareConfig{
-			Enabled:          getEnv("FORGELAB_SHARING_ENABLED", "false") == "true",
-			GatewayTunnelURL: getEnv("GATEWAY_TUNNEL_URL", ""),
-			GatewayPublicURL: strings.TrimRight(getEnv("GATEWAY_PUBLIC_URL", ""), "/"),
-			GatewayAuthToken: getEnv("GATEWAY_AUTH_TOKEN", ""),
-			TLSSkipVerify:    getEnv("GATEWAY_TLS_SKIP_VERIFY", "false") == "true",
-			AppHostIP:        getEnv("FORGELAB_APP_HOST_IP", "127.0.0.1"),
-		},
+		Share: func() ShareConfig {
+			enabled := getEnv("FORGELAB_SHARING_ENABLED", "false") == "true"
+			gatewayTunnel := getEnv("GATEWAY_TUNNEL_URL", "")
+			gatewayPublic := strings.TrimRight(getEnv("GATEWAY_PUBLIC_URL", ""), "/")
+			gatewayAuth := getEnv("GATEWAY_AUTH_TOKEN", "")
+			if gatewayAuth == "" {
+				gatewayAuth = getEnv("GATEWAY_AUTH_SECRET", "")
+			}
+			provider := strings.ToLower(strings.TrimSpace(getEnv("FORGELAB_SHARING_PROVIDER", "")))
+			if provider == "" {
+				if gatewayTunnel != "" && gatewayAuth != "" {
+					provider = "gateway"
+				} else {
+					provider = "cloudflare"
+				}
+			}
+			cloudflaredPath := getEnv("FORGELAB_CLOUDFLARED_PATH", "cloudflared")
+
+			return ShareConfig{
+				Enabled:          enabled,
+				Provider:         provider,
+				CloudflaredPath:  cloudflaredPath,
+				GatewayTunnelURL: gatewayTunnel,
+				GatewayPublicURL: gatewayPublic,
+				GatewayAuthToken: gatewayAuth,
+				TLSSkipVerify:    getEnv("GATEWAY_TLS_SKIP_VERIFY", "false") == "true",
+				AppHostIP:        getEnv("FORGELAB_APP_HOST_IP", "127.0.0.1"),
+			}
+		}(),
 	}
 
 	return cfg, nil

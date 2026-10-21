@@ -293,34 +293,41 @@ ForgeLAB supports registration-free local deployments for self-hosted and single
 
 ## 10. Public Project Sharing & Outbound Gateway Trust Boundaries
 
-ForgeLAB’s public sharing feature enables users to share locally deployed projects over the internet without compromising control-plane integrity, exposing private network topology, or allowing arbitrary host access:
+ForgeLAB’s public sharing feature enables users to share locally deployed projects over the internet without compromising control-plane integrity, exposing private network topology, or allowing arbitrary host access. ForgeLAB supports both domainless Cloudflare Quick Tunnels (default) and self-hosted public gateways.
 
-1. **Architectural Separation of Ingress Gateway (`cmd/gateway`):**
-   - The public gateway runs on an internet-facing host isolated from the ForgeLAB control plane.
-   - It possesses **zero** access to the host Docker daemon, PostgreSQL, Redis, or local source files.
-   - It cannot initiate arbitrary outbound connections into internal networks; it can only multiplex visitor requests across authenticated tunnels established outbound by ForgeLAB instances.
-   - The gateway rejects requests with invalid hostnames, missing share headers, or unregistered subdomains.
+### 1. Cloudflare Quick Tunnel Provider Security Model (`FORGELAB_SHARING_PROVIDER=cloudflare`)
+- **Zero Inbound Attack Surface:** Outbound QUIC/HTTP2 tunnel initiated by a supervised child process (`cloudflared tunnel --url http://127.0.0.1:<LOCAL_PORT>`). No router port forwarding, static IP, or public domain required.
+- **Safe Subprocess Execution:** Cloudflared is executed via Go's safe `os/exec.CommandContext` using explicit argv slices without shell interpretation (`sh -c`). Process arguments are never constructed via string formatting with user or visitor input.
+- **Strict Ephemeral Port & Loopback Binding:** The local router (`LocalShareServer`) binds strictly to loopback (`127.0.0.1:0`), obtaining an ephemeral random port allocated by the OS kernel. It is never exposed on `0.0.0.0` or external network interfaces.
+- **URL Discovery & Validation:** Captures tunnel output into bounded line buffers (capped at 512 lines) and validates the provider-issued URL with a strict regex (`^https://[a-zA-Z0-9-]+\.trycloudflare\.com$`). Rejects any malformed, non-HTTPS, or placeholder domain (`example.com`, `localhost`).
+- **Config Conflict Detection:** Cloudflare Quick Tunnels fail if a pre-existing `~/.cloudflared/config.yml` exists. ForgeLAB detects this conflict and surfaces an actionable notice without modifying or deleting user files.
+- **Process Supervision & Lifecycle Cleanup:** The child process is supervised with an in-memory registry. Revocation, expiration, project deletion, or server shutdown immediately terminates the process via `os.Interrupt`, falling back to `Kill()` if unresponsive after 3 seconds.
+- **Startup Stale Share Reconciliation:** Ephemeral trycloudflare URLs cannot survive a ForgeLAB restart. On server boot, `ReconcileStaleShares` discovers orphaned active cloudflared shares in the database and marks them `revoked`, guaranteeing the UI never displays dead ghost links.
 
-2. **Authenticated Outbound Multiplexed Tunnel:**
-   - The tunnel connection is initiated strictly **outbound** from the local ForgeLAB server to the public gateway over TLS (`GATEWAY_TUNNEL_URL`).
-   - The owner's machine requires **no inbound port forwarding**, no static public IP, and no firewall holes.
-   - Connection handshake requires a shared cryptographic secret (`GATEWAY_AUTH_TOKEN`). Connections presenting invalid tokens are dropped immediately.
-   - Using `yamux`, visitor requests are multiplexed as isolated virtual streams over the single authenticated TCP connection.
+### 2. Self-Hosted Gateway Security Model (`FORGELAB_SHARING_PROVIDER=gateway`)
+- **Architectural Separation:** The public gateway (`cmd/gateway`) runs on an isolated internet-facing server with zero access to Docker, PostgreSQL, Redis, or local source files.
+- **Constant-Time Secret Comparison:** Handshake authentication uses `crypto/subtle.ConstantTimeCompare`, neutralizing timing side-channel attacks.
+- **Fail-Closed Secret Validation:** Gateway refuses to start if `GATEWAY_AUTH_SECRET` is empty or shorter than 16 bytes.
+- **Per-Session Registration Isolation:** Registered share routes are tracked per Yamux tunnel session. A tunnel cannot deregister or overwrite shares belonging to another active tunnel session.
+- **Synchronous Acknowledgment Handshake:** `TunnelManager.RegisterShare` waits for an explicit gateway acknowledgment frame with a bounded 5-second timeout; if unacknowledged or disconnected, the operation fails closed without reporting the share as online.
+- **Native HTTPS & TLS Ingress:** The gateway natively supports TLS on `:443` or an upstream TLS-terminating reverse proxy.
 
-3. **Local Request Router & Security Defense-in-Depth (`internal/tunnel/local_router.go`):**
-   - **Path Traversal Defense:** Both the raw `RequestURI` and normalized `URL.Path` are inspected before route evaluation. Any path containing `..` or attempting directory traversal outside allowed service boundaries is immediately rejected with HTTP `400 Bad Request`.
-   - **Management Plane Protection:** The router maintains a hardcoded exclusion list of sensitive ports and paths. It strictly refuses to proxy requests to the ForgeLAB API (`:8080`), local source agent (`:4142`), PostgreSQL (`:5432`), Redis (`:6379`), or the Docker socket.
-   - **Authoritative Route Allowlists:** The local router resolves target services solely from authoritative ForgeLAB database records (`public_shares` and `services`). Visitors and gateway headers cannot specify arbitrary target IP addresses, internal hostnames, or ports.
-   - **Service State & Ownership Verification:** Traffic is only routed if the target service is in a verified `running` state and belongs to the project associated with the share token.
+### 3. Share-Scoped Request Router (`internal/tunnel/share_router.go`)
+- **Path Traversal Defense:** Both raw `RequestURI` and normalized `URL.Path` are validated. Any path containing `..` or URL-encoded variations (`%2e%2e`) is immediately rejected with HTTP `400 Bad Request`.
+- **Management Plane Protection:** The router strictly blocks proxying to ForgeLAB management ports (:8080), local source agent (:4142), PostgreSQL (:5432), Redis (:6379), and the Docker socket.
+- **Longest-Prefix Deterministic Matching:** Routes are sorted by prefix length in descending order, guaranteeing `/api/*` requests reach the backend API rather than being swallowed by the frontend `/` fallback handler.
+- **Authoritative Route Allowlists:** Target service IDs and host ports are resolved solely from verified database records. Visitors cannot control upstream targets via headers or query parameters.
+- **WebSocket Hijacking & Streaming:** Supported via safe `http.Hijacker` connection takeover with bidirectional byte copying, bounded timeouts, and strict error handling.
 
-4. **Container Host Port Loopback Binding:**
-   - Deployed application container host ports bind to `127.0.0.1` by default via `FORGELAB_APP_HOST_IP`.
-   - This eliminates LAN/WAN bypass attacks where an attacker on the same local network attempts to reach deployed containers directly on their raw host ports (`10000–60000`), forcing all external traffic through the authenticated tunnel and local router.
+### 4. Container Host Port Loopback Binding
+- Deployed application container host ports bind to `127.0.0.1` by default via `FORGELAB_APP_HOST_IP`.
+- Prevents LAN/WAN bypass attacks where an attacker on the same local network attempts to reach deployed containers directly on raw host ports (`10000–60000`).
 
-5. **Immediate Revocation & Expiration Invariant:**
-   - Revoking a share immediately marks the database record as `revoked`, deregisters the route from the local tunnel router, and sends an explicit deregistration frame to the public gateway.
-   - Expired shares are rejected with HTTP `410 Gone` or `404 Not Found` without touching application containers.
-   - Revocation never alters running container state, does not trigger rebuilds, and does not affect local preview URLs.
+### 5. Immediate Revocation & Expiration Invariant
+- Revoking a share marks the DB record `revoked`, terminates the child tunnel process or deregisters the gateway route, and closes the local ephemeral HTTP listener.
+- Expired or revoked shares return HTTP `404 Not Found` or `410 Gone`.
+- Revocation never alters running container state, does not rebuild containers, and does not affect local preview URLs.
+
 
 
 

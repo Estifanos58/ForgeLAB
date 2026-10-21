@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	dockerclient "github.com/docker/docker/client"
@@ -46,6 +47,21 @@ func (r *DockerUpstreamResolver) ResolveUpstream(ctx context.Context, service *m
 		cJSON, err := r.dockerCli.ContainerInspect(inspectCtx, *service.ContainerID)
 		cancel()
 		if err == nil && cJSON.NetworkSettings != nil {
+			// In Docker Compose mode, ensure backend container joins the service's network
+			if isDockerEnv {
+				myContainer := os.Getenv("HOSTNAME")
+				if myContainer == "" {
+					myContainer, _ = os.Hostname()
+				}
+				if myContainer != "" {
+					for netName := range cJSON.NetworkSettings.Networks {
+						connCtx, connCancel := context.WithTimeout(ctx, 2*time.Second)
+						_ = r.dockerCli.NetworkConnect(connCtx, netName, myContainer, nil)
+						connCancel()
+					}
+				}
+			}
+
 			for _, netSettings := range cJSON.NetworkSettings.Networks {
 				if netSettings != nil && netSettings.IPAddress != "" {
 					candidates = append(candidates, fmt.Sprintf("http://%s:%d", netSettings.IPAddress, intPort))
@@ -56,6 +72,7 @@ func (r *DockerUpstreamResolver) ResolveUpstream(ctx context.Context, service *m
 			}
 		}
 	}
+
 
 	// 2. Add HostPort candidates
 	if service.HostPort != nil && *service.HostPort > 0 {
@@ -72,17 +89,22 @@ func (r *DockerUpstreamResolver) ResolveUpstream(ctx context.Context, service *m
 	}
 
 	// 3. Fast connectivity probe: pick the first responsive candidate
-	for _, candidate := range candidates {
-		hostPort := stringsTrimHTTP(candidate)
-		conn, err := net.DialTimeout("tcp", hostPort, 400*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			return candidate, nil
+	for attempt := 0; attempt < 2; attempt++ {
+		for _, candidate := range candidates {
+			hostPort := stringsTrimHTTP(candidate)
+			conn, err := net.DialTimeout("tcp", hostPort, 500*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				return candidate, nil
+			}
+		}
+		if attempt == 0 {
+			time.Sleep(150 * time.Millisecond)
 		}
 	}
 
-	// If no candidate affirmatively answered TCP probe, return the first one as fallback
-	return candidates[0], nil
+	return "", fmt.Errorf("service %q is unreachable: no candidate endpoints (%s) answered TCP probe",
+		service.Name, strings.Join(candidates, ", "))
 }
 
 func stringsTrimHTTP(s string) string {

@@ -813,7 +813,7 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 ## 5. Public Project Sharing (`/api/projects/{id}/share`)
 
 ### `GET /api/projects/{id}/share`
-Retrieves public sharing configuration, outbound tunnel health, and active share details for a project.
+Retrieves public sharing configuration, active provider health, and active share details for a project.
 
 - **Authentication:** Required (User JWT or isolated Guest Session)
 - **Rate Limit:** 60 requests/minute
@@ -821,15 +821,19 @@ Retrieves public sharing configuration, outbound tunnel health, and active share
   ```json
   {
     "configured": true,
+    "provider": "cloudflare",
     "tunnel_state": "online",
+    "install_guide": "",
     "share": {
       "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
       "project_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
       "owner_id": "1fa85f64-5717-4562-b3fc-2c963f66afa1",
       "share_token": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
-      "public_url": "https://a1b2c3d4e5f60718293a4b5c6d7e8f90.preview.example.com",
-      "public_host": "a1b2c3d4e5f60718293a4b5c6d7e8f90.preview.example.com",
+      "provider": "cloudflare",
+      "public_url": "https://random-words-1234.trycloudflare.com",
+      "public_host": "random-words-1234.trycloudflare.com",
       "primary_service_id": "service-uuid-1",
+      "local_port": 39421,
       "route_mappings": [
         {
           "path_prefix": "/",
@@ -865,13 +869,26 @@ Retrieves public sharing configuration, outbound tunnel health, and active share
     ]
   }
   ```
-- **Unconfigured Response (`200 OK`):**
-  When public sharing or the outbound gateway is unconfigured (`FORGELAB_SHARING_ENABLED=false` or missing `GATEWAY_*`), the endpoint returns `configured: false` with actionable configuration guidance:
+- **Tunnel State Values (`tunnel_state`):**
+  - `"not_shared"`: Sharing is configured and ready; no public share is currently active.
+  - `"checking_prerequisites"`: Provider is verifying binary prerequisites (`cloudflared`).
+  - `"starting_tunnel"`: Ephemeral router listener bound and child tunnel process starting.
+  - `"connecting"`: Tunnel established; waiting for provider URL discovery and origin readiness.
+  - `"online"`: Provider-issued URL validated and origin serving requests.
+  - `"disconnected"`: Tunnel process or outbound stream disconnected.
+  - `"unavailable"`: Provider unconfigured, binary missing, or disabled.
+  - `"expired"`: Share has expired according to its `expires_at` timestamp.
+  - `"revoked"`: Share was explicitly revoked.
+  - `"failed"`: Tunnel process or gateway registration failed.
+- **Prerequisites Missing Response (`200 OK`):**
+  When `cloudflared` is not found on `$PATH` or specified binary path:
   ```json
   {
     "configured": false,
+    "provider": "cloudflare",
     "tunnel_state": "unavailable",
-    "message": "Public project sharing is not enabled on this ForgeLAB installation. Configure FORGELAB_SHARING_ENABLED=true and GATEWAY_* settings to enable outbound preview links."
+    "install_guide": "Cloudflare Quick Tunnel requires cloudflared. Install it on your machine:\n- macOS: brew install cloudflared\n- Linux: sudo apt-get install cloudflared\n- Windows: winget install --id Cloudflare.cloudflared\nSee: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+    "message": "cloudflared binary is not installed or not executable"
   }
   ```
 - **Error Responses:**
@@ -880,7 +897,12 @@ Retrieves public sharing configuration, outbound tunnel health, and active share
   - `404 Not Found`: Project not found.
 
 ### `POST /api/projects/{id}/share`
-Creates a new public share or updates route mappings for an existing active share. Generates a 128-bit cryptographically secure token and registers the routes over the outbound tunnel.
+Creates a new public share or updates route mappings for an existing active share.
+1. Creates an ephemeral local router bound to `127.0.0.1:0`.
+2. Starts the supervised `cloudflared` child process (or registers routes with the self-hosted gateway).
+3. Captures and validates the provider-issued URL (`https://*.trycloudflare.com`).
+4. Verifies origin readiness via HTTP probe.
+5. Persists the share record and transitions to `online`.
 
 - **Authentication:** Required (User JWT or isolated Guest Session)
 - **Rate Limit:** 30 requests/minute
@@ -913,9 +935,13 @@ Creates a new public share or updates route mappings for an existing active shar
     "share": {
       "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
       "project_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "owner_id": "1fa85f64-5717-4562-b3fc-2c963f66afa1",
       "share_token": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
-      "public_url": "https://a1b2c3d4e5f60718293a4b5c6d7e8f90.preview.example.com",
-      "public_host": "a1b2c3d4e5f60718293a4b5c6d7e8f90.preview.example.com",
+      "provider": "cloudflare",
+      "public_url": "https://random-words-1234.trycloudflare.com",
+      "public_host": "random-words-1234.trycloudflare.com",
+      "primary_service_id": "service-uuid-1",
+      "local_port": 39421,
       "status": "active"
     }
   }
@@ -924,10 +950,10 @@ Creates a new public share or updates route mappings for an existing active shar
   - `400 Bad Request`: Invalid payload, unserviceable prefix, or target service not running.
   - `403 Forbidden`: Project or service not owned by user.
   - `404 Not Found`: Project or target service does not exist.
-  - `503 Service Unavailable`: Public sharing or gateway tunnel is not configured or offline.
+  - `503 Service Unavailable`: Sharing provider missing binary, unconfigured, or tunnel process failed to start.
 
 ### `DELETE /api/projects/{id}/share`
-Immediately revokes the active public share for the project, deregistering the routes from both the local router and the public gateway.
+Immediately revokes the active public share for the project, terminates any running child tunnel processes, closes the local ephemeral router, and deregisters gateway routes.
 
 - **Authentication:** Required (User JWT or isolated Guest Session)
 - **Success Response (`200 OK`):**

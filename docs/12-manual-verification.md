@@ -1800,80 +1800,83 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 
 ### 38. Secure Public Project Sharing & Outbound Tunnel
 
-#### Test Procedure 38.1 — Unconfigured Gateway Graceful Failure
-1. Ensure `FORGELAB_SHARING_ENABLED=false` or `GATEWAY_TUNNEL_URL` is unset in `.env`.
+#### Test Procedure 38.1 — Missing `cloudflared` Prerequisite Handling
+1. With `FORGELAB_SHARING_PROVIDER=cloudflare` (default), temporarily ensure `cloudflared` is not on `$PATH` (or set `FORGELAB_CLOUDFLARED_PATH=/nonexistent/cloudflared`).
 2. Open ForgeLAB at `http://localhost:3000` and navigate to a deployed project.
 3. Click the **Share Preview** button in the project header.
 4. Verify the modal opens and displays:
+   - Provider badge: `Cloudflare Quick Tunnel`
    - Status badge: `Unavailable`
-   - Actionable alert explaining that public sharing is not configured on this installation, with clear instructions on which `.env` variables (`FORGELAB_SHARING_ENABLED`, `GATEWAY_*`) to configure.
+   - Actionable alert explaining that `cloudflared` is required, with copyable installation commands for macOS (`brew`), Ubuntu/Debian (`apt-get`), Arch (`pacman`), and Windows (`winget`).
    - The "Create Public Share" button is disabled.
-5. Verify the backend did not panic, and no fake or simulated share URL is generated.
+5. Verify the backend returns `configured: false`, `tunnel_state: "unavailable"`, and actionable `install_guide` text.
+6. Verify no fake or simulated share URL is generated.
 
-#### Test Procedure 38.2 — Share Creation & Token Unpredictability
-1. In development, configure `FORGELAB_SHARING_ENABLED=true`, `GATEWAY_TUNNEL_URL=localhost:8443`, `GATEWAY_PUBLIC_URL=https://preview.example.com`, and `GATEWAY_AUTH_TOKEN=test-token`.
-2. Deploy a two-service application (frontend on port 3000, backend API on port 8080).
+#### Test Procedure 38.2 — Quick Tunnel Share Creation & Ephemeral Router
+1. Install `cloudflared` on the host and configure `FORGELAB_SHARING_ENABLED=true` and `FORGELAB_SHARING_PROVIDER=cloudflare`.
+2. Deploy a multi-service application (frontend and backend API).
 3. Open **Share Preview** modal:
-   - Select the frontend service as the primary service.
+   - Select frontend as the primary service.
    - Configure `/` -> frontend service and `/api` -> backend service.
-   - Select expiration (e.g. 24 hours).
    - Click **Create Public Link**.
-4. Verify response:
-   - Share token is a 32-character hexadecimal string generated via `crypto/rand` (128-bit entropy).
-   - Generated URL matches `https://<share-token>.preview.example.com`.
-   - Copy button correctly copies the link to the clipboard with visual checkmark confirmation.
+4. Verify server-side execution:
+   - Ephemeral HTTP listener binds to `127.0.0.1:0`.
+   - Child process `cloudflared tunnel --url http://127.0.0.1:<port>` starts via `exec.CommandContext` without shell interpolation.
+   - Standard error output is scanned for the generated URL matching `^https://[a-zA-Z0-9-]+\.trycloudflare\.com$`.
+   - Origin readiness is verified via HTTP GET probe.
 5. Inspect PostgreSQL database:
-   - Query `SELECT * FROM public_shares WHERE project_id = '<id>';`
-   - Confirm record exists with `status = 'active'`, correct route mappings in JSONB, and valid `expires_at`.
+   - Query `SELECT id, provider, share_token, public_url, local_port, status FROM public_shares WHERE project_id = '<id>';`
+   - Confirm `provider = 'cloudflare'`, `local_port` matches the ephemeral port, and `public_url` contains the actual `trycloudflare.com` domain.
+6. Verify UI modal:
+   - Displays real HTTPS link `https://<random>.trycloudflare.com`.
+   - Copy button successfully copies link to clipboard.
+   - Disclaimer notes Quick Tunnel characteristics (ephemeral URL, no SLA, no SSE support).
 
 #### Test Procedure 38.3 — Cross-Network Visitor Access (Physical Internet Test)
-> **Note on Prerequisites:** This physical cross-network test requires a live public gateway deployed on an internet-reachable server with a wildcard DNS record (e.g. `*.preview.yourdomain.com`) and a valid wildcard TLS certificate. If internet infrastructure is not yet provisioned, mark this test as `BLOCKED: Awaiting Public Gateway & DNS Provisioning` rather than claiming verified.
+> **Note on Prerequisites:** Testing physical cross-network visitor access requires internet connectivity and an active Cloudflare Quick Tunnel (or a deployed self-hosted gateway with wildcard DNS/TLS). If external internet is disconnected or cloudflared is unavailable, mark physical access as `BLOCKED: Awaiting cloudflared installation & Internet Connectivity` rather than claiming verified.
 
-1. **Gateway Deployment:**
-   - On a cloud VM, start `backend/cmd/gateway/main.go` with `GATEWAY_INGRESS_PORT=443`, `GATEWAY_TUNNEL_PORT=8443`, valid TLS certificates, and `GATEWAY_AUTH_TOKEN`.
-2. **Local ForgeLAB Connection:**
-   - On the owner's laptop/workstation (behind standard home/office NAT), start ForgeLAB with `GATEWAY_TUNNEL_URL=<gateway-ip>:8443`.
-   - Verify tunnel manager successfully establishes the outbound TLS Yamux session and registers active shares.
-3. **External Client Test:**
-   - Disconnect a mobile phone or secondary laptop from the local WiFi network (use cellular data hotspot).
-   - In the mobile browser, navigate to `https://<share-token>.preview.yourdomain.com`.
-4. **End-to-End Application Verification:**
-   - Verify the frontend UI renders correctly without mixed-content warnings.
-   - Trigger an application action that calls `/api/*` (e.g., logging in or submitting a form in the deployed app).
-   - Verify the request travels through the public gateway -> outbound tunnel -> local router -> local backend container -> local database, and returns a valid response to the mobile browser.
-   - Verify WebSocket connections (if used by the deployed application) upgrade cleanly and stream bidirectional data.
+1. **Quick Tunnel External Test:**
+   - From a device on an external cellular network (e.g. mobile phone), open `https://<random>.trycloudflare.com`.
+   - Verify the frontend UI renders correctly with zero mixed-content warnings.
+   - Perform an action triggering `/api/*` requests.
+   - Verify request routes through Cloudflare Edge -> local cloudflared process -> share-scoped router -> local backend container -> response.
+   - Verify WebSocket connections (if used) upgrade and stream bidirectional frames.
 
-#### Test Procedure 38.4 — Immediate Revocation & Expiration Invariant
-1. While the remote visitor is browsing the shared application:
-2. On the owner's computer, click **Revoke Link Immediately** in the ForgeLAB Share Preview modal.
-3. Confirm revocation prompt.
-4. Verify local state immediately transitions: status changes to `Revoked`, public URL card disappears, and a notification confirms revocation.
-5. On the remote visitor's browser, refresh the page:
-   - Verify the public gateway returns HTTP 404 Not Found or HTTP 410 Gone.
-   - Verify traffic is completely blocked at both the public gateway and the local router.
-6. Verify local application preservation:
-   - Open the local preview URL (`http://localhost:<host_port>`).
-   - Confirm the deployed application is still running healthy and unaffected by the revocation.
+#### Test Procedure 38.4 — Immediate Revocation & Process Termination
+1. While the share is active:
+2. In the Share Preview modal, click **Revoke Link Immediately**.
+3. Verify server-side execution:
+   - Supervised `cloudflared` child process receives `SIGTERM` / `os.Interrupt` and exits cleanly within 3 seconds.
+   - Ephemeral local router listener (`127.0.0.1:<port>`) is closed.
+   - Database record transitions to `status = 'revoked'`.
+4. On the external client:
+   - Attempting to visit the `trycloudflare.com` URL returns Cloudflare error 1033 / 502 Bad Gateway.
+5. Verify local application preservation:
+   - Local preview URL (`http://localhost:<host_port>`) continues to respond normally; container is not restarted or stopped.
 
 #### Test Procedure 38.5 — Security Boundary Defense & Port Isolation
 1. **Directory Traversal Attack:**
-   - Send HTTP requests targeting the share token with traversal sequences:
-     `curl -k "https://<share-token>.preview.example.com/api/../../etc/passwd"`
-     `curl -k "https://<share-token>.preview.example.com/../"`
-   - Verify the local router rejects the request with HTTP `400 Bad Request` (`path traversal sequences ('..') are strictly forbidden`).
-2. **Management Plane Port Shielding:**
-   - Attempt to access ForgeLAB management API, local agent (:4142), Postgres (:5432), or Redis (:6379) through the tunnel.
-   - Verify all management ports are strictly blocked from routing.
-3. **Local Container Host Port Binding:**
-   - Check Docker container port bindings: `docker inspect <container_id> --format '{{json .NetworkSettings.Ports}}'`.
-   - Verify `HostIp` is `127.0.0.1` (not `0.0.0.0`).
-   - From another device on the same local LAN, attempt to connect directly to `http://<laptop-lan-ip>:<host_port>`.
-   - Verify the connection is refused, confirming local containers cannot be reached directly without passing through ForgeLAB.
+   - Send requests targeting the share with traversal sequences:
+     `curl -k "https://<share-domain>/api/../../etc/passwd"`
+     `curl -k "https://<share-domain>/api/%2e%2e/admin"`
+   - Verify the share router rejects the request with HTTP `400 Bad Request` (`path traversal sequences are strictly forbidden`).
+2. **Management Plane Shielding:**
+   - Verify requests to `:8080` (ForgeLAB API), `:4142` (agent), `:5432` (Postgres), and `:6379` (Redis) are rejected by the router.
+3. **Loopback Isolation:**
+   - Confirm application containers bind strictly to `127.0.0.1` (`FORGELAB_APP_HOST_IP`), preventing LAN bypass.
+
+#### Test Procedure 38.6 — Restart Reconciliation (No Stale/Ghost Shares)
+1. With an active Cloudflare Quick Tunnel share, restart the ForgeLAB backend server (`cmd/server`).
+2. On startup, verify `shareService.ReconcileStaleShares` executes:
+   - Marks orphaned cloudflared shares in the database as `status = 'revoked'`.
+3. Open the Share Preview modal in the UI:
+   - Verify the share is displayed as `Revoked` / `Not shared` rather than claiming to be `Online`.
 
 #### Verification Record
-- **Status:** NOT RECORDED
-- **Verified by:** —
-- **Date:** —
-- **Environment:** —
-- **Notes:** —
+- **Status:** CODE COMPLETE & LOCALLY TESTED (Provider Unit Tests, Router Routing Tests, Gateway Auth/Ack Tests, and Frontend Build PASS)
+- **External Internet Test:** BLOCKED: `cloudflared` executable not installed on host test environment; external connectivity through trycloudflare.com edge requires host package installation.
+- **Verified by:** Antigravity AI
+- **Date:** 2026-10-21
+- **Environment:** Linux 6.6.137+rpt-rpi-2712 aarch64, Go 1.24, Node.js v20.18.0
+- **Notes:** Automated test coverage validates provider abstraction, URL discovery parsing, config conflict error detection, longest-prefix routing, path traversal defense, gateway constant-time auth, and registration acks.
 

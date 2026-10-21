@@ -32,6 +32,18 @@ RUN for i in 1 2 3 4 5; do \
         (echo "Retrying apk add in 3s..." && sleep 3); \
     done
 
+# Install official cloudflared binary for domainless public sharing
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then CLOUDFLARED_ARCH="amd64"; \
+    elif [ "$ARCH" = "aarch64" ]; then CLOUDFLARED_ARCH="arm64"; \
+    else CLOUDFLARED_ARCH="amd64"; fi && \
+    for i in 1 2 3 4 5; do \
+        curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CLOUDFLARED_ARCH}" && \
+        chmod +x /usr/local/bin/cloudflared && break || \
+        (echo "Retrying cloudflared download in 3s..." && sleep 3); \
+    done
+
+
 WORKDIR /app
 
 COPY --from=builder /app/forgelab-server .
