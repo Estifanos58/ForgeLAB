@@ -52,18 +52,18 @@ Installation Instructions:
 Documentation: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/`
 
 type managedTunnel struct {
-	shareToken   string
-	cmd          *exec.Cmd
-	cancel       context.CancelFunc
-	localServer  *LocalShareServer
-	publicURL    string
-	publicHost   string
-	localPort    int
-	state        string
-	reason       string
-	recentLogs   []string
-	mu           sync.RWMutex
-	done         chan struct{}
+	shareToken  string
+	cmd         *exec.Cmd
+	cancel      context.CancelFunc
+	localServer *LocalShareServer
+	publicURL   string
+	publicHost  string
+	localPort   int
+	state       string
+	reason      string
+	recentLogs  []string
+	mu          sync.RWMutex
+	done        chan struct{}
 }
 
 func (t *managedTunnel) addLog(line string) {

@@ -390,7 +390,7 @@ func Load() (*Config, error) {
 			CORSAllowedOrigins: corsOrigins,
 			CookieSecure:       getEnv("COOKIE_SECURE", "false") == "true",
 			AllowGuestMode: func() bool {
-				if guestEnv, ok := os.LookupEnv("FORGELAB_ALLOW_GUEST_MODE"); ok {
+				if guestEnv, ok := os.LookupEnv("FORGELAB_ALLOW_GUEST_MODE"); ok && strings.TrimSpace(guestEnv) != "" {
 					guestEnvLower := strings.ToLower(strings.TrimSpace(guestEnv))
 					return guestEnvLower == "true" || guestEnvLower == "1" || guestEnvLower == "yes"
 				}

@@ -41,10 +41,10 @@ type Config struct {
 type Server struct {
 	config Config
 
-	mu           sync.RWMutex
-	routes       map[string]*yamux.Session          // shareToken -> active yamux session
+	mu            sync.RWMutex
+	routes        map[string]*yamux.Session          // shareToken -> active yamux session
 	sessionShares map[*yamux.Session]map[string]bool // session -> registered shareTokens
-	closed       bool
+	closed        bool
 }
 
 // NewServer creates a new Gateway Server.

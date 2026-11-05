@@ -578,4 +578,3 @@ func TestBuildArgs_NextJSServerEnvInheritance(t *testing.T) {
 		assert.NotContains(t, runnerStage, fmt.Sprintf("ENV %s", k), "runner stage must not bake build-stage secrets as ENV %s", k)
 	}
 }
-

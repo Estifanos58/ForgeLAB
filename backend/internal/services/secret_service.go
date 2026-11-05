@@ -331,6 +331,9 @@ func (s *SecretService) ComputeEnvConfigHash(ctx context.Context, projectID uuid
 			scope:    scope,
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating environment variables for hash: %w", err)
+	}
 
 	if len(effectiveVars) == 0 {
 		return nil, nil
@@ -404,6 +407,9 @@ func (s *SecretService) CreateEnvSnapshot(ctx context.Context, projectID uuid.UU
 			Scope:    scope,
 			IsSecret: isSecret,
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("error iterating environment variables for snapshot: %w", err)
 	}
 
 	if len(effectiveVars) == 0 {

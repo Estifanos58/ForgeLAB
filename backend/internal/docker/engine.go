@@ -567,23 +567,6 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	hasPreviousHealthy := (previousServiceStatus == models.ServiceStatusRunning && previousContainerID != nil && *previousContainerID != "")
 
 	redactor := logging.NewLogRedactor()
-	var runtimeEnvMap map[string]string
-	var normalBuildArgs map[string]string
-	var secretBuildVars map[string]string
-
-	if e.secretService != nil {
-		if len(serviceDeploy.EnvSnapshot) > 0 {
-			runtimeEnvMap, _, _ = e.secretService.GetEnvMapFromSnapshot(serviceDeploy.EnvSnapshot, models.EnvScopeRuntime)
-		} else {
-			runtimeEnvMap, _, _ = e.secretService.GetDecryptedEnvMap(execCtx, project.ID, &service.ID, models.EnvScopeRuntime)
-		}
-		normalArgs, secretVars, allSecrets, err := e.secretService.GetBuildVariables(execCtx, project.ID, &service.ID, serviceDeploy.EnvSnapshot)
-		if err == nil {
-			normalBuildArgs = normalArgs
-			secretBuildVars = secretVars
-			redactor.SetSecrets(allSecrets)
-		}
-	}
 
 	emitLog := func(phase, stream, message string) {
 		redactedMsg := redactor.Redact(message)
@@ -700,6 +683,41 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				},
 			})
 		}
+	}
+
+	var runtimeEnvMap map[string]string
+	var normalBuildArgs map[string]string
+	var secretBuildVars map[string]string
+
+	if e.secretService != nil {
+		var envErr error
+		if len(serviceDeploy.EnvSnapshot) > 0 {
+			runtimeEnvMap, _, envErr = e.secretService.GetEnvMapFromSnapshot(serviceDeploy.EnvSnapshot, models.EnvScopeRuntime)
+			if envErr != nil {
+				failReason := fmt.Sprintf("failed to decrypt environment snapshot: %v", envErr)
+				emitLog("init", "stderr", failReason)
+				emitStatus(models.DeployStatusFailed, nil, &failReason)
+				return fmt.Errorf("failed to get env map from snapshot: %w", envErr)
+			}
+		} else {
+			runtimeEnvMap, _, envErr = e.secretService.GetDecryptedEnvMap(execCtx, project.ID, &service.ID, models.EnvScopeRuntime)
+			if envErr != nil {
+				failReason := fmt.Sprintf("failed to decrypt environment variables: %v", envErr)
+				emitLog("init", "stderr", failReason)
+				emitStatus(models.DeployStatusFailed, nil, &failReason)
+				return fmt.Errorf("failed to get decrypted env map: %w", envErr)
+			}
+		}
+		normalArgs, secretVars, allSecrets, buildVarErr := e.secretService.GetBuildVariables(execCtx, project.ID, &service.ID, serviceDeploy.EnvSnapshot)
+		if buildVarErr != nil {
+			failReason := fmt.Sprintf("failed to process build environment variables: %v", buildVarErr)
+			emitLog("init", "stderr", failReason)
+			emitStatus(models.DeployStatusFailed, nil, &failReason)
+			return fmt.Errorf("failed to get build variables: %w", buildVarErr)
+		}
+		normalBuildArgs = normalArgs
+		secretBuildVars = secretVars
+		redactor.SetSecrets(allSecrets)
 	}
 
 	emitLog(models.LogPhaseSource, models.LogStreamSystem, fmt.Sprintf("Starting service deployment #%d for '%s' (role: %s, runtime: %s)...", serviceDeploy.DeployNumber, service.Name, service.Role, service.RuntimeType))
@@ -1459,8 +1477,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 	}
 
-	// Auto-heal missing environment variables for local agent projects:
-	if len(runtimeEnvMap) == 0 && e.projectService != nil && project.SourceType == models.SourceTypeLocalAgent {
+	// Auto-heal missing environment variables for local agent projects when no snapshot exists:
+	if len(serviceDeploy.EnvSnapshot) == 0 && len(runtimeEnvMap) == 0 && e.projectService != nil && project.SourceType == models.SourceTypeLocalAgent {
 		if importedCount, err := e.projectService.ImportProjectEnvironment(execCtx, project, project.OwnerID); err == nil && importedCount > 0 {
 			if e.secretService != nil {
 				if reloaded, _, err := e.secretService.GetDecryptedEnvMap(execCtx, project.ID, &service.ID, models.EnvScopeRuntime); err == nil && len(reloaded) > 0 {
@@ -2660,22 +2678,34 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	var runtimeEnvMap map[string]string
 
 	if e.secretService != nil {
+		var envErr error
 		if len(deployment.EnvSnapshot) > 0 {
-			runtimeEnvMap, _, _ = e.secretService.GetEnvMapFromSnapshot(deployment.EnvSnapshot, models.EnvScopeRuntime)
+			runtimeEnvMap, _, envErr = e.secretService.GetEnvMapFromSnapshot(deployment.EnvSnapshot, models.EnvScopeRuntime)
+			if envErr != nil {
+				failReason := fmt.Sprintf("failed to decrypt environment snapshot: %v", envErr)
+				emitLog("init", "stderr", failReason)
+				updateStatus(models.DeployStatusFailed, &failReason)
+				return fmt.Errorf("failed to get env map from snapshot: %w", envErr)
+			}
 		} else {
-			runtimeEnvMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeRuntime)
-		}
-		normalArgs, secretVars, allSecrets, err := e.secretService.GetBuildVariables(ctx, project.ID, nil, deployment.EnvSnapshot)
-		if err == nil {
-			normalBuildArgs = normalArgs
-			secretBuildVars = secretVars
-			redactor.SetSecrets(allSecrets)
-		} else {
-			_, secrets, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, "")
-			if err == nil {
-				redactor.SetSecrets(secrets)
+			runtimeEnvMap, _, envErr = e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeRuntime)
+			if envErr != nil {
+				failReason := fmt.Sprintf("failed to decrypt environment variables: %v", envErr)
+				emitLog("init", "stderr", failReason)
+				updateStatus(models.DeployStatusFailed, &failReason)
+				return fmt.Errorf("failed to get decrypted env map: %w", envErr)
 			}
 		}
+		normalArgs, secretVars, allSecrets, buildVarErr := e.secretService.GetBuildVariables(ctx, project.ID, nil, deployment.EnvSnapshot)
+		if buildVarErr != nil {
+			failReason := fmt.Sprintf("failed to process build environment variables: %v", buildVarErr)
+			emitLog("init", "stderr", failReason)
+			updateStatus(models.DeployStatusFailed, &failReason)
+			return fmt.Errorf("failed to get build variables: %w", buildVarErr)
+		}
+		normalBuildArgs = normalArgs
+		secretBuildVars = secretVars
+		redactor.SetSecrets(allSecrets)
 	}
 
 	runImage := ""
@@ -3099,12 +3129,12 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	}
 	targetPortStr := fmt.Sprintf("%d/tcp", intPort)
 
-	var envMap map[string]string
-	if e.secretService != nil {
+	envMap := runtimeEnvMap
+	if envMap == nil && e.secretService != nil && len(deployment.EnvSnapshot) == 0 {
 		envMap, _, _ = e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeRuntime)
 	}
 
-	if len(envMap) == 0 && e.projectService != nil && project.SourceType == models.SourceTypeLocalAgent {
+	if len(deployment.EnvSnapshot) == 0 && len(envMap) == 0 && e.projectService != nil && project.SourceType == models.SourceTypeLocalAgent {
 		if importedCount, err := e.projectService.ImportProjectEnvironment(ctx, project, project.OwnerID); err == nil && importedCount > 0 {
 			if e.secretService != nil {
 				if reloaded, _, err := e.secretService.GetDecryptedEnvMap(ctx, project.ID, nil, models.EnvScopeRuntime); err == nil && len(reloaded) > 0 {

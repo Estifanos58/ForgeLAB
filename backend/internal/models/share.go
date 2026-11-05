@@ -81,12 +81,12 @@ type CreateShareInput struct {
 
 // ShareStatusResponse provides detailed status for project public sharing.
 type ShareStatusResponse struct {
-	Enabled       bool         `json:"enabled"`
-	Configured    bool         `json:"configured"`
-	Provider      string       `json:"provider"` // cloudflare, gateway
-	Share         *PublicShare `json:"share,omitempty"`
-	TunnelState   string       `json:"tunnel_state"` // not_shared, checking_prerequisites, starting_tunnel, connecting, online, disconnected, expired, revoked, unavailable, failed
-	GatewayURL    string       `json:"gateway_url,omitempty"`
-	Reason        string       `json:"reason,omitempty"`
-	InstallGuide  string       `json:"install_guide,omitempty"`
+	Enabled      bool         `json:"enabled"`
+	Configured   bool         `json:"configured"`
+	Provider     string       `json:"provider"` // cloudflare, gateway
+	Share        *PublicShare `json:"share,omitempty"`
+	TunnelState  string       `json:"tunnel_state"` // not_shared, checking_prerequisites, starting_tunnel, connecting, online, disconnected, expired, revoked, unavailable, failed
+	GatewayURL   string       `json:"gateway_url,omitempty"`
+	Reason       string       `json:"reason,omitempty"`
+	InstallGuide string       `json:"install_guide,omitempty"`
 }

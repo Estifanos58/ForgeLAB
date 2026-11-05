@@ -73,7 +73,6 @@ func (r *DockerUpstreamResolver) ResolveUpstream(ctx context.Context, service *m
 		}
 	}
 
-
 	// 2. Add HostPort candidates
 	if service.HostPort != nil && *service.HostPort > 0 {
 		hp := *service.HostPort

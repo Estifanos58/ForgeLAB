@@ -361,7 +361,10 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 	}
 
 	if s.secretService != nil {
-		envSnap, envHash, _ := s.secretService.CreateEnvSnapshot(ctx, project.ID, nil)
+		envSnap, envHash, err := s.secretService.CreateEnvSnapshot(ctx, project.ID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create environment snapshot for project %s: %w", project.ID, err)
+		}
 		deployment.EnvSnapshot = envSnap
 		deployment.EnvConfigHash = envHash
 	}
@@ -402,51 +405,66 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		 FROM services WHERE project_id = $1`,
 		project.ID,
 	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query services for deployment: %w", err)
+	}
+	defer rows.Close()
+
 	var svcList []models.Service
-	if err == nil {
-		for rows.Next() {
-			var s models.Service
-			var dependsOnJSON, volumesJSON, networksJSON, hcJSON, docJSON []byte
-			if err := rows.Scan(
-				&s.ID, &s.Name, &s.Role, &s.BuildStrategy, &s.BuildCommand, &s.StartCommand, &s.RuntimeType,
-				&s.InternalPort, &s.DockerfilePath, &s.BuildContext, &s.HealthStrategy, &s.HealthCheckPath,
-				&s.CpuMillicores, &s.MemoryMB, &s.PidsLimit, &s.EphemeralStorageMB,
-				&s.Classification, &s.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON, &docJSON,
-			); err == nil {
-				if len(dependsOnJSON) > 0 {
-					_ = json.Unmarshal(dependsOnJSON, &s.DependsOn)
-				}
-				if s.DependsOn == nil {
-					s.DependsOn = []string{}
-				}
-				if len(volumesJSON) > 0 {
-					_ = json.Unmarshal(volumesJSON, &s.Volumes)
-				}
-				if s.Volumes == nil {
-					s.Volumes = []models.VolumeMountConfig{}
-				}
-				if len(networksJSON) > 0 {
-					_ = json.Unmarshal(networksJSON, &s.Networks)
-				}
-				if s.Networks == nil {
-					s.Networks = []string{}
-				}
-				if len(hcJSON) > 0 && string(hcJSON) != "{}" {
-					var hc models.HealthCheckConfig
-					if err := json.Unmarshal(hcJSON, &hc); err == nil {
-						s.HealthCheckConfig = &hc
-					}
-				}
-				if len(docJSON) > 0 && string(docJSON) != "{}" {
-					_ = json.Unmarshal(docJSON, &s.DependsOnConditions)
-				}
-				if s.DependsOnConditions == nil {
-					s.DependsOnConditions = map[string]string{}
-				}
-				svcList = append(svcList, s)
+	for rows.Next() {
+		var s models.Service
+		var dependsOnJSON, volumesJSON, networksJSON, hcJSON, docJSON []byte
+		if err := rows.Scan(
+			&s.ID, &s.Name, &s.Role, &s.BuildStrategy, &s.BuildCommand, &s.StartCommand, &s.RuntimeType,
+			&s.InternalPort, &s.DockerfilePath, &s.BuildContext, &s.HealthStrategy, &s.HealthCheckPath,
+			&s.CpuMillicores, &s.MemoryMB, &s.PidsLimit, &s.EphemeralStorageMB,
+			&s.Classification, &s.Image, &dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON, &docJSON,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan service for deployment: %w", err)
+		}
+		if len(dependsOnJSON) > 0 {
+			if err := json.Unmarshal(dependsOnJSON, &s.DependsOn); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on for service %s: %w", s.Name, err)
 			}
 		}
-		rows.Close()
+		if s.DependsOn == nil {
+			s.DependsOn = []string{}
+		}
+		if len(volumesJSON) > 0 {
+			if err := json.Unmarshal(volumesJSON, &s.Volumes); err != nil {
+				return nil, fmt.Errorf("failed to decode volumes for service %s: %w", s.Name, err)
+			}
+		}
+		if s.Volumes == nil {
+			s.Volumes = []models.VolumeMountConfig{}
+		}
+		if len(networksJSON) > 0 {
+			if err := json.Unmarshal(networksJSON, &s.Networks); err != nil {
+				return nil, fmt.Errorf("failed to decode networks for service %s: %w", s.Name, err)
+			}
+		}
+		if s.Networks == nil {
+			s.Networks = []string{}
+		}
+		if len(hcJSON) > 0 && string(hcJSON) != "{}" {
+			var hc models.HealthCheckConfig
+			if err := json.Unmarshal(hcJSON, &hc); err != nil {
+				return nil, fmt.Errorf("failed to decode healthcheck_config for service %s: %w", s.Name, err)
+			}
+			s.HealthCheckConfig = &hc
+		}
+		if len(docJSON) > 0 && string(docJSON) != "{}" {
+			if err := json.Unmarshal(docJSON, &s.DependsOnConditions); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on_conditions for service %s: %w", s.Name, err)
+			}
+		}
+		if s.DependsOnConditions == nil {
+			s.DependsOnConditions = map[string]string{}
+		}
+		svcList = append(svcList, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating services for deployment: %w", err)
 	}
 
 	for _, svcItem := range svcList {
@@ -462,7 +480,11 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		var envConfigHash *string
 		var envSnapshot []byte
 		if s.secretService != nil {
-			envSnapshot, envConfigHash, _ = s.secretService.CreateEnvSnapshot(ctx, project.ID, &svcItem.ID)
+			var snapErr error
+			envSnapshot, envConfigHash, snapErr = s.secretService.CreateEnvSnapshot(ctx, project.ID, &svcItem.ID)
+			if snapErr != nil {
+				return nil, fmt.Errorf("failed to create environment snapshot for service %s: %w", svcItem.Name, snapErr)
+			}
 		}
 
 		dependsOnBytes, _ := json.Marshal(svcItem.DependsOn)
@@ -706,7 +728,11 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	var envConfigHash *string
 	var envSnapshot []byte
 	if s.secretService != nil {
-		envSnapshot, envConfigHash, _ = s.secretService.CreateEnvSnapshot(ctx, project.ID, &targetService.ID)
+		var snapErr error
+		envSnapshot, envConfigHash, snapErr = s.secretService.CreateEnvSnapshot(ctx, project.ID, &targetService.ID)
+		if snapErr != nil {
+			return nil, fmt.Errorf("failed to create environment snapshot for service %s: %w", targetService.Name, snapErr)
+		}
 	}
 
 	svcDeployID := uuid.New()
@@ -1479,19 +1505,25 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 		 FROM services WHERE project_id = $1`,
 		project.ID,
 	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query services for rollback: %w", err)
+	}
+	defer rows.Close()
+
 	var svcList []models.Service
-	if err == nil {
-		for rows.Next() {
-			var s models.Service
-			if err := rows.Scan(
-				&s.ID, &s.Name, &s.Role, &s.BuildStrategy, &s.BuildCommand, &s.StartCommand, &s.RuntimeType,
-				&s.InternalPort, &s.DockerfilePath, &s.BuildContext, &s.HealthStrategy, &s.HealthCheckPath,
-				&s.CpuMillicores, &s.MemoryMB, &s.PidsLimit, &s.EphemeralStorageMB,
-			); err == nil {
-				svcList = append(svcList, s)
-			}
+	for rows.Next() {
+		var s models.Service
+		if err := rows.Scan(
+			&s.ID, &s.Name, &s.Role, &s.BuildStrategy, &s.BuildCommand, &s.StartCommand, &s.RuntimeType,
+			&s.InternalPort, &s.DockerfilePath, &s.BuildContext, &s.HealthStrategy, &s.HealthCheckPath,
+			&s.CpuMillicores, &s.MemoryMB, &s.PidsLimit, &s.EphemeralStorageMB,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan service for rollback: %w", err)
 		}
-		rows.Close()
+		svcList = append(svcList, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating services for rollback: %w", err)
 	}
 
 	// In single-container legacy mode, require immutable image or tag
@@ -1772,31 +1804,40 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 	}
 
 	if len(dependsOnJSON) > 0 {
-		_ = json.Unmarshal(dependsOnJSON, &sd.DependsOn)
+		if err := json.Unmarshal(dependsOnJSON, &sd.DependsOn); err != nil {
+			return nil, fmt.Errorf("failed to decode depends_on: %w", err)
+		}
 	}
 	if sd.DependsOn == nil {
 		sd.DependsOn = []string{}
 	}
 	if len(volumesJSON) > 0 {
-		_ = json.Unmarshal(volumesJSON, &sd.Volumes)
+		if err := json.Unmarshal(volumesJSON, &sd.Volumes); err != nil {
+			return nil, fmt.Errorf("failed to decode volumes: %w", err)
+		}
 	}
 	if sd.Volumes == nil {
 		sd.Volumes = []models.VolumeMountConfig{}
 	}
 	if len(networksJSON) > 0 {
-		_ = json.Unmarshal(networksJSON, &sd.Networks)
+		if err := json.Unmarshal(networksJSON, &sd.Networks); err != nil {
+			return nil, fmt.Errorf("failed to decode networks: %w", err)
+		}
 	}
 	if sd.Networks == nil {
 		sd.Networks = []string{}
 	}
 	if len(hcJSON) > 0 && string(hcJSON) != "{}" {
 		var hc models.HealthCheckConfig
-		if err := json.Unmarshal(hcJSON, &hc); err == nil {
-			sd.HealthCheckConfig = &hc
+		if err := json.Unmarshal(hcJSON, &hc); err != nil {
+			return nil, fmt.Errorf("failed to decode healthcheck_config: %w", err)
 		}
+		sd.HealthCheckConfig = &hc
 	}
 	if len(docJSON) > 0 && string(docJSON) != "{}" {
-		_ = json.Unmarshal(docJSON, &sd.DependsOnConditions)
+		if err := json.Unmarshal(docJSON, &sd.DependsOnConditions); err != nil {
+			return nil, fmt.Errorf("failed to decode depends_on_conditions: %w", err)
+		}
 	}
 	if sd.DependsOnConditions == nil {
 		sd.DependsOnConditions = map[string]string{}
@@ -1860,31 +1901,40 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 			return nil, fmt.Errorf("failed to scan service deployment: %w", err)
 		}
 		if len(dependsOnJSON) > 0 {
-			_ = json.Unmarshal(dependsOnJSON, &sd.DependsOn)
+			if err := json.Unmarshal(dependsOnJSON, &sd.DependsOn); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on for service deployment %s: %w", sd.ID, err)
+			}
 		}
 		if sd.DependsOn == nil {
 			sd.DependsOn = []string{}
 		}
 		if len(volumesJSON) > 0 {
-			_ = json.Unmarshal(volumesJSON, &sd.Volumes)
+			if err := json.Unmarshal(volumesJSON, &sd.Volumes); err != nil {
+				return nil, fmt.Errorf("failed to decode volumes for service deployment %s: %w", sd.ID, err)
+			}
 		}
 		if sd.Volumes == nil {
 			sd.Volumes = []models.VolumeMountConfig{}
 		}
 		if len(networksJSON) > 0 {
-			_ = json.Unmarshal(networksJSON, &sd.Networks)
+			if err := json.Unmarshal(networksJSON, &sd.Networks); err != nil {
+				return nil, fmt.Errorf("failed to decode networks for service deployment %s: %w", sd.ID, err)
+			}
 		}
 		if sd.Networks == nil {
 			sd.Networks = []string{}
 		}
 		if len(hcJSON) > 0 && string(hcJSON) != "{}" {
 			var hc models.HealthCheckConfig
-			if err := json.Unmarshal(hcJSON, &hc); err == nil {
-				sd.HealthCheckConfig = &hc
+			if err := json.Unmarshal(hcJSON, &hc); err != nil {
+				return nil, fmt.Errorf("failed to decode healthcheck_config for service deployment %s: %w", sd.ID, err)
 			}
+			sd.HealthCheckConfig = &hc
 		}
 		if len(docJSON) > 0 && string(docJSON) != "{}" {
-			_ = json.Unmarshal(docJSON, &sd.DependsOnConditions)
+			if err := json.Unmarshal(docJSON, &sd.DependsOnConditions); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on_conditions for service deployment %s: %w", sd.ID, err)
+			}
 		}
 		if sd.DependsOnConditions == nil {
 			sd.DependsOnConditions = map[string]string{}
@@ -1896,6 +1946,9 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 			sd.PreviewURL = nil
 		}
 		list = append(list, sd)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating service deployments: %w", err)
 	}
 
 	if list == nil {
@@ -1983,7 +2036,7 @@ func scanLogs(rows pgx.Rows) ([]*models.DeploymentLog, error) {
 	if logs == nil {
 		logs = []*models.DeploymentLog{}
 	}
-	return logs, nil
+	return logs, rows.Err()
 }
 
 // GetDeploymentLogs retrieves recent logs for a release deployment with bounded limit (default 2000, max 5000).
@@ -2297,31 +2350,40 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 			return nil, fmt.Errorf("failed to scan service deployment: %w", err)
 		}
 		if len(dependsOnJSON) > 0 {
-			_ = json.Unmarshal(dependsOnJSON, &sd.DependsOn)
+			if err := json.Unmarshal(dependsOnJSON, &sd.DependsOn); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on for service deployment %s: %w", sd.ID, err)
+			}
 		}
 		if sd.DependsOn == nil {
 			sd.DependsOn = []string{}
 		}
 		if len(volumesJSON) > 0 {
-			_ = json.Unmarshal(volumesJSON, &sd.Volumes)
+			if err := json.Unmarshal(volumesJSON, &sd.Volumes); err != nil {
+				return nil, fmt.Errorf("failed to decode volumes for service deployment %s: %w", sd.ID, err)
+			}
 		}
 		if sd.Volumes == nil {
 			sd.Volumes = []models.VolumeMountConfig{}
 		}
 		if len(networksJSON) > 0 {
-			_ = json.Unmarshal(networksJSON, &sd.Networks)
+			if err := json.Unmarshal(networksJSON, &sd.Networks); err != nil {
+				return nil, fmt.Errorf("failed to decode networks for service deployment %s: %w", sd.ID, err)
+			}
 		}
 		if sd.Networks == nil {
 			sd.Networks = []string{}
 		}
 		if len(hcJSON) > 0 && string(hcJSON) != "{}" {
 			var hc models.HealthCheckConfig
-			if err := json.Unmarshal(hcJSON, &hc); err == nil {
-				sd.HealthCheckConfig = &hc
+			if err := json.Unmarshal(hcJSON, &hc); err != nil {
+				return nil, fmt.Errorf("failed to decode healthcheck_config for service deployment %s: %w", sd.ID, err)
 			}
+			sd.HealthCheckConfig = &hc
 		}
 		if len(docJSON) > 0 && string(docJSON) != "{}" {
-			_ = json.Unmarshal(docJSON, &sd.DependsOnConditions)
+			if err := json.Unmarshal(docJSON, &sd.DependsOnConditions); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on_conditions for service deployment %s: %w", sd.ID, err)
+			}
 		}
 		if sd.DependsOnConditions == nil {
 			sd.DependsOnConditions = map[string]string{}
@@ -2333,6 +2395,9 @@ func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deployme
 			sd.PreviewURL = nil
 		}
 		list = append(list, sd)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating service deployments: %w", err)
 	}
 
 	if list == nil {
@@ -2493,39 +2558,52 @@ func (s *DeploymentService) listServicesTx(ctx context.Context, tx pgx.Tx, proje
 			&svc.Classification, &svc.Image,
 			&dependsOnJSON, &volumesJSON, &networksJSON, &hcJSON, &docJSON,
 		)
-		if err == nil {
-			if len(dependsOnJSON) > 0 {
-				_ = json.Unmarshal(dependsOnJSON, &svc.DependsOn)
-			}
-			if svc.DependsOn == nil {
-				svc.DependsOn = []string{}
-			}
-			if len(volumesJSON) > 0 {
-				_ = json.Unmarshal(volumesJSON, &svc.Volumes)
-			}
-			if svc.Volumes == nil {
-				svc.Volumes = []models.VolumeMountConfig{}
-			}
-			if len(networksJSON) > 0 {
-				_ = json.Unmarshal(networksJSON, &svc.Networks)
-			}
-			if svc.Networks == nil {
-				svc.Networks = []string{}
-			}
-			if len(hcJSON) > 0 && string(hcJSON) != "{}" {
-				var hc models.HealthCheckConfig
-				if err := json.Unmarshal(hcJSON, &hc); err == nil {
-					svc.HealthCheckConfig = &hc
-				}
-			}
-			if len(docJSON) > 0 && string(docJSON) != "{}" {
-				_ = json.Unmarshal(docJSON, &svc.DependsOnConditions)
-			}
-			if svc.DependsOnConditions == nil {
-				svc.DependsOnConditions = map[string]string{}
-			}
-			list = append(list, svc)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan service: %w", err)
 		}
+		if len(dependsOnJSON) > 0 {
+			if err := json.Unmarshal(dependsOnJSON, &svc.DependsOn); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on for service %s: %w", svc.Name, err)
+			}
+		}
+		if svc.DependsOn == nil {
+			svc.DependsOn = []string{}
+		}
+		if len(volumesJSON) > 0 {
+			if err := json.Unmarshal(volumesJSON, &svc.Volumes); err != nil {
+				return nil, fmt.Errorf("failed to decode volumes for service %s: %w", svc.Name, err)
+			}
+		}
+		if svc.Volumes == nil {
+			svc.Volumes = []models.VolumeMountConfig{}
+		}
+		if len(networksJSON) > 0 {
+			if err := json.Unmarshal(networksJSON, &svc.Networks); err != nil {
+				return nil, fmt.Errorf("failed to decode networks for service %s: %w", svc.Name, err)
+			}
+		}
+		if svc.Networks == nil {
+			svc.Networks = []string{}
+		}
+		if len(hcJSON) > 0 && string(hcJSON) != "{}" {
+			var hc models.HealthCheckConfig
+			if err := json.Unmarshal(hcJSON, &hc); err != nil {
+				return nil, fmt.Errorf("failed to decode healthcheck_config for service %s: %w", svc.Name, err)
+			}
+			svc.HealthCheckConfig = &hc
+		}
+		if len(docJSON) > 0 && string(docJSON) != "{}" {
+			if err := json.Unmarshal(docJSON, &svc.DependsOnConditions); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on_conditions for service %s: %w", svc.Name, err)
+			}
+		}
+		if svc.DependsOnConditions == nil {
+			svc.DependsOnConditions = map[string]string{}
+		}
+		list = append(list, svc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating services: %w", err)
 	}
 	return list, nil
 }
@@ -2620,9 +2698,13 @@ func (s *DeploymentService) ReconcileQueuedDeployments(ctx context.Context, q De
 	var items []queuedItem
 	for rows.Next() {
 		var it queuedItem
-		if err := rows.Scan(&it.id, &it.serviceID, &it.createdAt); err == nil {
-			items = append(items, it)
+		if err := rows.Scan(&it.id, &it.serviceID, &it.createdAt); err != nil {
+			return 0, fmt.Errorf("failed to scan queued service deployment: %w", err)
 		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("error iterating queued service deployments: %w", err)
 	}
 
 	reconciled := 0
@@ -2684,48 +2766,53 @@ func (s *DeploymentService) ReconcileQueuedDeployments(ctx context.Context, q De
 		 ORDER BY created_at ASC`,
 		models.DeployStatusQueued, minAge.String(),
 	)
-	if dErr == nil {
-		defer depRows.Close()
-		type queuedDepItem struct {
-			id           uuid.UUID
-			projectID    uuid.UUID
-			deployNumber int
-			createdAt    time.Time
+	if dErr != nil {
+		return 0, fmt.Errorf("failed to query queued deployments: %w", dErr)
+	}
+	defer depRows.Close()
+	type queuedDepItem struct {
+		id           uuid.UUID
+		projectID    uuid.UUID
+		deployNumber int
+		createdAt    time.Time
+	}
+	var depItems []queuedDepItem
+	for depRows.Next() {
+		var it queuedDepItem
+		if err := depRows.Scan(&it.id, &it.projectID, &it.deployNumber, &it.createdAt); err != nil {
+			return 0, fmt.Errorf("failed to scan queued deployment: %w", err)
 		}
-		var depItems []queuedDepItem
-		for depRows.Next() {
-			var it queuedDepItem
-			if err := depRows.Scan(&it.id, &it.projectID, &it.deployNumber, &it.createdAt); err == nil {
-				depItems = append(depItems, it)
-			}
+		depItems = append(depItems, it)
+	}
+	if err := depRows.Err(); err != nil {
+		return 0, fmt.Errorf("error iterating queued deployments: %w", err)
+	}
+
+	for _, item := range depItems {
+		activeOrQueued, err := q.IsJobEnqueuedOrActive(ctx, item.id)
+		if err != nil || activeOrQueued {
+			continue
 		}
 
-		for _, item := range depItems {
-			activeOrQueued, err := q.IsJobEnqueuedOrActive(ctx, item.id)
-			if err != nil || activeOrQueued {
-				continue
-			}
+		if isSuperseded, _ := s.IsDeploymentSuperseded(ctx, item.projectID, item.deployNumber); isSuperseded {
+			reason := "Reconciliation: queued deployment was superseded by a newer deployment"
+			_ = s.UpdateDeploymentStatus(ctx, item.id, models.DeployStatusFailed, &reason)
+			reconciled++
+			continue
+		}
 
-			if isSuperseded, _ := s.IsDeploymentSuperseded(ctx, item.projectID, item.deployNumber); isSuperseded {
-				reason := "Reconciliation: queued deployment was superseded by a newer deployment"
-				_ = s.UpdateDeploymentStatus(ctx, item.id, models.DeployStatusFailed, &reason)
-				reconciled++
-				continue
-			}
-
-			attempts, _ := q.GetAttempts(ctx, item.id)
-			if attempts < maxRetries {
-				if err := q.EnqueueDeployment(ctx, item.id); err == nil {
-					_, _ = q.IncrementAttempts(ctx, item.id)
-					slog.Info("re-enqueued missing queued project release deployment via reconciliation",
-						"deployment_id", item.id, "attempts", attempts+1)
-					reconciled++
-				}
-			} else {
-				reason := fmt.Sprintf("Reconciliation: queued deployment was missing from queue and exceeded max recovery attempts (%d)", maxRetries)
-				_ = s.UpdateDeploymentStatus(ctx, item.id, models.DeployStatusFailed, &reason)
+		attempts, _ := q.GetAttempts(ctx, item.id)
+		if attempts < maxRetries {
+			if err := q.EnqueueDeployment(ctx, item.id); err == nil {
+				_, _ = q.IncrementAttempts(ctx, item.id)
+				slog.Info("re-enqueued missing queued project release deployment via reconciliation",
+					"deployment_id", item.id, "attempts", attempts+1)
 				reconciled++
 			}
+		} else {
+			reason := fmt.Sprintf("Reconciliation: queued deployment was missing from queue and exceeded max recovery attempts (%d)", maxRetries)
+			_ = s.UpdateDeploymentStatus(ctx, item.id, models.DeployStatusFailed, &reason)
+			reconciled++
 		}
 	}
 
@@ -2772,9 +2859,13 @@ func (s *DeploymentService) ReconcileOrphanedDeploymentsWithQueue(ctx context.Co
 	var items []activeItem
 	for rows.Next() {
 		var it activeItem
-		if err := rows.Scan(&it.id, &it.serviceID, &it.deploymentID, &it.status, &it.createdAt, &it.startedAt); err == nil {
-			items = append(items, it)
+		if err := rows.Scan(&it.id, &it.serviceID, &it.deploymentID, &it.status, &it.createdAt, &it.startedAt); err != nil {
+			return 0, fmt.Errorf("failed to scan active service deployment: %w", err)
 		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("error iterating active service deployments: %w", err)
 	}
 
 	reconciled := 0

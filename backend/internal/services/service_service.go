@@ -71,41 +71,57 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 		}
 
 		if len(candidatesJSON) > 0 {
-			_ = json.Unmarshal(candidatesJSON, &svc.BuildCandidates)
+			if err := json.Unmarshal(candidatesJSON, &svc.BuildCandidates); err != nil {
+				return nil, fmt.Errorf("failed to decode build_candidates for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.BuildCandidates == nil {
 			svc.BuildCandidates = []models.BuildCandidate{}
 		}
 		if len(dependsOnJSON) > 0 {
-			_ = json.Unmarshal(dependsOnJSON, &svc.DependsOn)
+			if err := json.Unmarshal(dependsOnJSON, &svc.DependsOn); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.DependsOn == nil {
 			svc.DependsOn = []string{}
 		}
 		if len(depCondsJSON) > 0 {
-			_ = json.Unmarshal(depCondsJSON, &svc.DependsOnConditions)
+			if err := json.Unmarshal(depCondsJSON, &svc.DependsOnConditions); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on_conditions for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.DependsOnConditions == nil {
 			svc.DependsOnConditions = make(map[string]string)
 		}
 		if len(volumesJSON) > 0 {
-			_ = json.Unmarshal(volumesJSON, &svc.Volumes)
+			if err := json.Unmarshal(volumesJSON, &svc.Volumes); err != nil {
+				return nil, fmt.Errorf("failed to decode volumes for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.Volumes == nil {
 			svc.Volumes = []models.VolumeMountConfig{}
 		}
 		if len(networksJSON) > 0 {
-			_ = json.Unmarshal(networksJSON, &svc.Networks)
+			if err := json.Unmarshal(networksJSON, &svc.Networks); err != nil {
+				return nil, fmt.Errorf("failed to decode networks for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.Networks == nil {
 			svc.Networks = []string{}
 		}
 		if len(hcJSON) > 0 && string(hcJSON) != "{}" {
-			_ = json.Unmarshal(hcJSON, &svc.HealthCheckConfig)
+			if err := json.Unmarshal(hcJSON, &svc.HealthCheckConfig); err != nil {
+				return nil, fmt.Errorf("failed to decode healthcheck_config for service %s: %w", svc.Name, err)
+			}
 		}
 
 		populateServicePreviewURL(svc)
 		services = append(services, svc)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating services: %w", err)
 	}
 
 	if services == nil {
@@ -158,44 +174,60 @@ func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectID
 		}
 
 		if len(candidatesJSON) > 0 {
-			_ = json.Unmarshal(candidatesJSON, &svc.BuildCandidates)
+			if err := json.Unmarshal(candidatesJSON, &svc.BuildCandidates); err != nil {
+				return nil, fmt.Errorf("failed to decode build_candidates for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.BuildCandidates == nil {
 			svc.BuildCandidates = []models.BuildCandidate{}
 		}
 		if len(dependsOnJSON) > 0 {
-			_ = json.Unmarshal(dependsOnJSON, &svc.DependsOn)
+			if err := json.Unmarshal(dependsOnJSON, &svc.DependsOn); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.DependsOn == nil {
 			svc.DependsOn = []string{}
 		}
 		if len(depCondsJSON) > 0 {
-			_ = json.Unmarshal(depCondsJSON, &svc.DependsOnConditions)
+			if err := json.Unmarshal(depCondsJSON, &svc.DependsOnConditions); err != nil {
+				return nil, fmt.Errorf("failed to decode depends_on_conditions for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.DependsOnConditions == nil {
 			svc.DependsOnConditions = make(map[string]string)
 		}
 		if len(volumesJSON) > 0 {
-			_ = json.Unmarshal(volumesJSON, &svc.Volumes)
+			if err := json.Unmarshal(volumesJSON, &svc.Volumes); err != nil {
+				return nil, fmt.Errorf("failed to decode volumes for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.Volumes == nil {
 			svc.Volumes = []models.VolumeMountConfig{}
 		}
 		if len(networksJSON) > 0 {
-			_ = json.Unmarshal(networksJSON, &svc.Networks)
+			if err := json.Unmarshal(networksJSON, &svc.Networks); err != nil {
+				return nil, fmt.Errorf("failed to decode networks for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.Networks == nil {
 			svc.Networks = []string{}
 		}
 		if len(hcJSON) > 0 && string(hcJSON) != "{}" {
-			_ = json.Unmarshal(hcJSON, &svc.HealthCheckConfig)
+			if err := json.Unmarshal(hcJSON, &svc.HealthCheckConfig); err != nil {
+				return nil, fmt.Errorf("failed to decode healthcheck_config for service %s: %w", svc.Name, err)
+			}
 		}
 
 		populateServicePreviewURL(svc)
 		result[svc.ProjectID] = append(result[svc.ProjectID], svc)
 	}
 
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating batch services: %w", err)
+	}
+
+	return result, nil
 }
 
 // ListActiveServices retrieves all services that are currently marked as running or deploying, or have an assigned container.
@@ -238,7 +270,9 @@ func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Serv
 		}
 
 		if len(candidatesJSON) > 0 {
-			_ = json.Unmarshal(candidatesJSON, &svc.BuildCandidates)
+			if err := json.Unmarshal(candidatesJSON, &svc.BuildCandidates); err != nil {
+				return nil, fmt.Errorf("failed to decode build_candidates for service %s: %w", svc.Name, err)
+			}
 		}
 		if svc.BuildCandidates == nil {
 			svc.BuildCandidates = []models.BuildCandidate{}
@@ -248,10 +282,14 @@ func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Serv
 		services = append(services, svc)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating active services: %w", err)
+	}
+
 	if services == nil {
 		services = []*models.Service{}
 	}
-	return services, rows.Err()
+	return services, nil
 }
 
 // GetService retrieves a service by ID.
@@ -292,37 +330,49 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 	}
 
 	if len(candidatesJSON) > 0 {
-		_ = json.Unmarshal(candidatesJSON, &svc.BuildCandidates)
+		if err := json.Unmarshal(candidatesJSON, &svc.BuildCandidates); err != nil {
+			return nil, fmt.Errorf("failed to decode build_candidates for service %s: %w", svc.Name, err)
+		}
 	}
 	if svc.BuildCandidates == nil {
 		svc.BuildCandidates = []models.BuildCandidate{}
 	}
 	if len(dependsOnJSON) > 0 {
-		_ = json.Unmarshal(dependsOnJSON, &svc.DependsOn)
+		if err := json.Unmarshal(dependsOnJSON, &svc.DependsOn); err != nil {
+			return nil, fmt.Errorf("failed to decode depends_on for service %s: %w", svc.Name, err)
+		}
 	}
 	if svc.DependsOn == nil {
 		svc.DependsOn = []string{}
 	}
 	if len(depCondsJSON) > 0 {
-		_ = json.Unmarshal(depCondsJSON, &svc.DependsOnConditions)
+		if err := json.Unmarshal(depCondsJSON, &svc.DependsOnConditions); err != nil {
+			return nil, fmt.Errorf("failed to decode depends_on_conditions for service %s: %w", svc.Name, err)
+		}
 	}
 	if svc.DependsOnConditions == nil {
 		svc.DependsOnConditions = make(map[string]string)
 	}
 	if len(volumesJSON) > 0 {
-		_ = json.Unmarshal(volumesJSON, &svc.Volumes)
+		if err := json.Unmarshal(volumesJSON, &svc.Volumes); err != nil {
+			return nil, fmt.Errorf("failed to decode volumes for service %s: %w", svc.Name, err)
+		}
 	}
 	if svc.Volumes == nil {
 		svc.Volumes = []models.VolumeMountConfig{}
 	}
 	if len(networksJSON) > 0 {
-		_ = json.Unmarshal(networksJSON, &svc.Networks)
+		if err := json.Unmarshal(networksJSON, &svc.Networks); err != nil {
+			return nil, fmt.Errorf("failed to decode networks for service %s: %w", svc.Name, err)
+		}
 	}
 	if svc.Networks == nil {
 		svc.Networks = []string{}
 	}
 	if len(hcJSON) > 0 && string(hcJSON) != "{}" {
-		_ = json.Unmarshal(hcJSON, &svc.HealthCheckConfig)
+		if err := json.Unmarshal(hcJSON, &svc.HealthCheckConfig); err != nil {
+			return nil, fmt.Errorf("failed to decode healthcheck_config for service %s: %w", svc.Name, err)
+		}
 	}
 
 	populateServicePreviewURL(svc)

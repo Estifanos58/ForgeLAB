@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -434,4 +435,50 @@ func TestConfigGuestModeDefaults(t *testing.T) {
 			t.Errorf("expected AllowGuestMode to be false when explicitly disabled in dev")
 		}
 	})
+
+	t.Run("empty string falls back to development default", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		os.Setenv("APP_ENV", "development")
+		os.Setenv("JWT_SECRET", "dev-secret-that-is-short")
+		os.Setenv("FORGELAB_ALLOW_GUEST_MODE", "")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.App.AllowGuestMode {
+			t.Errorf("expected AllowGuestMode to be true in development when env var is empty string")
+		}
+	})
+}
+
+func TestDockerComposeGuestModeDefault(t *testing.T) {
+	candidates := []string{
+		"../../../docker-compose.yml",
+		"../../docker-compose.yml",
+		"../docker-compose.yml",
+		"docker-compose.yml",
+	}
+	var content []byte
+	var found bool
+	for _, path := range candidates {
+		var err error
+		content, err = os.ReadFile(path)
+		if err == nil {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("could not locate docker-compose.yml")
+	}
+	text := string(content)
+	if strings.Contains(text, "${FORGELAB_ALLOW_GUEST_MODE:-false}") {
+		t.Errorf("docker-compose.yml must not default FORGELAB_ALLOW_GUEST_MODE to false for local deployments")
+	}
+	if !strings.Contains(text, "FORGELAB_ALLOW_GUEST_MODE: ${FORGELAB_ALLOW_GUEST_MODE:-true}") &&
+		!strings.Contains(text, "FORGELAB_ALLOW_GUEST_MODE=${FORGELAB_ALLOW_GUEST_MODE:-true}") {
+		t.Errorf("docker-compose.yml must default FORGELAB_ALLOW_GUEST_MODE to true")
+	}
 }

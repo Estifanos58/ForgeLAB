@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isTrustedProxy, extractClientIp } from '../src/lib/api/trusted-proxy.ts';
+import { isTrustedProxy, extractClientIp, cleanAndValidateIp } from '../src/lib/api/trusted-proxy.ts';
 
 test('isTrustedProxy identifies IP addresses and CIDR blocks correctly', () => {
   const proxies = ['127.0.0.1', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.1.50'];
@@ -27,6 +27,18 @@ test('isTrustedProxy identifies IP addresses and CIDR blocks correctly', () => {
   assert.equal(isTrustedProxy('', proxies), false);
   assert.equal(isTrustedProxy('invalid-ip', proxies), false);
   assert.equal(isTrustedProxy('127.0.0.1', []), false);
+});
+
+test('cleanAndValidateIp cleans ports, brackets, and validates IPs', () => {
+  assert.equal(cleanAndValidateIp('192.168.1.1'), '192.168.1.1');
+  assert.equal(cleanAndValidateIp('192.168.1.1:8080'), '192.168.1.1');
+  assert.equal(cleanAndValidateIp('::1'), '::1');
+  assert.equal(cleanAndValidateIp('[::1]:3000'), '::1');
+  assert.equal(cleanAndValidateIp('2001:db8::1'), '2001:db8::1');
+  assert.equal(cleanAndValidateIp('[2001:db8::1]:443'), '2001:db8::1');
+  assert.equal(cleanAndValidateIp('malformed-ip'), null);
+  assert.equal(cleanAndValidateIp('<script>'), null);
+  assert.equal(cleanAndValidateIp(''), null);
 });
 
 test('extractClientIp rejects spoofed headers from untrusted direct peer', () => {
@@ -67,4 +79,48 @@ test('extractClientIp defaults in development mode', () => {
   // Dev mode trusts local requests
   const clientIp = extractClientIp(headers, ['127.0.0.1'], true, '127.0.0.1');
   assert.equal(clientIp, '198.51.100.25');
+});
+
+test('extractClientIp in production Next.js proxy environment without undocumented request.ip or socket', () => {
+  const trustedProxies = ['127.0.0.1', '::1', '172.16.0.0/12', '10.0.0.0/8', '192.168.0.0/16'];
+
+  // Normal reverse proxy forwarding single client
+  const h1 = new Headers();
+  h1.set('x-forwarded-for', '203.0.113.55');
+  assert.equal(extractClientIp(h1, trustedProxies, false), '203.0.113.55');
+
+  // Multi-hop proxy chain: Client -> Untrusted Proxy (attacker) -> Ingress -> Next.js
+  const h2 = new Headers();
+  h2.set('x-forwarded-for', '1.1.1.1, 203.0.113.99, 172.18.0.5');
+  assert.equal(extractClientIp(h2, trustedProxies, false), '203.0.113.99');
+
+  // Preserves per-client distinction for accurate rate limiting
+  const h3 = new Headers();
+  h3.set('x-forwarded-for', '198.51.100.1, 10.0.0.2');
+  const h4 = new Headers();
+  h4.set('x-forwarded-for', '198.51.100.2, 10.0.0.2');
+  assert.notEqual(
+    extractClientIp(h3, trustedProxies, false),
+    extractClientIp(h4, trustedProxies, false)
+  );
+
+  // Cloudflare CF-Connecting-IP fallback
+  const h5 = new Headers();
+  h5.set('cf-connecting-ip', '203.0.113.77');
+  assert.equal(extractClientIp(h5, trustedProxies, false), '203.0.113.77');
+
+  // True-Client-IP fallback
+  const h6 = new Headers();
+  h6.set('true-client-ip', '203.0.113.88');
+  assert.equal(extractClientIp(h6, trustedProxies, false), '203.0.113.88');
+
+  // Malformed IP in X-Forwarded-For is safely ignored
+  const h7 = new Headers();
+  h7.set('x-forwarded-for', '<script>alert(1)</script>, 203.0.113.12, 10.0.0.5');
+  assert.equal(extractClientIp(h7, trustedProxies, false), '203.0.113.12');
+
+  // Rejects forwarding when no trusted proxies are configured in production
+  const h8 = new Headers();
+  h8.set('x-forwarded-for', '203.0.113.12');
+  assert.equal(extractClientIp(h8, [], false), '127.0.0.1');
 });

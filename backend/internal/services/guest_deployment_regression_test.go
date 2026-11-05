@@ -74,6 +74,8 @@ func setupGuestTestRouter(
 	integrationHandler := handlers.NewIntegrationHandler(nil, nil, nil, "http://localhost:3000", false)
 	sourceHandler := handlers.NewSourceHandler(sourceService, nil)
 	discoveryHandler := handlers.NewDiscoveryHandler(nil, sourceService, nil, secretService)
+	shareService := services.NewShareService(pool, projectService, serviceService, false, "", "")
+	shareHandler := handlers.NewShareHandler(shareService, projectService)
 
 	allowedOrigins := []string{"http://localhost:3000", "http://127.0.0.1:3000"}
 	r := chi.NewRouter()
@@ -124,6 +126,9 @@ func setupGuestTestRouter(
 
 				r.Get("/{id}/services", serviceHandler.List)
 				r.Get("/{id}/deployments", projectHandler.ListDeployments)
+				r.Get("/{id}/share", shareHandler.Get)
+				r.Post("/{id}/share", shareHandler.Create)
+				r.Delete("/{id}/share", shareHandler.Revoke)
 			})
 		})
 	})
@@ -566,6 +571,14 @@ func TestGuestMode_DisabledByConfig(t *testing.T) {
 	r.ServeHTTP(recUpload, reqUpload)
 	assert.Equal(t, http.StatusUnauthorized, recUpload.Code)
 
+	// Unauthenticated request to project share
+	testProjID := uuid.New()
+	reqShare := httptest.NewRequest("GET", fmt.Sprintf("/api/projects/%s/share", testProjID), nil)
+	recShare := httptest.NewRecorder()
+	r.ServeHTTP(recShare, reqShare)
+	assert.Equal(t, http.StatusUnauthorized, recShare.Code)
+	assert.Contains(t, recShare.Body.String(), "guest mode disabled on this installation")
+
 	// Check /api/auth/mode indicates guest mode is disabled
 	reqMode := httptest.NewRequest("GET", "/api/auth/mode", nil)
 	recMode := httptest.NewRecorder()
@@ -574,6 +587,38 @@ func TestGuestMode_DisabledByConfig(t *testing.T) {
 	var modeResp map[string]interface{}
 	require.NoError(t, json.Unmarshal(recMode.Body.Bytes(), &modeResp))
 	assert.Equal(t, false, modeResp["allow_guest_mode"])
+}
+
+// 7b. When AllowGuestMode is true, unauthenticated users can access public preview share status
+func TestGuestMode_PublicPreviewShareAllowedWhenGuestModeEnabled(t *testing.T) {
+	r, _, projectService, _, _, _ := setupGuestTestRouter(t, true) // allowGuestMode = true
+	ctx := context.Background()
+
+	// Create a guest project
+	guestRepoDir := createTestDir(t)
+	guestProj, err := projectService.CreateProject(ctx, models.GuestUserID, services.CreateProjectInput{
+		Name:           "Guest Shareable Project",
+		SourceType:     models.SourceTypeLocalDirectory,
+		RepositoryPath: guestRepoDir,
+		Services: []services.CreateServiceInput{
+			{Name: "web", SourcePath: ".", Runtime: "generic", BuildStrategy: "auto", InternalPort: 3000},
+		},
+	})
+	require.NoError(t, err)
+	defer projectService.DeleteProject(ctx, guestProj.ID, models.GuestUserID, nil)
+
+	// Unauthenticated GET /api/projects/:id/share must not be rejected with "guest mode disabled"
+	reqShare := httptest.NewRequest("GET", fmt.Sprintf("/api/projects/%s/share", guestProj.ID), nil)
+	recShare := httptest.NewRecorder()
+	r.ServeHTTP(recShare, reqShare)
+
+	// It must succeed (200 OK) with share status rather than 401 guest mode disabled
+	assert.Equal(t, http.StatusOK, recShare.Code)
+	assert.NotContains(t, recShare.Body.String(), "guest mode disabled on this installation")
+
+	var shareStatus models.ShareStatusResponse
+	require.NoError(t, json.Unmarshal(recShare.Body.Bytes(), &shareStatus))
+	assert.Equal(t, models.TunnelStateUnavailable, shareStatus.TunnelState) // since mock sharing is unconfigured
 }
 
 // 8. Untrusted origin guest mutations are rejected before state change occurs

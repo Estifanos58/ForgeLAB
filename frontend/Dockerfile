@@ -13,7 +13,7 @@ COPY package.json package-lock.json* ./
 RUN npm config set fetch-retries 5 && \
     npm config set fetch-retry-mintimeout 20000 && \
     npm config set fetch-retry-maxtimeout 180000 && \
-    (npm ci || npm install)
+    npm ci
 
 
 # Stage 2: Build the Next.js application

@@ -1,7 +1,7 @@
 # Multi-stage Dockerfile for ForgeLab Go Backend Control Plane
 
 # Build stage
-FROM golang:alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -25,24 +25,32 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s -X main.Version=${VERSION} -X main.CommitSHA=${COMMIT_SHA} -X main.BuildTime=${BUILD_TIME}" -o /app/forgelab-migrate ./cmd/migrate
 
 # Final runtime stage
-FROM alpine:3.19
+FROM alpine:3.21
 
 RUN for i in 1 2 3 4 5; do \
         apk add --no-cache ca-certificates curl docker-cli && break || \
         (echo "Retrying apk add in 3s..." && sleep 3); \
     done
 
-# Install official cloudflared binary for domainless public sharing
+# Install official cloudflared binary for domainless public sharing with pinned version and checksum verification
+ARG CLOUDFLARED_VERSION=2026.10.7
 RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then CLOUDFLARED_ARCH="amd64"; \
-    elif [ "$ARCH" = "aarch64" ]; then CLOUDFLARED_ARCH="arm64"; \
-    else CLOUDFLARED_ARCH="amd64"; fi && \
+    if [ "$ARCH" = "x86_64" ]; then \
+        CLOUDFLARED_ARCH="amd64"; \
+        CLOUDFLARED_SHA256="1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872"; \
+    elif [ "$ARCH" = "aarch64" ]; then \
+        CLOUDFLARED_ARCH="arm64"; \
+        CLOUDFLARED_SHA256="3df43aedc9ff291d1735b5cb576cb97e0b157488796db2e32b28aecabb445775"; \
+    else \
+        CLOUDFLARED_ARCH="amd64"; \
+        CLOUDFLARED_SHA256="1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872"; \
+    fi && \
     for i in 1 2 3 4 5; do \
-        curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CLOUDFLARED_ARCH}" && \
+        curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${CLOUDFLARED_ARCH}" && \
+        echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c - && \
         chmod +x /usr/local/bin/cloudflared && break || \
-        (echo "Retrying cloudflared download in 3s..." && sleep 3); \
+        (echo "Retrying cloudflared download/verification in 3s..." && rm -f /usr/local/bin/cloudflared && sleep 3); \
     done
-
 
 WORKDIR /app
 

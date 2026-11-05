@@ -58,8 +58,7 @@ async function handleProxy(request: NextRequest) {
   // Derive authoritative client IP using trusted-proxy model
   const trustedProxies = getTrustedProxies();
   const isDev = process.env.NODE_ENV !== 'production';
-  const directPeerIp = (request as any).ip || (request as any).socket?.remoteAddress;
-  const clientIp = extractClientIp(request.headers, trustedProxies, isDev, directPeerIp);
+  const clientIp = extractClientIp(request.headers, trustedProxies, isDev);
   const proto = request.nextUrl.protocol.replace(':', '') || 'http';
   const host = request.headers.get('host') || 'localhost:3000';
 

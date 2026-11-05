@@ -25,10 +25,10 @@ type HandshakeRequest struct {
 
 // HandshakeResponse is returned by the Gateway after verifying the auth token.
 type HandshakeResponse struct {
-	Status          string `json:"status"` // "success" or "error"
-	Error           string `json:"error,omitempty"`
-	BaseDomain      string `json:"base_domain,omitempty"`
-	GatewayVersion  string `json:"gateway_version,omitempty"`
+	Status         string `json:"status"` // "success" or "error"
+	Error          string `json:"error,omitempty"`
+	BaseDomain     string `json:"base_domain,omitempty"`
+	GatewayVersion string `json:"gateway_version,omitempty"`
 }
 
 // ControlMessage is sent by ForgeLAB to register/deregister share tokens on the active session.
