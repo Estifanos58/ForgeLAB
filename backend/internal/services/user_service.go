@@ -39,6 +39,14 @@ func NewUserService(db *pgxpool.Pool, jwtManager *auth.JWTManager) *UserService 
 	}
 }
 
+// RefreshTokenExpiry returns the configured refresh token duration.
+func (s *UserService) RefreshTokenExpiry() time.Duration {
+	if s != nil && s.jwtManager != nil {
+		return s.jwtManager.RefreshTokenExpiry()
+	}
+	return 7 * 24 * time.Hour
+}
+
 // RegisterInput holds the data needed to register a new user.
 type RegisterInput struct {
 	Email       string `json:"email"`

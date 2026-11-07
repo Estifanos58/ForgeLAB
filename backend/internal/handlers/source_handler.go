@@ -578,7 +578,7 @@ func (h *SourceHandler) ValidateLocalPath(w http.ResponseWriter, r *http.Request
 			writeJSON(w, http.StatusOK, res)
 			return
 		}
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		writeJSON(w, http.StatusAccepted, ValidateLocalPathResponse{
 			SessionID:      sessionID,
 			Status:         "scanning",

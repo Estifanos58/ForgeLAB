@@ -477,7 +477,7 @@ func main() {
 
 	// WebSocket endpoint & ticket generation
 	r.With(wsConnThrottle).Get("/api/ws", wsHub.ServeWS)
-	r.With(wsConnThrottle).Post("/api/ws/ticket", wsHub.CreateTicketHandler)
+	r.With(wsConnThrottle, middleware.AuthOrGuestMiddleware(jwtManager, cfg.App.AllowGuestMode, cfg.App.AllowedOriginsList()...)).Post("/api/ws/ticket", wsHub.CreateTicketHandler)
 
 	// API routes
 	r.Route("/api", func(r chi.Router) {

@@ -1235,3 +1235,124 @@ func TestWebSocket_RefreshTokenPresentWithoutAccessTokenReturns401(t *testing.T)
 		t.Fatalf("expected 401 Unauthorized, got: %v", resp)
 	}
 }
+
+func TestCreateTicketHandler_AuthenticationAndGuestIsolation(t *testing.T) {
+	secret := "test-secret-key-32-bytes-long!!"
+	jwtManager := auth.NewJWTManager(secret, 15*time.Minute, 7*24*time.Hour)
+	expiredJwtManager := auth.NewJWTManager(secret, -1*time.Minute, 7*24*time.Hour)
+
+	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000")
+	hub.SetAllowGuestMode(true)
+
+	regUserID := uuid.New()
+	regEmail := "registered@forgelab.local"
+
+	validToken, err := jwtManager.GenerateAccessToken(regUserID, regEmail)
+	if err != nil {
+		t.Fatalf("failed to generate valid token: %v", err)
+	}
+
+	expiredToken, err := expiredJwtManager.GenerateAccessToken(regUserID, regEmail)
+	if err != nil {
+		t.Fatalf("failed to generate expired token: %v", err)
+	}
+
+	t.Run("ValidAccessTokenCookie", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/ws/ticket", nil)
+		req.AddCookie(&http.Cookie{Name: "forgelab_access_token", Value: validToken})
+		rec := httptest.NewRecorder()
+
+		hub.CreateTicketHandler(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201 Created, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var body map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("failed to parse JSON response: %v", err)
+		}
+		ticketStr, ok := body["ticket"].(string)
+		if !ok || ticketStr == "" {
+			t.Fatalf("expected ticket in response, got %v", body)
+		}
+
+		// Verify ticket resolves to authenticated user
+		ticket, valid := hub.ConsumeTicket(ticketStr)
+		if !valid || ticket == nil {
+			t.Fatalf("ticket was not valid")
+		}
+		if ticket.UserID != regUserID {
+			t.Fatalf("expected ticket userID %s, got %s", regUserID, ticket.UserID)
+		}
+		if ticket.UserEmail != regEmail {
+			t.Fatalf("expected ticket userEmail %s, got %s", regEmail, ticket.UserEmail)
+		}
+	})
+
+	t.Run("ExpiredAccessTokenRejection_NeverDowngradeToGuest", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/ws/ticket", nil)
+		req.AddCookie(&http.Cookie{Name: "forgelab_access_token", Value: expiredToken})
+		rec := httptest.NewRecorder()
+
+		hub.CreateTicketHandler(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized for expired token, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("RefreshTokenPresentWithoutAccessToken_NeverDowngradeToGuest", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/ws/ticket", nil)
+		req.AddCookie(&http.Cookie{Name: "forgelab_refresh_token", Value: "some-refresh-token"})
+		rec := httptest.NewRecorder()
+
+		hub.CreateTicketHandler(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized when refresh token exists, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("GuestModeEnabled_AssignsIsolatedGuestSession", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/ws/ticket", nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+		rec := httptest.NewRecorder()
+
+		hub.CreateTicketHandler(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201 Created for guest, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var body map[string]interface{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &body)
+		ticketStr := body["ticket"].(string)
+
+		ticket, valid := hub.ConsumeTicket(ticketStr)
+		if !valid || ticket == nil {
+			t.Fatalf("expected valid guest ticket")
+		}
+		if ticket.UserID == uuid.Nil || ticket.UserID == regUserID {
+			t.Fatalf("invalid guest user ID: %s", ticket.UserID)
+		}
+		if !strings.Contains(ticket.UserEmail, "guest") {
+			t.Fatalf("expected guest email pattern, got %s", ticket.UserEmail)
+		}
+
+		// Verify cookie was set for browser
+		cookieHeader := rec.Header().Get("Set-Cookie")
+		if !strings.Contains(cookieHeader, "forgelab_guest_session") {
+			t.Fatalf("expected forgelab_guest_session cookie to be set, got %s", cookieHeader)
+		}
+	})
+
+	t.Run("GuestModeDisabled_RejectsUnauthenticated", func(t *testing.T) {
+		hub.SetAllowGuestMode(false)
+		defer hub.SetAllowGuestMode(true)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/ws/ticket", nil)
+		rec := httptest.NewRecorder()
+
+		hub.CreateTicketHandler(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized when guest mode is disabled, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+}

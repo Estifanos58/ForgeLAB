@@ -92,8 +92,9 @@ frontend/
 │   │   ├── auth/                     # AuthContext, useAuth hook (session state)
 │   │   └── deployments/              # LifecycleControls, TerminalViewer, History, EnvManager
 │   ├── lib/
-│   │   ├── api/                      # Typed API client (types.ts, client.ts)
-│   │   └── websocket/                # Scoped WebSocket streaming hook
+│   │   ├── api/                      # Modular domain API clients (base, auth, projects, services, env, integrations, sources, agent, discovery, client facade)
+│   │   ├── auth/                     # Centralized SessionManager (cross-tab Web Locks, BroadcastChannel, upload preflight)
+│   │   └── websocket/                # Scoped WebSocket streaming hook (use-deployment-ws)
 │   └── proxy.ts                      # Next.js 16 proxy convention for route protection
 ├── next.config.ts                    # Backend reverse-proxy rewrite configuration
 ├── tailwind.config.ts                # Tailwind design system configuration
@@ -105,14 +106,23 @@ frontend/
 
 ---
 
-## 3. Backend-Owned Authentication & Session Management
+## 3. Backend-Owned Authentication & Centralized Session Management
 
 ### No Client-Side Token Storage
 - Neither access tokens nor refresh tokens are stored in `localStorage`, `sessionStorage`, cookies readable by JavaScript, or client-side URL parameters.
 - All tokens are issued by the Go backend as **HttpOnly, SameSite, Secure (configurable)** cookies:
   - `forgelab_access_token` (15-minute expiry)
-  - `forgelab_refresh_token` (7-day expiry)
+  - `forgelab_refresh_token` (dynamically derived from `JWT_REFRESH_TOKEN_EXPIRY`)
 - Every API call from the browser sends `credentials: 'include'`. The browser automatically attaches cookies to all requests proxied to the backend.
+
+### Centralized Session Management & Cross-Tab Synchronization
+ForgeLAB provides a unified `SessionManager` (`frontend/src/lib/auth/session-manager.ts`) shared across the API client, WebSocket ticket requests, and upload flows:
+1. **Web Locks Coordination:** Refreshes acquire `navigator.locks.request('forgelab_auth_refresh_lock', ...)` to serialize refresh attempts across browser tabs.
+2. **Recheck on Lock Acquisition:** Peer tabs waiting on the lock re-verify session validity immediately upon acquiring the lock, eliminating duplicate `/api/auth/refresh` calls that rotate and invalidate valid refresh tokens.
+3. **Single-Flight Coalescing:** Multiple concurrent requests within the same browser tab share an in-flight refresh promise.
+4. **BroadcastChannel Synchronization:** Refreshed tabs notify peer tabs via `BroadcastChannel('forgelab_session_channel')` to reset retry state.
+5. **Upload Preflight Check:** Large uploads pre-validate session freshness via `SessionManager.preflightUploadSession()` before initiating multipart streaming; failed transfers are not automatically retried midway.
+6. **WebSocket Ticket Recovery:** When WebSocket connections receive authentication or ticket errors, `fetchTicketWithSession()` refreshes the session, fetches a new ticket, and reconnects with `last_sequence` log replay. Genuine resource denial errors are classified to prevent infinite refresh cycles.
 
 ### Next.js 16 `proxy.ts` Route Protection
 Next.js 16 introduces `proxy.ts` as the standard route interceptor replacing `middleware.ts`.
@@ -125,6 +135,7 @@ The UI provides unified authentication across:
 1. **Google OAuth 2.0:** Server-side authorization code flow (`/api/auth/google`).
 2. **GitHub OAuth:** Server-side web OAuth flow (`/api/auth/github`) requesting minimum `read:user user:email` scopes.
 3. **Email / Password:** bcrypt-authenticated email and password credentials.
+4. **Isolated Guest Mode:** Unauthenticated sandbox sessions preserved without token leaks or cross-tenant degradation.
 
 ---
 

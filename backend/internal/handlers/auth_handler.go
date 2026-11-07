@@ -387,6 +387,12 @@ func (h *AuthHandler) setAuthCookies(w http.ResponseWriter, tokens *services.Aut
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   accessMaxAge,
 	})
+	refreshMaxAge := 7 * 24 * 3600
+	if h.userService != nil {
+		if dur := int(h.userService.RefreshTokenExpiry().Seconds()); dur > 0 {
+			refreshMaxAge = dur
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "forgelab_refresh_token",
 		Value:    tokens.RefreshToken,
@@ -394,7 +400,7 @@ func (h *AuthHandler) setAuthCookies(w http.ResponseWriter, tokens *services.Aut
 		HttpOnly: true,
 		Secure:   h.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   7 * 24 * 3600,
+		MaxAge:   refreshMaxAge,
 	})
 }
 

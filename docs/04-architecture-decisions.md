@@ -548,4 +548,39 @@ Container configuration is validated through authoritative unified boundaries in
   - If a service or project was previously deployed and is currently inactive (e.g. stopped, crashed, failed), the dashboard and service cards expose a prominent **Redeploy** action that triggers the deployment pipeline.
   - Previous successful deployment history (`current_deployment_id`, `image_digest`, historical configurations) is preserved, ensuring rollback guarantees are retained.
 
+### 12. Session Reliability & Cross-Tab Refresh Coordination
+- **Cross-Tab Refresh Synchronization:** Frontend session refreshes are coordinated across multiple browser tabs using the Web Locks API (`navigator.locks.request('forgelab_auth_refresh_lock', ...)`) with a safe in-memory fallback.
+- **Recheck After Lock Acquisition:** When multiple tabs encounter an expired access token simultaneously, only the lock-winning tab executes the refresh HTTP call (`/api/auth/refresh`). Waiting tabs recheck session freshness immediately upon acquiring the lock, skipping redundant token rotation and preventing accidental cookie invalidation.
+- **BroadcastChannel Notification:** Successful refreshes broadcast a synchronization message over `new BroadcastChannel('forgelab_session_channel')` notifying peer tabs to reset their failure counts and synchronize timestamps.
+- **WebSocket Ticket Authentication:** `CreateTicketHandler` validates incoming access tokens and strictly rejects expired tokens with HTTP 401 instead of silently degrading authenticated sessions to Guest mode. Guest sessions remain isolated and enabled by default for unauthenticated exploratory use.
+- **WebSocket Reconnection with Session Recovery:** When WebSocket connections receive authentication or ticket expiration errors, the client recovers the session via `SessionManager.fetchTicketWithSession()`, requests a fresh single-use ticket, and reconnects while strictly preserving `last_sequence` to replay missed logs without infinite refresh loops on resource-denied errors.
+- **Upload Authentication Preflight:** Large source archives execute `SessionManager.preflightUploadSession()` prior to beginning file transmission. If transmission fails midway, the upload is never blindly retried without explicit user action.
+- **Dynamic Cookie Expiration:** Refresh cookie `MaxAge` is derived dynamically from backend configuration `JWT_REFRESH_TOKEN_EXPIRY` rather than a hardcoded duration.
+
+### 13. Subsystem Modularization & Separation of Responsibilities
+To maintain maintainability and clean boundaries, oversized files across the backend and frontend are refactored into cohesive modules targeting ~300–500 lines:
+- **Docker Engine:**
+  - `engine.go`: Core struct, constructor, build semaphore, active execution registry.
+  - `engine_deploy.go`: Release deployment DAG orchestration and multi-service lifecycle.
+  - `engine_service_deploy.go`: Single service deployment execution pipeline.
+  - `engine_app_control.go`: Application start, stop, and restart operations.
+  - `engine_log_collectors.go`: Continuous container runtime log streaming, secret redaction, and WebSocket broadcasting.
+  - `engine_cleanup.go`: Safe container, image, and network pruning.
+  - `engine_reconcile.go`: Synchronous daemon container startup reconciliation.
+  - `engine_networks.go`: Docker network creation, options, and cleanup.
+  - `engine_runtime_health.go`: Periodic container inspection, daemon checks, and crash detection.
+  - `engine_status.go`: Project and service status recalculation and status mapping.
+  - `engine_stream.go`: Docker multiplexed log stream demuxing and timestamp stripping.
+- **Services & Queues:**
+  - `deployment_service`: Modularized into `create`, `service_deploy`, `rollback`, `get`, `logs`, `reconcile`, and `status`.
+  - `project_service`: Modularized into `crud`, `status`, and `env`.
+  - `source_service`: Modularized into `credentials` and `ingest`.
+  - `github_service`: Modularized into `auth`, `repos`, and `tarball`.
+  - `agent/server`: Modularized into `auth`, `folders`, and `sources`.
+  - `queue/redis_queue`: Modularized into `leases`, `recovery`, `scripts`, and `worker`.
+  - `websocket/hub`: Modularized into `tickets`, `subscriptions`, and `events`.
+- **Frontend API Architecture:**
+  - `lib/api/`: Domain clients (`auth-client`, `projects-client`, `services-client`, `env-client`, `integrations-client`, `sources-client`, `agent-client`, `discovery-client`) built on a common `base.ts` fetch engine, exported through a backward-compatible facade in `client.ts`.
+
+
 

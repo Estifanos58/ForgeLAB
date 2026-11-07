@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { DeploymentLog } from '../api/types';
 import { getWebSocketUrl } from './config';
+import { sessionManager } from '../auth/session-manager';
 
 export type WSConnectionState =
   | 'connecting'
@@ -77,6 +78,7 @@ export function useDeploymentWS({
   const backoffDelayRef = useRef<number>(1000); // 1s, 2s, 4s, 8s, 16s, max 30s
   const isIntentionalCloseRef = useRef<boolean>(false);
   const lastSequenceRef = useRef<number>(0);
+  const authRetryCountRef = useRef<number>(0);
 
   const clearLogs = useCallback(() => {
     setLogs([]);
@@ -179,14 +181,7 @@ export function useDeploymentWS({
           process.env.NEXT_PUBLIC_BACKEND_PORT && typeof window !== 'undefined' && window.location.port === '3000'
             ? `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_PORT}/api/ws/ticket`
             : '/api/ws/ticket';
-        const res = await fetch(ticketUrl, {
-          method: 'POST',
-          credentials: 'include',
-        });
-        if (res.ok) {
-          const data = await res.json();
-          return data.ticket || null;
-        }
+        return await sessionManager.fetchTicketWithSession(ticketUrl);
       } catch {
         // Fallback to cookie / guest session if ticket endpoint is unreachable
       }
@@ -275,6 +270,7 @@ export function useDeploymentWS({
                 // Subscription acknowledged by backend: the stream is now fully live!
                 setConnectionState('subscribed');
                 backoffDelayRef.current = 1000; // Reset backoff on successful subscription
+                authRetryCountRef.current = 0;
                 onSubscribedRef.current?.(msg.channel);
               }
               break;
@@ -282,13 +278,24 @@ export function useDeploymentWS({
             case 'error':
               console.warn('[ForgeLAB WS] Server-side error:', msg.code, msg.message);
               onErrorRef.current?.(msg);
-              if (msg.code === 'UNAUTHORIZED') {
-                fetch('/api/auth/refresh', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  credentials: 'include',
-                  body: JSON.stringify({}),
-                }).catch(() => {});
+              const errMsg = typeof msg.message === 'string' ? msg.message.toLowerCase() : '';
+              const isResourceDenied =
+                errMsg.includes('access denied') ||
+                errMsg.includes('not found') ||
+                errMsg.includes('parent service not found');
+
+              if (msg.code === 'UNAUTHORIZED' && !isResourceDenied) {
+                if (authRetryCountRef.current < 2) {
+                  authRetryCountRef.current += 1;
+                  sessionManager
+                    .refreshSession()
+                    .then(() => {
+                      if (!isDisposed) {
+                        connect();
+                      }
+                    })
+                    .catch(() => {});
+                }
               }
               break;
 
