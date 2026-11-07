@@ -303,6 +303,7 @@ export function useDeploymentWS({
             case 'service_deployment_log':
             case 'release_log':
               if (msg.data) {
+                sessionManager.recordActivity('deployment_logs');
                 const logEntry: DeploymentLog = parseWSLogEntry(msg.data, channel);
 
                 const seq = typeof msg.sequence === 'number' ? msg.sequence : (typeof logEntry.id === 'number' ? logEntry.id : 0);
@@ -341,6 +342,7 @@ export function useDeploymentWS({
 
             case 'status_change':
               if (msg.data) {
+                sessionManager.recordActivity('deployment_logs');
                 setStatusChange(msg.data);
                 onStatusChangeRef.current?.(msg.data);
               }

@@ -108,16 +108,24 @@ func (s *GitHubService) GetStatus(ctx context.Context, userID uuid.UUID) (*GitHu
 	if strings.HasPrefix(plainTokenStr, "ghu_") || authType == "app" {
 		authType = "app"
 		hasRepoScope = true
-	} else if strings.HasPrefix(plainTokenStr, "github_pat_") || strings.HasPrefix(plainTokenStr, "ghp_") || authType == "pat" {
+	} else if strings.HasPrefix(plainTokenStr, "github_pat_") {
 		authType = "pat"
-		hasRepoScope = true
-	} else {
 		for _, sc := range scopes {
-			if sc == "pat" {
-				authType = "pat"
+			if sc == "repo" || sc == "fine-grained" {
 				hasRepoScope = true
 				break
 			}
+		}
+	} else if strings.HasPrefix(plainTokenStr, "ghp_") || authType == "pat" {
+		authType = "pat"
+		for _, sc := range scopes {
+			if sc == "repo" {
+				hasRepoScope = true
+				break
+			}
+		}
+	} else {
+		for _, sc := range scopes {
 			if sc == "repo" {
 				hasRepoScope = true
 				break
@@ -210,7 +218,7 @@ func (s *GitHubService) GetConnectURL(ctx context.Context, userID uuid.UUID) (au
 		redirectURL = "http://localhost:3000/api/integrations/github/callback"
 	}
 	params.Set("redirect_uri", redirectURL)
-	params.Set("scope", "repo,read:user,user:email")
+	params.Set("scope", "repo read:user user:email")
 	params.Set("prompt", "consent")
 	params.Set("state", state)
 
@@ -358,22 +366,34 @@ func (s *GitHubService) HandleCallback(ctx context.Context, code, state, nonce s
 	if strings.HasPrefix(tokenRes.AccessToken, "ghu_") {
 		authType = "app"
 		if storedScope == "" {
-			storedScope = "repo,read:user,user:email"
+			storedScope = "repo read:user user:email"
 		}
 	} else if strings.HasPrefix(tokenRes.AccessToken, "github_pat_") || strings.HasPrefix(tokenRes.AccessToken, "ghp_") {
 		authType = "pat"
 		if storedScope == "" {
-			storedScope = "pat,repo"
+			storedScope = "pat repo"
 		}
 	} else if storedScope == "" {
-		// Probe if classic OAuth token has repo access
-		repoCheckReq, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/repos?per_page=1", nil)
+		// Probe whether OAuth token has private repository access.
+		// Note: accessing /user/repos without visibility=private will succeed (HTTP 200) even for
+		// tokens with only read:user or public_repo permissions. We specifically test private visibility.
+		repoCheckReq, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/repos?visibility=private&per_page=1", nil)
 		repoCheckReq.Header.Set("Authorization", "Bearer "+tokenRes.AccessToken)
 		repoCheckReq.Header.Set("Accept", "application/vnd.github+json")
 		repoCheckReq.Header.Set("User-Agent", "ForgeLAB-App")
 		if repoCheckResp, checkErr := s.httpClient.Do(repoCheckReq); checkErr == nil {
 			if repoCheckResp.StatusCode == http.StatusOK {
-				storedScope = "repo,read:user"
+				if sc := strings.TrimSpace(repoCheckResp.Header.Get("X-OAuth-Scopes")); sc != "" {
+					storedScope = sc
+				} else {
+					storedScope = "repo read:user user:email"
+				}
+			} else {
+				if sc := strings.TrimSpace(repoCheckResp.Header.Get("X-OAuth-Scopes")); sc != "" {
+					storedScope = sc
+				} else {
+					storedScope = "read:user user:email"
+				}
 			}
 			repoCheckResp.Body.Close()
 		}
@@ -449,8 +469,8 @@ func (s *GitHubService) ConnectWithPAT(ctx context.Context, userID uuid.UUID, pa
 		return nil, errors.New("failed to retrieve GitHub user profile with token")
 	}
 
-	// Verify actual repository access to ensure the token has sufficient permissions
-	repoReq, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/repos?per_page=1", nil)
+	// Verify actual private repository access to ensure the token has sufficient permissions
+	repoReq, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/repos?visibility=private&per_page=1", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -464,19 +484,22 @@ func (s *GitHubService) ConnectWithPAT(ctx context.Context, userID uuid.UUID, pa
 	}
 	defer repoResp.Body.Close()
 
-	if repoResp.StatusCode == http.StatusUnauthorized || repoResp.StatusCode == http.StatusForbidden {
-		return nil, errors.New("invalid GitHub token permissions: repository access is not authorized. Please grant repository permissions (Contents, Metadata, etc.).")
+	if repoResp.StatusCode == http.StatusUnauthorized || repoResp.StatusCode == http.StatusForbidden || repoResp.StatusCode == http.StatusUnprocessableEntity {
+		return nil, errors.New("invalid GitHub token permissions: private repository access is not authorized. Please grant repository permissions ('repo' scope for classic tokens or 'Contents' read access for fine-grained tokens).")
 	}
 	if repoResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API returned status %d when verifying repository access", repoResp.StatusCode)
 	}
 
 	scopeHeader := resp.Header.Get("X-OAuth-Scopes")
+	if scopeHeader == "" {
+		scopeHeader = repoResp.Header.Get("X-OAuth-Scopes")
+	}
 	var savedScope string
 	if scopeHeader != "" {
 		savedScope = scopeHeader + ",pat"
 	} else {
-		savedScope = "pat,fine-grained"
+		savedScope = "pat,fine-grained,repo"
 	}
 
 	encryptedToken, err := s.encryptor.Encrypt([]byte(cleanToken))
@@ -541,9 +564,9 @@ func (s *GitHubService) getDecryptedTokenAndScope(ctx context.Context, userID uu
 	}
 	tokenStr := string(plainToken)
 
-	// If token is a GitHub App user token (ghu_) or fine-grained PAT, or auth_type is app/pat,
+	// If token is a GitHub App user token (ghu_) or fine-grained PAT, or auth_type is app,
 	// ensure scope reflects repo capability so downstream callers do not falsely reject it.
-	if strings.HasPrefix(tokenStr, "ghu_") || strings.HasPrefix(tokenStr, "github_pat_") || authType == "app" || authType == "pat" {
+	if strings.HasPrefix(tokenStr, "ghu_") || strings.HasPrefix(tokenStr, "github_pat_") || authType == "app" {
 		scopes := parseOAuthScopes(scope)
 		hasRepo := false
 		for _, sc := range scopes {
@@ -556,7 +579,7 @@ func (s *GitHubService) getDecryptedTokenAndScope(ctx context.Context, userID uu
 			if scope == "" {
 				scope = "repo"
 			} else {
-				scope = "repo," + scope
+				scope = "repo " + scope
 			}
 		}
 	}

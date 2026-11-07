@@ -44,6 +44,15 @@ export async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {
     ...(options.headers as Record<string, string>),
   };
 
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const guestId = localStorage.getItem('forgelab_guest_session_id');
+      if (guestId && !headers['X-Guest-Session']) {
+        headers['X-Guest-Session'] = guestId;
+      }
+    } catch {}
+  }
+
   if (options.body && !(options.body instanceof FormData)) {
     headers['Content-Type'] = 'application/json';
   }
@@ -53,6 +62,13 @@ export async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {
     headers,
     credentials: 'include',
   });
+
+  const guestHeader = response.headers.get('x-guest-session');
+  if (guestHeader && typeof localStorage !== 'undefined') {
+    try {
+      localStorage.setItem('forgelab_guest_session_id', guestHeader);
+    } catch {}
+  }
 
   // Handle 401 with a single controlled refresh and retry
   const isAuthEndpoint =
@@ -90,6 +106,10 @@ export async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {
     const errorMsg =
       typeof data === 'object' && data?.error ? data.error : `Request failed with status ${response.status}`;
     throw new ApiClientError(errorMsg, response.status, data);
+  }
+
+  if (!isAuthEndpoint && !url.includes('/api/auth/touch')) {
+    sessionManager.recordActivity('user');
   }
 
   return data as T;

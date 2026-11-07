@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -360,14 +361,24 @@ func (h *IntegrationHandler) GetAppInstallURL(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	userID, ok := h.getRegisteredUserID(w, r)
+	if !ok {
+		return
+	}
+
 	slug := h.appManager.AppSlug()
 	if slug == "" {
 		writeError(w, http.StatusServiceUnavailable, "GitHub App slug is not configured")
 		return
 	}
 
-	state := uuid.New().String()
-	installURL := fmt.Sprintf("https://github.com/apps/%s/installations/new?state=%s", url.PathEscape(slug), state)
+	state, err := h.appManager.CreateInstallState(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate secure installation state")
+		return
+	}
+
+	installURL := fmt.Sprintf("https://github.com/apps/%s/installations/new?state=%s", url.PathEscape(slug), url.QueryEscape(state))
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"url": installURL,
@@ -376,26 +387,59 @@ func (h *IntegrationHandler) GetAppInstallURL(w http.ResponseWriter, r *http.Req
 
 // GitHubAppCallback handles GET /api/integrations/github/app/callback
 func (h *IntegrationHandler) GitHubAppCallback(w http.ResponseWriter, r *http.Request) {
-	installationIDStr := r.URL.Query().Get("installation_id")
+	if h.appManager == nil || !h.appManager.IsConfigured() {
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=github_app_not_configured", http.StatusFound)
+		return
+	}
+
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	if state == "" {
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=missing_installation_state", http.StatusFound)
+		return
+	}
+
+	installationIDStr := strings.TrimSpace(r.URL.Query().Get("installation_id"))
 	if installationIDStr == "" {
 		http.Redirect(w, r, h.frontendURL+"/dashboard?error=missing_installation_id", http.StatusFound)
 		return
 	}
 
 	installationID, err := strconv.ParseInt(installationIDStr, 10, 64)
-	if err != nil {
+	if err != nil || installationID <= 0 {
 		http.Redirect(w, r, h.frontendURL+"/dashboard?error=invalid_installation_id", http.StatusFound)
 		return
 	}
 
-	userID, ok := getUserIDFromContext(r)
-	if ok && h.appManager != nil {
-		details, err := h.appManager.GetInstallationDetails(r.Context(), installationID)
-		if err == nil && details != nil {
-			_ = h.appManager.SaveInstallation(r.Context(), userID, details)
-		}
+	// 1. Validate and consume the cryptographic state bound to the initiating user
+	userID, err := h.appManager.ValidateAndConsumeInstallState(r.Context(), state)
+	if err != nil {
+		slog.Warn("github app callback rejected: invalid or expired state", "error", err)
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=invalid_or_expired_installation_state", http.StatusFound)
+		return
 	}
 
+	// 2. Verify installation details against GitHub API before associating with the ForgeLAB account
+	details, err := h.appManager.GetInstallationDetails(r.Context(), installationID)
+	if err != nil || details == nil {
+		slog.Error("failed to verify github app installation with github api", "installation_id", installationID, "error", err)
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=failed_to_verify_github_installation", http.StatusFound)
+		return
+	}
+
+	if details.ID != installationID || strings.TrimSpace(details.AccountLogin) == "" {
+		slog.Error("github app installation details mismatch or incomplete", "installation_id", installationID, "details_id", details.ID)
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=invalid_installation_details", http.StatusFound)
+		return
+	}
+
+	// 3. Persist the verified installation associated with the bound user
+	if err := h.appManager.SaveInstallation(r.Context(), userID, details); err != nil {
+		slog.Error("failed to persist github app installation", "user_id", userID, "installation_id", installationID, "error", err)
+		http.Redirect(w, r, h.frontendURL+"/dashboard?error=failed_to_save_installation", http.StatusFound)
+		return
+	}
+
+	slog.Info("github app installation successfully bound to user", "user_id", userID, "installation_id", installationID, "account", details.AccountLogin)
 	http.Redirect(w, r, h.frontendURL+"/dashboard?github_app_installed=true", http.StatusFound)
 }
 

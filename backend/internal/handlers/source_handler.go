@@ -662,7 +662,7 @@ func (h *SourceHandler) CreateAgentSession(w http.ResponseWriter, r *http.Reques
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
 	sm := agent.GetGlobalSessionManager()
-	session, err := sm.CreateSession(userID, req.AgentID, 30*time.Minute)
+	session, err := sm.CreateSession(userID, req.AgentID, 24*time.Hour)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create agent session: "+err.Error())
 		return

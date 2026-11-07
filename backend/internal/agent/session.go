@@ -22,7 +22,7 @@ var (
 )
 
 const (
-	DefaultSessionTTL = 15 * time.Minute
+	DefaultSessionTTL = 24 * time.Hour
 )
 
 // AgentSession represents a short-lived authenticated link between a user, agent, and source

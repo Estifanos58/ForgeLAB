@@ -30,14 +30,15 @@ var (
 
 // ProjectService handles project-related business logic.
 type ProjectService struct {
-	db                *pgxpool.Pool
-	pathValidator     *security.PathValidator
-	sourceService     *SourceService
-	githubService     *GitHubService
-	serviceService    *ServiceService
-	secretService     *SecretService
-	deploymentService *DeploymentService
-	importService     *RepositoryImportService
+	db                   *pgxpool.Pool
+	pathValidator        *security.PathValidator
+	sourceService        *SourceService
+	githubService        *GitHubService
+	serviceService       *ServiceService
+	secretService        *SecretService
+	deploymentService    *DeploymentService
+	importService        *RepositoryImportService
+	projectGetterForTest func(ctx context.Context, projectID, ownerID uuid.UUID) (*models.Project, error)
 }
 
 // NewProjectService creates a new ProjectService.
@@ -77,6 +78,11 @@ func (s *ProjectService) SetDeploymentService(ds *DeploymentService) {
 
 func (s *ProjectService) SetImportService(is *RepositoryImportService) {
 	s.importService = is
+}
+
+// SetProjectGetterForTest sets a test hook for GetProject.
+func (s *ProjectService) SetProjectGetterForTest(fn func(ctx context.Context, projectID, ownerID uuid.UUID) (*models.Project, error)) {
+	s.projectGetterForTest = fn
 }
 
 type CreateServiceInput struct {

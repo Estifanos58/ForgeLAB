@@ -2,15 +2,18 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/forgelab/backend/internal/auth"
 	"github.com/forgelab/backend/internal/models"
@@ -25,18 +28,37 @@ var (
 	ErrTokenNotFound   = errors.New("refresh token not found")
 )
 
+type cachedRotation struct {
+	tokens    *AuthTokens
+	expiresAt time.Time
+}
+
 // UserService handles user-related business logic.
 type UserService struct {
-	db         *pgxpool.Pool
-	jwtManager *auth.JWTManager
+	db            *pgxpool.Pool
+	jwtManager    *auth.JWTManager
+	redis         *redis.Client
+	rotationCache sync.Map
+	gracePeriod   time.Duration
 }
 
 // NewUserService creates a new UserService.
 func NewUserService(db *pgxpool.Pool, jwtManager *auth.JWTManager) *UserService {
 	return &UserService{
-		db:         db,
-		jwtManager: jwtManager,
+		db:          db,
+		jwtManager:  jwtManager,
+		gracePeriod: 30 * time.Second,
 	}
+}
+
+// SetRedisClient attaches a Redis client for distributed token rotation caching.
+func (s *UserService) SetRedisClient(r *redis.Client) {
+	s.redis = r
+}
+
+// SetGracePeriod configures the concurrency grace window for simultaneous refresh calls.
+func (s *UserService) SetGracePeriod(d time.Duration) {
+	s.gracePeriod = d
 }
 
 // RefreshTokenExpiry returns the configured refresh token duration.
@@ -44,7 +66,23 @@ func (s *UserService) RefreshTokenExpiry() time.Duration {
 	if s != nil && s.jwtManager != nil {
 		return s.jwtManager.RefreshTokenExpiry()
 	}
-	return 7 * 24 * time.Hour
+	return 30 * 24 * time.Hour
+}
+
+// AccessTokenExpiry returns the configured access token duration.
+func (s *UserService) AccessTokenExpiry() time.Duration {
+	if s != nil && s.jwtManager != nil {
+		return s.jwtManager.AccessTokenExpiry()
+	}
+	return 24 * time.Hour
+}
+
+// JWTManager returns the underlying JWT manager instance.
+func (s *UserService) JWTManager() *auth.JWTManager {
+	if s != nil {
+		return s.jwtManager
+	}
+	return nil
 }
 
 // RegisterInput holds the data needed to register a new user.
@@ -191,10 +229,73 @@ func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User
 	return user, tokens, nil
 }
 
-// RefreshTokens validates a refresh token and issues new tokens atomically in a single PostgreSQL transaction.
-func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*AuthTokens, error) {
-	tokenHash := auth.HashToken(refreshToken)
+func (s *UserService) cacheRotation(ctx context.Context, oldTokenHash string, tokens *AuthTokens) {
+	if s.gracePeriod <= 0 {
+		return
+	}
+	grace := s.gracePeriod
 	now := time.Now()
+
+	s.rotationCache.Store(oldTokenHash, &cachedRotation{
+		tokens:    tokens,
+		expiresAt: now.Add(grace),
+	})
+
+	if s.redis != nil {
+		payload, err := json.Marshal(tokens)
+		if err == nil {
+			_ = s.redis.Set(ctx, "forgelab:refresh_rotation:"+oldTokenHash, string(payload), grace).Err()
+		}
+	}
+}
+
+func (s *UserService) getCachedRotation(ctx context.Context, oldTokenHash string) *AuthTokens {
+	if s.gracePeriod <= 0 {
+		return nil
+	}
+	now := time.Now()
+
+	if val, ok := s.rotationCache.Load(oldTokenHash); ok {
+		if entry, ok := val.(*cachedRotation); ok && entry != nil {
+			if now.Before(entry.expiresAt) {
+				return entry.tokens
+			}
+			s.rotationCache.Delete(oldTokenHash)
+		}
+	}
+
+	if s.redis != nil {
+		rawStr, err := s.redis.Get(ctx, "forgelab:refresh_rotation:"+oldTokenHash).Result()
+		if err == nil && rawStr != "" {
+			var tokens AuthTokens
+			if err := json.NewDecoder(strings.NewReader(rawStr)).Decode(&tokens); err == nil && tokens.RefreshToken != "" {
+				s.rotationCache.Store(oldTokenHash, &cachedRotation{
+					tokens:    &tokens,
+					expiresAt: now.Add(15 * time.Second),
+				})
+				return &tokens
+			}
+		}
+	}
+
+	return nil
+}
+
+// RefreshTokens validates a refresh token and issues new tokens atomically in a single PostgreSQL transaction.
+// It implements a concurrency grace window to allow simultaneous requests from independent browser tabs
+// or components to receive fresh rotated tokens without losing sessions or hitting false replay errors.
+func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*AuthTokens, error) {
+	cleanToken := strings.TrimSpace(refreshToken)
+	if cleanToken == "" {
+		return nil, ErrTokenNotFound
+	}
+	tokenHash := auth.HashToken(cleanToken)
+	now := time.Now()
+
+	// Fast-path: Check if this token was already rotated within the concurrency grace window
+	if cached := s.getCachedRotation(ctx, tokenHash); cached != nil {
+		return cached, nil
+	}
 
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -220,10 +321,17 @@ func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Token couldn't be claimed. Check why to return precise error.
+			_ = tx.Rollback(ctx)
+
+			// Re-check rotation cache: a concurrent request may have completed rotation just ahead of us
+			if cached := s.getCachedRotation(ctx, tokenHash); cached != nil {
+				return cached, nil
+			}
+
+			// Token couldn't be claimed. Query token state to determine exact failure cause.
 			var isRevoked bool
 			var expiresAt time.Time
-			checkErr := tx.QueryRow(ctx,
+			checkErr := s.db.QueryRow(ctx,
 				"SELECT revoked, expires_at FROM refresh_tokens WHERE token_hash = $1",
 				tokenHash,
 			).Scan(&isRevoked, &expiresAt)
@@ -234,6 +342,11 @@ func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*
 				return nil, fmt.Errorf("failed to check refresh token state: %w", checkErr)
 			}
 			if isRevoked {
+				// Brief spin to allow any winning concurrent transaction in flight to commit and cache
+				time.Sleep(20 * time.Millisecond)
+				if cached := s.getCachedRotation(ctx, tokenHash); cached != nil {
+					return cached, nil
+				}
 				return nil, ErrTokenRevoked
 			}
 			if now.After(expiresAt) {
@@ -272,11 +385,16 @@ func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*
 		return nil, fmt.Errorf("failed to commit refresh token rotation: %w", err)
 	}
 
-	return &AuthTokens{
+	tokens := &AuthTokens{
 		AccessToken:  accessToken,
 		RefreshToken: newRefreshToken,
 		ExpiresIn:    int(s.jwtManager.AccessTokenExpiry().Seconds()),
-	}, nil
+	}
+
+	// Record in rotation cache with grace period for concurrent requests
+	s.cacheRotation(ctx, tokenHash, tokens)
+
+	return tokens, nil
 }
 
 // GetUserByID retrieves a user by their ID.

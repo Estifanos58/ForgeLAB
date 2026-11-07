@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/rsa"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/forgelab/backend/internal/config"
 	"github.com/forgelab/backend/internal/models"
@@ -31,6 +34,7 @@ var (
 type GitHubAppManager struct {
 	cfg        config.GitHubAppConfig
 	db         *pgxpool.Pool
+	redis      *redis.Client
 	httpClient *http.Client
 
 	rsaKeyOnce sync.Once
@@ -38,9 +42,24 @@ type GitHubAppManager struct {
 	rsaKeyErr  error
 
 	// tokenCache caches installation access tokens: installation_id -> cachedToken
-	tokenMu    sync.RWMutex
-	tokenCache map[int64]*cachedInstallationToken
+	tokenMu     sync.RWMutex
+	tokenCache  map[int64]*cachedInstallationToken
+	fallbackMem sync.Map
 }
+
+type GitHubAppInstallStateRecord struct {
+	UserID    string    `json:"user_id"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+var consumeGitHubAppStateScript = redis.NewScript(`
+	local val = redis.call('GET', KEYS[1])
+	if val then
+		redis.call('DEL', KEYS[1])
+	end
+	return val
+`)
 
 type cachedInstallationToken struct {
 	token     string
@@ -58,6 +77,98 @@ func NewGitHubAppManager(cfg config.GitHubAppConfig, db *pgxpool.Pool, httpClien
 		httpClient: httpClient,
 		tokenCache: make(map[int64]*cachedInstallationToken),
 	}
+}
+
+// SetRedisClient configures Redis for state storage.
+func (m *GitHubAppManager) SetRedisClient(r *redis.Client) {
+	m.redis = r
+}
+
+// CreateInstallState generates and persists a cryptographically secure, short-lived,
+// single-use state bound to the authenticated ForgeLAB user.
+func (m *GitHubAppManager) CreateInstallState(ctx context.Context, userID uuid.UUID) (string, error) {
+	if userID == uuid.Nil {
+		return "", errors.New("user ID cannot be nil when initiating GitHub App installation")
+	}
+
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return "", fmt.Errorf("failed to generate random state: %w", err)
+	}
+	state := hex.EncodeToString(stateBytes)
+
+	now := time.Now()
+	record := GitHubAppInstallStateRecord{
+		UserID:    userID.String(),
+		CreatedAt: now,
+		ExpiresAt: now.Add(15 * time.Minute),
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return "", err
+	}
+
+	key := "forgelab:github_app_state:" + state
+
+	if m.redis != nil {
+		if err := m.redis.Set(ctx, key, string(payload), 15*time.Minute).Err(); err != nil {
+			return "", fmt.Errorf("failed to store github app state in redis: %w", err)
+		}
+	} else {
+		m.fallbackMem.Store(key, record)
+	}
+
+	return state, nil
+}
+
+// ValidateAndConsumeInstallState validates and consumes the single-use state from the public callback,
+// returning the bound authenticated user ID.
+func (m *GitHubAppManager) ValidateAndConsumeInstallState(ctx context.Context, state string) (uuid.UUID, error) {
+	cleanState := strings.TrimSpace(state)
+	if cleanState == "" {
+		return uuid.Nil, errors.New("missing installation state")
+	}
+
+	key := "forgelab:github_app_state:" + cleanState
+	var record GitHubAppInstallStateRecord
+
+	if m.redis != nil {
+		res, err := consumeGitHubAppStateScript.Run(ctx, m.redis, []string{key}).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				return uuid.Nil, errors.New("invalid or expired installation state")
+			}
+			return uuid.Nil, fmt.Errorf("failed to query github app state: %w", err)
+		}
+		rawStr, ok := res.(string)
+		if !ok || rawStr == "" {
+			return uuid.Nil, errors.New("invalid or expired installation state")
+		}
+		if err := json.Unmarshal([]byte(rawStr), &record); err != nil {
+			return uuid.Nil, errors.New("corrupted installation state record")
+		}
+	} else {
+		raw, ok := m.fallbackMem.LoadAndDelete(key)
+		if !ok {
+			return uuid.Nil, errors.New("invalid or expired installation state")
+		}
+		rec, ok := raw.(GitHubAppInstallStateRecord)
+		if !ok || time.Now().After(rec.ExpiresAt) {
+			return uuid.Nil, errors.New("invalid or expired installation state")
+		}
+		record = rec
+	}
+
+	if time.Now().After(record.ExpiresAt) {
+		return uuid.Nil, errors.New("installation state has expired")
+	}
+
+	parsedUID, err := uuid.Parse(record.UserID)
+	if err != nil || parsedUID == uuid.Nil {
+		return uuid.Nil, errors.New("invalid user ID in installation state")
+	}
+
+	return parsedUID, nil
 }
 
 // IsConfigured returns true if GitHub App credentials are set.

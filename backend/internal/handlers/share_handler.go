@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -49,6 +50,11 @@ func (h *ShareHandler) Get(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "project not found")
 			return
 		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			slog.Warn("share access unauthorized: identity mismatch", "project_id", projectID, "user_id", userID)
+			writeError(w, http.StatusForbidden, "unauthorized: you do not own this project")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -84,6 +90,11 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "project not found")
 			return
 		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			slog.Warn("share access unauthorized: identity mismatch", "project_id", projectID, "user_id", userID)
+			writeError(w, http.StatusForbidden, "unauthorized: you do not own this project")
+			return
+		}
 		if errors.Is(err, services.ErrShareNotConfigured) {
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
@@ -117,6 +128,11 @@ func (h *ShareHandler) Revoke(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			slog.Warn("share access unauthorized: identity mismatch", "project_id", projectID, "user_id", userID)
+			writeError(w, http.StatusForbidden, "unauthorized: you do not own this project")
 			return
 		}
 		if errors.Is(err, services.ErrShareNotFound) {

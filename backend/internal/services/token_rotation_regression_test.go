@@ -54,9 +54,16 @@ func TestUserService_AtomicRefreshTokenRotation(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, isRevoked, "new token must NOT be revoked")
 
-		// Test replaying old token returns ErrTokenRevoked
+		// Verify within grace period, replaying old token safely returns the cached rotated token
+		replayTokens, err := userSvc.RefreshTokens(ctx, origTokens.RefreshToken)
+		require.NoError(t, err, "within grace period, replaying old token must succeed safely")
+		assert.Equal(t, newTokens.RefreshToken, replayTokens.RefreshToken)
+
+		// Test replaying old token returns ErrTokenRevoked when grace period expires
+		userSvc.SetGracePeriod(0)
 		_, err = userSvc.RefreshTokens(ctx, origTokens.RefreshToken)
-		assert.ErrorIs(t, err, services.ErrTokenRevoked, "replaying old token must return ErrTokenRevoked")
+		assert.ErrorIs(t, err, services.ErrTokenRevoked, "replaying old token after grace expiry must return ErrTokenRevoked")
+		userSvc.SetGracePeriod(30 * time.Second)
 
 		// Successive rotation with new token works
 		newerTokens, err := userSvc.RefreshTokens(ctx, newTokens.RefreshToken)
@@ -85,7 +92,7 @@ func TestUserService_AtomicRefreshTokenRotation(t *testing.T) {
 		assert.ErrorIs(t, err, services.ErrTokenNotFound, "non-existent token must return ErrTokenNotFound")
 	})
 
-	t.Run("concurrent refresh requests claim token exactly once", func(t *testing.T) {
+	t.Run("concurrent refresh requests claim token safely within grace window", func(t *testing.T) {
 		// Log in to obtain fresh token
 		_, loginTokens, err := userSvc.Login(ctx, services.LoginInput{
 			Email:    testEmail,
@@ -97,27 +104,52 @@ func TestUserService_AtomicRefreshTokenRotation(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(concurrency)
 
-		successCount := 0
-		revokedCount := 0
-		var mu sync.Mutex
+		successTokens := make([]*services.AuthTokens, concurrency)
+		errs := make([]error, concurrency)
 
 		for i := 0; i < concurrency; i++ {
+			idx := i
 			go func() {
 				defer wg.Done()
-				_, rErr := userSvc.RefreshTokens(ctx, loginTokens.RefreshToken)
-				mu.Lock()
-				defer mu.Unlock()
-				if rErr == nil {
-					successCount++
-				} else if rErr == services.ErrTokenRevoked {
-					revokedCount++
-				}
+				toks, rErr := userSvc.RefreshTokens(ctx, loginTokens.RefreshToken)
+				successTokens[idx] = toks
+				errs[idx] = rErr
 			}()
 		}
 
 		wg.Wait()
 
-		assert.Equal(t, 1, successCount, "exactly one concurrent request must successfully claim the token")
-		assert.Equal(t, concurrency-1, revokedCount, "all other concurrent requests must see ErrTokenRevoked")
+		// All concurrent requests within the grace window must succeed
+		for i := 0; i < concurrency; i++ {
+			assert.NoError(t, errs[i], "concurrent request %d should succeed within grace window", i)
+			require.NotNil(t, successTokens[i], "concurrent request %d should return tokens", i)
+			assert.NotEmpty(t, successTokens[i].AccessToken)
+			assert.NotEmpty(t, successTokens[i].RefreshToken)
+		}
+
+		// All concurrent callers receive the same fresh rotated tokens
+		for i := 1; i < concurrency; i++ {
+			assert.Equal(t, successTokens[0].RefreshToken, successTokens[i].RefreshToken, "concurrent callers must receive the same rotated refresh token")
+		}
+	})
+
+	t.Run("replaying token after grace window expired returns ErrTokenRevoked", func(t *testing.T) {
+		userSvc.SetGracePeriod(0)
+		defer userSvc.SetGracePeriod(30 * time.Second)
+
+		_, loginTokens, err := userSvc.Login(ctx, services.LoginInput{
+			Email:    testEmail,
+			Password: "SuperPassword123!",
+		})
+		require.NoError(t, err)
+
+		// First refresh succeeds and rotates the token
+		newTokens, err := userSvc.RefreshTokens(ctx, loginTokens.RefreshToken)
+		require.NoError(t, err)
+		assert.NotEmpty(t, newTokens.RefreshToken)
+
+		// Immediate second refresh with old token when grace period is 0 must fail with ErrTokenRevoked
+		_, err = userSvc.RefreshTokens(ctx, loginTokens.RefreshToken)
+		assert.ErrorIs(t, err, services.ErrTokenRevoked, "replaying token after grace period expires must return ErrTokenRevoked")
 	})
 }

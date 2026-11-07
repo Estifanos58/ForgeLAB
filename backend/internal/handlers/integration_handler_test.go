@@ -2,16 +2,26 @@ package handlers_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/forgelab/backend/internal/config"
 	"github.com/forgelab/backend/internal/handlers"
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/services"
 )
 
@@ -63,4 +73,189 @@ func TestIntegrationHandler_ListRepositories_NotConnected_Returns403Forbidden(t 
 
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func generateTestRSAPEM(t *testing.T) string {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	der := x509.MarshalPKCS1PrivateKey(key)
+	pemBlock := &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: der,
+	}
+	return string(pem.EncodeToMemory(pemBlock))
+}
+
+type roundTripFunc func(req *http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestIntegrationHandler_GetAppInstallURL(t *testing.T) {
+	appCfg := config.GitHubAppConfig{
+		AppID:      "12345",
+		Slug:       "forgelab-test-app",
+		PrivateKey: generateTestRSAPEM(t),
+	}
+	appMgr := services.NewGitHubAppManager(appCfg, nil, nil)
+	handler := handlers.NewIntegrationHandler(nil, appMgr, nil, "http://localhost:3000")
+
+	t.Run("guest user rejected with 403 Forbidden", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/integrations/github/app/install", nil)
+		req = req.WithContext(withTestUser(req.Context(), models.GuestUserID))
+		rec := httptest.NewRecorder()
+
+		handler.GetAppInstallURL(rec, req)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+	})
+
+	t.Run("registered user generates cryptographically bound single-use state", func(t *testing.T) {
+		regUser := uuid.New()
+		req := httptest.NewRequest(http.MethodGet, "/api/integrations/github/app/install", nil)
+		req = req.WithContext(withTestUser(req.Context(), regUser))
+		rec := httptest.NewRecorder()
+
+		handler.GetAppInstallURL(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(rec.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		installURL := resp["url"]
+		require.NotEmpty(t, installURL)
+		parsedURL, err := url.Parse(installURL)
+		require.NoError(t, err)
+
+		assert.Equal(t, "github.com", parsedURL.Host)
+		assert.Equal(t, "/apps/forgelab-test-app/installations/new", parsedURL.Path)
+
+		stateParam := parsedURL.Query().Get("state")
+		require.NotEmpty(t, stateParam)
+		assert.Len(t, stateParam, 64, "state must be 32 cryptographically secure hex bytes")
+
+		// Verify state is bound to registered user and consumable
+		boundUser, err := appMgr.ValidateAndConsumeInstallState(context.Background(), stateParam)
+		require.NoError(t, err)
+		assert.Equal(t, regUser, boundUser)
+
+		// Verify single-use: cannot be consumed again
+		_, err = appMgr.ValidateAndConsumeInstallState(context.Background(), stateParam)
+		assert.Error(t, err, "state must be single-use and invalid after consumption")
+	})
+}
+
+func TestIntegrationHandler_GitHubAppCallback_ValidationAndSecurity(t *testing.T) {
+	testUser := uuid.New()
+	rsaPEM := generateTestRSAPEM(t)
+
+	t.Run("missing state redirects with error", func(t *testing.T) {
+		appCfg := config.GitHubAppConfig{AppID: "12345", Slug: "forgelab-app", PrivateKey: rsaPEM}
+		appMgr := services.NewGitHubAppManager(appCfg, nil, nil)
+		handler := handlers.NewIntegrationHandler(nil, appMgr, nil, "http://localhost:3000")
+
+		req := httptest.NewRequest(http.MethodGet, "/api/integrations/github/app/callback?installation_id=9876", nil)
+		rec := httptest.NewRecorder()
+
+		handler.GitHubAppCallback(rec, req)
+		assert.Equal(t, http.StatusFound, rec.Code)
+		assert.Contains(t, rec.Header().Get("Location"), "error=missing_installation_state")
+	})
+
+	t.Run("invalid or expired state redirects with error", func(t *testing.T) {
+		appCfg := config.GitHubAppConfig{AppID: "12345", Slug: "forgelab-app", PrivateKey: rsaPEM}
+		appMgr := services.NewGitHubAppManager(appCfg, nil, nil)
+		handler := handlers.NewIntegrationHandler(nil, appMgr, nil, "http://localhost:3000")
+
+		req := httptest.NewRequest(http.MethodGet, "/api/integrations/github/app/callback?state=invalid-state-token&installation_id=9876", nil)
+		rec := httptest.NewRecorder()
+
+		handler.GitHubAppCallback(rec, req)
+		assert.Equal(t, http.StatusFound, rec.Code)
+		assert.Contains(t, rec.Header().Get("Location"), "error=invalid_or_expired_installation_state")
+	})
+
+	t.Run("missing installation_id redirects with error", func(t *testing.T) {
+		appCfg := config.GitHubAppConfig{AppID: "12345", Slug: "forgelab-app", PrivateKey: rsaPEM}
+		appMgr := services.NewGitHubAppManager(appCfg, nil, nil)
+		state, err := appMgr.CreateInstallState(context.Background(), testUser)
+		require.NoError(t, err)
+
+		handler := handlers.NewIntegrationHandler(nil, appMgr, nil, "http://localhost:3000")
+		req := httptest.NewRequest(http.MethodGet, "/api/integrations/github/app/callback?state="+state, nil)
+		rec := httptest.NewRecorder()
+
+		handler.GitHubAppCallback(rec, req)
+		assert.Equal(t, http.StatusFound, rec.Code)
+		assert.Contains(t, rec.Header().Get("Location"), "error=missing_installation_id")
+	})
+
+	t.Run("failed github api verification redirects with error", func(t *testing.T) {
+		mockClient := &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       io.NopCloser(strings.NewReader(`{"message":"Not Found"}`)),
+					Header:     make(http.Header),
+				}, nil
+			}),
+		}
+
+		appCfg := config.GitHubAppConfig{AppID: "12345", Slug: "forgelab-app", PrivateKey: rsaPEM}
+		appMgr := services.NewGitHubAppManager(appCfg, nil, mockClient)
+		state, err := appMgr.CreateInstallState(context.Background(), testUser)
+		require.NoError(t, err)
+
+		handler := handlers.NewIntegrationHandler(nil, appMgr, nil, "http://localhost:3000")
+		req := httptest.NewRequest(http.MethodGet, "/api/integrations/github/app/callback?state="+state+"&installation_id=9876", nil)
+		rec := httptest.NewRecorder()
+
+		handler.GitHubAppCallback(rec, req)
+		assert.Equal(t, http.StatusFound, rec.Code)
+		assert.Contains(t, rec.Header().Get("Location"), "error=failed_to_verify_github_installation")
+	})
+
+	t.Run("successful verification binds installation and redirects", func(t *testing.T) {
+		mockClient := &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				// GitHub App installations API response
+				jsonResp := `{
+					"id": 9876,
+					"account": {
+						"login": "testorg",
+						"id": 5555,
+						"type": "Organization",
+						"avatar_url": "https://avatars.githubusercontent.com/u/5555"
+					},
+					"repository_selection": "all",
+					"permissions": {"metadata": "read", "contents": "read"}
+				}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(jsonResp)),
+					Header:     make(http.Header),
+				}, nil
+			}),
+		}
+
+		appCfg := config.GitHubAppConfig{AppID: "12345", Slug: "forgelab-app", PrivateKey: rsaPEM}
+		appMgr := services.NewGitHubAppManager(appCfg, nil, mockClient)
+		state, err := appMgr.CreateInstallState(context.Background(), testUser)
+		require.NoError(t, err)
+
+		handler := handlers.NewIntegrationHandler(nil, appMgr, nil, "http://localhost:3000")
+		req := httptest.NewRequest(http.MethodGet, "/api/integrations/github/app/callback?state="+state+"&installation_id=9876", nil)
+		rec := httptest.NewRecorder()
+
+		handler.GitHubAppCallback(rec, req)
+		assert.Equal(t, http.StatusFound, rec.Code)
+		assert.Equal(t, "http://localhost:3000/dashboard?github_app_installed=true", rec.Header().Get("Location"))
+
+		// Verify replaying the callback with the same state is rejected
+		recReplay := httptest.NewRecorder()
+		handler.GitHubAppCallback(recReplay, req)
+		assert.Equal(t, http.StatusFound, recReplay.Code)
+		assert.Contains(t, recReplay.Header().Get("Location"), "error=invalid_or_expired_installation_state")
+	})
 }

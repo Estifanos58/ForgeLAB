@@ -171,7 +171,7 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 					}
 				}
 			}
-			if len(allRepos) > 0 || targetOrg != "" {
+			if len(allRepos) > 0 {
 				return allRepos, hasMoreTotal, nil
 			}
 		}
@@ -200,7 +200,7 @@ func (s *GitHubService) ListRepositories(ctx context.Context, userID uuid.UUID, 
 
 	var apiURL string
 	if targetOrg != "" {
-		apiURL = fmt.Sprintf("https://api.github.com/orgs/%s/repos?sort=updated&direction=desc&page=%d&per_page=%d", url.PathEscape(targetOrg), page, perPage)
+		apiURL = fmt.Sprintf("https://api.github.com/orgs/%s/repos?type=all&sort=updated&direction=desc&page=%d&per_page=%d", url.PathEscape(targetOrg), page, perPage)
 	} else {
 		apiURL = fmt.Sprintf("https://api.github.com/user/repos?visibility=all&affiliation=owner,collaborator,organization_member&sort=updated&direction=desc&page=%d&per_page=%d", page, perPage)
 	}

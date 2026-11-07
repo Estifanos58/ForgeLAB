@@ -260,13 +260,17 @@ func (s *ShareService) CreateShare(ctx context.Context, projectID, userID uuid.U
 		return nil, fmt.Errorf("%w: public sharing is disabled or unconfigured", ErrShareNotConfigured)
 	}
 
-	if s.projectService == nil || s.serviceService == nil || s.pool == nil {
-		return nil, errors.New("share service dependencies not initialized")
+	var project *models.Project
+	if s.projectService != nil {
+		p, err := s.projectService.GetProject(ctx, projectID, userID)
+		if err != nil {
+			return nil, err
+		}
+		project = p
 	}
 
-	project, err := s.projectService.GetProject(ctx, projectID, userID)
-	if err != nil {
-		return nil, err
+	if s.serviceService == nil || s.pool == nil {
+		return nil, errors.New("share service dependencies not initialized")
 	}
 
 	services, err := s.serviceService.ListServices(ctx, projectID)
@@ -286,7 +290,7 @@ func (s *ShareService) CreateShare(ctx context.Context, projectID, userID uuid.U
 			hasRunningService = true
 		}
 	}
-	if !hasRunningService && project.Status != models.ProjectStatusRunning {
+	if !hasRunningService && (project == nil || project.Status != models.ProjectStatusRunning) {
 		return nil, ErrServiceNotEligible
 	}
 

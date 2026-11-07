@@ -15,6 +15,7 @@ import { DeploymentHistory } from '@/features/deployments/deployment-history';
 import { EnvManager } from '@/features/deployments/env-manager';
 import { TopologySection } from '@/features/projects/topology-section';
 import { useDeploymentWS } from '@/lib/websocket/use-deployment-ws';
+import { sessionManager } from '@/lib/auth/session-manager';
 import {
   Sliders,
   Terminal,
@@ -179,6 +180,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
       fetchPromise
         .then((historyLogs) => {
           if (currentGen !== logFetchGenRef.current) return;
+          sessionManager.recordActivity('deployment_logs');
           addHistoricalLogsRef.current(historyLogs);
         })
         .catch((err) => {
@@ -326,6 +328,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
   useEffect(() => {
     if (!isAnyDeploying) return;
     const interval = setInterval(() => {
+      sessionManager.recordActivity('deployment_logs');
       loadData();
     }, 3000);
     return () => clearInterval(interval);

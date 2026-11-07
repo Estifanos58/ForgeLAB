@@ -16,19 +16,31 @@ export interface SessionFetchOptions extends RequestInit {
   _retry?: boolean;
 }
 
-const REFRESH_COOLDOWN_MS = 2500;
+export const REFRESH_COOLDOWN_MS = 2500;
+export const ACTIVITY_UPDATE_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes between proactive session touches
+export const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes before considering completely idle
+export const USER_ACTIVITY_THROTTLE_MS = 30 * 1000; // Throttle direct DOM user events to at most once per 30s
 const LOCK_NAME = 'forgelab_auth_refresh_lock';
 const BROADCAST_CHANNEL_NAME = 'forgelab_session_channel';
 const LOCAL_STORAGE_KEY = 'forgelab_last_refresh_timestamp';
 
 export class SessionManager {
   private localLastRefreshTime = 0;
+  private lastActivityTime = Date.now();
+  private lastSessionUpdateTime = 0;
+  private lastUserEventTime = 0;
   private activeRefreshPromise: Promise<void> | null = null;
+  private activeTouchPromise: Promise<void> | null = null;
   private broadcastChannel: BroadcastChannel | null = null;
   private listeners: Set<(event: SessionEvent) => void> = new Set();
+  private keepAliveTimer: any = null;
+  private userActivityCleanup: (() => void) | null = null;
 
   constructor() {
     this.initBroadcastChannel();
+    this.initStorageListener();
+    this.initUserActivityListeners();
+    this.initKeepAliveTimer();
   }
 
   private initBroadcastChannel() {
@@ -46,6 +58,58 @@ export class SessionManager {
         };
       } catch {
         // BroadcastChannel unavailable in this environment
+      }
+    }
+  }
+
+  private initStorageListener() {
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      try {
+        window.addEventListener('storage', (event: StorageEvent) => {
+          if (event.key === LOCAL_STORAGE_KEY && event.newValue) {
+            const ts = Number(event.newValue) || 0;
+            if (ts > this.localLastRefreshTime) {
+              this.localLastRefreshTime = ts;
+              this.lastSessionUpdateTime = Math.max(this.lastSessionUpdateTime, ts);
+              this.notifyListeners({ type: 'REFRESH_SUCCESS', timestamp: ts });
+            }
+          }
+        });
+      } catch {
+        // Storage event listener unavailable
+      }
+    }
+  }
+
+  private initUserActivityListeners() {
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      try {
+        const events = ['mousedown', 'keydown', 'scroll', 'touchstart'];
+        const handler = () => this.recordActivity('user');
+        events.forEach((evt) => window.addEventListener(evt, handler, { passive: true }));
+        this.userActivityCleanup = () => {
+          events.forEach((evt) => window.removeEventListener(evt, handler));
+        };
+      } catch {
+        // Window events unavailable
+      }
+    }
+  }
+
+  private initKeepAliveTimer() {
+    if (typeof window !== 'undefined' && typeof window.setInterval === 'function') {
+      try {
+        this.keepAliveTimer = setInterval(() => {
+          const now = Date.now();
+          const isRecentlyActive = now - this.lastActivityTime < INACTIVITY_TIMEOUT_MS;
+          const isUpdateDue = now - Math.max(this.lastSessionUpdateTime, this.localLastRefreshTime) >= ACTIVITY_UPDATE_INTERVAL_MS;
+
+          if (isRecentlyActive && isUpdateDue) {
+            this.touchSession().catch(() => {});
+          }
+        }, 60 * 1000);
+      } catch {
+        // Interval unavailable
       }
     }
   }
@@ -99,6 +163,75 @@ export class SessionManager {
   }
 
   /**
+   * Cross-tab mutex using localStorage with heartbeats and expiry.
+   * Used when Web Locks API (navigator.locks) is unavailable in the environment.
+   */
+  private async withStorageLock<T>(fn: () => Promise<T>): Promise<T> {
+    if (typeof localStorage === 'undefined') {
+      return await fn();
+    }
+
+    const lockKey = 'forgelab_auth_refresh_lock_token';
+    const lockTtlMs = 4000;
+    const pollIntervalMs = 50;
+    const maxWaitMs = 5000;
+    const clientId = Math.random().toString(36).substring(2) + '_' + Date.now();
+    const startTime = Date.now();
+
+    const tryAcquire = (): boolean => {
+      try {
+        const raw = localStorage.getItem(lockKey);
+        const now = Date.now();
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            if (now - (parsed.ts || 0) < lockTtlMs && parsed.id !== clientId) {
+              return false; // lock held by another tab
+            }
+          } catch {
+            // malformed lock entry; reclaim
+          }
+        }
+        localStorage.setItem(lockKey, JSON.stringify({ id: clientId, ts: now }));
+        // Read back to ensure no race condition
+        const verify = localStorage.getItem(lockKey);
+        if (verify) {
+          const parsed = JSON.parse(verify);
+          return parsed.id === clientId;
+        }
+        return true;
+      } catch {
+        return true;
+      }
+    };
+
+    const release = () => {
+      try {
+        const raw = localStorage.getItem(lockKey);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed.id === clientId) {
+            localStorage.removeItem(lockKey);
+          }
+        }
+      } catch {}
+    };
+
+    while (!tryAcquire()) {
+      if (Date.now() - startTime >= maxWaitMs) {
+        break; // Max wait exceeded; proceed with single-flight tab protection
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
    * Refreshes the session with cross-tab locking and synchronization.
    * If another tab has refreshed the session within REFRESH_COOLDOWN_MS,
    * rechecks the state and returns immediately without a redundant network call.
@@ -118,6 +251,16 @@ export class SessionManager {
       return this.activeRefreshPromise;
     }
 
+    const runGuarded = async () => {
+      // Recheck after acquiring the lock: another tab may have refreshed while we waited
+      const postLockStored = this.getStoredTimestamp();
+      const postLockRecent = Math.max(this.localLastRefreshTime, postLockStored);
+      if (Date.now() - postLockRecent < REFRESH_COOLDOWN_MS) {
+        return;
+      }
+      await this.performRefreshCall();
+    };
+
     this.activeRefreshPromise = (async () => {
       try {
         // Use Web Locks API if supported in browser
@@ -126,18 +269,10 @@ export class SessionManager {
           'locks' in navigator &&
           typeof navigator.locks?.request === 'function'
         ) {
-          await navigator.locks.request(LOCK_NAME, async () => {
-            // Recheck after acquiring the lock!
-            const postLockStored = this.getStoredTimestamp();
-            const postLockRecent = Math.max(this.localLastRefreshTime, postLockStored);
-            if (Date.now() - postLockRecent < REFRESH_COOLDOWN_MS) {
-              return;
-            }
-            await this.performRefreshCall();
-          });
+          await navigator.locks.request(LOCK_NAME, runGuarded);
         } else {
-          // Safe fallback for environments without Web Locks (e.g. Node.js tests, SSR)
-          await this.performRefreshCall();
+          // Safe fallback for environments without Web Locks (e.g. Node.js tests, SSR, older browsers)
+          await this.withStorageLock(runGuarded);
         }
       } finally {
         this.activeRefreshPromise = null;
@@ -165,6 +300,16 @@ export class SessionManager {
 
     if (!res.ok) {
       const ts = Date.now();
+      // Check whether another tab refreshed right around this time
+      const stored = this.getStoredTimestamp();
+      const recent = Math.max(this.localLastRefreshTime, stored);
+      if (ts - recent < REFRESH_COOLDOWN_MS) {
+        // Another tab successfully rotated tokens and updated browser cookies!
+        // Treat as fresh without broadcasting SESSION_EXPIRED or destroying the session.
+        this.broadcast({ type: 'REFRESH_SUCCESS', timestamp: recent });
+        return;
+      }
+
       this.broadcast({ type: 'REFRESH_FAILED', timestamp: ts });
       if (res.status === 401) {
         this.broadcast({ type: 'SESSION_EXPIRED', timestamp: ts });
@@ -174,6 +319,7 @@ export class SessionManager {
 
     const successTs = Date.now();
     this.localLastRefreshTime = successTs;
+    this.lastSessionUpdateTime = successTs;
     this.setStoredTimestamp(successTs);
     this.broadcast({ type: 'REFRESH_SUCCESS', timestamp: successTs });
   }
@@ -248,6 +394,108 @@ export class SessionManager {
       // Network failure
     }
     return null;
+  }
+
+  /**
+   * Proactively touches and extends the active session (JWT or guest) on interaction.
+   * If the cooldown has not elapsed since the last update, returns immediately without network churn.
+   */
+  public async touchSession(): Promise<void> {
+    const now = Date.now();
+    const stored = this.getStoredTimestamp();
+    const mostRecent = Math.max(this.localLastRefreshTime, this.lastSessionUpdateTime, stored);
+
+    if (now - mostRecent < REFRESH_COOLDOWN_MS) {
+      return;
+    }
+
+    if (this.activeTouchPromise) {
+      return this.activeTouchPromise;
+    }
+
+    this.activeTouchPromise = (async () => {
+      try {
+        const touchUrl = '/api/auth/touch';
+        let res: Response;
+        try {
+          res = await fetch(touchUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({}),
+          });
+        } catch {
+          // If touch endpoint is unavailable, fall back to refreshSession
+          await this.refreshSession();
+          return;
+        }
+
+        if (res.ok) {
+          const successTs = Date.now();
+          this.lastSessionUpdateTime = successTs;
+          this.localLastRefreshTime = successTs;
+          this.setStoredTimestamp(successTs);
+          this.broadcast({ type: 'REFRESH_SUCCESS', timestamp: successTs });
+        } else if (res.status === 401) {
+          // Try standard token refresh
+          await this.refreshSession();
+        }
+      } finally {
+        this.activeTouchPromise = null;
+      }
+    })();
+
+    return this.activeTouchPromise;
+  }
+
+  /**
+   * Records an interaction with the application.
+   *
+   * Crucially, receiving logs from a codebase being deployed is considered
+   * active interaction ('deployment_logs'), keeping the session updated even
+   * if the user does not touch the keyboard or mouse during long-running builds.
+   */
+  public recordActivity(source: 'user' | 'deployment_logs' = 'user'): void {
+    const now = Date.now();
+    this.lastActivityTime = now;
+
+    if (source === 'user') {
+      if (now - this.lastUserEventTime < USER_ACTIVITY_THROTTLE_MS) {
+        return;
+      }
+      this.lastUserEventTime = now;
+    }
+
+    const timeSinceLastUpdate = now - Math.max(this.lastSessionUpdateTime, this.localLastRefreshTime);
+    if (timeSinceLastUpdate >= ACTIVITY_UPDATE_INTERVAL_MS) {
+      this.touchSession().catch(() => {});
+    }
+  }
+
+  public getLastActivityTime(): number {
+    return this.lastActivityTime;
+  }
+
+  public getLastSessionUpdateTime(): number {
+    return this.lastSessionUpdateTime;
+  }
+
+  public destroy(): void {
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
+    if (this.userActivityCleanup) {
+      this.userActivityCleanup();
+      this.userActivityCleanup = null;
+    }
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.close();
+      } catch {}
+      this.broadcastChannel = null;
+    }
+    this.listeners.clear();
   }
 }
 

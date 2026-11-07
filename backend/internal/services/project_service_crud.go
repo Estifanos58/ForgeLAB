@@ -16,6 +16,10 @@ import (
 
 // GetProject retrieves a project by ID, verifying ownership.
 func (s *ProjectService) GetProject(ctx context.Context, projectID, ownerID uuid.UUID) (*models.Project, error) {
+	if s.projectGetterForTest != nil {
+		return s.projectGetterForTest(ctx, projectID, ownerID)
+	}
+
 	project, err := s.GetProjectByIDWithoutOwnership(ctx, projectID)
 	if err != nil {
 		return nil, err
@@ -361,6 +365,10 @@ func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID u
 
 // GetProjectByIDWithoutOwnership retrieves a project by ID without ownership check.
 func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, projectID uuid.UUID) (*models.Project, error) {
+	if s.db == nil {
+		return nil, ErrProjectNotFound
+	}
+
 	p := &models.Project{}
 	err := s.db.QueryRow(ctx,
 		`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,

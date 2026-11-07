@@ -16,7 +16,7 @@ import (
 )
 
 func TestEngine_EnsureNetwork_IdempotencyAndConcurrency(t *testing.T) {
-	if os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
+	if testing.Short() || os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
 		t.Skip("Skipping live Docker network test")
 	}
 
@@ -84,7 +84,7 @@ func TestEngine_EnsureNetwork_IdempotencyAndConcurrency(t *testing.T) {
 }
 
 func TestEngine_PruneDanglingNetworks(t *testing.T) {
-	if os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
+	if testing.Short() || os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
 		t.Skip("Skipping live Docker network test")
 	}
 
@@ -125,7 +125,7 @@ func TestEngine_PruneDanglingNetworks(t *testing.T) {
 }
 
 func TestEngine_CleanUpProjectContainers_RemovesProjectNetworks(t *testing.T) {
-	if os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
+	if testing.Short() || os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
 		t.Skip("Skipping live Docker network test")
 	}
 

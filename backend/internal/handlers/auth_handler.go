@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 
+	"github.com/forgelab/backend/internal/middleware"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/services"
 )
@@ -140,8 +142,14 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	tokens, err := h.userService.RefreshTokens(r.Context(), input.RefreshToken)
 	if err != nil {
+		if errors.Is(err, services.ErrTokenRevoked) {
+			// Do NOT clear cookies on revoked token: a concurrent winning refresh
+			// request may have already set new valid cookies in the browser.
+			// Clearing cookies here would cause the browser to lose its active session.
+			writeError(w, http.StatusUnauthorized, "refresh token revoked")
+			return
+		}
 		if errors.Is(err, services.ErrTokenNotFound) ||
-			errors.Is(err, services.ErrTokenRevoked) ||
 			errors.Is(err, services.ErrTokenExpired) {
 			h.clearAuthCookies(w)
 			writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
@@ -155,6 +163,100 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"expires_in": tokens.ExpiresIn,
 	})
+}
+
+// Touch handles POST /api/auth/touch
+// It updates and extends the active session (whether authenticated JWT or guest session)
+// whenever interaction occurs, including when live logs are received from a running deployment.
+func (h *AuthHandler) Touch(w http.ResponseWriter, r *http.Request) {
+	// 1. Try refreshing active user session if refresh token is present
+	refreshToken := ""
+	if cookie, err := r.Cookie("forgelab_refresh_token"); err == nil && cookie.Value != "" {
+		refreshToken = cookie.Value
+	}
+	if refreshToken == "" && r.Body != nil && r.ContentLength > 0 {
+		var input struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&input)
+		refreshToken = input.RefreshToken
+	}
+
+	if refreshToken != "" && h.userService != nil {
+		tokens, err := h.userService.RefreshTokens(r.Context(), refreshToken)
+		if err == nil {
+			h.setAuthCookies(w, tokens)
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":        "ok",
+				"authenticated": true,
+				"expires_in":    tokens.ExpiresIn,
+			})
+			return
+		}
+		if errors.Is(err, services.ErrTokenRevoked) {
+			// Token was already safely rotated within the concurrency window
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":        "ok",
+				"authenticated": true,
+			})
+			return
+		}
+	}
+
+	// 2. Try validating existing access token
+	tokenString := ""
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			tokenString = parts[1]
+		}
+	}
+	if tokenString == "" {
+		if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
+			tokenString = cookie.Value
+		}
+	}
+
+	if tokenString != "" && h.userService != nil && h.userService.JWTManager() != nil {
+		claims, err := h.userService.JWTManager().ValidateAccessToken(tokenString)
+		if err == nil && claims != nil {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":        "ok",
+				"authenticated": true,
+				"user_id":       claims.UserID,
+			})
+			return
+		}
+	}
+
+	// 3. Fallback to guest session if guest mode is allowed
+	if h.allowGuestMode {
+		guestID := middleware.ResolveGuestSession(w, r)
+		if h.userService != nil {
+			_ = h.userService.EnsureGuestUserWithID(r.Context(), guestID)
+		}
+		models.RegisterGuestID(guestID)
+		if w != nil {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "forgelab_guest_session",
+				Value:    guestID.String(),
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   86400 * 30, // 30 days
+			})
+			w.Header().Set("X-Guest-Session", guestID.String())
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":        "ok",
+			"authenticated": false,
+			"guest":         true,
+			"guest_id":      guestID.String(),
+		})
+		return
+	}
+
+	writeError(w, http.StatusUnauthorized, "no active session found")
 }
 
 // Logout handles POST /api/auth/logout
@@ -374,7 +476,12 @@ func (h *AuthHandler) redirectWithError(w http.ResponseWriter, r *http.Request, 
 }
 
 func (h *AuthHandler) setAuthCookies(w http.ResponseWriter, tokens *services.AuthTokens) {
-	accessMaxAge := 15 * 60
+	accessMaxAge := 24 * 3600
+	if h.userService != nil {
+		if dur := int(h.userService.AccessTokenExpiry().Seconds()); dur > 0 {
+			accessMaxAge = dur
+		}
+	}
 	if tokens != nil && tokens.ExpiresIn > 0 {
 		accessMaxAge = tokens.ExpiresIn
 	}
@@ -387,7 +494,7 @@ func (h *AuthHandler) setAuthCookies(w http.ResponseWriter, tokens *services.Aut
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   accessMaxAge,
 	})
-	refreshMaxAge := 7 * 24 * 3600
+	refreshMaxAge := 30 * 24 * 3600
 	if h.userService != nil {
 		if dur := int(h.userService.RefreshTokenExpiry().Seconds()); dur > 0 {
 			refreshMaxAge = dur

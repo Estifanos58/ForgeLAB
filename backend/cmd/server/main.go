@@ -161,10 +161,16 @@ func main() {
 	sourceService := services.NewSourceService(pool, cfg.Docker.SourcesDir, encryptor)
 	githubService := services.NewGitHubService(pool, encryptor, cfg.GitHub, redisClient)
 	githubAppManager := services.NewGitHubAppManager(cfg.GitHubApp, pool, nil)
+	if redisClient != nil {
+		githubAppManager.SetRedisClient(redisClient)
+	}
 	githubService.SetGitHubAppManager(githubAppManager)
 	repositoryImportService := services.NewRepositoryImportService(pool, cfg.Docker.SourcesDir, githubService)
 
 	userService := services.NewUserService(pool, jwtManager)
+	if redisClient != nil {
+		userService.SetRedisClient(redisClient)
+	}
 	if cfg.App.AllowGuestMode {
 		if err := userService.EnsureGuestUser(ctx); err != nil {
 			slog.Error("failed to ensure guest user identity during startup", "error", err)
@@ -496,6 +502,7 @@ func main() {
 			r.With(authThrottle).Post("/register", authHandler.Register)
 			r.With(authThrottle).Post("/login", authHandler.Login)
 			r.With(authThrottle).Post("/refresh", authHandler.Refresh)
+			r.Post("/touch", authHandler.Touch)
 			r.Post("/logout", authHandler.Logout)
 
 			// OAuth routes (public)

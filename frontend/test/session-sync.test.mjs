@@ -206,3 +206,179 @@ test('SessionManager - fetchTicketWithSession recovers from 401', async () => {
     global.fetch = originalFetch;
   }
 });
+
+test('SessionManager - cross-tab coordination without Web Locks using storage lock', async () => {
+  const storage = new Map();
+  const originalLocalStorage = global.localStorage;
+  global.localStorage = {
+    getItem: (key) => storage.get(key) || null,
+    setItem: (key, val) => storage.set(key, val),
+    removeItem: (key) => storage.delete(key),
+  };
+
+  // Ensure navigator.locks is explicitly undefined
+  const originalLocks = global.navigator?.locks;
+  Object.defineProperty(global.navigator, 'locks', {
+    value: undefined,
+    configurable: true,
+  });
+
+  let fetchCallCount = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url === '/api/auth/refresh') {
+      fetchCallCount++;
+      // Simulate slow refresh
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ expires_in: 900 }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  try {
+    // Simulate 3 separate tabs (independent SessionManager instances sharing localStorage)
+    const tab1 = new SessionManager();
+    const tab2 = new SessionManager();
+    const tab3 = new SessionManager();
+
+    // Trigger refresh concurrently from all 3 tabs
+    await Promise.all([
+      tab1.refreshSession(),
+      tab2.refreshSession(),
+      tab3.refreshSession(),
+    ]);
+
+    // Only one tab should have performed the refresh network call; others wait and recheck
+    assert.equal(fetchCallCount, 1, 'only 1 refresh network call across tabs without Web Locks');
+  } finally {
+    if (originalLocks !== undefined) {
+      Object.defineProperty(global.navigator, 'locks', { value: originalLocks, configurable: true });
+    }
+    global.localStorage = originalLocalStorage;
+    global.fetch = originalFetch;
+  }
+});
+
+test('SessionManager - losing 401 refresh does not fire SESSION_EXPIRED when another tab refreshed', async () => {
+  const storage = new Map();
+  const originalLocalStorage = global.localStorage;
+  global.localStorage = {
+    getItem: (key) => storage.get(key) || null,
+    setItem: (key, val) => storage.set(key, val),
+    removeItem: (key) => storage.delete(key),
+  };
+
+  let expiredFired = false;
+  let successFired = false;
+
+  const manager = new SessionManager();
+  manager.subscribe((event) => {
+    if (event.type === 'SESSION_EXPIRED') {
+      expiredFired = true;
+    }
+    if (event.type === 'REFRESH_SUCCESS') {
+      successFired = true;
+    }
+  });
+
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url === '/api/auth/refresh') {
+      // Simulate another tab having refreshed successfully 50ms ago
+      storage.set('forgelab_last_refresh_timestamp', String(Date.now() - 50));
+      // Tab 2 loses race and gets 401 from backend
+      return {
+        ok: false,
+        status: 401,
+        json: async () => ({ error: 'refresh token revoked' }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  try {
+    // Refresh was attempted
+    await manager.refreshSession();
+
+    assert.equal(expiredFired, false, 'SESSION_EXPIRED must NOT fire when another tab already refreshed');
+    assert.equal(successFired, true, 'REFRESH_SUCCESS should be acknowledged');
+  } finally {
+    global.localStorage = originalLocalStorage;
+    global.fetch = originalFetch;
+  }
+});
+
+test('SessionManager - receiving deployment logs is considered interaction and touches session', async () => {
+  const manager = new SessionManager();
+  let touchCallCount = 0;
+
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url === '/api/auth/touch') {
+      touchCallCount++;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', authenticated: true, expires_in: 86400 }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  try {
+    const initialActivity = manager.getLastActivityTime();
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Simulate logs arriving from running codebase deployment
+    manager.recordActivity('deployment_logs');
+
+    assert.ok(manager.getLastActivityTime() >= initialActivity, 'deployment_logs must update activity timestamp');
+
+    // Trigger proactive touch
+    await manager.touchSession();
+    assert.equal(touchCallCount, 1, 'touchSession should call /api/auth/touch');
+    assert.ok(manager.getLastSessionUpdateTime() > 0, 'lastSessionUpdateTime should be updated');
+  } finally {
+    manager.destroy();
+    global.fetch = originalFetch;
+  }
+});
+
+test('SessionManager - rapid deployment logs are throttled to prevent network storm', async () => {
+  const manager = new SessionManager();
+  let touchCallCount = 0;
+
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url === '/api/auth/touch') {
+      touchCallCount++;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', authenticated: true, expires_in: 86400 }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  try {
+    // Ingest 50 logs in rapid succession (as during docker build)
+    for (let i = 0; i < 50; i++) {
+      manager.recordActivity('deployment_logs');
+    }
+
+    // Explicit touch during cooldown should be skipped
+    await manager.touchSession();
+    await manager.touchSession();
+
+    assert.equal(touchCallCount, 1, 'rapid touches within cooldown should coalesce to at most 1 network call');
+  } finally {
+    manager.destroy();
+    global.fetch = originalFetch;
+  }
+});

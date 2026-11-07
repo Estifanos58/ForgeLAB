@@ -148,6 +148,17 @@ func ResolveGuestSession(w http.ResponseWriter, r *http.Request) uuid.UUID {
 	// 1. Check cookie
 	if cookie, err := r.Cookie("forgelab_guest_session"); err == nil && cookie.Value != "" {
 		if id, err := uuid.Parse(cookie.Value); err == nil && id != uuid.Nil {
+			if w != nil {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "forgelab_guest_session",
+					Value:    id.String(),
+					Path:     "/",
+					HttpOnly: true,
+					SameSite: http.SameSiteLaxMode,
+					MaxAge:   86400 * 30, // 30 days sliding window
+				})
+				w.Header().Set("X-Guest-Session", id.String())
+			}
 			return id
 		}
 	}
@@ -155,6 +166,17 @@ func ResolveGuestSession(w http.ResponseWriter, r *http.Request) uuid.UUID {
 	// 2. Check header
 	if headerVal := r.Header.Get("X-Guest-Session"); headerVal != "" {
 		if id, err := uuid.Parse(headerVal); err == nil && id != uuid.Nil {
+			if w != nil {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "forgelab_guest_session",
+					Value:    id.String(),
+					Path:     "/",
+					HttpOnly: true,
+					SameSite: http.SameSiteLaxMode,
+					MaxAge:   86400 * 30, // 30 days sliding window
+				})
+				w.Header().Set("X-Guest-Session", id.String())
+			}
 			return id
 		}
 	}

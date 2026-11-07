@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Alert } from '@/components/ui/alert';
 import { Spinner } from '@/components/ui/spinner';
 import { api } from '@/lib/api/client';
+import { sessionManager } from '@/lib/auth/session-manager';
 import { Project, ShareStatusResponse, RouteMapping, CreateShareInput } from '@/lib/api/types';
 import {
   Globe,
@@ -87,6 +88,7 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
         setIsChecking(true);
       }
       setError(null);
+      await sessionManager.touchSession();
       const data = await api.projects.getShare(project.id);
       setStatusData(data);
       hasLoadedRef.current = true;
@@ -150,6 +152,7 @@ export function ShareModal({ isOpen, onClose, project }: ShareModalProps) {
     try {
       setIsSubmitting(true);
       setError(null);
+      await sessionManager.touchSession();
 
       const routeMappings: RouteMapping[] = [
         {
