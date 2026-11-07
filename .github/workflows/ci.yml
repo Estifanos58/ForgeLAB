@@ -205,3 +205,45 @@ jobs:
         if: always()
         run: |
           docker compose down -v
+
+  security-scan:
+    name: Security & Vulnerability Scanning (govulncheck, Trivy, npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Run Go Vulnerability Check (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          cd backend
+          govulncheck ./...
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend Dependency Vulnerability Audit
+        run: |
+          cd frontend
+          npm audit --audit-level=high
+
+      - name: Run Trivy Vulnerability Scanner (Repo & FS)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+

@@ -335,13 +335,23 @@ func Load() (*Config, error) {
 				}
 			}
 		}
-		if getEnv("FORGELAB_SHARING_ENABLED", "false") == "true" {
-			if strings.TrimSpace(getEnv("GATEWAY_TUNNEL_URL", "")) == "" {
-				return nil, fmt.Errorf("%s configuration error: GATEWAY_TUNNEL_URL must be configured when FORGELAB_SHARING_ENABLED is true", envMode)
-			}
-			if strings.TrimSpace(getEnv("GATEWAY_AUTH_TOKEN", "")) == "" {
-				return nil, fmt.Errorf("%s configuration error: GATEWAY_AUTH_TOKEN must be configured when FORGELAB_SHARING_ENABLED is true", envMode)
-			}
+	}
+
+	sharingEnabled := getEnv("FORGELAB_SHARING_ENABLED", "false") == "true"
+	gatewayTunnel := getEnv("GATEWAY_TUNNEL_URL", "")
+	gatewayPublic := strings.TrimRight(getEnv("GATEWAY_PUBLIC_URL", ""), "/")
+	gatewayAuth := getGatewayAuth()
+	sharingProvider := strings.ToLower(strings.TrimSpace(getEnv("FORGELAB_SHARING_PROVIDER", "")))
+	if sharingProvider == "" {
+		if gatewayTunnel != "" && gatewayAuth != "" {
+			sharingProvider = "gateway"
+		} else {
+			sharingProvider = "cloudflare"
+		}
+	}
+	if sharingEnabled {
+		if err := validateSharingConfig(sharingEnabled, sharingProvider, gatewayTunnel, gatewayAuth, envMode, isDev); err != nil {
+			return nil, err
 		}
 	}
 
@@ -429,35 +439,16 @@ func Load() (*Config, error) {
 			WSSubscriptionLimit: parseIntEnv("RATE_LIMIT_WS_SUB_PER_MINUTE", 120),
 			TrustedProxies:      trustedProxies,
 		},
-		Share: func() ShareConfig {
-			enabled := getEnv("FORGELAB_SHARING_ENABLED", "false") == "true"
-			gatewayTunnel := getEnv("GATEWAY_TUNNEL_URL", "")
-			gatewayPublic := strings.TrimRight(getEnv("GATEWAY_PUBLIC_URL", ""), "/")
-			gatewayAuth := getEnv("GATEWAY_AUTH_TOKEN", "")
-			if gatewayAuth == "" {
-				gatewayAuth = getEnv("GATEWAY_AUTH_SECRET", "")
-			}
-			provider := strings.ToLower(strings.TrimSpace(getEnv("FORGELAB_SHARING_PROVIDER", "")))
-			if provider == "" {
-				if gatewayTunnel != "" && gatewayAuth != "" {
-					provider = "gateway"
-				} else {
-					provider = "cloudflare"
-				}
-			}
-			cloudflaredPath := getEnv("FORGELAB_CLOUDFLARED_PATH", "cloudflared")
-
-			return ShareConfig{
-				Enabled:          enabled,
-				Provider:         provider,
-				CloudflaredPath:  cloudflaredPath,
-				GatewayTunnelURL: gatewayTunnel,
-				GatewayPublicURL: gatewayPublic,
-				GatewayAuthToken: gatewayAuth,
-				TLSSkipVerify:    getEnv("GATEWAY_TLS_SKIP_VERIFY", "false") == "true",
-				AppHostIP:        getEnv("FORGELAB_APP_HOST_IP", "127.0.0.1"),
-			}
-		}(),
+		Share: ShareConfig{
+			Enabled:          sharingEnabled,
+			Provider:         sharingProvider,
+			CloudflaredPath:  getEnv("FORGELAB_CLOUDFLARED_PATH", "cloudflared"),
+			GatewayTunnelURL: gatewayTunnel,
+			GatewayPublicURL: gatewayPublic,
+			GatewayAuthToken: gatewayAuth,
+			TLSSkipVerify:    getEnv("GATEWAY_TLS_SKIP_VERIFY", "false") == "true",
+			AppHostIP:        getEnv("FORGELAB_APP_HOST_IP", "127.0.0.1"),
+		},
 	}
 
 	return cfg, nil
@@ -684,4 +675,50 @@ func validateFrontendAndCORS(frontendURL, corsAllowed, envMode string) error {
 		return fmt.Errorf("%s configuration error: CORS_ALLOWED_ORIGINS must contain at least one valid origin in %s mode", envMode, envMode)
 	}
 	return nil
+}
+
+func getGatewayAuth() string {
+	auth := getEnv("GATEWAY_AUTH_TOKEN", "")
+	if auth == "" {
+		auth = getEnv("GATEWAY_AUTH_SECRET", "")
+	}
+	return auth
+}
+
+func validateSharingConfig(enabled bool, provider, gatewayTunnel, gatewayAuth, envMode string, isDev bool) error {
+	if !enabled {
+		return nil
+	}
+	p := strings.ToLower(strings.TrimSpace(provider))
+	if p == "" {
+		if strings.TrimSpace(gatewayTunnel) != "" && strings.TrimSpace(gatewayAuth) != "" {
+			p = "gateway"
+		} else {
+			p = "cloudflare"
+		}
+	}
+	switch p {
+	case "cloudflare":
+		// Cloudflare Quick Tunnels require no self-hosted gateway credentials or tunnel URLs
+		return nil
+	case "gateway":
+		if strings.TrimSpace(gatewayTunnel) == "" {
+			if !isDev {
+				return fmt.Errorf("%s configuration error: GATEWAY_TUNNEL_URL must be configured when FORGELAB_SHARING_PROVIDER is 'gateway'", envMode)
+			}
+			return fmt.Errorf("GATEWAY_TUNNEL_URL must be configured when FORGELAB_SHARING_PROVIDER is 'gateway'")
+		}
+		if strings.TrimSpace(gatewayAuth) == "" {
+			if !isDev {
+				return fmt.Errorf("%s configuration error: GATEWAY_AUTH_TOKEN must be configured when FORGELAB_SHARING_PROVIDER is 'gateway'", envMode)
+			}
+			return fmt.Errorf("GATEWAY_AUTH_TOKEN must be configured when FORGELAB_SHARING_PROVIDER is 'gateway'")
+		}
+		return nil
+	default:
+		if !isDev {
+			return fmt.Errorf("%s configuration error: unsupported public sharing provider %q (must be 'cloudflare' or 'gateway')", envMode, provider)
+		}
+		return fmt.Errorf("unsupported public sharing provider %q (must be 'cloudflare' or 'gateway')", provider)
+	}
 }

@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "test": "node --import tsx --test test/websocket.test.mjs test/local_agent_import.test.mjs test/lifecycle_redeploy.test.mjs test/trusted-proxy.test.mjs test/log_filters_pagination.test.mjs"
+    "test": "node --import tsx --test test/websocket.test.mjs test/local_agent_import.test.mjs test/lifecycle_redeploy.test.mjs test/trusted-proxy.test.mjs test/log_filters_pagination.test.mjs test/security-headers.test.mjs"
   },
   "dependencies": {
     "clsx": "^2.1.1",

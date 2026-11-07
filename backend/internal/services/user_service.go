@@ -183,16 +183,22 @@ func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User
 	return user, tokens, nil
 }
 
-// RefreshTokens validates a refresh token and issues new tokens atomically.
+// RefreshTokens validates a refresh token and issues new tokens atomically in a single PostgreSQL transaction.
 func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*AuthTokens, error) {
 	tokenHash := auth.HashToken(refreshToken)
 	now := time.Now()
 
-	// Atomically revoke the token and fetch user details only if it is not revoked and not expired
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Step 1 & 2: Atomically validate and claim the existing refresh token, revoking it in the same transaction
 	var rtID uuid.UUID
 	var userID uuid.UUID
 	var userEmail string
-	err := s.db.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`UPDATE refresh_tokens rt
 		 SET revoked = true
 		 FROM users u
@@ -206,10 +212,10 @@ func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Token couldn't be revoked atomically. Let's check why to return precise error.
+			// Token couldn't be claimed. Check why to return precise error.
 			var isRevoked bool
 			var expiresAt time.Time
-			checkErr := s.db.QueryRow(ctx,
+			checkErr := tx.QueryRow(ctx,
 				"SELECT revoked, expires_at FROM refresh_tokens WHERE token_hash = $1",
 				tokenHash,
 			).Scan(&isRevoked, &expiresAt)
@@ -230,14 +236,39 @@ func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 
-	// Generate new tokens
-	user := &models.User{ID: userID, Email: userEmail}
-	tokens, err := s.generateTokens(ctx, user)
+	// Step 3: Generate replacement access token and new refresh token
+	accessToken, err := s.jwtManager.GenerateAccessToken(userID, userEmail)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate access token: %w", err)
 	}
 
-	return tokens, nil
+	newRefreshToken := s.jwtManager.GenerateRefreshToken()
+	newTokenHash := auth.HashToken(newRefreshToken)
+
+	// Persist the replacement token hash in the SAME transaction
+	_, err = tx.Exec(ctx,
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, created_at)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		uuid.New(),
+		userID,
+		newTokenHash,
+		now.Add(s.jwtManager.RefreshTokenExpiry()),
+		now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store replacement refresh token: %w", err)
+	}
+
+	// Step 4: Commit both changes together
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit refresh token rotation: %w", err)
+	}
+
+	return &AuthTokens{
+		AccessToken:  accessToken,
+		RefreshToken: newRefreshToken,
+		ExpiresIn:    int(s.jwtManager.AccessTokenExpiry().Seconds()),
+	}, nil
 }
 
 // GetUserByID retrieves a user by their ID.

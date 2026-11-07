@@ -3,9 +3,7 @@ package ratelimit
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -140,95 +138,14 @@ func (l *Limiter) Allow(ctx context.Context, category, identifier string, limit 
 
 // IsTrustedProxy checks whether remoteAddr belongs to a configured trusted proxy IP or CIDR block.
 func IsTrustedProxy(remoteAddr string, trustedProxies []string) bool {
-	if len(trustedProxies) == 0 {
-		return false
-	}
-
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
-	}
-	ip := net.ParseIP(strings.TrimSpace(host))
-	if ip == nil {
-		return false
-	}
-
-	for _, proxy := range trustedProxies {
-		proxy = strings.TrimSpace(proxy)
-		if proxy == "" {
-			continue
-		}
-		if strings.Contains(proxy, "/") {
-			_, ipNet, err := net.ParseCIDR(proxy)
-			if err == nil && ipNet.Contains(ip) {
-				return true
-			}
-		} else {
-			proxyIP := net.ParseIP(proxy)
-			if proxyIP != nil && proxyIP.Equal(ip) {
-				return true
-			}
-		}
-	}
-
-	return false
+	return middleware.IsTrustedProxy(remoteAddr, trustedProxies)
 }
 
 // ExtractClientIP extracts the client IP address from the request.
 // X-Forwarded-For and X-Real-IP headers are ONLY trusted when the direct remote address
 // originates from a configured trusted proxy. Otherwise, the direct RemoteAddr host IP is used.
 func ExtractClientIP(r *http.Request, trustedProxies ...[]string) string {
-	var proxies []string
-	if len(trustedProxies) > 0 {
-		proxies = trustedProxies[0]
-	}
-
-	directHost, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		directHost = r.RemoteAddr
-	}
-	directHost = strings.TrimSpace(directHost)
-
-	// Only inspect forwarding headers if the immediate peer is a configured trusted proxy
-	if IsTrustedProxy(r.RemoteAddr, proxies) {
-		xff := r.Header.Get("X-Forwarded-For")
-		if xff != "" {
-			parts := strings.Split(xff, ",")
-			// Walk from right to left (closest trusted proxy to furthest)
-			for i := len(parts) - 1; i >= 0; i-- {
-				candidate := strings.TrimSpace(parts[i])
-				if candidate == "" {
-					continue
-				}
-				// Validate that candidate is a valid IP address
-				if net.ParseIP(candidate) == nil {
-					continue
-				}
-				// If candidate is another trusted proxy in the chain, step left
-				if IsTrustedProxy(candidate, proxies) {
-					continue
-				}
-				// The first non-trusted IP from the right is the genuine client IP
-				return candidate
-			}
-			// If all IPs in the chain were trusted proxies, return leftmost valid IP
-			for _, p := range parts {
-				candidate := strings.TrimSpace(p)
-				if net.ParseIP(candidate) != nil {
-					return candidate
-				}
-			}
-		}
-
-		xri := strings.TrimSpace(r.Header.Get("X-Real-IP"))
-		if xri != "" && net.ParseIP(xri) != nil {
-			if !IsTrustedProxy(xri, proxies) {
-				return xri
-			}
-		}
-	}
-
-	return directHost
+	return middleware.ExtractClientIP(r, trustedProxies...)
 }
 
 // Middleware creates an HTTP middleware that throttles requests per IP or authenticated user.

@@ -145,7 +145,14 @@ The status classifications strictly follow these definitions:
 | **Google OAuth Authentication** | IMPLEMENTED | NOT RECORDED | Backend-owned OAuth2 authorization code flow, CSRF state in Redis |
 | **GitHub OAuth Authentication** | IMPLEMENTED | NOT RECORDED | Backend-owned web OAuth flow, `read:user user:email` scopes, CSRF state in Redis |
 | **Multi-Provider Identity Model** | IMPLEMENTED | NOT RECORDED | `auth_identities` table, nullable password, deterministic account linking |
-| **Atomic Refresh Token Rotation** | IMPLEMENTED | NOT RECORDED | Single-use rotation via PostgreSQL atomic updates |
+| **Atomic Refresh Token Rotation** | IMPLEMENTED | NOT RECORDED | Single PostgreSQL transaction rotation, atomic claiming & revocation, replayed token detection |
+| **Deployment Recovery Reliability** | IMPLEMENTED | NOT RECORDED | Inspect-verified previous container restoration, degraded state on failed restart, zero false recoveries |
+| **Trusted Proxy Client IP Extraction** | IMPLEMENTED | NOT RECORDED | Right-to-left header parsing, strict socket IP for untrusted peers, rate-limit spoofing defense |
+| **Frontend & API Security Headers** | IMPLEMENTED | NOT RECORDED | SecurityHeaders middleware, Next.js CSP, X-Frame-Options, X-Content-Type-Options, HTTPS-only HSTS |
+| **Provider-Specific Sharing Validation** | IMPLEMENTED | NOT RECORDED | Domainless Cloudflare Quick Tunnels vs Gateway validation, Guest Mode default alignment |
+| **Docker Build Security & Cleanup** | IMPLEMENTED | NOT RECORDED | ForceRemove/Remove intermediate container cleanup, CPU/memory limits, socket boundaries |
+| **Modularized Project Creation Wizard** | IMPLEMENTED | NOT RECORDED | Decomposed into PlanReviewStep, ConfigStep, ArchiveUploadSource, LocalAgentSource, GitHubImportSource |
+| **Decomposed Deployment Service** | IMPLEMENTED | NOT RECORDED | Decomposed into deployment_service_logs, status, reconcile, and engine_legacy |
 | **Project CRUD & Ownership** | IMPLEMENTED | NOT RECORDED | Server-side user ownership checks on all endpoints |
 | **Direct Local-Directory Deployment** | IMPLEMENTED | NOT RECORDED | `POST /api/sources/local/validate`, zero browser upload, direct filesystem build source |
 | **Streaming Docker Build Context** | IMPLEMENTED | NOT RECORDED | `io.Pipe()` + `tar.Writer`, zero in-memory buffer materialization, virtual Dockerfile injection |

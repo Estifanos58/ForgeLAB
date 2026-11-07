@@ -361,21 +361,158 @@ func BodyLimit(maxBytes int64) func(http.Handler) http.Handler {
 	}
 }
 
-// SecurityHeaders applies production HTTP security headers.
-func SecurityHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'none';")
+// IsTrustedProxy checks whether remoteAddr belongs to a configured trusted proxy IP or CIDR block.
+func IsTrustedProxy(remoteAddr string, trustedProxies []string) bool {
+	if len(trustedProxies) == 0 {
+		return false
+	}
 
-		// Apply HSTS when HTTPS is active
-		if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	if ip == nil {
+		return false
+	}
+
+	for _, proxy := range trustedProxies {
+		proxy = strings.TrimSpace(proxy)
+		if proxy == "" {
+			continue
+		}
+		if strings.Contains(proxy, "/") {
+			_, ipNet, err := net.ParseCIDR(proxy)
+			if err == nil && ipNet.Contains(ip) {
+				return true
+			}
+		} else {
+			proxyIP := net.ParseIP(proxy)
+			if proxyIP != nil && proxyIP.Equal(ip) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// ExtractClientIP extracts the client IP address from the request.
+// X-Forwarded-For and X-Real-IP headers are ONLY trusted when the direct remote address
+// originates from a configured trusted proxy. Otherwise, the direct RemoteAddr host IP is used.
+func ExtractClientIP(r *http.Request, trustedProxies ...[]string) string {
+	var proxies []string
+	if len(trustedProxies) > 0 {
+		proxies = trustedProxies[0]
+	}
+
+	directHost, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		directHost = r.RemoteAddr
+	}
+	directHost = strings.TrimSpace(directHost)
+
+	// Only inspect forwarding headers if the immediate peer is a configured trusted proxy
+	if IsTrustedProxy(r.RemoteAddr, proxies) {
+		xff := r.Header.Get("X-Forwarded-For")
+		if xff != "" {
+			parts := strings.Split(xff, ",")
+			// Walk from right to left (closest trusted proxy to furthest)
+			for i := len(parts) - 1; i >= 0; i-- {
+				candidate := strings.TrimSpace(parts[i])
+				if candidate == "" {
+					continue
+				}
+				// Validate that candidate is a valid IP address
+				if net.ParseIP(candidate) == nil {
+					continue
+				}
+				// If candidate is another trusted proxy in the chain, step left
+				if IsTrustedProxy(candidate, proxies) {
+					continue
+				}
+				// The first non-trusted IP from the right is the genuine client IP
+				return candidate
+			}
+			// If all IPs in the chain were trusted proxies, return leftmost valid IP
+			for _, p := range parts {
+				candidate := strings.TrimSpace(p)
+				if net.ParseIP(candidate) != nil {
+					return candidate
+				}
+			}
 		}
 
-		next.ServeHTTP(w, r)
-	})
+		xri := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+		if xri != "" && net.ParseIP(xri) != nil {
+			if !IsTrustedProxy(xri, proxies) {
+				return xri
+			}
+		}
+	}
+
+	return directHost
+}
+
+// TrustedProxyRealIP replaces unconditional chi RealIP with trusted-proxy-aware IP extraction.
+// If the direct connection originates from a configured trusted proxy (e.g. Next.js internal proxy),
+// r.RemoteAddr is updated with the genuine client IP extracted from X-Forwarded-For / X-Real-IP.
+// If the direct connection is from an untrusted client, forwarding headers are ignored and
+// r.RemoteAddr remains the direct peer IP, preventing rate limit bypass via header spoofing.
+func TrustedProxyRealIP(trustedProxies ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(trustedProxies) > 0 && IsTrustedProxy(r.RemoteAddr, trustedProxies) {
+				clientIP := ExtractClientIP(r, trustedProxies)
+				if clientIP != "" {
+					_, port, err := net.SplitHostPort(r.RemoteAddr)
+					if err == nil && port != "" {
+						r.RemoteAddr = net.JoinHostPort(clientIP, port)
+					} else {
+						r.RemoteAddr = clientIP
+					}
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// SecurityHeaders applies production HTTP security headers.
+func SecurityHeaders(next http.Handler) http.Handler {
+	return SecurityHeadersWithTrustedProxies(nil)(next)
+}
+
+// SecurityHeadersWithTrustedProxies applies production HTTP security headers with trusted proxy awareness.
+// HSTS is strictly applied only when TLS is active on the direct connection or when
+// a trusted reverse proxy forwards X-Forwarded-Proto: https.
+func SecurityHeadersWithTrustedProxies(trustedProxies []string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'none';")
+
+			// Apply HSTS only under correctly configured HTTPS conditions
+			isDirectTLS := r.TLS != nil
+			isForwardedHTTPS := false
+			if len(trustedProxies) > 0 {
+				if IsTrustedProxy(r.RemoteAddr, trustedProxies) {
+					isForwardedHTTPS = strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+				}
+			} else {
+				// Standalone legacy behavior when trusted proxies slice is omitted:
+				// evaluate X-Forwarded-Proto directly
+				isForwardedHTTPS = strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+			}
+			if isDirectTLS || isForwardedHTTPS {
+				w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // RequestLogger logs HTTP request details.

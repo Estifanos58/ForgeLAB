@@ -455,7 +455,8 @@ func main() {
 
 	// Global middleware
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
+	r.Use(middleware.TrustedProxyRealIP(cfg.RateLimit.TrustedProxies...))
+	r.Use(middleware.SecurityHeadersWithTrustedProxies(cfg.RateLimit.TrustedProxies))
 	r.Use(middleware.RequestLogger)
 	r.Use(middleware.MaxBodySize(10*1024*1024, 105*1024*1024))
 	r.Use(middleware.CORS(cfg.App.AllowedOriginsList()...))

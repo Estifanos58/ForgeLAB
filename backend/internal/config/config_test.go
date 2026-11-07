@@ -482,3 +482,152 @@ func TestDockerComposeGuestModeDefault(t *testing.T) {
 		t.Errorf("docker-compose.yml must default FORGELAB_ALLOW_GUEST_MODE to true")
 	}
 }
+
+func TestConfigPublicSharing(t *testing.T) {
+	setupProdEnv := func() {
+		os.Setenv("APP_ENV", "production")
+		os.Setenv("COOKIE_SECURE", "true")
+		os.Setenv("RATE_LIMIT_TRUSTED_PROXIES", "127.0.0.1")
+		os.Setenv("JWT_SECRET", "this-is-a-valid-production-jwt-secret-with-more-than-32-chars")
+		os.Setenv("FORGELAB_ENCRYPTION_KEY", "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=")
+		os.Setenv("DATABASE_URL", "postgres://forgelab:strong_prod_pass_123@db:5432/forgelab")
+		os.Setenv("FORGELAB_ALLOWED_SOURCE_ROOTS", "/var/forgelab/sources")
+		os.Setenv("FRONTEND_URL", "https://app.forgelab.com")
+		os.Setenv("CORS_ALLOWED_ORIGINS", "https://app.forgelab.com")
+	}
+
+	cleanupEnv := func() {
+		os.Unsetenv("APP_ENV")
+		os.Unsetenv("COOKIE_SECURE")
+		os.Unsetenv("RATE_LIMIT_TRUSTED_PROXIES")
+		os.Unsetenv("JWT_SECRET")
+		os.Unsetenv("FORGELAB_ENCRYPTION_KEY")
+		os.Unsetenv("DATABASE_URL")
+		os.Unsetenv("FORGELAB_ALLOWED_SOURCE_ROOTS")
+		os.Unsetenv("FRONTEND_URL")
+		os.Unsetenv("CORS_ALLOWED_ORIGINS")
+		os.Unsetenv("FORGELAB_ALLOW_GUEST_MODE")
+		os.Unsetenv("FORGELAB_SHARING_ENABLED")
+		os.Unsetenv("FORGELAB_SHARING_PROVIDER")
+		os.Unsetenv("GATEWAY_TUNNEL_URL")
+		os.Unsetenv("GATEWAY_PUBLIC_URL")
+		os.Unsetenv("GATEWAY_AUTH_TOKEN")
+		os.Unsetenv("GATEWAY_AUTH_SECRET")
+	}
+
+	t.Run("cloudflare provider does not require gateway credentials in production", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("FORGELAB_SHARING_ENABLED", "true")
+		os.Setenv("FORGELAB_SHARING_PROVIDER", "cloudflare")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("expected cloudflare sharing to succeed without gateway credentials in production, got error: %v", err)
+		}
+		if !cfg.Share.Enabled {
+			t.Errorf("expected Share.Enabled to be true")
+		}
+		if cfg.Share.Provider != "cloudflare" {
+			t.Errorf("expected Share.Provider to be 'cloudflare', got: %s", cfg.Share.Provider)
+		}
+	})
+
+	t.Run("default provider is cloudflare when gateway credentials are absent", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("FORGELAB_SHARING_ENABLED", "true")
+		os.Unsetenv("FORGELAB_SHARING_PROVIDER")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("expected default sharing provider to resolve to cloudflare and succeed, got error: %v", err)
+		}
+		if cfg.Share.Provider != "cloudflare" {
+			t.Errorf("expected Share.Provider to default to 'cloudflare', got: %s", cfg.Share.Provider)
+		}
+	})
+
+	t.Run("gateway provider requires tunnel url in production", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("FORGELAB_SHARING_ENABLED", "true")
+		os.Setenv("FORGELAB_SHARING_PROVIDER", "gateway")
+		os.Setenv("GATEWAY_AUTH_TOKEN", "valid-auth-token")
+		os.Unsetenv("GATEWAY_TUNNEL_URL")
+
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error when gateway provider is missing GATEWAY_TUNNEL_URL in production")
+		}
+		if !strings.Contains(err.Error(), "GATEWAY_TUNNEL_URL") {
+			t.Errorf("expected error message to mention GATEWAY_TUNNEL_URL, got: %v", err)
+		}
+	})
+
+	t.Run("gateway provider requires auth token in production", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("FORGELAB_SHARING_ENABLED", "true")
+		os.Setenv("FORGELAB_SHARING_PROVIDER", "gateway")
+		os.Setenv("GATEWAY_TUNNEL_URL", "tunnel.example.com:8443")
+		os.Unsetenv("GATEWAY_AUTH_TOKEN")
+		os.Unsetenv("GATEWAY_AUTH_SECRET")
+
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error when gateway provider is missing GATEWAY_AUTH_TOKEN in production")
+		}
+		if !strings.Contains(err.Error(), "GATEWAY_AUTH_TOKEN") {
+			t.Errorf("expected error message to mention GATEWAY_AUTH_TOKEN, got: %v", err)
+		}
+	})
+
+	t.Run("gateway provider succeeds with valid credentials in production", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("FORGELAB_SHARING_ENABLED", "true")
+		os.Setenv("FORGELAB_SHARING_PROVIDER", "gateway")
+		os.Setenv("GATEWAY_TUNNEL_URL", "tunnel.example.com:8443")
+		os.Setenv("GATEWAY_AUTH_TOKEN", "my-secret-token")
+		os.Setenv("GATEWAY_PUBLIC_URL", "https://preview.example.com")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("expected gateway sharing to succeed with valid credentials in production, got: %v", err)
+		}
+		if !cfg.Share.Enabled {
+			t.Errorf("expected Share.Enabled to be true")
+		}
+		if cfg.Share.Provider != "gateway" {
+			t.Errorf("expected Share.Provider to be 'gateway', got: %s", cfg.Share.Provider)
+		}
+		if cfg.Share.GatewayTunnelURL != "tunnel.example.com:8443" {
+			t.Errorf("unexpected GatewayTunnelURL: %s", cfg.Share.GatewayTunnelURL)
+		}
+		if cfg.Share.GatewayAuthToken != "my-secret-token" {
+			t.Errorf("unexpected GatewayAuthToken: %s", cfg.Share.GatewayAuthToken)
+		}
+	})
+
+	t.Run("unsupported sharing provider is rejected with clear error", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("FORGELAB_SHARING_ENABLED", "true")
+		os.Setenv("FORGELAB_SHARING_PROVIDER", "ngrok")
+
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error for unsupported sharing provider 'ngrok'")
+		}
+		if !strings.Contains(err.Error(), "unsupported public sharing provider") || !strings.Contains(err.Error(), "ngrok") {
+			t.Errorf("expected unsupported provider error mentioning ngrok, got: %v", err)
+		}
+	})
+}

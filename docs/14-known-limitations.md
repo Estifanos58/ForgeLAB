@@ -310,6 +310,58 @@ These are identified codebase behaviors that require investigation and resolutio
   5. *Gateway Security & Handshake Hardening:* Constant-time secret comparison with `crypto/subtle.ConstantTimeCompare`, startup non-empty secret enforcement, per-session route isolation preventing cross-tenant route hijacking, and bounded 5s synchronous registration acknowledgments.
   6. *Truthful Frontend Experience:* Truthful states (`not_shared`, `checking_prerequisites`, `starting_tunnel`, `connecting`, `online`, `disconnected`, `unavailable`, `expired`, `revoked`, `failed`), missing prerequisite copyable install guide, and Quick Tunnel caveats notice.
 
+### 41. Atomic Refresh Token Rotation via PostgreSQL Transactions (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/user_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/user_service.go), [`backend/internal/services/token_rotation_regression_test.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/token_rotation_regression_test.go)
+- **Resolution:** Refresh-token rotation executes inside a single PostgreSQL transaction (`tx.Begin(ctx)`):
+  1. Atomically claims and revokes the active token via conditional update (`UPDATE refresh_tokens SET revoked = true WHERE token_hash = $1 AND revoked = false AND expires_at > $2`).
+  2. Generates new access and refresh token pair.
+  3. Inserts the hashed replacement refresh token into `refresh_tokens` within the same transaction.
+  4. Commits both operations together (`tx.Commit`).
+  If any database error occurs or if concurrent requests attempt to reuse the token, the transaction rolls back cleanly; users are never left with a revoked token and no replacement session. Replayed tokens, expired tokens, and invalid tokens fail closed with explicit errors (`ErrTokenRevoked`, `ErrTokenExpired`, `ErrTokenNotFound`).
+
+### 42. Trusted-Proxy Client IP Extraction and Rate-Limit Spoofing Mitigation (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/middleware/middleware.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/middleware/middleware.go), [`backend/internal/ratelimit/limiter.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/ratelimit/limiter.go), [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go), [`frontend/test/trusted-proxy.test.mjs`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/test/trusted-proxy.test.mjs)
+- **Resolution:** Removed unconditional trust of `X-Forwarded-For` and `X-Real-IP` from `chi/middleware.RealIP` and rate limiting. Replaced with `middleware.TrustedProxyRealIP(cfg.RateLimit.TrustedProxies...)`.
+  - Rate limiting and auditing invoke `ExtractClientIP(r, trustedProxies)`.
+  - When the direct remote peer is NOT in `TRUSTED_PROXIES`, client IP extraction strictly uses the direct TCP socket address (`r.RemoteAddr`), completely ignoring attacker-supplied forwarding headers.
+  - When the direct peer IS a configured trusted proxy (e.g. Next.js proxy, Cloudflare, nginx), it traverses `X-Forwarded-For` right-to-left, peeling off trusted intermediary hops until reaching the first untrusted client IP.
+  - Fully supports IPv4/IPv6 addresses and CIDR subnets (e.g. `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.1/32`).
+
+### 43. Security Headers Middleware & Production CSP Registration (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go), [`backend/internal/middleware/middleware.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/middleware/middleware.go), [`frontend/next.config.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.ts), [`frontend/test/security-headers.test.mjs`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/test/security-headers.test.mjs)
+- **Resolution:**
+  - Registered `SecurityHeadersWithTrustedProxies` on the backend Chi router, injecting `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`, `Referrer-Policy: strict-origin-when-cross-origin`, and `Permissions-Policy`.
+  - Configured Next.js frontend headers in `next.config.ts`: Content-Security-Policy (CSP) compatible with Next.js inline hydration and styles, `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, and `Referrer-Policy: strict-origin-when-cross-origin`.
+  - HSTS (`Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`) is applied exclusively when requests arrive over verified HTTPS or when a trusted reverse proxy signals `X-Forwarded-Proto: https`, preventing breakage during local HTTP development.
+
+### 44. Deployment Recovery Reliability & Degraded State Reporting (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_recovery.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_recovery.go), [`backend/internal/docker/engine_recovery_test.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_recovery_test.go)
+- **Resolution:**
+  - When replacement container creation, secondary network attachment, startup, or health-check gating fails, `restorePreviousIfNeeded` invokes `RestorePreviousHealthyContainer`.
+  - Starts the previous container and performs Docker daemon inspection (`ContainerInspect`) to verify `State.Running == true`.
+  - Re-attaches runtime log collectors if the container is running.
+  - If restarting the previous container fails or if the container is not in `running` state, `hasPreviousHealthy` flips to `false`. ForgeLAB never reports successful recovery; the coarse service status is degraded to `models.ServiceStatusFailed`, and failure diagnostics are logged and persisted.
+
+### 45. Provider-Specific Sharing Configuration & Guest Mode Alignment (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/config/config.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config.go), [`backend/internal/config/config_test.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config_test.go), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml), [`.env.example`](file:///c:/Users/estif/Desktop/ForgeLAB/.env.example)
+- **Resolution:**
+  - `validateSharingConfig` distinguishes providers: Cloudflare Quick Tunnels (`SHARE_PROVIDER=cloudflare`) require no gateway credentials or tunnel URL, enabling domainless sharing out of the box. Gateway provider (`SHARE_PROVIDER=gateway`) validates `GATEWAY_TUNNEL_URL` and `GATEWAY_AUTH_TOKEN`/`GATEWAY_AUTH_SECRET`. Unsupported providers are rejected at startup with clear descriptive errors.
+  - Guest Mode enabled-by-default behavior (`FORGELAB_ALLOW_GUEST_MODE=true`) is aligned across backend configuration, `.env.example`, and Docker Compose. Compose defaults to `${FORGELAB_ALLOW_GUEST_MODE:-true}`, preserving registration-free local deployments.
+
+### 46. Docker Build Intermediate Container Cleanup & Host Trust Boundaries (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
+- **Resolution:**
+  - Configured `Remove: true` and `ForceRemove: true` on all `types.ImageBuildOptions` invocations in `buildImage`, guaranteeing that intermediate build containers and dangling build layers are automatically cleaned up on both successful and failed/cancelled builds.
+  - Documented Docker socket trust boundaries: on a single-node daemon, complete host-level escape prevention cannot be achieved purely in userspace software due to Docker daemon architecture. ForgeLAB implements active defense-in-depth: Docker socket mount stripping, `CapDrop: ALL`, `no-new-privileges: true`, resource quotas (CPU/Memory/PIDs), bounded tar contexts, and path validation.
+
+### 47. Modularized Project Creation Wizard & Decomposed Deployment Service (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`frontend/src/components/dashboard/create-project/`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/components/dashboard/create-project/), [`frontend/src/components/dashboard/create-project-modal.tsx`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/components/dashboard/create-project-modal.tsx), [`backend/internal/services/deployment_service*.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/), [`backend/internal/docker/engine_legacy.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_legacy.go)
+- **Resolution:**
+  - Refactored frontend `CreateProjectModal` (reduced from 3,710 to 1,952 lines) by extracting modular components: `PlanReviewStep`, `ConfigStep`, `ArchiveUploadSource`, `LocalAgentSource`, and `GitHubImportSource`, preserving all interfaces, callbacks, and validation steps.
+  - Decomposed backend `deployment_service.go` (reduced from 3,321 to ~2,050 lines) by extracting log persistence and query methods (`deployment_service_logs.go`), deployment and service status transitions (`deployment_service_status.go`), and deployment queue reconciliation and cancellation (`deployment_service_reconcile.go`).
+  - Extracted legacy single-container deployment execution into `backend/internal/docker/engine_legacy.go` (750 lines).
+
+
 ---
 
 ## 3. Security Hardening Items (Deferred Backlog)

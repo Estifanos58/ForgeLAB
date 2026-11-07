@@ -250,6 +250,10 @@ func (e *Engine) buildImage(
 		return err
 	}
 
+	// Always enforce cleanup of intermediate build containers on both success and failure
+	options.Remove = true
+	options.ForceRemove = true
+
 	// 1. Acquire Docker build slot under configurable concurrency limit (BuildSemaphore) if not already held.
 	// Acquired BEFORE the build-maintenance lock so that queued builds waiting for a build slot do not
 	// unnecessarily block Docker image pruning or maintenance operations.

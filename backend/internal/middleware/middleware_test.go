@@ -1,6 +1,7 @@
 package middleware_test
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,6 +126,128 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 	if !strings.Contains(rec.Header().Get("Content-Security-Policy"), "default-src 'self'") {
 		t.Errorf("missing or incorrect Content-Security-Policy")
 	}
+}
+
+func TestTrustedProxyRealIP(t *testing.T) {
+	trustedProxies := []string{"127.0.0.1", "172.16.0.0/12"}
+
+	t.Run("untrusted client cannot spoof IP via X-Forwarded-For", func(t *testing.T) {
+		var capturedAddr string
+		mw := middleware.TrustedProxyRealIP(trustedProxies...)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedAddr = r.RemoteAddr
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest("GET", "/api/projects", nil)
+		req.RemoteAddr = "203.0.113.195:43210"
+		req.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if capturedAddr != "203.0.113.195:43210" {
+			t.Errorf("expected RemoteAddr to remain direct peer IP, got: %s", capturedAddr)
+		}
+	})
+
+	t.Run("trusted proxy extracts genuine client IP from X-Forwarded-For", func(t *testing.T) {
+		var capturedAddr string
+		mw := middleware.TrustedProxyRealIP(trustedProxies...)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedAddr = r.RemoteAddr
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest("GET", "/api/projects", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("X-Forwarded-For", "198.51.100.42")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if !strings.HasPrefix(capturedAddr, "198.51.100.42:") && capturedAddr != "198.51.100.42" {
+			t.Errorf("expected RemoteAddr to be set to client IP 198.51.100.42, got: %s", capturedAddr)
+		}
+	})
+
+	t.Run("trusted CIDR proxy extracts genuine client IP", func(t *testing.T) {
+		var capturedAddr string
+		mw := middleware.TrustedProxyRealIP(trustedProxies...)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedAddr = r.RemoteAddr
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest("GET", "/api/projects", nil)
+		req.RemoteAddr = "172.18.0.4:54321"
+		req.Header.Set("X-Real-IP", "198.51.100.99")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if !strings.HasPrefix(capturedAddr, "198.51.100.99:") && capturedAddr != "198.51.100.99" {
+			t.Errorf("expected RemoteAddr to be set to client IP 198.51.100.99, got: %s", capturedAddr)
+		}
+	})
+}
+
+func TestSecurityHeadersWithTrustedProxies(t *testing.T) {
+	trustedProxies := []string{"127.0.0.1", "172.16.0.0/12"}
+
+	t.Run("untrusted client sending X-Forwarded-Proto does not get HSTS", func(t *testing.T) {
+		mw := middleware.SecurityHeadersWithTrustedProxies(trustedProxies)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.RemoteAddr = "203.0.113.50:12345"
+		req.Header.Set("X-Forwarded-Proto", "https")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Strict-Transport-Security") != "" {
+			t.Errorf("untrusted client must NOT receive Strict-Transport-Security header")
+		}
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("missing X-Content-Type-Options header")
+		}
+		if rec.Header().Get("X-Frame-Options") != "DENY" {
+			t.Errorf("missing X-Frame-Options header")
+		}
+	})
+
+	t.Run("trusted proxy sending X-Forwarded-Proto: https receives HSTS", func(t *testing.T) {
+		mw := middleware.SecurityHeadersWithTrustedProxies(trustedProxies)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("X-Forwarded-Proto", "https")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Strict-Transport-Security") == "" {
+			t.Errorf("trusted proxy with X-Forwarded-Proto: https must receive Strict-Transport-Security")
+		}
+	})
+
+	t.Run("direct TLS connection receives HSTS", func(t *testing.T) {
+		mw := middleware.SecurityHeadersWithTrustedProxies(trustedProxies)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.RemoteAddr = "203.0.113.50:12345"
+		req.TLS = &tls.ConnectionState{}
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Strict-Transport-Security") == "" {
+			t.Errorf("direct TLS request must receive Strict-Transport-Security")
+		}
+	})
 }
 
 func TestCORSMiddleware(t *testing.T) {
