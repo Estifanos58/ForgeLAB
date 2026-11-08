@@ -609,6 +609,9 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			"forgelab.deployment_id": deployment.ID.String(),
 		},
 	}
+	if len(project.Services) > 0 && strings.TrimSpace(project.Services[0].User) != "" {
+		containerConfig.User = strings.TrimSpace(project.Services[0].User)
+	}
 
 	hostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
 		PortBindings: nat.PortMap{

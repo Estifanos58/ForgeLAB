@@ -87,8 +87,8 @@ Configuration is managed via `.env` with fallback defaults in `.env.example`:
 | `DATABASE_URL` | `postgres://forgelab:forgelab_dev_password@postgres:5432/forgelab?sslmode=disable` | PostgreSQL connection DSN |
 | `REDIS_URL` | `redis://redis:6379/0` | Redis connection URL |
 | `JWT_SECRET` | `forgelab-dev-jwt-secret-change-in-production` | Secret key for signing HS256 tokens |
-| `JWT_ACCESS_TOKEN_EXPIRY` | `15` | Access token lifespan in minutes |
-| `JWT_REFRESH_TOKEN_EXPIRY`| `7` | Refresh token lifespan in days |
+| `JWT_ACCESS_TOKEN_EXPIRY` | `48h` | Access token lifespan (e.g. 48h, 2d, or minutes like 2880) |
+| `JWT_REFRESH_TOKEN_EXPIRY`| `14d` | Refresh token lifespan (e.g. 14d, 30d, or days like 14) |
 | `FORGELAB_ENCRYPTION_KEY` | `dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=` | 32-byte Base64 key for AES-256-GCM secret encryption |
 | `FORGELAB_WORK_DIR` | `/app/data/builds` | Working directory where source snapshots are staged (for snapshot build mode) |
 | `FORGELAB_SOURCES_DIR` | `/app/data/sources` | Working directory where uploaded source archives are extracted |

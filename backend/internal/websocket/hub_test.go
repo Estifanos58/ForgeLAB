@@ -1356,3 +1356,80 @@ func TestCreateTicketHandler_AuthenticationAndGuestIsolation(t *testing.T) {
 		}
 	})
 }
+
+func TestWebSocketSessionUpdateAndPing(t *testing.T) {
+	secret := "test-jwt-secret-key-that-is-at-least-32-bytes-long"
+	jwtManager := auth.NewJWTManager(secret, 48*time.Hour, 14*24*time.Hour)
+	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000")
+
+	userID := uuid.New()
+	token, err := jwtManager.GenerateAccessToken(userID, "test@forgelab.local")
+	if err != nil {
+		t.Fatalf("failed to generate token: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hub.ServeWS(w, r)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/ws"
+	header := http.Header{}
+	header.Add("Cookie", "forgelab_access_token="+token)
+	header.Add("Origin", "http://localhost:3000")
+
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v (response status: %v)", err, resp)
+	}
+	defer conn.Close()
+
+	// 1. Send touch_session message
+	touchMsg := ClientMessage{
+		Type: "touch_session",
+	}
+	if err := conn.WriteJSON(touchMsg); err != nil {
+		t.Fatalf("failed to write touch_session: %v", err)
+	}
+
+	var sessionResp EventMessage
+	if err := conn.ReadJSON(&sessionResp); err != nil {
+		t.Fatalf("failed to read session_updated event: %v", err)
+	}
+	if sessionResp.Type != "session_updated" {
+		t.Fatalf("expected event type 'session_updated', got %q", sessionResp.Type)
+	}
+	sessionData, ok := sessionResp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map in sessionResp.Data, got %T", sessionResp.Data)
+	}
+	if sessionData["status"] != "active" {
+		t.Errorf("expected status 'active', got %v", sessionData["status"])
+	}
+	if _, hasTs := sessionData["timestamp"]; !hasTs {
+		t.Errorf("expected timestamp in sessionData, got %v", sessionData)
+	}
+
+	// 2. Send ping message
+	pingMsg := ClientMessage{
+		Type: "ping",
+	}
+	if err := conn.WriteJSON(pingMsg); err != nil {
+		t.Fatalf("failed to write ping: %v", err)
+	}
+
+	var pongResp EventMessage
+	if err := conn.ReadJSON(&pongResp); err != nil {
+		t.Fatalf("failed to read pong event: %v", err)
+	}
+	if pongResp.Type != "pong" {
+		t.Fatalf("expected event type 'pong', got %q", pongResp.Type)
+	}
+	pongData, ok := pongResp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map in pongResp.Data, got %T", pongResp.Data)
+	}
+	if _, hasTs := pongData["timestamp"]; !hasTs {
+		t.Errorf("expected timestamp in pongData, got %v", pongData)
+	}
+}

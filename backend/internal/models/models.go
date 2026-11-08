@@ -326,6 +326,58 @@ func ValidateProjectResourceQuota(services []*Service, maxMemoryMB, maxCpuMillic
 	return nil
 }
 
+// ValidateOwnerResourceQuota validates cumulative resource usage across all active services of an owner.
+func ValidateOwnerResourceQuota(activeServices []*Service, newServices []*Service, maxOwnerMemoryMB, maxOwnerCpuMillicores int) error {
+	if maxOwnerMemoryMB <= 0 && maxOwnerCpuMillicores <= 0 {
+		return nil
+	}
+
+	totalMem := 0
+	totalCpu := 0
+
+	for _, svc := range activeServices {
+		if svc == nil {
+			continue
+		}
+		mem := svc.MemoryMB
+		if mem <= 0 {
+			mem = DefaultResourceConfig().MemoryMB
+		}
+		cpu := svc.CpuMillicores
+		if cpu <= 0 {
+			cpu = DefaultResourceConfig().CpuMillicores
+		}
+		totalMem += mem
+		totalCpu += cpu
+	}
+
+	for _, svc := range newServices {
+		if svc == nil {
+			continue
+		}
+		mem := svc.MemoryMB
+		if mem <= 0 {
+			mem = DefaultResourceConfig().MemoryMB
+		}
+		cpu := svc.CpuMillicores
+		if cpu <= 0 {
+			cpu = DefaultResourceConfig().CpuMillicores
+		}
+		totalMem += mem
+		totalCpu += cpu
+	}
+
+	if maxOwnerMemoryMB > 0 && totalMem > maxOwnerMemoryMB {
+		return fmt.Errorf("owner memory quota exceeded: total active memory %d MB would exceed quota limit of %d MB", totalMem, maxOwnerMemoryMB)
+	}
+
+	if maxOwnerCpuMillicores > 0 && totalCpu > maxOwnerCpuMillicores {
+		return fmt.Errorf("owner CPU quota exceeded: total active CPU %d millicores would exceed quota limit of %d millicores", totalCpu, maxOwnerCpuMillicores)
+	}
+
+	return nil
+}
+
 // Service represents an individual deployable service within a parent Project.
 type Service struct {
 	ID                         uuid.UUID           `json:"id"`
@@ -335,6 +387,7 @@ type Service struct {
 	Role                       string              `json:"role"`           // "frontend", "backend", "worker", "other"
 	Classification             string              `json:"classification"` // "application", "worker", "infrastructure", "job"
 	Image                      string              `json:"image,omitempty"`
+	User                       string              `json:"user,omitempty"`
 	DependsOn                  []string            `json:"depends_on,omitempty"`
 	DependsOnConditions        map[string]string   `json:"depends_on_conditions,omitempty"`
 	Volumes                    []VolumeMountConfig `json:"volumes,omitempty"`
@@ -378,6 +431,7 @@ type ServiceDeployment struct {
 	Status              string              `json:"status"`
 	Classification      string              `json:"classification,omitempty"`
 	Image               string              `json:"image,omitempty"`
+	User                string              `json:"user,omitempty"`
 	DependsOn           []string            `json:"depends_on,omitempty"`
 	DependsOnConditions map[string]string   `json:"depends_on_conditions,omitempty"`
 	Volumes             []VolumeMountConfig `json:"volumes,omitempty"`

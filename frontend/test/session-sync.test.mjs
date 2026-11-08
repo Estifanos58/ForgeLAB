@@ -382,3 +382,65 @@ test('SessionManager - rapid deployment logs are throttled to prevent network st
     global.fetch = originalFetch;
   }
 });
+
+test('SessionManager - WebSocket communication updates session and triggers touch frame', async () => {
+  const manager = new SessionManager();
+  const sentFrames = [];
+  const mockWs = {
+    readyState: 1, // OPEN
+    send: (payload) => {
+      sentFrames.push(JSON.parse(payload));
+    },
+  };
+
+  let touchCallCount = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url === '/api/auth/touch') {
+      touchCallCount++;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', authenticated: true, expires_in: 172800 }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  try {
+    // 1. Register active WebSocket
+    manager.registerWebSocket(mockWs);
+    assert.equal(manager.getActiveWebSocket(), mockWs, 'active WebSocket should be registered');
+
+    // 2. WebSocket activity records interaction
+    const beforeActivity = manager.getLastActivityTime();
+    await new Promise((r) => setTimeout(r, 10));
+    manager.recordActivity('websocket');
+    assert.ok(manager.getLastActivityTime() >= beforeActivity, 'websocket activity must update activity time');
+
+    // 3. Proactive touch sends touch_session frame over WebSocket as well as HTTP touch
+    await manager.touchSession();
+    assert.equal(sentFrames.length, 1, 'touchSession should send a touch_session frame over WebSocket');
+    assert.equal(sentFrames[0].type, 'touch_session', 'frame type should be touch_session');
+    assert.equal(touchCallCount, 1, 'touchSession should also invoke HTTP /api/auth/touch');
+
+    // 4. Inbound WebSocket session update synchronizes timestamps and fires listener
+    let listenerFired = false;
+    let eventData = null;
+    const unsub = manager.subscribe((evt) => {
+      listenerFired = true;
+      eventData = evt;
+    });
+
+    const updateTs = Date.now() + 5000;
+    manager.handleWebSocketSessionUpdate(updateTs);
+    assert.ok(listenerFired, 'handleWebSocketSessionUpdate should notify subscribers');
+    assert.equal(eventData?.type, 'REFRESH_SUCCESS');
+    assert.equal(manager.getLastSessionUpdateTime(), updateTs);
+
+    unsub();
+  } finally {
+    manager.destroy();
+    global.fetch = originalFetch;
+  }
+});

@@ -1880,3 +1880,79 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Environment:** Linux 6.6.137+rpt-rpi-2712 aarch64, Go 1.24, Node.js v20.18.0
 - **Notes:** Automated test coverage validates provider abstraction, URL discovery parsing, config conflict error detection, longest-prefix routing, path traversal defense, gateway constant-time auth, and registration acks.
 
+---
+
+### 39. Security, Control-Plane Isolation & Reliability Hardening
+
+#### Test Procedure 39.1 — Control-Plane Network Isolation
+1. Deploy a multi-service Compose project with an internal network.
+2. In another terminal, inspect the Docker network connections of the `forgelab-backend` container:
+   `docker inspect forgelab-backend --format '{{json .NetworkSettings.Networks}}'`
+3. Verify `forgelab-backend` belongs solely to `forgelab-net` (or internal compose network) and is **never** connected to the tenant project network (`forgelab-net-<project-id>`).
+4. Create a public share preview for the project.
+5. Verify the share router proxies traffic to the tenant container via published `HostPort` (`127.0.0.1:<port>` or `host.docker.internal:<port>`), completely without `dockerCli.NetworkConnect(...)`.
+
+#### Test Procedure 39.2 — Production Guest Mode Default
+1. Start ForgeLAB without `FORGELAB_ALLOW_GUEST_MODE` configured or with `APP_ENV=production`.
+2. Inspect `GET /api/auth/mode` response.
+3. Verify `allow_guest_mode` is `false`.
+4. Attempt a project mutation without an access token cookie/header (`POST /api/projects`).
+5. Verify the request is rejected with HTTP `401 Unauthorized` (`guest mode disabled on this installation`).
+6. Explicitly set `FORGELAB_ALLOW_GUEST_MODE=true` in `.env` and verify guest mode is available and isolated.
+
+#### Test Procedure 39.3 — Untrusted Forwarding Header Stripping & CORS Validation
+1. Send an unauthenticated request from an untrusted client IP with spoofed forwarding headers:
+   `curl -H "X-Forwarded-For: 1.2.3.4" -H "X-Forwarded-Proto: https" -H "X-Forwarded-Host: evil.com" http://localhost:8080/api/projects`
+2. Verify the server logs and rate-limiter evaluate `r.RemoteAddr` (the direct socket IP), completely ignoring spoofed headers.
+3. Verify HSTS header is **not** returned for untrusted plaintext HTTP connections even when `X-Forwarded-Proto: https` is spoofed.
+4. Verify CORS preflight from an unregistered `*.trycloudflare.com` domain is rejected with HTTP `403 Forbidden`. Only active registered share hosts are permitted.
+
+#### Test Procedure 39.4 — Gateway Verified TLS in Production
+1. In `APP_ENV=production` mode, set `SHARE_PROVIDER=gateway` and `GATEWAY_TLS_SKIP_VERIFY=true`.
+2. Start the backend server.
+3. Verify startup fails with an explicit fatal configuration error: `GATEWAY_TLS_SKIP_VERIFY=true is strictly forbidden in production mode`.
+4. Set valid TLS configuration and verify `tls.DialWithDialer` is used without automatic plaintext fallback.
+
+#### Test Procedure 39.5 — Concurrent Refresh Token Multi-Tab Synchronization
+1. Log in to ForgeLAB across two separate browser tabs with the same user account.
+2. Trigger simultaneous token refresh requests across both tabs (or execute concurrent script requests with the same refresh token).
+3. Verify both tabs remain logged in:
+   - One tab claims the refresh token and rotates it in PostgreSQL.
+   - The concurrent tab receives the fresh rotated token from the rotation grace cache.
+   - Neither tab is logged out with `SESSION_EXPIRED`.
+
+#### Test Procedure 39.6 — Cloudflare Process Graceful Termination
+1. Create a Cloudflare Quick Tunnel share link.
+2. In the terminal, monitor the child `cloudflared` process ID (`Get-Process cloudflared` or `pgrep cloudflared`).
+3. Click **Revoke Link Immediately** in the UI.
+4. Verify `cloudflared` receives `os.Interrupt` (SIGINT) and terminates within 3 seconds without leaving orphaned background processes.
+5. Stop the backend server and verify `CloudflareProvider.Close()` waits for all active tunnel processes to exit cleanly.
+
+#### Test Procedure 39.7 — Container Capability Minimization & Non-Root Execution
+1. Deploy a service specifying `user: "1000:1000"` in its Compose definition.
+2. Inspect the created container:
+   `docker inspect <container_id> --format '{{.Config.User}}'`
+3. Verify `Config.User` is `1000:1000`.
+4. Inspect container capabilities:
+   `docker inspect <container_id> --format '{{json .HostConfig.CapAdd}}'`
+5. Verify `CapAdd` contains strictly `["CHOWN", "SETGID", "SETUID"]` and does **not** contain `DAC_OVERRIDE` or `FOWNER`.
+
+#### Test Procedure 39.8 — Per-Owner Storage & Resource Quota Enforcement
+1. Attempt to upload a source archive when cumulative owner storage exceeds 1GB (`MaxOwnerStorageQuotaBytes`).
+2. Verify the upload is rejected with `ErrOwnerStorageQuotaExceeded`.
+3. Verify cumulative owner CPU and Memory limits are enforced via `ValidateOwnerResourceQuota`.
+
+#### Test Procedure 39.9 — Prolonged Session & WebSocket Session Update
+1. Log in to ForgeLAB and observe active cookie expiration for `forgelab_access_token` (48 hours) and `forgelab_refresh_token` (14 days).
+2. Connect to an active project deployment stream in the UI over WebSockets (`/api/ws`).
+3. While leaving the browser tab open with WebSocket communication active, observe that session keepalive pings and `touch_session` frames are exchanged periodically.
+4. Verify the backend responds with `session_updated` events and that the frontend session manager updates `lastSessionUpdateTime` without requiring full-page reloads or redundant HTTP polling.
+5. Verify the session remains active past the previous 30-minute idle threshold, remaining active up to 24 hours of inactivity.
+
+#### Verification Record (Section 39)
+- **Status:** CODE COMPLETE & AUTOMATED TEST COVERAGE PASS (Unit & Regression Tests PASS; Live Docker & External Physical Internet Verification Pending Live Host Environment Execution)
+- **Verified by:** Antigravity AI
+- **Date:** 2026-11-08
+- **Environment:** Windows amd64 / Go 1.27 / Node.js v24.21.0 / PostgreSQL 16 & Redis 7 (Mocks / Isolated Test Harness)
+- **Notes:** Full regression suites passing for `middleware`, `tunnel`, `models`, `config`, and `frontend`. Manual verification checklist documented above for physical host execution.
+

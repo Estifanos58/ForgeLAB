@@ -40,10 +40,11 @@ type Client struct {
 }
 
 type ClientMessage struct {
-	Type          string `json:"type"`                     // subscribe | unsubscribe | ping
+	Type          string `json:"type"`                     // subscribe | unsubscribe | ping | touch_session | session_update
 	Channel       string `json:"channel"`                  // deployment:<uuid> | project:<uuid>
 	LastSequence  int64  `json:"last_sequence,omitempty"`  // replay logs after this sequence
 	AfterSequence int64  `json:"after_sequence,omitempty"` // alias for last_sequence
+	Timestamp     int64  `json:"timestamp,omitempty"`
 }
 
 type EventMessage struct {
@@ -436,7 +437,24 @@ func (c *Client) readPump() {
 
 		switch req.Type {
 		case "ping":
-			c.sendEvent(&EventMessage{Type: "pong"})
+			c.sendEvent(&EventMessage{
+				Type: "pong",
+				Data: map[string]interface{}{
+					"timestamp": time.Now().UnixMilli(),
+					"user_id":   c.userID,
+				},
+			})
+
+		case "touch_session", "session_update":
+			slog.Debug("ws session touch received", "user_id", c.userID)
+			c.sendEvent(&EventMessage{
+				Type: "session_updated",
+				Data: map[string]interface{}{
+					"user_id":   c.userID,
+					"timestamp": time.Now().UnixMilli(),
+					"status":    "active",
+				},
+			})
 
 		case "subscribe":
 			lastSeq := req.LastSequence

@@ -191,6 +191,20 @@ func TestTrustBoundary_EnforcesTruthfulResourceLimitsAndIsolation(t *testing.T) 
 		t.Errorf("expected CapDrop [ALL], got %v", cfg.CapDrop)
 	}
 
+	// Invariant: Minimal safe capabilities omitting DAC_OVERRIDE and FOWNER by default
+	expectedDefaultCaps := map[string]bool{"CHOWN": true, "SETGID": true, "SETUID": true}
+	if len(cfg.CapAdd) != len(expectedDefaultCaps) {
+		t.Errorf("expected %d default CapAdd capabilities, got %v", len(expectedDefaultCaps), cfg.CapAdd)
+	}
+	for _, cap := range cfg.CapAdd {
+		if !expectedDefaultCaps[cap] {
+			t.Errorf("unexpected default capability %s in CapAdd", cap)
+		}
+		if cap == "DAC_OVERRIDE" || cap == "FOWNER" {
+			t.Errorf("forbidden default capability %s present in standard CapAdd", cap)
+		}
+	}
+
 	// Default resources: 1 core = 1_000_000_000 nanocores
 	if cfg.Resources.NanoCPUs != 1_000_000_000 {
 		t.Errorf("expected default NanoCPUs 1_000_000_000, got %d", cfg.Resources.NanoCPUs)

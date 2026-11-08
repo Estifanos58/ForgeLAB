@@ -42,26 +42,14 @@ func (r *DockerUpstreamResolver) ResolveUpstream(ctx context.Context, service *m
 	}
 
 	// 1. Inspect container network settings if Docker client is available
+	// Control-plane isolation: We strictly DO NOT attach the backend container to tenant networks.
+	// Privileged control plane services (Docker socket, Postgres, Redis, API) must never be exposed
+	// to deployed tenant workloads.
 	if r.dockerCli != nil && service.ContainerID != nil && *service.ContainerID != "" {
 		inspectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		cJSON, err := r.dockerCli.ContainerInspect(inspectCtx, *service.ContainerID)
 		cancel()
 		if err == nil && cJSON.NetworkSettings != nil {
-			// In Docker Compose mode, ensure backend container joins the service's network
-			if isDockerEnv {
-				myContainer := os.Getenv("HOSTNAME")
-				if myContainer == "" {
-					myContainer, _ = os.Hostname()
-				}
-				if myContainer != "" {
-					for netName := range cJSON.NetworkSettings.Networks {
-						connCtx, connCancel := context.WithTimeout(ctx, 2*time.Second)
-						_ = r.dockerCli.NetworkConnect(connCtx, netName, myContainer, nil)
-						connCancel()
-					}
-				}
-			}
-
 			for _, netSettings := range cJSON.NetworkSettings.Networks {
 				if netSettings != nil && netSettings.IPAddress != "" {
 					candidates = append(candidates, fmt.Sprintf("http://%s:%d", netSettings.IPAddress, intPort))

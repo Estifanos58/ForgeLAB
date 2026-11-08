@@ -22,15 +22,19 @@ import (
 )
 
 var (
-	ErrInvalidSourceArchive  = errors.New("invalid or corrupt source archive")
-	ErrPathTraversalDetected = errors.New("path traversal detected in source archive")
-	ErrArchiveTooLarge       = errors.New("uncompressed source exceeds maximum allowed size (100MB)")
-	ErrSourceDirNotFound     = errors.New("source directory not found")
-	ErrUnauthorizedSource    = errors.New("unauthorized source workspace access")
-	ErrSourceNotReady        = errors.New("source workspace is still processing")
+	ErrInvalidSourceArchive      = errors.New("invalid or corrupt source archive")
+	ErrPathTraversalDetected     = errors.New("path traversal detected in source archive")
+	ErrArchiveTooLarge           = errors.New("uncompressed source exceeds maximum allowed size (100MB)")
+	ErrSourceDirNotFound         = errors.New("source directory not found")
+	ErrUnauthorizedSource        = errors.New("unauthorized source workspace access")
+	ErrSourceNotReady            = errors.New("source workspace is still processing")
+	ErrOwnerStorageQuotaExceeded = errors.New("owner storage quota exceeded: total source storage exceeds maximum allowed quota (1GB)")
 )
 
-const MaxUncompressedBytes = 100 * 1024 * 1024 // 100MB
+const (
+	MaxUncompressedBytes      = 100 * 1024 * 1024        // 100MB per archive
+	MaxOwnerStorageQuotaBytes = 1024 * 1024 * 1024       // 1GB cumulative per owner
+)
 
 const (
 	SourceStatusUploading  = "uploading"

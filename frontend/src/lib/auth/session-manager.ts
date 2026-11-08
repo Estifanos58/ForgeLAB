@@ -18,8 +18,9 @@ export interface SessionFetchOptions extends RequestInit {
 
 export const REFRESH_COOLDOWN_MS = 2500;
 export const ACTIVITY_UPDATE_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes between proactive session touches
-export const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes before considering completely idle
+export const INACTIVITY_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours before considering completely idle (extended multi-day session)
 export const USER_ACTIVITY_THROTTLE_MS = 30 * 1000; // Throttle direct DOM user events to at most once per 30s
+export const WEBSOCKET_ACTIVITY_THROTTLE_MS = 5 * 1000; // Throttle WebSocket activity updates to at most once per 5s
 const LOCK_NAME = 'forgelab_auth_refresh_lock';
 const BROADCAST_CHANNEL_NAME = 'forgelab_session_channel';
 const LOCAL_STORAGE_KEY = 'forgelab_last_refresh_timestamp';
@@ -29,6 +30,8 @@ export class SessionManager {
   private lastActivityTime = Date.now();
   private lastSessionUpdateTime = 0;
   private lastUserEventTime = 0;
+  private lastWebSocketEventTime = 0;
+  private activeWebSocket: WebSocket | null = null;
   private activeRefreshPromise: Promise<void> | null = null;
   private activeTouchPromise: Promise<void> | null = null;
   private broadcastChannel: BroadcastChannel | null = null;
@@ -299,15 +302,28 @@ export class SessionManager {
     }
 
     if (!res.ok) {
-      const ts = Date.now();
+      let ts = Date.now();
       // Check whether another tab refreshed right around this time
-      const stored = this.getStoredTimestamp();
-      const recent = Math.max(this.localLastRefreshTime, stored);
+      let stored = this.getStoredTimestamp();
+      let recent = Math.max(this.localLastRefreshTime, stored);
       if (ts - recent < REFRESH_COOLDOWN_MS) {
         // Another tab successfully rotated tokens and updated browser cookies!
         // Treat as fresh without broadcasting SESSION_EXPIRED or destroying the session.
         this.broadcast({ type: 'REFRESH_SUCCESS', timestamp: recent });
         return;
+      }
+
+      // If 401, wait a short grace window (150ms) to see if a concurrent tab's successful refresh
+      // is propagating via localStorage or BroadcastChannel before declaring SESSION_EXPIRED
+      if (res.status === 401) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        ts = Date.now();
+        stored = this.getStoredTimestamp();
+        recent = Math.max(this.localLastRefreshTime, stored);
+        if (ts - recent < REFRESH_COOLDOWN_MS) {
+          this.broadcast({ type: 'REFRESH_SUCCESS', timestamp: recent });
+          return;
+        }
       }
 
       this.broadcast({ type: 'REFRESH_FAILED', timestamp: ts });
@@ -409,6 +425,18 @@ export class SessionManager {
       return;
     }
 
+    // If an active WebSocket connection is open, send a session touch message over WebSocket
+    if (this.activeWebSocket && typeof (this.activeWebSocket as any).readyState === 'number') {
+      const readyState = (this.activeWebSocket as any).readyState;
+      if (readyState === 1) { // 1 = OPEN
+        try {
+          this.activeWebSocket.send(JSON.stringify({ type: 'touch_session', timestamp: now }));
+        } catch {
+          // Ignore WS send error
+        }
+      }
+    }
+
     if (this.activeTouchPromise) {
       return this.activeTouchPromise;
     }
@@ -449,13 +477,41 @@ export class SessionManager {
   }
 
   /**
+   * Registers or unregisters the active WebSocket connection with the session manager.
+   * This enables real-time bidirectional session keepalives and updates over WebSocket communication.
+   */
+  public registerWebSocket(ws: WebSocket | null): void {
+    this.activeWebSocket = ws;
+    if (ws) {
+      this.recordActivity('websocket');
+    }
+  }
+
+  public getActiveWebSocket(): WebSocket | null {
+    return this.activeWebSocket;
+  }
+
+  /**
+   * Handles incoming session update messages received from WebSocket communication.
+   * Synchronizes session timestamps across tabs without requiring an extra HTTP roundtrip.
+   */
+  public handleWebSocketSessionUpdate(timestamp?: number): void {
+    const ts = timestamp && timestamp > 0 ? timestamp : Date.now();
+    this.lastActivityTime = Math.max(this.lastActivityTime, ts);
+    this.lastSessionUpdateTime = Math.max(this.lastSessionUpdateTime, ts);
+    this.localLastRefreshTime = Math.max(this.localLastRefreshTime, ts);
+    this.setStoredTimestamp(ts);
+    this.broadcast({ type: 'REFRESH_SUCCESS', timestamp: ts });
+  }
+
+  /**
    * Records an interaction with the application.
    *
-   * Crucially, receiving logs from a codebase being deployed is considered
-   * active interaction ('deployment_logs'), keeping the session updated even
-   * if the user does not touch the keyboard or mouse during long-running builds.
+   * Receiving logs from a codebase being deployed ('deployment_logs') or communicating
+   * over an active WebSocket stream ('websocket') is considered active interaction,
+   * keeping the session updated even if the user does not touch the keyboard or mouse.
    */
-  public recordActivity(source: 'user' | 'deployment_logs' = 'user'): void {
+  public recordActivity(source: 'user' | 'deployment_logs' | 'websocket' = 'user'): void {
     const now = Date.now();
     this.lastActivityTime = now;
 
@@ -464,6 +520,11 @@ export class SessionManager {
         return;
       }
       this.lastUserEventTime = now;
+    } else if (source === 'websocket') {
+      if (now - this.lastWebSocketEventTime < WEBSOCKET_ACTIVITY_THROTTLE_MS) {
+        return;
+      }
+      this.lastWebSocketEventTime = now;
     }
 
     const timeSinceLastUpdate = now - Math.max(this.lastSessionUpdateTime, this.localLastRefreshTime);
@@ -495,6 +556,7 @@ export class SessionManager {
       } catch {}
       this.broadcastChannel = null;
     }
+    this.activeWebSocket = null;
     this.listeners.clear();
   }
 }

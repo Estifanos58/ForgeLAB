@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgelab/backend/internal/middleware"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/tunnel"
 )
@@ -470,6 +471,10 @@ func (s *ShareService) CreateShare(ctx context.Context, projectID, userID uuid.U
 		return nil, fmt.Errorf("failed to commit share transaction: %w", err)
 	}
 
+	if share.PublicHost != "" {
+		middleware.RegisterPreviewHost(share.PublicHost)
+	}
+
 	return &share, nil
 }
 
@@ -485,18 +490,22 @@ func (s *ShareService) RevokeShare(ctx context.Context, projectID, userID uuid.U
 		return ErrShareNotFound
 	}
 
-	var shareToken string
+	var shareToken, publicHost string
 	err := s.pool.QueryRow(ctx, `
 		UPDATE public_shares
 		SET status = 'revoked', revoked_at = NOW(), updated_at = NOW()
 		WHERE project_id = $1 AND status = 'active'
-		RETURNING share_token
-	`, projectID).Scan(&shareToken)
+		RETURNING share_token, public_host
+	`, projectID).Scan(&shareToken, &publicHost)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrShareNotFound
 		}
 		return fmt.Errorf("failed to revoke share: %w", err)
+	}
+
+	if publicHost != "" {
+		middleware.UnregisterPreviewHost(publicHost)
 	}
 
 	if s.provider != nil && shareToken != "" {
@@ -590,14 +599,25 @@ func (s *ShareService) ReconcileStaleShares(ctx context.Context) error {
 	if s.pool == nil {
 		return nil
 	}
-	// Cloudflare Quick Tunnel processes terminate when the server stops; their ephemeral trycloudflare URLs
+	// Ephemeral tunnel processes terminate when the server stops; their ephemeral URLs
 	// cannot be re-used. Clean them up so stale links are not shown as active.
-	_, err := s.pool.Exec(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		UPDATE public_shares
 		SET status = 'revoked', revoked_at = NOW(), updated_at = NOW()
-		WHERE status = 'active' AND provider = 'cloudflare'
+		WHERE status = 'active'
+		RETURNING public_host
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var host string
+		if scanErr := rows.Scan(&host); scanErr == nil && host != "" {
+			middleware.UnregisterPreviewHost(host)
+		}
+	}
+	return rows.Err()
 }
 
 // Close gracefully terminates all provider tunnels.

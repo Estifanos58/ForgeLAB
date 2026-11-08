@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestConfigLoadDevelopment(t *testing.T) {
@@ -474,12 +475,9 @@ func TestDockerComposeGuestModeDefault(t *testing.T) {
 		t.Fatalf("could not locate docker-compose.yml")
 	}
 	text := string(content)
-	if strings.Contains(text, "${FORGELAB_ALLOW_GUEST_MODE:-false}") {
-		t.Errorf("docker-compose.yml must not default FORGELAB_ALLOW_GUEST_MODE to false for local deployments")
-	}
-	if !strings.Contains(text, "FORGELAB_ALLOW_GUEST_MODE: ${FORGELAB_ALLOW_GUEST_MODE:-true}") &&
-		!strings.Contains(text, "FORGELAB_ALLOW_GUEST_MODE=${FORGELAB_ALLOW_GUEST_MODE:-true}") {
-		t.Errorf("docker-compose.yml must default FORGELAB_ALLOW_GUEST_MODE to true")
+	if !strings.Contains(text, "FORGELAB_ALLOW_GUEST_MODE: ${FORGELAB_ALLOW_GUEST_MODE:-false}") &&
+		!strings.Contains(text, "FORGELAB_ALLOW_GUEST_MODE=${FORGELAB_ALLOW_GUEST_MODE:-false}") {
+		t.Errorf("docker-compose.yml must default FORGELAB_ALLOW_GUEST_MODE to false for production safety")
 	}
 }
 
@@ -513,6 +511,7 @@ func TestConfigPublicSharing(t *testing.T) {
 		os.Unsetenv("GATEWAY_PUBLIC_URL")
 		os.Unsetenv("GATEWAY_AUTH_TOKEN")
 		os.Unsetenv("GATEWAY_AUTH_SECRET")
+		os.Unsetenv("GATEWAY_TLS_SKIP_VERIFY")
 	}
 
 	t.Run("cloudflare provider does not require gateway credentials in production", func(t *testing.T) {
@@ -612,6 +611,78 @@ func TestConfigPublicSharing(t *testing.T) {
 		}
 		if cfg.Share.GatewayAuthToken != "my-secret-token" {
 			t.Errorf("unexpected GatewayAuthToken: %s", cfg.Share.GatewayAuthToken)
+		}
+	})
+
+	t.Run("gateway provider rejects GATEWAY_TLS_SKIP_VERIFY=true in production", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Setenv("FORGELAB_SHARING_ENABLED", "true")
+		os.Setenv("FORGELAB_SHARING_PROVIDER", "gateway")
+		os.Setenv("GATEWAY_TUNNEL_URL", "tunnel.example.com:8443")
+		os.Setenv("GATEWAY_AUTH_TOKEN", "valid-auth-token")
+		os.Setenv("GATEWAY_TLS_SKIP_VERIFY", "true")
+
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error when GATEWAY_TLS_SKIP_VERIFY=true is set in production")
+		}
+		if !strings.Contains(err.Error(), "GATEWAY_TLS_SKIP_VERIFY") {
+			t.Errorf("expected error message to mention GATEWAY_TLS_SKIP_VERIFY, got: %v", err)
+		}
+	})
+
+	t.Run("jwt defaults align to more than a day access (48h) and more than a week refresh (14d)", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+		os.Unsetenv("JWT_ACCESS_TOKEN_EXPIRY")
+		os.Unsetenv("JWT_REFRESH_TOKEN_EXPIRY")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error loading config: %v", err)
+		}
+		if cfg.JWT.AccessTokenExpiry != 48*time.Hour {
+			t.Errorf("expected default AccessTokenExpiry to be 48h (more than a day), got: %v", cfg.JWT.AccessTokenExpiry)
+		}
+		if cfg.JWT.RefreshTokenExpiry != 14*24*time.Hour {
+			t.Errorf("expected default RefreshTokenExpiry to be 14d (more than a week), got: %v", cfg.JWT.RefreshTokenExpiry)
+		}
+	})
+
+	t.Run("jwt token expiry parses duration strings and numeric values", func(t *testing.T) {
+		cleanupEnv()
+		defer cleanupEnv()
+		setupProdEnv()
+
+		// Test day suffixes and duration strings
+		os.Setenv("JWT_ACCESS_TOKEN_EXPIRY", "2d")
+		os.Setenv("JWT_REFRESH_TOKEN_EXPIRY", "30d")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.JWT.AccessTokenExpiry != 48*time.Hour {
+			t.Errorf("expected 48h, got %v", cfg.JWT.AccessTokenExpiry)
+		}
+		if cfg.JWT.RefreshTokenExpiry != 30*24*time.Hour {
+			t.Errorf("expected 30d, got %v", cfg.JWT.RefreshTokenExpiry)
+		}
+
+		// Test numeric values (minutes for access, days for refresh)
+		os.Setenv("JWT_ACCESS_TOKEN_EXPIRY", "2880")
+		os.Setenv("JWT_REFRESH_TOKEN_EXPIRY", "14")
+		cfg2, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg2.JWT.AccessTokenExpiry != 48*time.Hour {
+			t.Errorf("expected 48h from numeric 2880m, got %v", cfg2.JWT.AccessTokenExpiry)
+		}
+		if cfg2.JWT.RefreshTokenExpiry != 14*24*time.Hour {
+			t.Errorf("expected 14d from numeric 14, got %v", cfg2.JWT.RefreshTokenExpiry)
 		}
 	})
 

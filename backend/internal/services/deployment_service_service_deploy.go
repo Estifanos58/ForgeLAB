@@ -221,6 +221,7 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 		EnvSnapshot:         envSnapshot,
 		Classification:      targetService.Classification,
 		Image:               targetService.Image,
+		User:                targetService.User,
 		DependsOn:           targetService.DependsOn,
 		DependsOnConditions: targetService.DependsOnConditions,
 		Volumes:             targetService.Volumes,

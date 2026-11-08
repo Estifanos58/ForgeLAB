@@ -277,33 +277,19 @@ func (tm *TunnelManager) connectAndServe(ctx context.Context) error {
 
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 
-	if tm.config.TLSSkipVerify || strings.HasSuffix(targetAddr, ":8443") || strings.HasPrefix(tm.config.GatewayTunnelURL, "tls://") {
-		// Use TLS
-		host, _, splitErr := net.SplitHostPort(targetAddr)
-		if splitErr != nil {
-			host = targetAddr
-		}
-		tlsConfig := &tls.Config{
-			ServerName:         host,
-			InsecureSkipVerify: tm.config.TLSSkipVerify, // true only for development
-			MinVersion:         tls.VersionTLS12,
-		}
-		rawConn, err = tls.DialWithDialer(dialer, "tcp", targetAddr, tlsConfig)
-	} else {
-		// Try TLS first, falling back to plaintext TCP if TLS handshake fails and running locally
-		host, _, splitErr := net.SplitHostPort(targetAddr)
-		if splitErr != nil {
-			host = targetAddr
-		}
-		tlsConfig := &tls.Config{
-			ServerName: host,
-			MinVersion: tls.VersionTLS12,
-		}
-		rawConn, err = tls.DialWithDialer(dialer, "tcp", targetAddr, tlsConfig)
-		if err != nil {
-			// Plaintext TCP fallback
-			rawConn, err = dialer.DialContext(ctx, "tcp", targetAddr)
-		}
+	// Always require TLS when connecting to the public gateway; automatic plaintext fallback is strictly prohibited.
+	host, _, splitErr := net.SplitHostPort(targetAddr)
+	if splitErr != nil {
+		host = targetAddr
+	}
+	tlsConfig := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: tm.config.TLSSkipVerify, // true only for development; rejected at config level in production
+		MinVersion:         tls.VersionTLS12,
+	}
+	rawConn, err = tls.DialWithDialer(dialer, "tcp", targetAddr, tlsConfig)
+	if err != nil {
+		return fmt.Errorf("failed to establish verified TLS connection to gateway %s: %w", targetAddr, err)
 	}
 
 	if err != nil {

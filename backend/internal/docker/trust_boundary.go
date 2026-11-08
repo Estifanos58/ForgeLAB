@@ -217,8 +217,8 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 
 	// 4. Construct secure HostConfig with defense-in-depth isolation
 	// Standard safe capabilities required by unprivileged container switch tools (e.g. gosu, su-exec, setpriv)
-	// used by official daemon images like postgres:16-alpine and redis:7-alpine to drop root privileges safely.
-	safeCaps := []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
+	// to drop privileges safely without granting arbitrary filesystem bypass capabilities like DAC_OVERRIDE or FOWNER.
+	safeCaps := []string{"CHOWN", "SETGID", "SETUID"}
 	if len(opts.CapAdd) > 0 {
 		dangerousCaps := map[string]bool{
 			"SYS_ADMIN": true, "NET_ADMIN": true, "SYS_PTRACE": true,

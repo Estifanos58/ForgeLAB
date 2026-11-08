@@ -89,7 +89,8 @@ As long as the control plane shares the host Docker socket, the boundary between
 **Active Operational Guardrails (Defense-in-Depth):**
 To mitigate this risk under the single-node architecture, ForgeLAB enforces strict multi-layered defenses:
 - **Zero Socket Exposure to Workloads:** Host Docker socket mounts (`/var/run/docker.sock` and `\\.\pipe\docker_engine`) are unconditionally rejected during preflight validation and sanitized from user Compose files. User containers are strictly prohibited from mounting or accessing the daemon socket.
-- **Strict Container Isolation:** All user containers are created with `CapDrop: ["ALL"]`, `SecurityOpt: ["no-new-privileges:true"]`, `Privileged: false`, isolated bridge networks (rejecting `--net=host` and `container:` network namespace sharing), and restricted resource limits (CPU millicores, RAM, and PIDs).
+- **Strict Container Isolation & Capability Minimization:** All user containers are created with `CapDrop: ["ALL"]`, minimized allowlisted capabilities `CapAdd: ["CHOWN", "SETGID", "SETUID"]` (explicitly omitting `DAC_OVERRIDE` and `FOWNER`), support for declared non-root `user` execution profiles, `SecurityOpt: ["no-new-privileges:true"]`, `Privileged: false`, isolated bridge networks (rejecting `--net=host` and `container:` network namespace sharing), per-service resource limits (CPU millicores, RAM, and PIDs), owner-level cumulative resource quotas (`ValidateOwnerResourceQuota`), and a 1GB cumulative source upload quota.
+- **Control-Plane Network Isolation:** The privileged ForgeLAB backend container is never attached to tenant application Docker networks. Preview routing resolves strictly via published container `HostPort` bindings on loopback or `host.docker.internal`, with explicit upstream blocking of management ports (:8080, :4142, :3000, :5432, :6379, the Docker socket, `forgelab-backend`, and `forgelab-frontend`).
 - **Source Root Sandboxing:** All host directory mounts are validated with canonical symlink resolution and constrained strictly beneath administrator-configured `FORGELAB_ALLOWED_SOURCE_ROOTS`, rejecting system directories (`/etc`, `/proc`, `/sys`, `/dev`, etc.).
 - **Build Reproducibility:** Pinning immutable source revisions (commit SHAs or content fingerprints `fp_...`) ensures that builds fail closed if host files change after plan review.
 
@@ -105,8 +106,8 @@ ForgeLAB implements backend-owned, cookie-based session management and hardened 
 │                                                             │
 │   Transport & Storage:                                      │
 │   • Issued as HttpOnly, Secure, SameSite cookies:           │
-│     - forgelab_access_token (15-minute expiry)              │
-│     - forgelab_refresh_token (7-day expiry)                 │
+│     - forgelab_access_token (48-hour default expiry, > 1 day)│
+│     - forgelab_refresh_token (14-day default expiry, > 1 week)│
 │   • Zero client-side persistence in localStorage            │
 │   • API client requests include 'credentials: include'      │
 │                                                             │
@@ -192,7 +193,10 @@ All user application containers created by ForgeLAB enforce these constraints:
 | :--- | :--- | :--- |
 | **No Privileged Mode** | ENFORCED | `Privileged: false` strictly enforced via `ValidateAndBuildSecureHostConfig` |
 | **No-New-Privileges** | ENFORCED | `SecurityOpt: ["no-new-privileges:true"]` enforced on all deployed containers |
-| **Capability Dropping** | ENFORCED | `CapDrop: ["ALL"]` enforced to prevent kernel privilege escalation |
+| **Capability Dropping & Minimization** | ENFORCED | `CapDrop: ["ALL"]` enforced to prevent kernel privilege escalation; minimized allowlist `CapAdd: ["CHOWN", "SETGID", "SETUID"]` (strictly omitting `DAC_OVERRIDE` and `FOWNER`) |
+| **Non-Root Execution Profiles** | ENFORCED | Preserves declared non-root `user` execution profile from Compose/Service definitions in `containerConfig.User` |
+| **Owner Resource & Storage Quotas** | ENFORCED | `ValidateOwnerResourceQuota` validates cumulative CPU/memory across owner's active and incoming services; 1GB cumulative storage quota on source uploads |
+| **Control-Plane Network Isolation** | ENFORCED | Privileged backend container is not attached to tenant Docker networks; reverse proxy routes via published host ports with management port blocking |
 | **No Host Network** | ENFORCED | Host networking rejected; binds container port to dynamic host port on loopback `127.0.0.1` by default via `FORGELAB_APP_HOST_IP` (eliminating direct LAN/WAN bypass) |
 | **No Docker Socket Mount** | ENFORCED | `/var/run/docker.sock` and named pipes are strictly rejected with security violation |
 | **No Host Root/Sensitive Mounts** | ENFORCED | User containers cannot mount `/proc`, `/sys`, `/dev`, `/etc`, `/root`, or host roots |
@@ -311,10 +315,14 @@ ForgeLAB’s public sharing feature enables users to share locally deployed proj
 - **Per-Session Registration Isolation:** Registered share routes are tracked per Yamux tunnel session. A tunnel cannot deregister or overwrite shares belonging to another active tunnel session.
 - **Synchronous Acknowledgment Handshake:** `TunnelManager.RegisterShare` waits for an explicit gateway acknowledgment frame with a bounded 5-second timeout; if unacknowledged or disconnected, the operation fails closed without reporting the share as online.
 - **Native HTTPS & TLS Ingress:** The gateway natively supports TLS on `:443` or an upstream TLS-terminating reverse proxy.
+- **Strict Verified TLS in Production:** Connecting to a public gateway in production (`!isDev`) strictly requires verified TLS. The backend rejects `GATEWAY_TLS_SKIP_VERIFY=true` during startup configuration validation and eliminates automatic TLS-to-plaintext TCP fallback.
 
-### 3. Share-Scoped Request Router (`internal/tunnel/share_router.go`)
+### 3. Share-Scoped Request Router (`internal/tunnel/share_router.go`) & Control-Plane Isolation
+- **Control-Plane Network Isolation:** The backend is never attached to tenant Docker networks. Upstream routing resolves strictly via published container `HostPort` bindings on loopback or `host.docker.internal`.
+- **Management Plane Protection:** The router and upstream resolver strictly block proxying to ForgeLAB management ports (:8080), local source agent (:4142), frontend (:3000), PostgreSQL (:5432), Redis (:6379), `forgelab-backend`, `forgelab-frontend`, and the Docker socket.
+- **Dynamic Preview Origin Validation:** Rather than trusting broad `*.trycloudflare.com` wildcards in CORS, the backend maintains a dynamic thread-safe host registry (`RegisterPreviewHost`, `UnregisterPreviewHost`) synchronized with active database shares. Untrusted forwarding headers are stripped before origin evaluation.
 - **Path Traversal Defense:** Both raw `RequestURI` and normalized `URL.Path` are validated. Any path containing `..` or URL-encoded variations (`%2e%2e`) is immediately rejected with HTTP `400 Bad Request`.
-- **Management Plane Protection:** The router strictly blocks proxying to ForgeLAB management ports (:8080), local source agent (:4142), PostgreSQL (:5432), Redis (:6379), and the Docker socket.
+
 - **Longest-Prefix Deterministic Matching:** Routes are sorted by prefix length in descending order, guaranteeing `/api/*` requests reach the backend API rather than being swallowed by the frontend `/` fallback handler.
 - **Authoritative Route Allowlists:** Target service IDs and host ports are resolved solely from verified database records. Visitors cannot control upstream targets via headers or query parameters.
 - **WebSocket Hijacking & Streaming:** Supported via safe `http.Hijacker` connection takeover with bidirectional byte copying, bounded timeouts, and strict error handling.

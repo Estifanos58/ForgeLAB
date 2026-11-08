@@ -1209,6 +1209,14 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		containerConfig.Labels["forgelab.deployment_id"] = serviceDeploy.DeploymentID.String()
 	}
 
+	runUser := strings.TrimSpace(serviceDeploy.User)
+	if runUser == "" && service != nil {
+		runUser = strings.TrimSpace(service.User)
+	}
+	if runUser != "" {
+		containerConfig.User = runUser
+	}
+
 	var cmdParts []string
 	startCmd := strings.TrimSpace(serviceDeploy.StartCommand)
 	if startCmd == "" {

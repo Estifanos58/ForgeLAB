@@ -149,7 +149,7 @@ The status classifications strictly follow these definitions:
 | **Deployment Recovery Reliability** | IMPLEMENTED | NOT RECORDED | Inspect-verified previous container restoration, degraded state on failed restart, zero false recoveries |
 | **Trusted Proxy Client IP Extraction** | IMPLEMENTED | NOT RECORDED | Right-to-left header parsing, strict socket IP for untrusted peers, rate-limit spoofing defense |
 | **Frontend & API Security Headers** | IMPLEMENTED | NOT RECORDED | SecurityHeaders middleware, Next.js CSP, X-Frame-Options, X-Content-Type-Options, HTTPS-only HSTS |
-| **Provider-Specific Sharing Validation** | IMPLEMENTED | NOT RECORDED | Domainless Cloudflare Quick Tunnels vs Gateway validation, Guest Mode default alignment |
+| **Provider-Specific Sharing Validation** | IMPLEMENTED | NOT RECORDED | Domainless Cloudflare Quick Tunnels vs Gateway validation, verified TLS required, Guest Mode disabled by default in production |
 | **Docker Build Security & Cleanup** | IMPLEMENTED | NOT RECORDED | ForceRemove/Remove intermediate container cleanup, CPU/memory limits, socket boundaries |
 | **Modularized Project Creation Wizard** | IMPLEMENTED | NOT RECORDED | Decomposed into PlanReviewStep, ConfigStep, ArchiveUploadSource, LocalAgentSource, GitHubImportSource |
 | **Decomposed Deployment Service** | IMPLEMENTED | NOT RECORDED | Decomposed into deployment_service_logs, status, reconcile, and engine_legacy |
@@ -202,8 +202,8 @@ The status classifications strictly follow these definitions:
 | **Zero-Downtime Rolling Updates** | NOT IMPLEMENTED | — | Blue/green or proxy traffic shifting deferred |
 | **Caddy Reverse Proxy & TLS** | NOT IMPLEMENTED | — | Reverse proxy routing not in MVP |
 | **OpenTelemetry Observability** | NOT IMPLEMENTED | — | Metrics and distributed tracing deferred |
-| **Container Resource Quotas** | IMPLEMENTED | NOT RECORDED | CPU (`NanoCPUs`), Memory (`Memory`), and PIDs (`PidsLimit`) enforced in Docker HostConfig via `ValidateAndBuildSecureHostConfig` |
-| **Docker Trust Boundary Enforcement** | IMPLEMENTED | NOT RECORDED | Reject `/var/run/docker.sock` and sensitive mounts in preflight & runtime, `CapDrop: [ALL]`, `no-new-privileges: true`, reject host network |
+| **Container Resource Quotas** | IMPLEMENTED | NOT RECORDED | CPU (`NanoCPUs`), Memory (`Memory`), and PIDs (`PidsLimit`) enforced via `ValidateAndBuildSecureHostConfig`; cumulative owner quota enforced via `ValidateOwnerResourceQuota`; 1GB cumulative source upload quota |
+| **Docker Trust Boundary Enforcement** | IMPLEMENTED | NOT RECORDED | Reject `/var/run/docker.sock` and sensitive mounts in preflight & runtime, `CapDrop: [ALL]`, minimized `CapAdd: [CHOWN, SETGID, SETUID]`, non-root execution profiles, control-plane network isolation, `no-new-privileges: true`, reject host network |
 | **Redis Job Lease Ownership & Recovery** | IMPLEMENTED | NOT RECORDED | Unique lease tokens (`workerID:uuid`), Lua atomic renewal/recovery and lease error reconciliation, stranded lease rescue on failure, background abandoned-job recovery, and `/health/queue` diagnostics |
 | **Deep Dependency Readiness Check** | IMPLEMENTED | NOT RECORDED | `/ready` and `/health/ready` probe PostgreSQL, Redis, and Docker Engine concurrently with 0 secret exposure; `/health` remains lightweight liveness |
 | **API & WebSocket Rate Limiting** | IMPLEMENTED | NOT RECORDED | Redis/in-memory fixed-window counter throttling with trusted reverse proxy validation on `/auth/*`, `/sources/*`, deploy/rollback, and WebSocket connect/subscribe returning HTTP 429 |

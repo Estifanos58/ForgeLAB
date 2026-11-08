@@ -342,17 +342,18 @@ func (r *LocalRouter) isForbiddenUpstream(upstreamURL string) bool {
 		return true
 	}
 
-	// ForgeLAB control plane (8080) and local agent (4142) on loopback or core management containers
+	// ForgeLAB control plane (8080), frontend (3000), local agent (4142), or core management containers
 	isManagementHost := host == "127.0.0.1" ||
 		host == "localhost" ||
 		host == "::1" ||
 		host == "0.0.0.0" ||
 		host == "host.docker.internal" ||
 		host == "forgelab-backend" ||
+		host == "forgelab-frontend" ||
 		host == "forgelab-postgres" ||
 		host == "forgelab-redis"
 
-	if isManagementHost && (port == "8080" || port == "4142") {
+	if isManagementHost && (port == "8080" || port == "4142" || port == "3000") {
 		return true
 	}
 

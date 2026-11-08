@@ -31,14 +31,25 @@ func TestCloudflareProvider_Prerequisites(t *testing.T) {
 }
 
 func TestCloudflareProvider_MockTunnelLifecycle(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping shell script test on Windows")
-	}
-
 	// Create a temporary mock cloudflared script
 	tmpDir := t.TempDir()
-	mockCloudflaredPath := filepath.Join(tmpDir, "cloudflared")
-	script := `#!/bin/sh
+	var mockCloudflaredPath string
+	if runtime.GOOS == "windows" {
+		mockCloudflaredPath = filepath.Join(tmpDir, "cloudflared.cmd")
+		script := `@echo off
+echo 2026-10-21T08:00:00Z INF Thank you for using Cloudflare Tunnel.
+echo 2026-10-21T08:00:01Z INF Your quick Tunnel has been created! Visit it at:
+echo 2026-10-21T08:00:01Z INF https://test-quick-tunnel-1234.trycloudflare.com
+echo 2026-10-21T08:00:02Z INF Ready to serve connections
+:loop
+ping -n 2 127.0.0.1 >nul
+goto loop
+`
+		err := os.WriteFile(mockCloudflaredPath, []byte(script), 0755)
+		require.NoError(t, err)
+	} else {
+		mockCloudflaredPath = filepath.Join(tmpDir, "cloudflared")
+		script := `#!/bin/sh
 echo "2026-10-21T08:00:00Z INF Thank you for using Cloudflare Tunnel."
 echo "2026-10-21T08:00:01Z INF Your quick Tunnel has been created! Visit it at:"
 echo "2026-10-21T08:00:01Z INF https://test-quick-tunnel-1234.trycloudflare.com"
@@ -48,8 +59,9 @@ while true; do
   sleep 1
 done
 `
-	err := os.WriteFile(mockCloudflaredPath, []byte(script), 0755)
-	require.NoError(t, err)
+		err := os.WriteFile(mockCloudflaredPath, []byte(script), 0755)
+		require.NoError(t, err)
+	}
 
 	provider := NewCloudflareProvider(true, mockCloudflaredPath)
 	defer provider.Close()
@@ -108,18 +120,25 @@ done
 }
 
 func TestCloudflareProvider_ConfigConflictDetection(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping shell script test on Windows")
-	}
-
 	tmpDir := t.TempDir()
-	mockCloudflaredPath := filepath.Join(tmpDir, "cloudflared-conflict")
-	script := `#!/bin/sh
+	var mockCloudflaredPath string
+	if runtime.GOOS == "windows" {
+		mockCloudflaredPath = filepath.Join(tmpDir, "cloudflared-conflict.cmd")
+		script := `@echo off
+echo Cannot use --url with a configuration file C:\Users\user\.cloudflared\config.yml
+exit /b 1
+`
+		err := os.WriteFile(mockCloudflaredPath, []byte(script), 0755)
+		require.NoError(t, err)
+	} else {
+		mockCloudflaredPath = filepath.Join(tmpDir, "cloudflared-conflict")
+		script := `#!/bin/sh
 echo "Cannot use --url with a configuration file /home/user/.cloudflared/config.yml"
 exit 1
 `
-	err := os.WriteFile(mockCloudflaredPath, []byte(script), 0755)
-	require.NoError(t, err)
+		err := os.WriteFile(mockCloudflaredPath, []byte(script), 0755)
+		require.NoError(t, err)
+	}
 
 	provider := NewCloudflareProvider(true, mockCloudflaredPath)
 	defer provider.Close()
@@ -132,7 +151,7 @@ exit 1
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err = provider.StartShare(ctx, share, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	_, err := provider.StartShare(ctx, share, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pre-existing cloudflared configuration file")
 }

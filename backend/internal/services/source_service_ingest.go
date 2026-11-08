@@ -28,6 +28,18 @@ import (
 // writing file bytes directly to a temporary staging workspace (.uploads/<sourceID>),
 // normalizing wrapper paths, atomically moving to final storage, and initiating async detection.
 func (s *SourceService) IngestMultipartStream(ctx context.Context, ownerID uuid.UUID, reader *multipart.Reader) (*SourceUploadResult, error) {
+	// Enforce practical per-owner storage quota
+	if s.db != nil {
+		var currentOwnerBytes int64
+		_ = s.db.QueryRow(ctx,
+			"SELECT COALESCE(SUM(total_bytes), 0) FROM source_workspaces WHERE owner_id = $1",
+			ownerID,
+		).Scan(&currentOwnerBytes)
+		if currentOwnerBytes >= MaxOwnerStorageQuotaBytes {
+			return nil, ErrOwnerStorageQuotaExceeded
+		}
+	}
+
 	sourceID := uuid.New()
 	uploadDir := filepath.Join(s.sourcesDir, ".uploads", sourceID.String())
 	targetDir := filepath.Join(s.sourcesDir, sourceID.String())

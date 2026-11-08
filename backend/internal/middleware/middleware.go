@@ -96,8 +96,60 @@ func AuthMiddleware(jwtManager *auth.JWTManager) func(http.Handler) http.Handler
 	}
 }
 
+var (
+	previewHostsMu   sync.RWMutex
+	previewHosts     = make(map[string]bool)
+	previewValidator func(host string) bool
+)
+
+// RegisterPreviewHost registers an active preview host for CORS and origin validation.
+func RegisterPreviewHost(host string) {
+	if host == "" {
+		return
+	}
+	previewHostsMu.Lock()
+	defer previewHostsMu.Unlock()
+	previewHosts[strings.ToLower(strings.TrimSpace(host))] = true
+}
+
+// UnregisterPreviewHost unregisters a preview host when a share is revoked or expired.
+func UnregisterPreviewHost(host string) {
+	if host == "" {
+		return
+	}
+	previewHostsMu.Lock()
+	defer previewHostsMu.Unlock()
+	delete(previewHosts, strings.ToLower(strings.TrimSpace(host)))
+}
+
+// SetPreviewOriginValidator sets a custom callback to validate active preview hosts.
+func SetPreviewOriginValidator(fn func(host string) bool) {
+	previewHostsMu.Lock()
+	defer previewHostsMu.Unlock()
+	previewValidator = fn
+}
+
+// IsValidPreviewHost checks whether host is an active registered preview host or matches the preview validator.
+func IsValidPreviewHost(host string) bool {
+	norm := strings.ToLower(strings.TrimSpace(host))
+	if norm == "" {
+		return false
+	}
+	previewHostsMu.RLock()
+	if previewHosts[norm] {
+		previewHostsMu.RUnlock()
+		return true
+	}
+	fn := previewValidator
+	previewHostsMu.RUnlock()
+	if fn != nil {
+		return fn(norm)
+	}
+	return false
+}
+
 // IsAllowedOrigin checks whether a given origin is in the allowed origins list,
-// or matches a trycloudflare.com preview tunnel domain.
+// or matches a verified active preview tunnel domain.
 func IsAllowedOrigin(origin string, allowedOrigins []string) bool {
 	if origin == "" {
 		return false
@@ -108,10 +160,20 @@ func IsAllowedOrigin(origin string, allowedOrigins []string) bool {
 		if normAllowed == "*" || normAllowed == normOrigin {
 			return true
 		}
+		// Support wildcard subdomain patterns like http://*.preview.domain or https://*.preview.domain
+		if strings.HasPrefix(normAllowed, "http://*.") || strings.HasPrefix(normAllowed, "https://*.") {
+			if u, err := url.Parse(normOrigin); err == nil {
+				dotIdx := strings.Index(normAllowed, "*.")
+				domainSuffix := normAllowed[dotIdx+2:]
+				if strings.HasSuffix(u.Hostname(), "."+domainSuffix) || u.Hostname() == domainSuffix {
+					return true
+				}
+			}
+		}
 	}
 	if u, err := url.Parse(normOrigin); err == nil {
 		host := u.Hostname()
-		if strings.HasSuffix(host, ".trycloudflare.com") {
+		if IsValidPreviewHost(host) {
 			return true
 		}
 	}
@@ -225,6 +287,13 @@ func ResolveGuestSession(w http.ResponseWriter, r *http.Request) uuid.UUID {
 // Origin and Referer headers are validated against allowedOrigins to prevent
 // unauthorized cross-origin mutations.
 func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool, allowedOrigins ...string) func(http.Handler) http.Handler {
+	return AuthOrGuestMiddlewareWithTrustedProxies(jwtManager, allowGuestMode, nil, allowedOrigins...)
+}
+
+// AuthOrGuestMiddlewareWithTrustedProxies validates JWT tokens for registered users or assigns an
+// isolated or local guest identity if unauthenticated and guest mode is enabled.
+// Untrusted forwarding headers like X-Forwarded-Host are only inspected when the immediate peer is a trusted proxy.
+func AuthOrGuestMiddlewareWithTrustedProxies(jwtManager *auth.JWTManager, allowGuestMode bool, trustedProxies []string, allowedOrigins ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tokenString := ""
@@ -286,10 +355,15 @@ func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool, all
 				if origin != "" {
 					allowed := IsAllowedOrigin(origin, allowedOrigins)
 					if !allowed {
-						if u, err := url.Parse(origin); err == nil {
-							fwdHost := r.Header.Get("X-Forwarded-Host")
-							if fwdHost != "" && strings.EqualFold(u.Hostname(), fwdHost) {
-								allowed = true
+						// Strictly require immediate peer to be a trusted proxy before inspecting X-Forwarded-Host
+						if len(trustedProxies) > 0 && IsTrustedProxy(r.RemoteAddr, trustedProxies) {
+							if u, err := url.Parse(origin); err == nil {
+								fwdHost := r.Header.Get("X-Forwarded-Host")
+								if fwdHost != "" && strings.EqualFold(u.Hostname(), fwdHost) {
+									if IsAllowedOrigin("https://"+fwdHost, allowedOrigins) || IsValidPreviewHost(fwdHost) {
+										allowed = true
+									}
+								}
 							}
 						}
 					}
@@ -312,9 +386,14 @@ func AuthOrGuestMiddleware(jwtManager *auth.JWTManager, allowGuestMode bool, all
 							refOrigin := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 							allowed := IsAllowedOrigin(refOrigin, allowedOrigins)
 							if !allowed {
-								fwdHost := r.Header.Get("X-Forwarded-Host")
-								if fwdHost != "" && strings.EqualFold(u.Hostname(), fwdHost) {
-									allowed = true
+								// Strictly require immediate peer to be a trusted proxy before inspecting X-Forwarded-Host
+								if len(trustedProxies) > 0 && IsTrustedProxy(r.RemoteAddr, trustedProxies) {
+									fwdHost := r.Header.Get("X-Forwarded-Host")
+									if fwdHost != "" && strings.EqualFold(u.Hostname(), fwdHost) {
+										if IsAllowedOrigin("https://"+fwdHost, allowedOrigins) || IsValidPreviewHost(fwdHost) {
+											allowed = true
+										}
+									}
 								}
 							}
 							if !allowed {
@@ -494,6 +573,13 @@ func TrustedProxyRealIP(trustedProxies ...string) func(http.Handler) http.Handle
 						r.RemoteAddr = clientIP
 					}
 				}
+			} else {
+				// Strip spoofed forwarding headers from untrusted clients
+				r.Header.Del("X-Forwarded-For")
+				r.Header.Del("X-Forwarded-Host")
+				r.Header.Del("X-Forwarded-Proto")
+				r.Header.Del("X-Forwarded-Port")
+				r.Header.Del("X-Real-IP")
 			}
 			next.ServeHTTP(w, r)
 		})
@@ -516,16 +602,10 @@ func SecurityHeadersWithTrustedProxies(trustedProxies []string) func(http.Handle
 			w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'none';")
 
-			// Apply HSTS only under correctly configured HTTPS conditions
+			// Apply HSTS only under verified HTTPS conditions (direct TLS or verified trusted proxy)
 			isDirectTLS := r.TLS != nil
 			isForwardedHTTPS := false
-			if len(trustedProxies) > 0 {
-				if IsTrustedProxy(r.RemoteAddr, trustedProxies) {
-					isForwardedHTTPS = strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-				}
-			} else {
-				// Standalone legacy behavior when trusted proxies slice is omitted:
-				// evaluate X-Forwarded-Proto directly
+			if len(trustedProxies) > 0 && IsTrustedProxy(r.RemoteAddr, trustedProxies) {
 				isForwardedHTTPS = strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 			}
 			if isDirectTLS || isForwardedHTTPS {
@@ -563,6 +643,11 @@ func RequestLogger(next http.Handler) http.Handler {
 // Preflight OPTIONS requests and standard requests from disallowed origins are strictly
 // forbidden from receiving Access-Control-Allow-Origin headers.
 func CORS(allowedOriginsInputs ...string) func(http.Handler) http.Handler {
+	return CORSWithTrustedProxies(nil, allowedOriginsInputs...)
+}
+
+// CORSWithTrustedProxies creates CORS middleware with trusted-proxy awareness.
+func CORSWithTrustedProxies(trustedProxies []string, allowedOriginsInputs ...string) func(http.Handler) http.Handler {
 	allowedOrigins := make(map[string]bool)
 	for _, input := range allowedOriginsInputs {
 		for _, o := range strings.Split(input, ",") {
@@ -585,9 +670,15 @@ func CORS(allowedOriginsInputs ...string) func(http.Handler) http.Handler {
 				if !isAllowed {
 					if u, err := url.Parse(normOrigin); err == nil {
 						host := u.Hostname()
-						fwdHost := r.Header.Get("X-Forwarded-Host")
-						if strings.HasSuffix(host, ".trycloudflare.com") || (fwdHost != "" && strings.EqualFold(host, fwdHost)) {
+						if IsValidPreviewHost(host) {
 							isAllowed = true
+						} else if len(trustedProxies) > 0 && IsTrustedProxy(r.RemoteAddr, trustedProxies) {
+							fwdHost := r.Header.Get("X-Forwarded-Host")
+							if fwdHost != "" && strings.EqualFold(host, fwdHost) {
+								if allowedOrigins["http://"+strings.ToLower(fwdHost)] || allowedOrigins["https://"+strings.ToLower(fwdHost)] || IsValidPreviewHost(fwdHost) {
+									isAllowed = true
+								}
+							}
 						}
 					}
 				}

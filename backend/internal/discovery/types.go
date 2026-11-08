@@ -90,6 +90,7 @@ type DiscoveredService struct {
 	NetworkAliases      map[string][]string     `json:"network_aliases,omitempty"`
 	Environment         []EnvironmentProvenance `json:"environment"`
 	ResourceConfig      models.ResourceConfig   `json:"resource_config"`
+	User                string                  `json:"user,omitempty"`
 	FilesCount          int                     `json:"files_count"`
 	TotalBytes          int64                   `json:"total_bytes"`
 }

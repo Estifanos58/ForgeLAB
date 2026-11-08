@@ -108,24 +108,54 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	req := httptest.NewRequest("GET", "/api/test", nil)
-	req.Header.Set("X-Forwarded-Proto", "https")
-	rec := httptest.NewRecorder()
+	t.Run("Direct TLS sets HSTS", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.TLS = &tls.ConnectionState{}
+		rec := httptest.NewRecorder()
 
-	mw.ServeHTTP(rec, req)
+		mw.ServeHTTP(rec, req)
 
-	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
-		t.Errorf("missing or incorrect X-Content-Type-Options header")
-	}
-	if rec.Header().Get("X-Frame-Options") != "DENY" {
-		t.Errorf("missing or incorrect X-Frame-Options header")
-	}
-	if rec.Header().Get("Strict-Transport-Security") == "" {
-		t.Errorf("missing Strict-Transport-Security for HTTPS request")
-	}
-	if !strings.Contains(rec.Header().Get("Content-Security-Policy"), "default-src 'self'") {
-		t.Errorf("missing or incorrect Content-Security-Policy")
-	}
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("missing or incorrect X-Content-Type-Options header")
+		}
+		if rec.Header().Get("X-Frame-Options") != "DENY" {
+			t.Errorf("missing or incorrect X-Frame-Options header")
+		}
+		if rec.Header().Get("Strict-Transport-Security") == "" {
+			t.Errorf("missing Strict-Transport-Security for HTTPS request")
+		}
+		if !strings.Contains(rec.Header().Get("Content-Security-Policy"), "default-src 'self'") {
+			t.Errorf("missing or incorrect Content-Security-Policy")
+		}
+	})
+
+	t.Run("Untrusted client spoofing X-Forwarded-Proto does not get HSTS", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.Header.Set("X-Forwarded-Proto", "https")
+		rec := httptest.NewRecorder()
+
+		mw.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Strict-Transport-Security") != "" {
+			t.Errorf("expected no Strict-Transport-Security header for untrusted client forwarding header")
+		}
+	})
+
+	t.Run("Trusted proxy forwarding X-Forwarded-Proto gets HSTS", func(t *testing.T) {
+		trustedMw := middleware.SecurityHeadersWithTrustedProxies([]string{"127.0.0.1"})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("X-Forwarded-Proto", "https")
+		rec := httptest.NewRecorder()
+
+		trustedMw.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Strict-Transport-Security") == "" {
+			t.Errorf("expected Strict-Transport-Security header when forwarded by trusted proxy")
+		}
+	})
 }
 
 func TestTrustedProxyRealIP(t *testing.T) {

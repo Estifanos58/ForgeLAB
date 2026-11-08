@@ -323,12 +323,22 @@ func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*
 		if errors.Is(err, pgx.ErrNoRows) {
 			_ = tx.Rollback(ctx)
 
-			// Re-check rotation cache: a concurrent request may have completed rotation just ahead of us
-			if cached := s.getCachedRotation(ctx, tokenHash); cached != nil {
-				return cached, nil
+			// If grace period is active, spin briefly checking rotation cache:
+			// a concurrent winning transaction is committing and caching replacement tokens.
+			if s.gracePeriod > 0 {
+				for attempt := 0; attempt < 10; attempt++ {
+					if cached := s.getCachedRotation(ctx, tokenHash); cached != nil {
+						return cached, nil
+					}
+					time.Sleep(time.Duration(15*(attempt+1)) * time.Millisecond)
+				}
+				if cached := s.getCachedRotation(ctx, tokenHash); cached != nil {
+					return cached, nil
+				}
 			}
 
-			// Token couldn't be claimed. Query token state to determine exact failure cause.
+			// Token couldn't be claimed and is not in rotation cache.
+			// Query token state to determine exact failure cause.
 			var isRevoked bool
 			var expiresAt time.Time
 			checkErr := s.db.QueryRow(ctx,
@@ -342,11 +352,6 @@ func (s *UserService) RefreshTokens(ctx context.Context, refreshToken string) (*
 				return nil, fmt.Errorf("failed to check refresh token state: %w", checkErr)
 			}
 			if isRevoked {
-				// Brief spin to allow any winning concurrent transaction in flight to commit and cache
-				time.Sleep(20 * time.Millisecond)
-				if cached := s.getCachedRotation(ctx, tokenHash); cached != nil {
-					return cached, nil
-				}
 				return nil, ErrTokenRevoked
 			}
 			if now.After(expiresAt) {

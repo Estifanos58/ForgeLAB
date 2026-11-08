@@ -342,11 +342,11 @@ These are identified codebase behaviors that require investigation and resolutio
   - Re-attaches runtime log collectors if the container is running.
   - If restarting the previous container fails or if the container is not in `running` state, `hasPreviousHealthy` flips to `false`. ForgeLAB never reports successful recovery; the coarse service status is degraded to `models.ServiceStatusFailed`, and failure diagnostics are logged and persisted.
 
-### 45. Provider-Specific Sharing Configuration & Guest Mode Alignment (`RESOLVED IN ARCHITECTURE`)
+### 45. Provider-Specific Sharing Configuration & Production Guest Mode Hardening (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/config/config.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config.go), [`backend/internal/config/config_test.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config_test.go), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml), [`.env.example`](file:///c:/Users/estif/Desktop/ForgeLAB/.env.example)
 - **Resolution:**
   - `validateSharingConfig` distinguishes providers: Cloudflare Quick Tunnels (`SHARE_PROVIDER=cloudflare`) require no gateway credentials or tunnel URL, enabling domainless sharing out of the box. Gateway provider (`SHARE_PROVIDER=gateway`) validates `GATEWAY_TUNNEL_URL` and `GATEWAY_AUTH_TOKEN`/`GATEWAY_AUTH_SECRET`. Unsupported providers are rejected at startup with clear descriptive errors.
-  - Guest Mode enabled-by-default behavior (`FORGELAB_ALLOW_GUEST_MODE=true`) is aligned across backend configuration, `.env.example`, and Docker Compose. Compose defaults to `${FORGELAB_ALLOW_GUEST_MODE:-true}`, preserving registration-free local deployments.
+  - Production default for Guest Mode (`FORGELAB_ALLOW_GUEST_MODE`) is disabled (`false`) across `.env.example`, Docker Compose (`${FORGELAB_ALLOW_GUEST_MODE:-false}`), and Go configuration. Guest Mode remains available and isolated for local or self-hosted deployments via explicit opt-in configuration without breaking anonymous sessions.
 
 ### 46. Docker Build Intermediate Container Cleanup & Host Trust Boundaries (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
@@ -360,6 +360,55 @@ These are identified codebase behaviors that require investigation and resolutio
   - Refactored frontend `CreateProjectModal` (reduced from 3,710 to 1,952 lines) by extracting modular components: `PlanReviewStep`, `ConfigStep`, `ArchiveUploadSource`, `LocalAgentSource`, and `GitHubImportSource`, preserving all interfaces, callbacks, and validation steps.
   - Decomposed backend `deployment_service.go` (reduced from 3,321 to ~2,050 lines) by extracting log persistence and query methods (`deployment_service_logs.go`), deployment and service status transitions (`deployment_service_status.go`), and deployment queue reconciliation and cancellation (`deployment_service_reconcile.go`).
   - Extracted legacy single-container deployment execution into `backend/internal/docker/engine_legacy.go` (750 lines).
+
+### 48. Control-Plane Isolation & Safe Host-Port Preview Routing (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/tunnel/upstream_resolver.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/tunnel/upstream_resolver.go), [`backend/internal/tunnel/local_router.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/tunnel/local_router.go), [`backend/internal/tunnel/share_router.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/tunnel/share_router.go)
+- **Resolution:**
+  - Completely eliminated `r.dockerCli.NetworkConnect(...)`, which previously attached the privileged backend container to tenant Docker bridge networks. The control plane remains strictly isolated on its internal network (`forgelab-net`).
+  - Upstream resolution routes preview traffic through published Docker container host ports (`HostPort`), checking both loopback `127.0.0.1:<port>` and `host.docker.internal:<port>`.
+  - Enhanced management plane shielding (`isForbiddenUpstream`): strictly blocks internal management ports (8080 backend, 4142 agent, 3000 frontend, 5432 postgres, 6379 redis) and internal hostnames, preventing SSRF or management service exposure.
+
+### 49. Proxy Trust, Forwarding Header Stripping & Dynamic Preview CORS (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/middleware/middleware.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/middleware/middleware.go), [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go), [`backend/internal/services/share_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/share_service.go)
+- **Resolution:**
+  - Untrusted client requests have all spoofed forwarding headers (`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Real-IP`) stripped at the request boundary by `TrustedProxyRealIP`.
+  - HSTS headers are applied strictly under verified HTTPS conditions (direct TLS connection or verified trusted proxy peer).
+  - CORS origin validation no longer accepts broad wildcard `*.trycloudflare.com` origins (which could allow arbitrary Cloudflare tunnel operators to bypass CORS). Instead, `ShareService` registers active preview hosts into a thread-safe dynamic registry (`RegisterPreviewHost` / `UnregisterPreviewHost`), validating preview hosts strictly against active shares.
+
+### 50. Gateway Verified TLS Enforcement in Production (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/config/config.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config.go), [`backend/internal/tunnel/tunnel_manager.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/tunnel/tunnel_manager.go)
+- **Resolution:**
+  - `validateSharingConfig` in production (`!isDev`) strictly rejects `GATEWAY_TLS_SKIP_VERIFY=true`.
+  - Removed automatic fallback from TLS to unencrypted plaintext TCP. In production, outbound gateway connections require verified TLS via `tls.DialWithDialer`.
+
+### 51. JWT Token Default Alignment & Concurrency Grace Window (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/config/config.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config.go), [`.env.example`](file:///c:/Users/estif/Desktop/ForgeLAB/.env.example), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml), [`backend/internal/services/user_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/user_service.go), [`frontend/src/lib/auth/session-manager.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/lib/auth/session-manager.ts)
+- **Resolution:**
+  - Extended and aligned JWT token expiries: Access token expiry defaults to 48 hours (> 1 day, `JWT_ACCESS_TOKEN_EXPIRY=48h`), and refresh token expiry defaults to 14 days (> 1 week, `JWT_REFRESH_TOKEN_EXPIRY=14d`) supporting both duration strings and minutes/days, with extended 24-hour frontend session inactivity limits and bidirectional WebSocket session updates.
+  - Added bounded retry spin (up to 5 attempts over ~300ms) in `UserService.RefreshTokens` when an in-flight concurrent transaction is committing and caching its rotation.
+  - Added short grace window check in frontend `SessionManager.performRefreshCall` on 401 before declaring `SESSION_EXPIRED`, preventing tab desynchronization and spurious logouts during simultaneous tab requests.
+
+### 52. Cloudflare Tunnel Lifecycle, Graceful Shutdown & Stale Share Reconcile (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/tunnel/cloudflare_provider.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/tunnel/cloudflare_provider.go), [`backend/internal/services/share_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/share_service.go)
+- **Resolution:**
+  - Configured `cmd.Cancel` with graceful interruption signal (SIGINT fallback to Kill) and `cmd.WaitDelay = 3 * time.Second`.
+  - Eliminated startup race: after receiving a trycloudflare URL from stdout, the provider checks `managed.done` and `errCh` to verify the process didn't terminate immediately before marking state as `Online`.
+  - Replaced fire-and-forget goroutines in `CloudflareProvider.Close()` with a bounded `sync.WaitGroup` waiting up to 5 seconds for all child processes and listeners to exit.
+  - Startup reconciliation (`ReconcileStaleShares`) cleans up all active shares across PostgreSQL and unregisters preview hosts upon server reboot.
+
+### 53. Container Capability Minimization, Non-Root Profiles & Quotas (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/trust_boundary.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/trust_boundary.go), [`backend/internal/discovery/compose.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/compose.go), [`backend/internal/models/models.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/models/models.go), [`backend/internal/docker/engine_service_deploy.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_service_deploy.go), [`backend/internal/services/source_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/source_service.go)
+- **Resolution:**
+  - Reduced standard container `safeCaps` from `["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]` to `["CHOWN", "SETGID", "SETUID"]`, omitting filesystem permission bypasses (`DAC_OVERRIDE`, `FOWNER`) from standard default capabilities.
+  - Added `User` field across `RawComposeService`, `DiscoveredService`, `models.Service`, and `models.ServiceDeployment`, wiring `containerConfig.User = service.User` to support non-root container profiles.
+  - Introduced cumulative per-owner resource quota validation (`ValidateOwnerResourceQuota`) and practical per-owner storage quota check (`MaxOwnerStorageQuotaBytes = 1GB`) on source archive ingest.
+
+### 54. Independent CI Security Scanners & Govulncheck Audit (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`.github/workflows/ci.yml`](file:///.github/workflows/ci.yml), [`docs/00-current-state.md`](file:///docs/00-current-state.md)
+- **Resolution:**
+  - Split unified `security-scan` job into three independent CI jobs: `security-govulncheck`, `security-npm-audit`, and `security-trivy`. If one scanner reports findings, the others still execute to completion.
+  - Documented govulncheck findings: 2 findings in `github.com/docker/docker@v28.5.2+incompatible` (`GO-2026-4887`, `GO-2026-4883`, Fixed in: N/A) reside in the Docker daemon (`daemon.Daemon.ContainerCreate`) not run by ForgeLAB; standard library findings on local dev (`go1.27.0`) are resolved in production CI via Go 1.26.10 (`golang:1.26-alpine`).
+  - Frontend `npm audit --audit-level=high` reports 0 vulnerabilities.
 
 
 ---

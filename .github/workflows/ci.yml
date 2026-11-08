@@ -206,8 +206,8 @@ jobs:
         run: |
           docker compose down -v
 
-  security-scan:
-    name: Security & Vulnerability Scanning (govulncheck, Trivy, npm audit)
+  security-govulncheck:
+    name: Go Security Scanning (govulncheck)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -226,6 +226,13 @@ jobs:
           cd backend
           govulncheck ./...
 
+  security-npm-audit:
+    name: Frontend Dependency Security Audit (npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -237,6 +244,13 @@ jobs:
         run: |
           cd frontend
           npm audit --audit-level=high
+
+  security-trivy:
+    name: Container & Filesystem Security Scanner (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Run Trivy Vulnerability Scanner (Repo & FS)
         uses: aquasecurity/trivy-action@master

@@ -155,6 +155,9 @@ export function useDeploymentWS({
 
       const activeWs = wsRef.current;
       if (activeWs) {
+        if (sessionManager.getActiveWebSocket() === activeWs) {
+          sessionManager.registerWebSocket(null);
+        }
         // Prevent onclose handler from scheduling reconnect during intentional cleanup
         activeWs.onclose = null;
         activeWs.onerror = null;
@@ -230,6 +233,8 @@ export function useDeploymentWS({
         }
 
         // Socket is open at the transport layer; now subscribe to the channel
+        sessionManager.registerWebSocket(ws);
+        sessionManager.recordActivity('websocket');
         setConnectionState('subscribing');
 
         // Send subscription request with replay support
@@ -248,6 +253,10 @@ export function useDeploymentWS({
           if (ws.readyState === WebSocket.OPEN) {
             try {
               ws.send(JSON.stringify({ type: 'ping' }));
+              const now = Date.now();
+              if (now - sessionManager.getLastSessionUpdateTime() >= 2 * 60 * 1000) {
+                ws.send(JSON.stringify({ type: 'touch_session', timestamp: now }));
+              }
             } catch {
               // Ignore ping send errors
             }
@@ -260,6 +269,7 @@ export function useDeploymentWS({
 
         try {
           const msg = JSON.parse(event.data);
+          sessionManager.recordActivity('websocket');
 
           switch (msg.type) {
             case 'subscribed':
@@ -349,7 +359,11 @@ export function useDeploymentWS({
               break;
 
             case 'pong':
-              // Heartbeat keepalive acknowledged
+              sessionManager.handleWebSocketSessionUpdate(msg.data?.timestamp);
+              break;
+
+            case 'session_updated':
+              sessionManager.handleWebSocketSessionUpdate(msg.data?.timestamp);
               break;
 
             default:
@@ -367,6 +381,9 @@ export function useDeploymentWS({
       };
 
       ws.onclose = (event) => {
+        if (sessionManager.getActiveWebSocket() === ws) {
+          sessionManager.registerWebSocket(null);
+        }
         if (isDisposed || isIntentionalCloseRef.current) {
           setConnectionState('offline');
           return;

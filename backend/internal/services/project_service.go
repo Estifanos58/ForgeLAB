@@ -111,6 +111,7 @@ type CreateServiceInput struct {
 	DependsOnConditions map[string]string          `json:"depends_on_conditions,omitempty"`
 	Volumes             []models.VolumeMountConfig `json:"volumes,omitempty"`
 	Networks            []string                   `json:"networks,omitempty"`
+	User                string                     `json:"user,omitempty"`
 }
 
 // CreateProjectInput holds the data needed to create a project.
@@ -576,6 +577,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				Role:                svcRole,
 				Classification:      svcClassification,
 				Image:               strings.TrimSpace(svcIn.Image),
+				User:                strings.TrimSpace(svcIn.User),
 				DependsOn:           svcIn.DependsOn,
 				DependsOnConditions: svcIn.DependsOnConditions,
 				Volumes:             sanitizedVolumes,

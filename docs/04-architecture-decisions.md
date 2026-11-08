@@ -552,10 +552,10 @@ Container configuration is validated through authoritative unified boundaries in
 - **Cross-Tab Refresh Synchronization:** Frontend session refreshes are coordinated across multiple browser tabs using the Web Locks API (`navigator.locks.request('forgelab_auth_refresh_lock', ...)`) with a safe in-memory fallback.
 - **Recheck After Lock Acquisition:** When multiple tabs encounter an expired access token simultaneously, only the lock-winning tab executes the refresh HTTP call (`/api/auth/refresh`). Waiting tabs recheck session freshness immediately upon acquiring the lock, skipping redundant token rotation and preventing accidental cookie invalidation.
 - **BroadcastChannel Notification:** Successful refreshes broadcast a synchronization message over `new BroadcastChannel('forgelab_session_channel')` notifying peer tabs to reset their failure counts and synchronize timestamps.
-- **WebSocket Ticket Authentication:** `CreateTicketHandler` validates incoming access tokens and strictly rejects expired tokens with HTTP 401 instead of silently degrading authenticated sessions to Guest mode. Guest sessions remain isolated and enabled by default for unauthenticated exploratory use.
-- **WebSocket Reconnection with Session Recovery:** When WebSocket connections receive authentication or ticket expiration errors, the client recovers the session via `SessionManager.fetchTicketWithSession()`, requests a fresh single-use ticket, and reconnects while strictly preserving `last_sequence` to replay missed logs without infinite refresh loops on resource-denied errors.
+- **WebSocket Ticket Authentication:** `CreateTicketHandler` validates incoming access tokens and strictly rejects expired tokens with HTTP 401 instead of silently degrading authenticated sessions to Guest mode. Guest sessions remain isolated and are enabled by default for local development (`isDev`), but disabled by default in production (`APP_ENV=production`) unless explicitly configured via `FORGELAB_ALLOW_GUEST_MODE=true`.
+- **WebSocket Reconnection with Session Recovery & Bidirectional Session Updates:** When WebSocket connections receive authentication or ticket expiration errors, the client recovers the session via `SessionManager.fetchTicketWithSession()`, requests a fresh single-use ticket, and reconnects while strictly preserving `last_sequence` to replay missed logs without infinite refresh loops on resource-denied errors. During active WebSocket communication (incoming logs, status updates, pongs, or explicit `touch_session` / `session_update` frames), the session is continuously touched and extended, synchronizing session timestamps across tabs without extra HTTP overhead.
 - **Upload Authentication Preflight:** Large source archives execute `SessionManager.preflightUploadSession()` prior to beginning file transmission. If transmission fails midway, the upload is never blindly retried without explicit user action.
-- **Dynamic Cookie Expiration:** Refresh cookie `MaxAge` is derived dynamically from backend configuration `JWT_REFRESH_TOKEN_EXPIRY` rather than a hardcoded duration.
+- **Dynamic Cookie Expiration & Prolonged Sessions:** Refresh cookie `MaxAge` is derived dynamically from backend configuration `JWT_REFRESH_TOKEN_EXPIRY` (default 14 days) and access cookie from `JWT_ACCESS_TOKEN_EXPIRY` (default 48 hours), with frontend session inactivity limits extended to 24 hours (`INACTIVITY_TIMEOUT_MS = 24 * 60 * 60 * 1000`).
 
 ### 13. Subsystem Modularization & Separation of Responsibilities
 To maintain maintainability and clean boundaries, oversized files across the backend and frontend are refactored into cohesive modules targeting ~300–500 lines:
@@ -581,6 +581,29 @@ To maintain maintainability and clean boundaries, oversized files across the bac
   - `websocket/hub`: Modularized into `tickets`, `subscriptions`, and `events`.
 - **Frontend API Architecture:**
   - `lib/api/`: Domain clients (`auth-client`, `projects-client`, `services-client`, `env-client`, `integrations-client`, `sources-client`, `agent-client`, `discovery-client`) built on a common `base.ts` fetch engine, exported through a backward-compatible facade in `client.ts`.
+
+### 14. Control-Plane Isolation, Gateway Security & Container Hardening
+- **Control-Plane Network Isolation:**
+  - The privileged ForgeLAB backend container is never attached to tenant application Docker networks.
+  - Public and local preview reverse-proxy routing resolves solely via container published `HostPort` bindings on loopback (`127.0.0.1:<hp>`) or `host.docker.internal:<hp>`.
+  - Upstream resolution strictly validates and blocks routing to management services (:8080, :4142, :3000, :5432, :6379, the Docker socket, `forgelab-backend`, and `forgelab-frontend`).
+- **Proxy Trust & Dynamic CORS Security:**
+  - Untrusted client requests have all forwarding headers (`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`) stripped before reaching routing middleware. Forwarding headers are parsed right-to-left exclusively when originating from configured trusted proxies (`RATE_LIMIT_TRUSTED_PROXIES`).
+  - HSTS headers are applied strictly to direct TLS connections or verified trusted-proxy HTTPS requests.
+  - Preview origin validation in CORS uses a dynamic thread-safe host registry (`RegisterPreviewHost`, `UnregisterPreviewHost`), rejecting arbitrary `*.trycloudflare.com` wildcards.
+- **Gateway & Tunnel Reliability:**
+  - Verified TLS is mandatory for gateway connections in production (`!isDev`). `GATEWAY_TLS_SKIP_VERIFY=true` is rejected during configuration validation, and automatic TLS-to-plaintext fallback is eliminated.
+  - Cloudflare Quick Tunnel child process lifecycles use `cmd.Cancel` with graceful `os.Interrupt`, 3-second wait delays, and synchronized `sync.WaitGroup` process reaping on `Close()`.
+  - Ephemeral stale shares from previous runs are reconciled and marked revoked upon server startup.
+- **Container Capability Minimization & Quotas:**
+  - Default container capabilities are minimized to `CapAdd: ["CHOWN", "SETGID", "SETUID"]` with `CapDrop: ["ALL"]`, removing filesystem permission bypasses (`DAC_OVERRIDE`, `FOWNER`).
+  - Support for declared non-root `user` execution profiles in Compose manifests and service definitions is propagated to `containerConfig.User`.
+  - Owner-level cumulative resource quotas (`ValidateOwnerResourceQuota`) and a 1GB cumulative source upload quota (`MaxOwnerStorageQuotaBytes`) prevent resource exhaustion across multi-project tenant workloads.
+- **Extended Token Lifespans & Concurrent Refresh Recovery:**
+  - JWT access tokens last more than a day (default 48 hours / 2 days) and refresh tokens last more than a week (default 14 days / 2 weeks), supporting both standard duration strings (`"48h"`, `"2d"`, `"14d"`, `"30d"`) and numeric values (`2880`, `14`).
+  - Refresh token rotation includes bounded retry cache spin on revocation checks to tolerate concurrent in-flight requests, and the frontend includes a 150ms grace recovery before emitting session expiration.
+  - Active WebSocket streams update and prolong user sessions seamlessly via `touch_session` and `session_updated` messaging.
+
 
 
 

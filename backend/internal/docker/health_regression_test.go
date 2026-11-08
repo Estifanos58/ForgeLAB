@@ -513,7 +513,8 @@ func TestRegression_TrustBoundary_SecurityModelPreserved(t *testing.T) {
 	assert.Equal(t, []string{"ALL"}, []string(cfg.CapDrop), "must drop ALL capabilities")
 
 	// Verify only minimum required safe capabilities for user privilege switching (gosu, su-exec)
-	expectedSafeCaps := []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
+	// (omitting DAC_OVERRIDE and FOWNER by default to prevent filesystem permission bypasses)
+	expectedSafeCaps := []string{"CHOWN", "SETGID", "SETUID"}
 	assert.ElementsMatch(t, expectedSafeCaps, cfg.CapAdd)
 
 	// Host network must be rejected

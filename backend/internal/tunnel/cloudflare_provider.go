@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -177,6 +178,16 @@ func (p *CloudflareProvider) StartShare(
 
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, p.cloudflaredPath, cmdArgs...)
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if err := cmd.Process.Signal(os.Interrupt); err == nil {
+			return nil
+		}
+		return cmd.Process.Kill()
+	}
+	cmd.WaitDelay = 3 * time.Second
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -284,7 +295,18 @@ func (p *CloudflareProvider) StartShare(
 
 	select {
 	case discoveredURL = <-urlFoundCh:
-		// Succeeded in finding URL
+		// Succeeded in finding URL - ensure process did not exit immediately afterwards
+		select {
+		case <-managed.done:
+			cancel()
+			_ = localServer.Close()
+			return nil, fmt.Errorf("cloudflared process exited immediately after reporting tunnel URL")
+		case err := <-errCh:
+			cancel()
+			_ = localServer.Close()
+			return nil, fmt.Errorf("cloudflared failed immediately after reporting tunnel URL: %w", err)
+		default:
+		}
 	case err := <-errCh:
 		cancel()
 		_ = localServer.Close()
@@ -312,6 +334,15 @@ func (p *CloudflareProvider) StartShare(
 		cancel()
 		_ = localServer.Close()
 		return nil, fmt.Errorf("%w: hostname %q does not match *.trycloudflare.com pattern", ErrInvalidTunnelURL, publicHost)
+	}
+
+	// Double-check process has not exited before marking online
+	select {
+	case <-managed.done:
+		cancel()
+		_ = localServer.Close()
+		return nil, fmt.Errorf("cloudflared process terminated during finalization")
+	default:
 	}
 
 	// 7. Mark online and register in manager
@@ -393,7 +424,7 @@ func (p *CloudflareProvider) GetShareStatus(ctx context.Context, shareToken stri
 	return state, reason, nil
 }
 
-// Close gracefully stops all active tunnels and listeners.
+// Close gracefully stops all active tunnels and listeners, waiting for processes to terminate.
 func (p *CloudflareProvider) Close() error {
 	p.mu.Lock()
 	p.stopped = true
@@ -404,27 +435,37 @@ func (p *CloudflareProvider) Close() error {
 	p.tunnels = make(map[string]*managedTunnel)
 	p.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
+	var wg sync.WaitGroup
 	for _, t := range allTunnels {
-		if t.cancel != nil {
-			t.cancel()
-		}
-		if t.localServer != nil {
-			_ = t.localServer.Close()
-		}
-		if t.cmd != nil && t.cmd.Process != nil {
-			go func(cmd *exec.Cmd, done chan struct{}) {
-				select {
-				case <-done:
-				case <-time.After(2 * time.Second):
-					_ = cmd.Process.Kill()
+		wg.Add(1)
+		go func(tunnel *managedTunnel) {
+			defer wg.Done()
+			if tunnel.cancel != nil {
+				tunnel.cancel()
+			}
+			if tunnel.localServer != nil {
+				_ = tunnel.localServer.Close()
+			}
+			select {
+			case <-tunnel.done:
+			case <-time.After(3 * time.Second):
+				if tunnel.cmd != nil && tunnel.cmd.Process != nil {
+					_ = tunnel.cmd.Process.Kill()
 				}
-			}(t.cmd, t.done)
-		}
+			}
+		}(t)
 	}
 
-	_ = ctx
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+
 	return nil
 }

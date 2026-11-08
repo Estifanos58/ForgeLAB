@@ -46,6 +46,9 @@ func connectTestDB(t *testing.T) (*pgxpool.Pool, string) {
 		t.Skipf("Skipping integration test; cannot connect to database at %s: %v", dbURL, err)
 		return nil, ""
 	}
+	t.Cleanup(func() {
+		pool.Close()
+	})
 	return pool, dbURL
 }
 

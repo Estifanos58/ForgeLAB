@@ -465,7 +465,7 @@ func main() {
 	r.Use(middleware.SecurityHeadersWithTrustedProxies(cfg.RateLimit.TrustedProxies))
 	r.Use(middleware.RequestLogger)
 	r.Use(middleware.MaxBodySize(10*1024*1024, 105*1024*1024))
-	r.Use(middleware.CORS(cfg.App.AllowedOriginsList()...))
+	r.Use(middleware.CORSWithTrustedProxies(cfg.RateLimit.TrustedProxies, cfg.App.AllowedOriginsList()...))
 	r.Use(chimiddleware.Recoverer)
 
 	// Health and readiness checks (unauthenticated)
@@ -483,7 +483,7 @@ func main() {
 
 	// WebSocket endpoint & ticket generation
 	r.With(wsConnThrottle).Get("/api/ws", wsHub.ServeWS)
-	r.With(wsConnThrottle, middleware.AuthOrGuestMiddleware(jwtManager, cfg.App.AllowGuestMode, cfg.App.AllowedOriginsList()...)).Post("/api/ws/ticket", wsHub.CreateTicketHandler)
+	r.With(wsConnThrottle, middleware.AuthOrGuestMiddlewareWithTrustedProxies(jwtManager, cfg.App.AllowGuestMode, cfg.RateLimit.TrustedProxies, cfg.App.AllowedOriginsList()...)).Post("/api/ws/ticket", wsHub.CreateTicketHandler)
 
 	// API routes
 	r.Route("/api", func(r chi.Router) {
@@ -520,7 +520,7 @@ func main() {
 
 		// GitHub Integrations & Imports (accessible to registered and guest users; permissions enforced per-repo)
 		r.Group(func(r chi.Router) {
-			r.Use(middleware.AuthOrGuestMiddleware(jwtManager, cfg.App.AllowGuestMode, cfg.App.AllowedOriginsList()...))
+			r.Use(middleware.AuthOrGuestMiddlewareWithTrustedProxies(jwtManager, cfg.App.AllowGuestMode, cfg.RateLimit.TrustedProxies, cfg.App.AllowedOriginsList()...))
 
 			// Integrations (GitHub Repository Access)
 			r.Route("/integrations", func(r chi.Router) {
@@ -547,7 +547,7 @@ func main() {
 
 		// Protected or Guest routes (Local Deployments)
 		r.Group(func(r chi.Router) {
-			r.Use(middleware.AuthOrGuestMiddleware(jwtManager, cfg.App.AllowGuestMode, cfg.App.AllowedOriginsList()...))
+			r.Use(middleware.AuthOrGuestMiddlewareWithTrustedProxies(jwtManager, cfg.App.AllowGuestMode, cfg.RateLimit.TrustedProxies, cfg.App.AllowedOriginsList()...))
 
 			// Source Management & Uploads
 			r.Route("/sources", func(r chi.Router) {

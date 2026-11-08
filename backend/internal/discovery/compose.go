@@ -70,6 +70,7 @@ type RawComposeService struct {
 	Extends     interface{}            `yaml:"extends"`
 	Privileged  bool                   `yaml:"privileged"`
 	CapAdd      []string               `yaml:"cap_add"`
+	User        string                 `yaml:"user"`
 	Ipc         string                 `yaml:"ipc"`
 	Pid         string                 `yaml:"pid"`
 	NetworkMode string                 `yaml:"network_mode"`
@@ -412,6 +413,7 @@ func parseComposeService(name string, raw RawComposeService, repoRoot, composeDi
 		NetworkAliases:      networkAliases,
 		Environment:         envVars,
 		ResourceConfig:      resConfig,
+		User:                strings.TrimSpace(raw.User),
 	}
 }
 

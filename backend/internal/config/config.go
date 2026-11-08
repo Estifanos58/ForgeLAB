@@ -235,12 +235,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid SERVER_PORT: %w", err)
 	}
 
-	accessExpiry, err := strconv.Atoi(getEnv("JWT_ACCESS_TOKEN_EXPIRY", "1440"))
+	accessExpiryDuration, err := parseTokenDuration(getEnv("JWT_ACCESS_TOKEN_EXPIRY", "48h"), time.Minute)
 	if err != nil {
 		return nil, fmt.Errorf("invalid JWT_ACCESS_TOKEN_EXPIRY: %w", err)
 	}
 
-	refreshExpiry, err := strconv.Atoi(getEnv("JWT_REFRESH_TOKEN_EXPIRY", "30"))
+	refreshExpiryDuration, err := parseTokenDuration(getEnv("JWT_REFRESH_TOKEN_EXPIRY", "14d"), 24*time.Hour)
 	if err != nil {
 		return nil, fmt.Errorf("invalid JWT_REFRESH_TOKEN_EXPIRY: %w", err)
 	}
@@ -341,6 +341,7 @@ func Load() (*Config, error) {
 	gatewayTunnel := getEnv("GATEWAY_TUNNEL_URL", "")
 	gatewayPublic := strings.TrimRight(getEnv("GATEWAY_PUBLIC_URL", ""), "/")
 	gatewayAuth := getGatewayAuth()
+	tlsSkipVerify := getEnv("GATEWAY_TLS_SKIP_VERIFY", "false") == "true"
 	sharingProvider := strings.ToLower(strings.TrimSpace(getEnv("FORGELAB_SHARING_PROVIDER", "")))
 	if sharingProvider == "" {
 		if gatewayTunnel != "" && gatewayAuth != "" {
@@ -350,7 +351,7 @@ func Load() (*Config, error) {
 		}
 	}
 	if sharingEnabled {
-		if err := validateSharingConfig(sharingEnabled, sharingProvider, gatewayTunnel, gatewayAuth, envMode, isDev); err != nil {
+		if err := validateSharingConfig(sharingEnabled, sharingProvider, gatewayTunnel, gatewayAuth, tlsSkipVerify, envMode, isDev); err != nil {
 			return nil, err
 		}
 	}
@@ -368,8 +369,8 @@ func Load() (*Config, error) {
 		},
 		JWT: JWTConfig{
 			Secret:             jwtSecret,
-			AccessTokenExpiry:  time.Duration(accessExpiry) * time.Minute,
-			RefreshTokenExpiry: time.Duration(refreshExpiry) * 24 * time.Hour,
+			AccessTokenExpiry:  accessExpiryDuration,
+			RefreshTokenExpiry: refreshExpiryDuration,
 		},
 		Encryption: EncryptionConfig{
 			Key: encKey,
@@ -482,6 +483,48 @@ func parseDurationEnv(key string, fallback time.Duration) time.Duration {
 		}
 	}
 	return fallback
+}
+
+// parseTokenDuration parses either a duration string (e.g. "48h", "2d", "14d", "30m", "2w")
+// or an integer value using defaultUnit (e.g. time.Minute for access token, 24*time.Hour for refresh token).
+func parseTokenDuration(val string, defaultUnit time.Duration) (time.Duration, error) {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return 0, fmt.Errorf("empty duration value")
+	}
+
+	lower := strings.ToLower(val)
+	// Check for custom day suffix "d" (e.g. "2d", "14d", "30d") which standard time.ParseDuration does not support
+	if strings.HasSuffix(lower, "d") {
+		daysStr := strings.TrimSuffix(lower, "d")
+		days, err := strconv.Atoi(daysStr)
+		if err != nil || days <= 0 {
+			return 0, fmt.Errorf("invalid days format %q", val)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+
+	// Check for custom week suffix "w" (e.g. "2w")
+	if strings.HasSuffix(lower, "w") {
+		weeksStr := strings.TrimSuffix(lower, "w")
+		weeks, err := strconv.Atoi(weeksStr)
+		if err != nil || weeks <= 0 {
+			return 0, fmt.Errorf("invalid weeks format %q", val)
+		}
+		return time.Duration(weeks) * 7 * 24 * time.Hour, nil
+	}
+
+	// Try standard Go duration (e.g. "48h", "30m", "72h")
+	if d, err := time.ParseDuration(val); err == nil && d > 0 {
+		return d, nil
+	}
+
+	// Try plain integer with defaultUnit (e.g. 2880 -> 2880 * defaultUnit; 14 -> 14 * defaultUnit)
+	if n, err := strconv.Atoi(val); err == nil && n > 0 {
+		return time.Duration(n) * defaultUnit, nil
+	}
+
+	return 0, fmt.Errorf("invalid duration value %q", val)
 }
 
 func parseStringSlice(s string) []string {
@@ -685,9 +728,12 @@ func getGatewayAuth() string {
 	return auth
 }
 
-func validateSharingConfig(enabled bool, provider, gatewayTunnel, gatewayAuth, envMode string, isDev bool) error {
+func validateSharingConfig(enabled bool, provider, gatewayTunnel, gatewayAuth string, tlsSkipVerify bool, envMode string, isDev bool) error {
 	if !enabled {
 		return nil
+	}
+	if !isDev && tlsSkipVerify {
+		return fmt.Errorf("%s configuration error: GATEWAY_TLS_SKIP_VERIFY=true is strictly forbidden in production", envMode)
 	}
 	p := strings.ToLower(strings.TrimSpace(provider))
 	if p == "" {

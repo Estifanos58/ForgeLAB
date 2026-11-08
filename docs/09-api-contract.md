@@ -34,8 +34,8 @@
   1. Secure HttpOnly cookie (`forgelab_access_token`)
   2. Standard HTTP header `Authorization: Bearer <access_token>`
   3. Short-lived single-use tickets: `POST /api/ws/ticket` returns a 60-second single-use ticket consumed via `GET /api/ws?ticket=<uuid>`. Once consumed or expired, the ticket is immediately invalidated.
-- Access tokens expire after 15 minutes (`JWT_ACCESS_TOKEN_EXPIRY`).
-- Refresh tokens expire after 7 days (`JWT_REFRESH_TOKEN_EXPIRY`) and use atomic single-use rotation.
+- Access tokens expire after 48 hours by default (> 1 day, configured via `JWT_ACCESS_TOKEN_EXPIRY`, supporting durations like `48h`, `2d`, or minutes).
+- Refresh tokens expire after 14 days by default (> 1 week, configured via `JWT_REFRESH_TOKEN_EXPIRY`, supporting durations like `14d`, `30d`, or days) and use atomic single-use rotation.
 
 ### Registration-Free Guest Workspace & Isolated Guest Sessions (Local Deployments)
 - When `FORGELAB_ALLOW_GUEST_MODE=true` (or in local development `isDev`), unauthenticated requests to local deployment endpoints (`/api/sources/*`, `/api/discovery/plan`, `/api/projects/*`, and `/api/ws`) use `middleware.AuthOrGuestMiddleware`.

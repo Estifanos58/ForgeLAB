@@ -111,7 +111,7 @@ frontend/
 ### No Client-Side Token Storage
 - Neither access tokens nor refresh tokens are stored in `localStorage`, `sessionStorage`, cookies readable by JavaScript, or client-side URL parameters.
 - All tokens are issued by the Go backend as **HttpOnly, SameSite, Secure (configurable)** cookies:
-  - `forgelab_access_token` (15-minute expiry)
+  - `forgelab_access_token` (48-hour default expiry, > 1 day)
   - `forgelab_refresh_token` (dynamically derived from `JWT_REFRESH_TOKEN_EXPIRY`)
 - Every API call from the browser sends `credentials: 'include'`. The browser automatically attaches cookies to all requests proxied to the backend.
 
@@ -123,6 +123,7 @@ ForgeLAB provides a unified `SessionManager` (`frontend/src/lib/auth/session-man
 4. **BroadcastChannel Synchronization:** Refreshed tabs notify peer tabs via `BroadcastChannel('forgelab_session_channel')` to reset retry state.
 5. **Upload Preflight Check:** Large uploads pre-validate session freshness via `SessionManager.preflightUploadSession()` before initiating multipart streaming; failed transfers are not automatically retried midway.
 6. **WebSocket Ticket Recovery:** When WebSocket connections receive authentication or ticket errors, `fetchTicketWithSession()` refreshes the session, fetches a new ticket, and reconnects with `last_sequence` log replay. Genuine resource denial errors are classified to prevent infinite refresh cycles.
+7. **Real-Time WebSocket Session Updates:** When active WebSocket connections stream deployment logs, pongs, or status changes, `SessionManager` records active interaction, extends the prolonged 24-hour inactivity timeout, and synchronizes session updates bidirectionally via `touch_session` and `session_updated` messaging without extra HTTP overhead.
 
 ### Next.js 16 `proxy.ts` Route Protection
 Next.js 16 introduces `proxy.ts` as the standard route interceptor replacing `middleware.ts`.
