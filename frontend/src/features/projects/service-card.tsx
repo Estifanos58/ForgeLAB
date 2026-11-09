@@ -92,18 +92,11 @@ export function ServiceCard({
         return 'Deploying...';
     }
   };
-
-  // Construct browser-accessible preview URL strictly when confirmed running and public
   const isPublicOrExposed = Boolean(
     service.public_exposed || service.role === 'frontend' || service.preview_url
   );
-  const previewUrl =
-    isRunning
-      ? service.preview_url ||
-        (isPublicOrExposed && service.host_port
-          ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${service.host_port}`
-          : null)
-      : null;
+  // Authoritative preview URL from backend when confirmed running
+  const previewUrl = isRunning ? service.preview_url || null : null;
 
   const wasServiceDeployed = Boolean(
     service.current_service_deployment_id ||

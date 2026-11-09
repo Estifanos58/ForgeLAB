@@ -168,6 +168,7 @@ func main() {
 	repositoryImportService := services.NewRepositoryImportService(pool, cfg.Docker.SourcesDir, githubService)
 
 	userService := services.NewUserService(pool, jwtManager)
+	userService.SetEncryptor(encryptor)
 	if redisClient != nil {
 		userService.SetRedisClient(redisClient)
 	}
@@ -430,6 +431,29 @@ func main() {
 				return
 			case <-importTicker.C:
 				repositoryImportService.PruneExpiredImports(ctx)
+			}
+		}
+	}()
+
+	// Launch periodic cleanup for expired public shares and expired refresh tokens
+	go func() {
+		janitorTicker := time.NewTicker(5 * time.Minute)
+		defer janitorTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-janitorTicker.C:
+				if prunedShares, err := shareService.CleanupExpiredShares(ctx); err != nil {
+					slog.Warn("failed to clean up expired public shares", "error", err)
+				} else if prunedShares > 0 {
+					slog.Info("cleaned up expired public shares", "count", prunedShares)
+				}
+				if prunedTokens, err := userService.PruneExpiredRefreshTokens(ctx); err != nil {
+					slog.Warn("failed to prune expired refresh tokens", "error", err)
+				} else if prunedTokens > 0 {
+					slog.Info("pruned expired refresh tokens", "count", prunedTokens)
+				}
 			}
 		}
 	}()

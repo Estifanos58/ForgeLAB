@@ -84,6 +84,39 @@ func TestAuthHandler_Touch(t *testing.T) {
 		assert.Equal(t, userID.String(), resp["user_id"])
 	})
 
+	t.Run("Valid access token with refresh token does not rotate refresh token", func(t *testing.T) {
+		handler.SetAllowGuestMode(true)
+		userID := uuid.New()
+		token, err := jwtManager.GenerateAccessToken(userID, "dev@example.com")
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/touch", nil)
+		req.AddCookie(&http.Cookie{
+			Name:  "forgelab_access_token",
+			Value: token,
+		})
+		req.AddCookie(&http.Cookie{
+			Name:  "forgelab_refresh_token",
+			Value: "existing-refresh-token-value",
+		})
+
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		err = json.NewDecoder(rec.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.Equal(t, "ok", resp["status"])
+		assert.Equal(t, true, resp["authenticated"])
+		assert.Equal(t, userID.String(), resp["user_id"])
+
+		// Ensure no new refresh token cookie was set (no rotation)
+		for _, c := range rec.Result().Cookies() {
+			assert.NotEqual(t, "forgelab_refresh_token", c.Name, "refresh token must NOT be rotated when access token is valid")
+		}
+	})
+
 	t.Run("Guest mode disabled without tokens returns 401", func(t *testing.T) {
 		handler.SetAllowGuestMode(false)
 		req := httptest.NewRequest(http.MethodPost, "/api/auth/touch", nil)

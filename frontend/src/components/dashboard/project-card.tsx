@@ -54,12 +54,9 @@ export function ProjectCard({
       <div className="pt-2.5 border-t border-surface-border flex flex-col gap-2 font-mono text-[11px]">
         <div className="flex items-center justify-between">
           <div>
-            {(project.status === 'running' || project.status === 'partially_running') && (project.preview_url || project.port) ? (
+            {(project.status === 'running' || project.status === 'partially_running') && project.preview_url ? (
               <a
-                href={
-                  project.preview_url ||
-                  `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`
-                }
+                href={project.preview_url}
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1 text-emerald-400 hover:underline"

@@ -43,6 +43,8 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-development}
       DATABASE_URL: postgres://${POSTGRES_USER:-forgelab}:${POSTGRES_PASSWORD:-forgelab_dev_password}@postgres:5432/${POSTGRES_DB:-forgelab}?sslmode=disable
+    volumes:
+      - ./backend/migrations:/app/migrations:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -93,7 +95,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-debug}
       FORGELAB_IN_DOCKER: "true"
       FORGELAB_AGENT_URL: ${FORGELAB_AGENT_URL:-http://host.docker.internal:4142}
-      RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+      RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-127.0.0.1,::1}
       FORGELAB_ALLOW_GUEST_MODE: ${FORGELAB_ALLOW_GUEST_MODE:-false}
       FORGELAB_SHARING_ENABLED: ${FORGELAB_SHARING_ENABLED:-true}
       FORGELAB_SHARING_PROVIDER: ${FORGELAB_SHARING_PROVIDER:-cloudflare}
@@ -137,7 +139,7 @@ services:
       NODE_ENV: production
       BACKEND_INTERNAL_URL: http://backend:8080
       NEXT_PUBLIC_APP_URL: http://localhost:3000
-      RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+      RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-127.0.0.1,::1}
     depends_on:
       backend:
         condition: service_healthy

@@ -38,40 +38,26 @@ function derivePrimaryPreviewUrl(project: Project | null): string | null {
     const frontendSvc = runningServices.find(
       (s) =>
         (s.role === 'frontend' || s.name.toLowerCase() === 'frontend') &&
-        (s.public_exposed || s.preview_url || s.host_port)
+        (s.public_exposed || s.preview_url)
     );
-    if (frontendSvc) {
-      return (
-        frontendSvc.preview_url ||
-        (frontendSvc.host_port
-          ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${frontendSvc.host_port}`
-          : null)
-      );
+    if (frontendSvc && frontendSvc.preview_url) {
+      return frontendSvc.preview_url;
     }
     const anyPublicSvc = runningServices.find(
-      (s) => (s.public_exposed || s.role === 'frontend') && (s.preview_url || s.host_port)
+      (s) => (s.public_exposed || s.role === 'frontend') && s.preview_url
     );
-    if (anyPublicSvc) {
-      return (
-        anyPublicSvc.preview_url ||
-        (anyPublicSvc.host_port
-          ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${anyPublicSvc.host_port}`
-          : null)
-      );
+    if (anyPublicSvc && anyPublicSvc.preview_url) {
+      return anyPublicSvc.preview_url;
     }
-    // If services exist, never fall back to project.port if no running public service exists
-    return null;
+    return project.preview_url || null;
   }
 
   // Fallback for single-service legacy projects without independent services
   if (
     project.status === 'running' &&
-    (project.preview_url || project.port)
+    project.preview_url
   ) {
-    return (
-      project.preview_url ||
-      `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`
-    );
+    return project.preview_url;
   }
   return null;
 }

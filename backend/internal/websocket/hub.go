@@ -26,6 +26,13 @@ type TicketInfo struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+const (
+	// MaxPendingMessages is the upper bound on queued messages per WebSocket client.
+	MaxPendingMessages = 50000
+	// MaxPendingBytes is the upper bound on queued bytes per WebSocket client (16 MB).
+	MaxPendingBytes = 16 * 1024 * 1024
+)
+
 type Client struct {
 	hub           *Hub
 	conn          *websocket.Conn
@@ -34,6 +41,7 @@ type Client struct {
 	subscriptions map[string]bool
 	send          chan []byte // preserved for mock/direct test channel inspection
 	pending       [][]byte
+	pendingBytes  int64
 	notify        chan struct{}
 	closed        bool
 	mu            sync.RWMutex
@@ -234,6 +242,7 @@ func (h *Hub) run() {
 				client.mu.Lock()
 				client.closed = true
 				client.pending = nil
+				client.pendingBytes = 0
 				for channel := range client.subscriptions {
 					if clients, exists := h.channels[channel]; exists {
 						delete(clients, client)
@@ -271,15 +280,18 @@ func (c *Client) enqueue(payload []byte) bool {
 		default:
 		}
 	}
-	// Safety ceiling of 50,000 pending messages prevents unbounded memory exhaustion if socket completely hangs
-	if len(c.pending) > 50000 {
+	// Safety ceiling of message count and byte limit prevents unbounded memory exhaustion if socket hangs
+	if len(c.pending) >= MaxPendingMessages || (c.pendingBytes+int64(len(payload))) > MaxPendingBytes {
 		c.closed = true
+		c.pending = nil
+		c.pendingBytes = 0
 		if c.conn != nil {
 			_ = c.conn.Close()
 		}
 		return false
 	}
 	c.pending = append(c.pending, payload)
+	c.pendingBytes += int64(len(payload))
 	if c.notify != nil {
 		select {
 		case c.notify <- struct{}{}:
@@ -329,8 +341,9 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		}
 		if tokenString == "" {
 			if queryToken := r.URL.Query().Get("token"); queryToken != "" {
-				slog.Warn("ws connection using deprecated query parameter token fallback; recommend upgrading to tickets or cookies", "remote_addr", r.RemoteAddr)
-				tokenString = queryToken
+				slog.Warn("ws connection rejected: query parameter token authentication has been removed", "remote_addr", r.RemoteAddr)
+				http.Error(w, "unauthorized: query parameter token authentication has been removed; use single-use tickets, cookies, or authorization header", http.StatusUnauthorized)
+				return
 			}
 		}
 
@@ -500,6 +513,7 @@ func (c *Client) writePump() {
 			}
 			messages := c.pending
 			c.pending = nil
+			c.pendingBytes = 0
 			c.mu.Unlock()
 
 			for _, msg := range messages {

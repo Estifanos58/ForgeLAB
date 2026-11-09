@@ -26,18 +26,18 @@ export function OAuthButtons({ mode = 'login', onError }: OAuthButtonsProps) {
   };
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full">
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full">
       {/* GitHub Button */}
       <button
         type="button"
         disabled={loadingProvider !== null}
         onClick={() => handleOAuthClick('github')}
-        className="w-full flex items-center justify-center gap-2.5 h-9 px-3 rounded-md border border-surface-border bg-surface hover:bg-surface-elevated hover:border-neutral-600 text-xs font-medium text-neutral-200 transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400 disabled:opacity-40 disabled:cursor-not-allowed select-none"
+        className="group relative flex items-center justify-center gap-2.5 h-10 px-4 rounded-lg border border-surface-border bg-surface-elevated/80 hover:bg-surface-hover hover:border-neutral-500 text-xs sm:text-sm font-medium text-neutral-200 transition-all duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400 disabled:opacity-40 disabled:cursor-not-allowed select-none shadow-sm"
       >
         {loadingProvider === 'github' ? (
-          <Loader2 className="w-3.5 h-3.5 animate-spin text-neutral-400" />
+          <Loader2 className="w-4 h-4 animate-spin text-neutral-400" />
         ) : (
-          <svg className="w-3.5 h-3.5 fill-current shrink-0" viewBox="0 0 24 24">
+          <svg className="w-4 h-4 fill-current text-white shrink-0 group-hover:scale-105 transition-transform" viewBox="0 0 24 24">
             <path
               fillRule="evenodd"
               clipRule="evenodd"
@@ -53,12 +53,12 @@ export function OAuthButtons({ mode = 'login', onError }: OAuthButtonsProps) {
         type="button"
         disabled={loadingProvider !== null}
         onClick={() => handleOAuthClick('google')}
-        className="w-full flex items-center justify-center gap-2.5 h-9 px-3 rounded-md border border-surface-border bg-surface hover:bg-surface-elevated hover:border-neutral-600 text-xs font-medium text-neutral-200 transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400 disabled:opacity-40 disabled:cursor-not-allowed select-none"
+        className="group relative flex items-center justify-center gap-2.5 h-10 px-4 rounded-lg border border-surface-border bg-surface-elevated/80 hover:bg-surface-hover hover:border-neutral-500 text-xs sm:text-sm font-medium text-neutral-200 transition-all duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400 disabled:opacity-40 disabled:cursor-not-allowed select-none shadow-sm"
       >
         {loadingProvider === 'google' ? (
-          <Loader2 className="w-3.5 h-3.5 animate-spin text-neutral-400" />
+          <Loader2 className="w-4 h-4 animate-spin text-neutral-400" />
         ) : (
-          <svg className="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24">
+          <svg className="w-4 h-4 shrink-0 group-hover:scale-105 transition-transform" viewBox="0 0 24 24">
             <path
               fill="#4285F4"
               d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"

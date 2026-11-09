@@ -2,15 +2,20 @@ package services_test
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/forgelab/backend/internal/auth"
+	"github.com/forgelab/backend/internal/crypto"
 	"github.com/forgelab/backend/internal/services"
 )
 
@@ -152,4 +157,80 @@ func TestUserService_AtomicRefreshTokenRotation(t *testing.T) {
 		_, err = userSvc.RefreshTokens(ctx, loginTokens.RefreshToken)
 		assert.ErrorIs(t, err, services.ErrTokenRevoked, "replaying token after grace period expires must return ErrTokenRevoked")
 	})
+}
+
+func TestUserService_RedisCachedRotationEncryption(t *testing.T) {
+	pool, _ := connectTestDB(t)
+	if pool == nil {
+		t.Skip("skipping test: database not available")
+	}
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	encKey := "dGhpcy1pcy1hLWRldi1rZXktY2hhbmdlLWluLXByb2Q=" // 32-byte valid key
+	enc, err := crypto.NewEncryptor(encKey)
+	require.NoError(t, err)
+
+	jwtManager := auth.NewJWTManager("test-secret-key-32-chars-long-here!", 15*time.Minute, 7*24*time.Hour)
+	userSvc := services.NewUserService(pool, jwtManager)
+	userSvc.SetRedisClient(rdb)
+	userSvc.SetEncryptor(enc)
+
+	ctx := context.Background()
+	testEmail := "encrypted-cache-" + uuid.New().String()[:8] + "@example.com"
+	_, origTokens, err := userSvc.Register(ctx, services.RegisterInput{
+		Email:       testEmail,
+		Password:    "SuperPassword123!",
+		DisplayName: "Encrypted Tester",
+	})
+	require.NoError(t, err)
+
+	// Perform token refresh, which triggers cacheRotation into Redis
+	newTokens, err := userSvc.RefreshTokens(ctx, origTokens.RefreshToken)
+	require.NoError(t, err)
+	require.NotEmpty(t, newTokens.RefreshToken)
+
+	// Check the raw key in Redis
+	oldHash := auth.HashToken(origTokens.RefreshToken)
+	redisKey := "forgelab:refresh_rotation:" + oldHash
+	rawVal, err := rdb.Get(ctx, redisKey).Result()
+	require.NoError(t, err)
+
+	// Value in Redis must be encrypted with AES-256-GCM prefix
+	assert.True(t, strings.HasPrefix(rawVal, "enc:v1:"), "cached rotation credentials must be encrypted with AES-256-GCM")
+	assert.False(t, strings.Contains(rawVal, newTokens.RefreshToken), "cached value in Redis must NOT contain plaintext refresh token")
+	assert.False(t, strings.Contains(rawVal, newTokens.AccessToken), "cached value in Redis must NOT contain plaintext access token")
+
+	// Replaying old token decrypts cache and returns matching tokens
+	cachedTokens, err := userSvc.RefreshTokens(ctx, origTokens.RefreshToken)
+	require.NoError(t, err)
+	assert.Equal(t, newTokens.RefreshToken, cachedTokens.RefreshToken)
+	assert.Equal(t, newTokens.AccessToken, cachedTokens.AccessToken)
+
+	// Test backwards compatibility: if plaintext JSON is present in Redis, it is still decoded safely
+	plainOldToken := "legacy-plain-token-" + uuid.New().String()
+	plainOldHash := auth.HashToken(plainOldToken)
+	plainKey := "forgelab:refresh_rotation:" + plainOldHash
+	expectedTokens := &services.AuthTokens{
+		AccessToken:  "legacy-access-token",
+		RefreshToken: "legacy-refresh-token",
+	}
+	plainJSON, _ := json.Marshal(expectedTokens)
+	require.NoError(t, rdb.Set(ctx, plainKey, string(plainJSON), time.Minute).Err())
+
+	// Insert active token record so DB verification succeeds
+	uID := uuid.New()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, revoked, expires_at, created_at)
+		 VALUES ($1, $2, $3, true, $4, $5)`,
+		uuid.New(), uID, plainOldHash, time.Now().Add(time.Hour), time.Now(),
+	)
+	require.NoError(t, err)
+
+	retrievedTokens, err := userSvc.RefreshTokens(ctx, plainOldToken)
+	require.NoError(t, err)
+	assert.Equal(t, expectedTokens.RefreshToken, retrievedTokens.RefreshToken)
+	assert.Equal(t, expectedTokens.AccessToken, retrievedTokens.AccessToken)
 }

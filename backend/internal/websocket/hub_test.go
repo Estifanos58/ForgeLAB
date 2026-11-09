@@ -1095,9 +1095,9 @@ func TestWebSocketLogEventsNotDroppedOnBurst(t *testing.T) {
 	}
 }
 
-// TestWebSocket_QueryTokenFallback verifies that query parameter JWT (?token=...) is supported as a fallback,
-// while invalid tokens are strictly rejected with 401.
-func TestWebSocket_QueryTokenFallback(t *testing.T) {
+// TestWebSocket_QueryTokenRejected verifies that query parameter JWT (?token=...)
+// has been deprecated and safely removed, and is rejected with HTTP 401 Unauthorized.
+func TestWebSocket_QueryTokenRejected(t *testing.T) {
 	jwtManager := auth.NewJWTManager("test-jwt-secret-key-that-is-at-least-32-bytes-long", 15*time.Minute, 7*24*time.Hour)
 	hub := NewHub(jwtManager, nil, nil, nil, "http://localhost:3000")
 	defer hub.cancel()
@@ -1109,15 +1109,17 @@ func TestWebSocket_QueryTokenFallback(t *testing.T) {
 	token, _ := jwtManager.GenerateAccessToken(userID, "user@example.com")
 	header := http.Header{"Origin": []string{"http://localhost:3000"}}
 
-	// 1. Valid token in query string should succeed via fallback
+	// 1. Valid token in query string must be rejected with 401
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + token
-	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
-	if err != nil {
-		t.Fatalf("expected query parameter token fallback connection to succeed, got err: %v, resp: %v", err, resp)
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatalf("expected query parameter token connection to be rejected, but dial succeeded")
 	}
-	_ = conn.Close()
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for query parameter token, got: %v", resp)
+	}
 
-	// 2. Invalid token in query string should be rejected with 401
+	// 2. Invalid token in query string should also be rejected with 401
 	badURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=invalid-jwt-token"
 	_, badResp, badErr := websocket.DefaultDialer.Dial(badURL, header)
 	if badErr == nil {
@@ -1125,6 +1127,37 @@ func TestWebSocket_QueryTokenFallback(t *testing.T) {
 	}
 	if badResp == nil || badResp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 Unauthorized for invalid query parameter token, got: %v", badResp)
+	}
+}
+
+// TestWebSocket_PendingBytesBufferLimit verifies that enqueueing messages beyond MaxPendingBytes
+// closes the client connection and bounds buffer memory.
+func TestWebSocket_PendingBytesBufferLimit(t *testing.T) {
+	client := &Client{
+		userID:  uuid.New(),
+		pending: make([][]byte, 0),
+		notify:  make(chan struct{}, 1),
+	}
+
+	// 1. Enqueueing small payloads should succeed
+	smallPayload := []byte("hello world")
+	if !client.enqueue(smallPayload) {
+		t.Fatalf("expected small payload enqueue to succeed")
+	}
+	if client.pendingBytes != int64(len(smallPayload)) {
+		t.Fatalf("expected pendingBytes=%d, got %d", len(smallPayload), client.pendingBytes)
+	}
+
+	// 2. Enqueueing payload exceeding MaxPendingBytes should close client and reject
+	largePayload := make([]byte, MaxPendingBytes+1)
+	if client.enqueue(largePayload) {
+		t.Fatalf("expected payload exceeding MaxPendingBytes to be rejected")
+	}
+	if !client.closed {
+		t.Fatalf("expected client to be marked closed on byte buffer breach")
+	}
+	if client.pendingBytes != 0 || len(client.pending) != 0 {
+		t.Fatalf("expected pending buffer and pendingBytes to be cleared on breach")
 	}
 }
 

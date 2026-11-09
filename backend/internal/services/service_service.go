@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -388,14 +388,14 @@ func populateServicePreviewURL(svc *models.Service) {
 	if svc == nil {
 		return
 	}
-	if svc.PublicExposed && svc.HostPort != nil && *svc.HostPort > 0 && svc.Status == models.ServiceStatusRunning {
-		host := os.Getenv("FORGELAB_PUBLIC_HOST")
-		if host == "" {
-			host = os.Getenv("PUBLIC_HOST")
-		}
-		if host == "" {
-			host = "localhost"
-		}
+	isInternal := svc.Classification == models.ClassificationInfrastructure ||
+		svc.Classification == models.ClassificationWorker ||
+		svc.Classification == models.ClassificationJob
+	isFrontend := !isInternal && (svc.Role == models.RoleFrontend || strings.Contains(strings.ToLower(svc.Name), "frontend"))
+	isPublic := !isInternal && (svc.PublicExposed || isFrontend)
+
+	if isPublic && svc.HostPort != nil && *svc.HostPort > 0 && svc.Status == models.ServiceStatusRunning {
+		host := ResolveAuthoritativeHost()
 		url := fmt.Sprintf("http://%s:%d", host, *svc.HostPort)
 		svc.PreviewURL = &url
 	} else {
@@ -620,7 +620,7 @@ func (s *ServiceService) PromoteServiceDeployment(
 		return nil
 	}
 
-	_, err := s.db.Exec(ctx,
+	res, err := s.db.Exec(ctx,
 		`UPDATE services SET
 		 status = $2,
 		 current_service_deployment_id = $3,
@@ -628,11 +628,23 @@ func (s *ServiceService) PromoteServiceDeployment(
 		 image_tag = $5,
 		 host_port = $6,
 		 updated_at = NOW()
-		 WHERE id = $1`,
+		 WHERE id = $1
+		   AND (
+		       current_service_deployment_id IS NULL
+		       OR (
+		           SELECT deploy_number FROM service_deployments WHERE id = $3
+		       ) >= (
+		           SELECT COALESCE(deploy_number, 0) FROM service_deployments WHERE id = services.current_service_deployment_id
+		       )
+		   )`,
 		serviceID, models.ServiceStatusRunning, serviceDeploymentID, containerID, imageTag, hostPort,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to promote service deployment: %w", err)
+	}
+
+	if res.RowsAffected() == 0 {
+		return fmt.Errorf("service deployment %s cannot be promoted: superseded by newer active deployment", serviceDeploymentID)
 	}
 
 	return nil

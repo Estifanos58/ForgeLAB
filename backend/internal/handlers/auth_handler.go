@@ -166,10 +166,38 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 }
 
 // Touch handles POST /api/auth/touch
-// It updates and extends the active session (whether authenticated JWT or guest session)
-// whenever interaction occurs, including when live logs are received from a running deployment.
+// It touches the session to extend session activity, avoiding unnecessary refresh-token rotation
+// when the user already holds a valid access token.
+// If the access token has expired or is absent but a refresh token is present, it rotates tokens.
+// Proactively invoked by SessionManager on interaction or live deployment log streams.
 func (h *AuthHandler) Touch(w http.ResponseWriter, r *http.Request) {
-	// 1. Try refreshing active user session if refresh token is present
+	// 1. Try validating existing access token first to avoid unnecessary token rotation
+	tokenString := ""
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			tokenString = parts[1]
+		}
+	}
+	if tokenString == "" {
+		if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
+			tokenString = cookie.Value
+		}
+	}
+
+	if tokenString != "" && h.userService != nil && h.userService.JWTManager() != nil {
+		claims, err := h.userService.JWTManager().ValidateAccessToken(tokenString)
+		if err == nil && claims != nil {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":        "ok",
+				"authenticated": true,
+				"user_id":       claims.UserID,
+			})
+			return
+		}
+	}
+
+	// 2. Access token is missing or expired: rotate using refresh token if present
 	refreshToken := ""
 	if cookie, err := r.Cookie("forgelab_refresh_token"); err == nil && cookie.Value != "" {
 		refreshToken = cookie.Value
@@ -198,32 +226,6 @@ func (h *AuthHandler) Touch(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"status":        "ok",
 				"authenticated": true,
-			})
-			return
-		}
-	}
-
-	// 2. Try validating existing access token
-	tokenString := ""
-	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
-			tokenString = parts[1]
-		}
-	}
-	if tokenString == "" {
-		if cookie, err := r.Cookie("forgelab_access_token"); err == nil && cookie.Value != "" {
-			tokenString = cookie.Value
-		}
-	}
-
-	if tokenString != "" && h.userService != nil && h.userService.JWTManager() != nil {
-		claims, err := h.userService.JWTManager().ValidateAccessToken(tokenString)
-		if err == nil && claims != nil {
-			writeJSON(w, http.StatusOK, map[string]interface{}{
-				"status":        "ok",
-				"authenticated": true,
-				"user_id":       claims.UserID,
 			})
 			return
 		}

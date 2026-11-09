@@ -155,6 +155,9 @@ func (s *ShareService) GetProjectShare(ctx context.Context, projectID, userID uu
 	if share.ExpiresAt != nil && time.Now().After(*share.ExpiresAt) {
 		share.Status = models.ShareStatusExpired
 		_, _ = s.pool.Exec(ctx, "UPDATE public_shares SET status = 'expired', updated_at = NOW() WHERE id = $1", share.ID)
+		if share.PublicHost != "" {
+			middleware.UnregisterPreviewHost(share.PublicHost)
+		}
 		if s.provider != nil {
 			_ = s.provider.StopShare(ctx, share.ShareToken)
 		} else if s.tunnelRegistrar != nil {
@@ -221,6 +224,9 @@ func (s *ShareService) GetShareByToken(ctx context.Context, shareToken string) (
 	if share.ExpiresAt != nil && time.Now().After(*share.ExpiresAt) {
 		share.Status = models.ShareStatusExpired
 		_, _ = s.pool.Exec(ctx, "UPDATE public_shares SET status = 'expired', updated_at = NOW() WHERE id = $1", share.ID)
+		if share.PublicHost != "" {
+			middleware.UnregisterPreviewHost(share.PublicHost)
+		}
 		if s.provider != nil {
 			_ = s.provider.StopShare(ctx, share.ShareToken)
 		}
@@ -421,7 +427,7 @@ func (s *ShareService) CreateShare(ctx context.Context, projectID, userID uuid.U
 		return nil, ErrShareNotConfigured
 	}
 
-	// Persist atomically in PostgreSQL transaction
+	// Persist atomically in PostgreSQL transaction with row-level locking
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		if s.provider != nil {
@@ -431,11 +437,21 @@ func (s *ShareService) CreateShare(ctx context.Context, projectID, userID uuid.U
 	}
 	defer tx.Rollback(ctx)
 
-	// Revoke any previous active share for this project
-	_, err = tx.Exec(ctx, `
+	// Lock project to serialize concurrent share creations and enforce single active share
+	var lockedID uuid.UUID
+	_ = tx.QueryRow(ctx, "SELECT id FROM projects WHERE id = $1 FOR UPDATE", projectID).Scan(&lockedID)
+
+	// Revoke and capture any previous active shares for this project
+	type prevShare struct {
+		token string
+		host  string
+	}
+	var prevShares []prevShare
+	rows, err := tx.Query(ctx, `
 		UPDATE public_shares
 		SET status = 'revoked', revoked_at = NOW(), updated_at = NOW()
 		WHERE project_id = $1 AND status = 'active'
+		RETURNING share_token, public_host
 	`, projectID)
 	if err != nil {
 		if s.provider != nil {
@@ -443,6 +459,13 @@ func (s *ShareService) CreateShare(ctx context.Context, projectID, userID uuid.U
 		}
 		return nil, fmt.Errorf("failed to revoke previous shares: %w", err)
 	}
+	for rows.Next() {
+		var ps prevShare
+		if scanErr := rows.Scan(&ps.token, &ps.host); scanErr == nil {
+			prevShares = append(prevShares, ps)
+		}
+	}
+	rows.Close()
 
 	insertQuery := `
 		INSERT INTO public_shares (
@@ -469,6 +492,18 @@ func (s *ShareService) CreateShare(ctx context.Context, projectID, userID uuid.U
 			_ = s.provider.StopShare(ctx, shareToken)
 		}
 		return nil, fmt.Errorf("failed to commit share transaction: %w", err)
+	}
+
+	// Safely clean up previous tunnels and unregister obsolete preview hosts
+	for _, ps := range prevShares {
+		if ps.host != "" {
+			middleware.UnregisterPreviewHost(ps.host)
+		}
+		if s.provider != nil && ps.token != "" {
+			_ = s.provider.StopShare(ctx, ps.token)
+		} else if s.tunnelRegistrar != nil && ps.token != "" {
+			_ = s.tunnelRegistrar.DeregisterShare(ps.token)
+		}
 	}
 
 	if share.PublicHost != "" {
@@ -515,6 +550,43 @@ func (s *ShareService) RevokeShare(ctx context.Context, projectID, userID uuid.U
 	}
 
 	return nil
+}
+
+// CleanupExpiredShares automatically identifies expired active shares, marks them expired,
+// unregisters their preview hosts, and stops active provider tunnels.
+func (s *ShareService) CleanupExpiredShares(ctx context.Context) (int, error) {
+	if s.pool == nil {
+		return 0, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		UPDATE public_shares
+		SET status = 'expired', updated_at = NOW()
+		WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= NOW()
+		RETURNING share_token, public_host
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("failed to clean up expired shares: %w", err)
+	}
+	defer rows.Close()
+
+	cleanedCount := 0
+	for rows.Next() {
+		var shareToken, publicHost string
+		if scanErr := rows.Scan(&shareToken, &publicHost); scanErr == nil {
+			cleanedCount++
+			if publicHost != "" {
+				middleware.UnregisterPreviewHost(publicHost)
+			}
+			if s.provider != nil && shareToken != "" {
+				_ = s.provider.StopShare(ctx, shareToken)
+			} else if s.tunnelRegistrar != nil && shareToken != "" {
+				_ = s.tunnelRegistrar.DeregisterShare(shareToken)
+			}
+		}
+	}
+
+	return cleanedCount, rows.Err()
 }
 
 // GetShareStatus returns detailed status information including provider and tunnel connectivity.

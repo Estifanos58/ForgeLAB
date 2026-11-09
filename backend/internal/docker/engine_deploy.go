@@ -398,6 +398,13 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 
 	newProjectStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
 
+	// Guard against stale worker whose lease expired or context was cancelled
+	if ctx.Err() != nil {
+		reason := fmt.Sprintf("Release deployment #%d aborted: worker context cancelled or lease lost", deployment.DeployNumber)
+		updateReleaseStatus(models.DeployStatusFailed, &reason)
+		return errors.New(reason)
+	}
+
 	if allHealthy && anyHealthy {
 		// Clean up preserved previous containers across services now that entire release is healthy
 		for _, sd := range svcDeploys {

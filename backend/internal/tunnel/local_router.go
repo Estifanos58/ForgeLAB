@@ -330,34 +330,7 @@ func (r *LocalRouter) isHopByHopHeader(header string) bool {
 
 // isForbiddenUpstream checks whether the target URL points to a forbidden ForgeLAB management or database infrastructure port.
 func (r *LocalRouter) isForbiddenUpstream(upstreamURL string) bool {
-	u, err := url.Parse(upstreamURL)
-	if err != nil {
-		return true
-	}
-	host := u.Hostname()
-	port := u.Port()
-
-	// Databases must never receive proxied HTTP traffic
-	if port == "5432" || port == "6379" {
-		return true
-	}
-
-	// ForgeLAB control plane (8080), frontend (3000), local agent (4142), or core management containers
-	isManagementHost := host == "127.0.0.1" ||
-		host == "localhost" ||
-		host == "::1" ||
-		host == "0.0.0.0" ||
-		host == "host.docker.internal" ||
-		host == "forgelab-backend" ||
-		host == "forgelab-frontend" ||
-		host == "forgelab-postgres" ||
-		host == "forgelab-redis"
-
-	if isManagementHost && (port == "8080" || port == "4142" || port == "3000") {
-		return true
-	}
-
-	return false
+	return IsForbiddenUpstream(upstreamURL)
 }
 
 // writeErrorResponse writes a clean, formatted HTTP error response into the stream.

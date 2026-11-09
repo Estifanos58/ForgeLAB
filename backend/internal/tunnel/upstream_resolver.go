@@ -58,6 +58,36 @@ func (r *DockerUpstreamResolver) ResolveUpstream(ctx context.Context, service *m
 			if cJSON.NetworkSettings.IPAddress != "" {
 				candidates = append(candidates, fmt.Sprintf("http://%s:%d", cJSON.NetworkSettings.IPAddress, intPort))
 			}
+
+			// Add bridge network gateway candidates for loopback-published ports in Docker Compose
+			if service.HostPort != nil && *service.HostPort > 0 {
+				hp := *service.HostPort
+				if cJSON.NetworkSettings.Gateway != "" {
+					candidates = append(candidates, fmt.Sprintf("http://%s:%d", cJSON.NetworkSettings.Gateway, hp))
+				}
+				for _, netSettings := range cJSON.NetworkSettings.Networks {
+					if netSettings != nil && netSettings.Gateway != "" {
+						candidates = append(candidates, fmt.Sprintf("http://%s:%d", netSettings.Gateway, hp))
+					}
+				}
+			}
+
+			// Inspect published host port bindings if HostPort was unassigned or differently mapped
+			if cJSON.NetworkSettings.Ports != nil {
+				for _, bindings := range cJSON.NetworkSettings.Ports {
+					for _, b := range bindings {
+						if b.HostPort != "" {
+							if isDockerEnv {
+								candidates = append(candidates, fmt.Sprintf("http://host.docker.internal:%s", b.HostPort))
+							}
+							if b.HostIP != "" && b.HostIP != "0.0.0.0" {
+								candidates = append(candidates, fmt.Sprintf("http://%s:%s", b.HostIP, b.HostPort))
+							}
+							candidates = append(candidates, fmt.Sprintf("http://127.0.0.1:%s", b.HostPort))
+						}
+					}
+				}
+			}
 		}
 	}
 

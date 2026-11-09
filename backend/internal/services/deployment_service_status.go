@@ -111,14 +111,27 @@ func (s *DeploymentService) UpdateDeploymentContainer(ctx context.Context, deplo
 	return nil
 }
 
-// SetCurrentDeployment updates the project's current deployment and status.
+// SetCurrentDeployment updates the project's current deployment and status, guarding against stale workers overwriting newer deployments.
 func (s *DeploymentService) SetCurrentDeployment(ctx context.Context, projectID, deploymentID uuid.UUID, projectStatus string) error {
-	_, err := s.db.Exec(ctx,
-		"UPDATE projects SET current_deployment_id = $1, status = $2, updated_at = $3 WHERE id = $4",
+	res, err := s.db.Exec(ctx,
+		`UPDATE projects SET
+		 current_deployment_id = $1, status = $2, updated_at = $3
+		 WHERE id = $4
+		   AND (
+		       current_deployment_id IS NULL
+		       OR (
+		           SELECT deploy_number FROM deployments WHERE id = $1
+		       ) >= (
+		           SELECT COALESCE(deploy_number, 0) FROM deployments WHERE id = projects.current_deployment_id
+		       )
+		   )`,
 		deploymentID, projectStatus, time.Now(), projectID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to set current deployment: %w", err)
+	}
+	if res.RowsAffected() == 0 {
+		return fmt.Errorf("deployment %s cannot be set as current: superseded by newer active deployment", deploymentID)
 	}
 	return nil
 }

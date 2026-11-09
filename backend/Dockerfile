@@ -10,7 +10,11 @@ ENV GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
 
 # Copy dependency files
 COPY go.mod go.sum ./
-RUN for i in 1 2 3; do go mod download && break || (echo "Retrying go mod download in 3s..." && sleep 3); done
+RUN success=0; for i in 1 2 3; do \
+        if go mod download; then success=1; break; fi; \
+        echo "Retrying go mod download in 3s..." && sleep 3; \
+    done; \
+    [ "$success" -eq 1 ] || exit 1
 
 # Copy source code
 COPY . .
@@ -27,10 +31,11 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # Final runtime stage
 FROM alpine:3.21
 
-RUN for i in 1 2 3 4 5; do \
-        apk add --no-cache ca-certificates curl docker-cli && break || \
-        (echo "Retrying apk add in 3s..." && sleep 3); \
-    done
+RUN success=0; for i in 1 2 3 4 5; do \
+        if apk add --no-cache ca-certificates curl docker-cli; then success=1; break; fi; \
+        echo "Retrying apk add in 3s..." && sleep 3; \
+    done; \
+    [ "$success" -eq 1 ] || exit 1
 
 # Install official cloudflared binary for domainless public sharing with pinned version and checksum verification
 ARG CLOUDFLARED_VERSION=2026.10.7
@@ -45,12 +50,15 @@ RUN ARCH=$(uname -m) && \
         CLOUDFLARED_ARCH="amd64"; \
         CLOUDFLARED_SHA256="1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872"; \
     fi && \
-    for i in 1 2 3 4 5; do \
-        curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${CLOUDFLARED_ARCH}" && \
-        echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c - && \
-        chmod +x /usr/local/bin/cloudflared && break || \
-        (echo "Retrying cloudflared download/verification in 3s..." && rm -f /usr/local/bin/cloudflared && sleep 3); \
-    done
+    success=0; for i in 1 2 3 4 5; do \
+        if curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${CLOUDFLARED_ARCH}" && \
+           echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c - && \
+           chmod +x /usr/local/bin/cloudflared; then \
+            success=1; break; \
+        fi; \
+        echo "Retrying cloudflared download/verification in 3s..." && rm -f /usr/local/bin/cloudflared && sleep 3; \
+    done; \
+    [ "$success" -eq 1 ] || exit 1
 
 WORKDIR /app
 

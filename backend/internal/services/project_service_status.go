@@ -34,7 +34,8 @@ func (s *ProjectService) UpdateProjectPort(ctx context.Context, projectID uuid.U
 	return s.GetProjectByIDWithoutOwnership(ctx, projectID)
 }
 
-func (s *ProjectService) resolveAuthoritativeHost() string {
+// ResolveAuthoritativeHost returns the public host name or IP used for preview URLs.
+func ResolveAuthoritativeHost() string {
 	if host := os.Getenv("FORGELAB_PUBLIC_HOST"); host != "" {
 		return host
 	}
@@ -47,6 +48,10 @@ func (s *ProjectService) resolveAuthoritativeHost() string {
 		}
 	}
 	return "localhost"
+}
+
+func (s *ProjectService) resolveAuthoritativeHost() string {
+	return ResolveAuthoritativeHost()
 }
 
 func (s *ProjectService) PopulateProjectPreviewURL(p *models.Project) {

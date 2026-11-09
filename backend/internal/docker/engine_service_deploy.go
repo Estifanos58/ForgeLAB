@@ -1687,6 +1687,13 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		return errors.New(detailedReason)
 	}
 
+	// Guard against stale worker whose lease expired or context was cancelled
+	if execCtx.Err() != nil {
+		reason := fmt.Sprintf("Service deployment #%d aborted: worker context cancelled or lease lost", serviceDeploy.DeployNumber)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return errors.New(reason)
+	}
+
 	// 5. Promote service
 	err = e.serviceService.PromoteServiceDeployment(execCtx, service.ID, serviceDeploy.ID, containerID, svcTag, hostPort)
 	if err != nil {

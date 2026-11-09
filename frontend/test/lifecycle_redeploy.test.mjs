@@ -3,25 +3,21 @@ import assert from 'node:assert/strict';
 
 // Helper functions mirroring dashboard & service-card logic
 
-function getProjectPreviewUrl(project, windowHost = 'localhost') {
+function getProjectPreviewUrl(project) {
   const isRunning = project.status === 'running' || project.status === 'partially_running';
-  if (isRunning && (project.preview_url || project.port)) {
-    return project.preview_url || `http://${windowHost}:${project.port}`;
+  if (isRunning && project.preview_url) {
+    return project.preview_url;
   }
   return null;
 }
 
-function getServicePreviewUrl(service, windowHost = 'localhost') {
+function getServicePreviewUrl(service) {
   const isRunning = service.status === 'running';
   if (!isRunning) {
     return null;
   }
   if (service.preview_url) {
     return service.preview_url;
-  }
-  const isPublicOrExposed = Boolean(service.public_exposed || service.role === 'frontend');
-  if (isPublicOrExposed && service.host_port) {
-    return `http://${windowHost}:${service.host_port}`;
   }
   return null;
 }
@@ -83,37 +79,43 @@ function deriveServiceButtonLabel(service) {
   return 'Deploy Service';
 }
 
-test('Preview URL — only displayed when project is confirmed running', () => {
-  const runningProj = { status: 'running', port: 8080 };
+test('Preview URL — only displayed when project is confirmed running and authoritative preview_url exists', () => {
+  const runningProj = { status: 'running', port: 8080, preview_url: 'http://localhost:8080' };
   assert.equal(getProjectPreviewUrl(runningProj), 'http://localhost:8080');
 
-  const partiallyRunningProj = { status: 'partially_running', port: 8080 };
+  const runningProjWithoutPreview = { status: 'running', port: 8080, preview_url: null };
+  assert.equal(getProjectPreviewUrl(runningProjWithoutPreview), null);
+
+  const partiallyRunningProj = { status: 'partially_running', port: 8080, preview_url: 'http://localhost:8080' };
   assert.equal(getProjectPreviewUrl(partiallyRunningProj), 'http://localhost:8080');
 
-  const stoppedProj = { status: 'stopped', port: 8080 };
+  const stoppedProj = { status: 'stopped', port: 8080, preview_url: 'http://localhost:8080' };
   assert.equal(getProjectPreviewUrl(stoppedProj), null);
 
-  const failedProj = { status: 'failed', port: 8080 };
+  const failedProj = { status: 'failed', port: 8080, preview_url: 'http://localhost:8080' };
   assert.equal(getProjectPreviewUrl(failedProj), null);
 
-  const deployingProj = { status: 'deploying', port: 8080 };
+  const deployingProj = { status: 'deploying', port: 8080, preview_url: 'http://localhost:8080' };
   assert.equal(getProjectPreviewUrl(deployingProj), null);
 });
 
-test('Preview URL — only displayed when service is confirmed running and public', () => {
-  const runningSvc = { status: 'running', public_exposed: true, host_port: 3001 };
+test('Preview URL — only displayed when service is confirmed running and authoritative preview_url exists', () => {
+  const runningSvc = { status: 'running', public_exposed: true, host_port: 3001, preview_url: 'http://localhost:3001' };
   assert.equal(getServicePreviewUrl(runningSvc), 'http://localhost:3001');
 
-  const runningFrontendSvc = { status: 'running', role: 'frontend', public_exposed: false, host_port: 3001 };
+  const runningFrontendSvc = { status: 'running', role: 'frontend', public_exposed: false, host_port: 3001, preview_url: 'http://localhost:3001' };
   assert.equal(getServicePreviewUrl(runningFrontendSvc), 'http://localhost:3001');
 
-  const stoppedSvc = { status: 'stopped', public_exposed: true, host_port: 3001 };
+  const runningSvcWithoutPreview = { status: 'running', public_exposed: true, host_port: 3001, preview_url: null };
+  assert.equal(getServicePreviewUrl(runningSvcWithoutPreview), null);
+
+  const stoppedSvc = { status: 'stopped', public_exposed: true, host_port: 3001, preview_url: 'http://localhost:3001' };
   assert.equal(getServicePreviewUrl(stoppedSvc), null);
 
-  const failedSvc = { status: 'failed', public_exposed: true, host_port: 3001 };
+  const failedSvc = { status: 'failed', public_exposed: true, host_port: 3001, preview_url: 'http://localhost:3001' };
   assert.equal(getServicePreviewUrl(failedSvc), null);
 
-  const privateSvc = { status: 'running', public_exposed: false, host_port: null };
+  const privateSvc = { status: 'running', public_exposed: false, host_port: null, preview_url: null };
   assert.equal(getServicePreviewUrl(privateSvc), null);
 });
 

@@ -35,21 +35,13 @@ export function ProjectHeader({
     );
 
     if (frontendSvc) {
-      primaryPreviewUrl =
-        frontendSvc.preview_url ||
-        (frontendSvc.host_port
-          ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${frontendSvc.host_port}`
-          : null);
+      primaryPreviewUrl = frontendSvc.preview_url || null;
     } else {
       const anyPublicSvc = runningServices.find(
-        (s) => (s.public_exposed || s.role === 'frontend') && (s.preview_url || s.host_port)
+        (s) => (s.public_exposed || s.role === 'frontend') && s.preview_url
       );
       if (anyPublicSvc) {
-        primaryPreviewUrl =
-          anyPublicSvc.preview_url ||
-          (anyPublicSvc.host_port
-            ? `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${anyPublicSvc.host_port}`
-            : null);
+        primaryPreviewUrl = anyPublicSvc.preview_url || null;
       }
     }
   }
@@ -60,12 +52,10 @@ export function ProjectHeader({
     !primaryPreviewUrl &&
     services.length === 0 &&
     project.status === 'running' &&
-    (project.preview_url || project.port)
+    project.preview_url
   ) {
-    primaryPreviewUrl =
-      project.preview_url ||
-      `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${project.port}`;
-  }
+    primaryPreviewUrl = project.preview_url;
+  };
 
   const getSourceIcon = () => {
     switch (project.source_type) {

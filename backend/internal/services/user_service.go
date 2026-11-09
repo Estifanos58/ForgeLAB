@@ -16,6 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/forgelab/backend/internal/auth"
+	"github.com/forgelab/backend/internal/crypto"
 	"github.com/forgelab/backend/internal/models"
 )
 
@@ -38,6 +39,7 @@ type UserService struct {
 	db            *pgxpool.Pool
 	jwtManager    *auth.JWTManager
 	redis         *redis.Client
+	encryptor     *crypto.Encryptor
 	rotationCache sync.Map
 	gracePeriod   time.Duration
 }
@@ -49,6 +51,11 @@ func NewUserService(db *pgxpool.Pool, jwtManager *auth.JWTManager) *UserService 
 		jwtManager:  jwtManager,
 		gracePeriod: 30 * time.Second,
 	}
+}
+
+// SetEncryptor attaches an encryptor to protect refresh credentials cached in Redis.
+func (s *UserService) SetEncryptor(enc *crypto.Encryptor) {
+	s.encryptor = enc
 }
 
 // SetRedisClient attaches a Redis client for distributed token rotation caching.
@@ -244,7 +251,13 @@ func (s *UserService) cacheRotation(ctx context.Context, oldTokenHash string, to
 	if s.redis != nil {
 		payload, err := json.Marshal(tokens)
 		if err == nil {
-			_ = s.redis.Set(ctx, "forgelab:refresh_rotation:"+oldTokenHash, string(payload), grace).Err()
+			dataToStore := string(payload)
+			if s.encryptor != nil {
+				if encrypted, encErr := s.encryptor.Encrypt(payload); encErr == nil {
+					dataToStore = string(encrypted)
+				}
+			}
+			_ = s.redis.Set(ctx, "forgelab:refresh_rotation:"+oldTokenHash, dataToStore, grace).Err()
 		}
 	}
 }
@@ -265,10 +278,19 @@ func (s *UserService) getCachedRotation(ctx context.Context, oldTokenHash string
 	}
 
 	if s.redis != nil {
-		rawStr, err := s.redis.Get(ctx, "forgelab:refresh_rotation:"+oldTokenHash).Result()
-		if err == nil && rawStr != "" {
+		rawBytes, err := s.redis.Get(ctx, "forgelab:refresh_rotation:"+oldTokenHash).Bytes()
+		if err == nil && len(rawBytes) > 0 {
+			dataToDecode := rawBytes
+			if s.encryptor != nil {
+				if decrypted, decErr := s.encryptor.Decrypt(rawBytes); decErr == nil {
+					dataToDecode = decrypted
+				} else {
+					// Fallback to raw bytes in case plaintext was stored by legacy instance
+					dataToDecode = rawBytes
+				}
+			}
 			var tokens AuthTokens
-			if err := json.NewDecoder(strings.NewReader(rawStr)).Decode(&tokens); err == nil && tokens.RefreshToken != "" {
+			if err := json.NewDecoder(strings.NewReader(string(dataToDecode))).Decode(&tokens); err == nil && tokens.RefreshToken != "" {
 				s.rotationCache.Store(oldTokenHash, &cachedRotation{
 					tokens:    &tokens,
 					expiresAt: now.Add(15 * time.Second),
@@ -279,6 +301,22 @@ func (s *UserService) getCachedRotation(ctx context.Context, oldTokenHash string
 	}
 
 	return nil
+}
+
+// PruneExpiredRefreshTokens deletes expired or revoked refresh tokens from the database.
+func (s *UserService) PruneExpiredRefreshTokens(ctx context.Context) (int64, error) {
+	if s.db == nil {
+		return 0, nil
+	}
+	tag, err := s.db.Exec(ctx, `
+		DELETE FROM refresh_tokens
+		WHERE expires_at < NOW()
+		   OR (revoked = TRUE AND created_at < NOW() - INTERVAL '7 days')
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("failed to prune expired refresh tokens: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // RefreshTokens validates a refresh token and issues new tokens atomically in a single PostgreSQL transaction.

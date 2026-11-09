@@ -32,8 +32,8 @@ var (
 )
 
 const (
-	MaxUncompressedBytes      = 100 * 1024 * 1024        // 100MB per archive
-	MaxOwnerStorageQuotaBytes = 1024 * 1024 * 1024       // 1GB cumulative per owner
+	MaxUncompressedBytes      = 100 * 1024 * 1024  // 100MB per archive
+	MaxOwnerStorageQuotaBytes = 1024 * 1024 * 1024 // 1GB cumulative per owner
 )
 
 const (
