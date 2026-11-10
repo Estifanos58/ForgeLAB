@@ -21,6 +21,7 @@ export {
   buildLogQuery,
   getAgentToken,
   setAgentToken,
+  type AgentFetchOptions,
   type ApiFetchOptions,
   type UploadProgress,
 } from './base';

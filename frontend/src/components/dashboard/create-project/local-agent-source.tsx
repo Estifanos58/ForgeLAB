@@ -75,6 +75,11 @@ export function LocalAgentSource({
               <p className="text-xs text-neutral-400 leading-relaxed">
                 The Local Agent must be running on your computer to open the native OS folder chooser, analyze multi-service projects in-place, and stream container builds directly to Docker without uploading project files through the browser.
               </p>
+              {agentStatus?.error && (
+                <p className="text-[11px] text-amber-300/90 font-mono">
+                  Agent probe detail: {agentStatus.error}
+                </p>
+              )}
             </div>
           </div>
 
@@ -130,6 +135,40 @@ export function LocalAgentSource({
       {/* Case 2: Agent Online - Folder Selection & Staged Progress */}
       {isLocalAgentOnline && !agentSession && (
         <div className="rounded-lg border border-surface-border bg-surface-elevated/30 p-6 space-y-5">
+          {agentStatus?.docker_status === 'unavailable' && (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 flex items-start justify-between gap-3 text-xs">
+              <div className="space-y-0.5">
+                <div className="font-medium text-amber-300">
+                  Docker daemon is currently unavailable
+                </div>
+                <p className="text-[11px] text-neutral-300 leading-relaxed">
+                  Local Agent is connected — you can browse and analyze project folders now. Start Docker Desktop before deploying containers.
+                </p>
+                {agentStatus.docker_error && (
+                  <p className="text-[10px] text-amber-300/80 font-mono">
+                    {agentStatus.docker_error}
+                  </p>
+                )}
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={onCheckAgentStatus}
+                className="text-[11px] h-7 px-2.5 flex-shrink-0"
+              >
+                Recheck
+              </Button>
+            </div>
+          )}
+
+          {agentStatus?.docker_status === 'checking' && (
+            <div className="rounded-md border border-surface-border bg-surface/60 px-3.5 py-2 text-[11px] text-neutral-400 font-mono flex items-center gap-2">
+              <RefreshCw className="w-3 h-3 animate-spin text-neutral-400" />
+              <span>Local Agent online. Checking Docker daemon availability in background...</span>
+            </div>
+          )}
+
           {/* Staged Progress Indicator Bar */}
           <div className="flex items-center justify-between gap-1 text-[11px] font-mono border-b border-surface-border/60 pb-3">
             <div

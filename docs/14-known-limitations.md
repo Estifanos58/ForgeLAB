@@ -410,6 +410,14 @@ These are identified codebase behaviors that require investigation and resolutio
   - Documented govulncheck findings: 2 findings in `github.com/docker/docker@v28.5.2+incompatible` (`GO-2026-4887`, `GO-2026-4883`, Fixed in: N/A) reside in the Docker daemon (`daemon.Daemon.ContainerCreate`) not run by ForgeLAB; standard library findings on local dev (`go1.27.0`) are resolved in production CI via Go 1.26.10 (`golang:1.26-alpine`).
   - Frontend `npm audit --audit-level=high` reports 0 vulnerabilities.
 
+### 55. Windows First-Launch Local Agent Cold-Start Race & Folder Picker Reliability (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/agent/server.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/server.go), [`backend/internal/agent/picker.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/picker.go), [`backend/internal/agent/picker_windows.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/picker_windows.go), [`backend/cmd/agent/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/agent/main.go), [`start-agent.ps1`](file:///c:/Users/estif/Desktop/ForgeLAB/start-agent.ps1), [`frontend/src/lib/api/base.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/lib/api/base.ts), [`frontend/src/lib/api/agent-client.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/lib/api/agent-client.ts), [`frontend/src/components/dashboard/create-project-modal.tsx`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/components/dashboard/create-project-modal.tsx)
+- **Resolution:**
+  - Decoupled `GET /api/agent/status` from synchronous 2-second Docker pings; Docker daemon health now runs asynchronously in a background monitor exposing cached `docker_status` (`checking`, `available`, `unavailable`), `docker_error`, and `docker_checked_at`.
+  - Fixed `ListenAddr()` formatting using `net.JoinHostPort` + `strconv.Itoa` (removing `rune` port corruption), guarded session/server close synchronization, and ensured `forgelab-agent` binds `net.Listen` synchronously before printing `Ready on http://...`.
+  - Fixed `agentFetch` to omit `Content-Type: application/json` on bodyless GET requests (avoiding unnecessary CORS preflight), increased default status timeout to 5s, cleanly separated timeouts (HTTP 408) from caller aborts (`AbortError`) and unreachable agent errors, and guarded `CreateProjectModal` against leaving `agentStage` stuck in `selecting`.
+  - Enforced interactive logged-in user session checks (`SessionId != 0` and visible window station) in both PowerShell startup scripts and Win32 preflight (`InspectInteractiveSession`), hardened PowerShell `-STA` `-EncodedCommand` `FolderBrowserDialog` invocation with a disposed invisible active-screen owner `Form`, UTF-8 Base64 path transport (`FORGELAB_PATH_B64:`), and distinct cancellation (`ErrPickerCancelled`) vs timeout (`ErrPickerTimedOut`).
+
 
 ---
 

@@ -39,18 +39,38 @@ func (s *AgentServer) handleSelectFolder(w http.ResponseWriter, r *http.Request)
 		}
 		if errors.Is(err, ErrPickerBusy) {
 			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "folder picker is already in progress",
+				"error":  "folder picker is already in progress",
+				"reason": "busy",
 			})
 			return
 		}
-		http.Error(w, fmt.Sprintf("Failed to open native folder picker: %v", err), http.StatusInternalServerError)
+		if errors.Is(err, ErrPickerTimedOut) {
+			writeJSON(w, http.StatusRequestTimeout, map[string]string{
+				"error":  "folder picker timed out waiting for folder selection",
+				"reason": "timeout",
+			})
+			return
+		}
+		if errors.Is(err, ErrPickerNotInteractive) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error":  err.Error(),
+				"reason": "non_interactive_session",
+			})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error":  fmt.Sprintf("Failed to open native folder picker: %v", err),
+			"reason": "picker_failed",
+		})
 		return
 	}
 
 	token, _ := r.Context().Value("agent_token").(string)
 	session, err := s.registerDirectory(selectedPath, token)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to inspect selected directory: %v", err), http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("Failed to inspect selected directory: %v", err),
+		})
 		return
 	}
 
@@ -123,8 +143,18 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 	s.mu.RLock()
 	var cachedAnalysis *analyzer.AnalysisResult
 	for _, sess := range s.sessions {
-		if sess.CanonicalPath == canonicalPath && (sess.Status == "ready" || sess.Status == "consumed") && sess.Analysis != nil && time.Since(sess.UpdatedAt) < 10*time.Minute {
-			cachedAnalysis = sess.Analysis
+		sess.mu.RLock()
+		match := sess.CanonicalPath == canonicalPath &&
+			(sess.Status == "ready" || sess.Status == "consumed") &&
+			sess.Analysis != nil &&
+			time.Since(sess.UpdatedAt) < 10*time.Minute
+		var analysis *analyzer.AnalysisResult
+		if match {
+			analysis = sess.Analysis
+		}
+		sess.mu.RUnlock()
+		if match {
+			cachedAnalysis = analysis
 			break
 		}
 	}
@@ -245,29 +275,41 @@ func (s *AgentServer) registerDirectory(rawPath, token string) (*LocalSourceSess
 
 func (s *AgentServer) renderSessionResponse(w http.ResponseWriter, session *LocalSourceSession) {
 	session.mu.RLock()
-	defer session.mu.RUnlock()
-
+	sourceID := session.SourceID
+	folderName := session.FolderName
+	canonPath := session.CanonicalPath
+	status := session.Status
+	phase := session.Phase
+	filesScanned := session.FilesScanned
 	totalFiles := session.TotalFiles
 	totalBytes := session.TotalBytes
+	detectedCount := session.DetectedCount
+	sessErr := session.Error
+	createdAt := session.CreatedAt
+	analysis := session.Analysis
+	disc := session.Discovery
+	session.mu.RUnlock()
+
 	var services []analyzer.ServiceDefinition
-	if session.Analysis != nil {
-		totalFiles = session.Analysis.TotalFiles
-		totalBytes = session.Analysis.TotalBytes
-		services = session.Analysis.Services
+	if analysis != nil {
+		totalFiles = analysis.TotalFiles
+		totalBytes = analysis.TotalBytes
+		services = analysis.Services
+		if disc == nil {
+			disc = analysis.Discovery
+		}
 	}
 	if services == nil {
 		services = []analyzer.ServiceDefinition{}
 	}
 
-	status := session.Status
-	phase := session.Phase
 	if status != "consumed" {
-		if session.Analysis != nil || len(services) > 0 {
+		if analysis != nil || len(services) > 0 {
 			status = "ready"
 			phase = "ready"
 		}
 		if status == "" {
-			if session.Error != "" {
+			if sessErr != "" {
 				status = "failed"
 				phase = "failed"
 			} else {
@@ -277,45 +319,46 @@ func (s *AgentServer) renderSessionResponse(w http.ResponseWriter, session *Loca
 		}
 	}
 
+	if disc == nil && canonPath != "" && (status == "ready" || status == "consumed") {
+		if d, err := discovery.Discover(canonPath); err == nil {
+			disc = d
+			session.mu.Lock()
+			if session.Discovery == nil {
+				session.Discovery = d
+			}
+			session.mu.Unlock()
+		}
+	}
+
 	resp := map[string]interface{}{
 		"source": map[string]interface{}{
-			"id":               session.SourceID.String(),
+			"id":               sourceID.String(),
 			"source_type":      "local_agent",
-			"source_reference": session.SourceID.String(),
+			"source_reference": sourceID.String(),
 			"agent_id":         s.agentID,
-			"folder_name":      session.FolderName,
+			"folder_name":      folderName,
 			"status":           status,
 			"phase":            phase,
 			"total_files":      totalFiles,
 			"total_bytes":      totalBytes,
 		},
-		"source_id":      session.SourceID.String(),
+		"source_id":      sourceID.String(),
 		"agent_id":       s.agentID,
-		"folder_name":    session.FolderName,
+		"folder_name":    folderName,
 		"status":         status,
 		"phase":          phase,
-		"files_scanned":  session.FilesScanned,
+		"files_scanned":  filesScanned,
 		"total_files":    totalFiles,
 		"total_bytes":    totalBytes,
-		"detected_count": session.DetectedCount,
+		"detected_count": detectedCount,
 		"services":       services,
-		"registered_at":  session.CreatedAt.Format(time.RFC3339),
+		"registered_at":  createdAt.Format(time.RFC3339),
 	}
 
-	if session.Error != "" {
-		resp["error"] = session.Error
+	if sessErr != "" {
+		resp["error"] = sessErr
 	}
 
-	disc := session.Discovery
-	if disc == nil && session.Analysis != nil {
-		disc = session.Analysis.Discovery
-	}
-	if disc == nil && session.CanonicalPath != "" && (session.Status == "ready" || session.Status == "consumed") {
-		if d, err := discovery.Discover(session.CanonicalPath); err == nil {
-			disc = d
-			session.Discovery = d
-		}
-	}
 	if disc != nil {
 		resp["discovery"] = disc
 	}

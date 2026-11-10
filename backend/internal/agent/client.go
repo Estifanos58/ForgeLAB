@@ -245,13 +245,25 @@ func ResolveAndVerifyAgentBaseURL(ctx context.Context, preferredBaseURL string, 
 
 // FetchSourceDiscovery contacts the running local agent and retrieves the authoritative DiscoveryResult for a source.
 func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUID, token string) (*discovery.DiscoveryResult, error) {
-	// 0. Check in-memory local source session first if available in the same runtime
-	if sess, ok := LookupLocalSourceSession(sourceID); ok && sess != nil {
+	lookupInMemoryDiscovery := func(sess *LocalSourceSession) *discovery.DiscoveryResult {
+		if sess == nil {
+			return nil
+		}
+		sess.mu.RLock()
+		defer sess.mu.RUnlock()
 		if sess.Discovery != nil {
-			return sess.Discovery, nil
+			return sess.Discovery
 		}
 		if sess.Analysis != nil && sess.Analysis.Discovery != nil {
-			return sess.Analysis.Discovery, nil
+			return sess.Analysis.Discovery
+		}
+		return nil
+	}
+
+	// 0. Check in-memory local source session first if available in the same runtime
+	if sess, ok := LookupLocalSourceSession(sourceID); ok {
+		if disc := lookupInMemoryDiscovery(sess); disc != nil {
+			return disc, nil
 		}
 	}
 
@@ -259,9 +271,9 @@ func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUI
 	verifiedBase, err := ResolveAndVerifyAgentBaseURL(ctx, baseURL, "")
 	if err != nil {
 		// Final fallback: check in-memory global registry once more
-		if sess, ok := LookupLocalSourceSession(sourceID); ok && sess != nil {
-			if sess.Discovery != nil {
-				return sess.Discovery, nil
+		if sess, ok := LookupLocalSourceSession(sourceID); ok {
+			if disc := lookupInMemoryDiscovery(sess); disc != nil {
+				return disc, nil
 			}
 		}
 		return nil, ErrAgentSessionUnavailable
@@ -325,9 +337,9 @@ func FetchSourceDiscovery(ctx context.Context, baseURL string, sourceID uuid.UUI
 	}
 
 	// Final fallback: check in-memory global registry once more
-	if sess, ok := LookupLocalSourceSession(sourceID); ok && sess != nil {
-		if sess.Discovery != nil {
-			return sess.Discovery, nil
+	if sess, ok := LookupLocalSourceSession(sourceID); ok {
+		if disc := lookupInMemoryDiscovery(sess); disc != nil {
+			return disc, nil
 		}
 	}
 

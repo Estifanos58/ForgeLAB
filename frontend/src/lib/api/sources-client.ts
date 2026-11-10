@@ -138,10 +138,14 @@ export const sourcesClient = {
     return res;
   },
 
-  async createAgentSession(agentId?: string): Promise<{ session_id: string; token: string; expires_at: string }> {
+  async createAgentSession(
+    agentId?: string,
+    signal?: AbortSignal
+  ): Promise<{ session_id: string; token: string; expires_at: string }> {
     return apiFetch('/api/sources/agent/session', {
       method: 'POST',
       body: JSON.stringify({ agent_id: agentId || '' }),
+      signal,
     });
   },
 

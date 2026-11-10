@@ -130,14 +130,28 @@ export interface ServiceDeployment {
   created_at: string;
 }
 
+export interface AgentDockerStatus {
+  available: boolean;
+  status: 'checking' | 'available' | 'unavailable';
+  error?: string;
+  last_checked_at?: string;
+}
+
 export interface AgentStatus {
   status: 'online' | 'offline';
   agent_id: string;
   version: string;
+  commit?: string;
   os: string;
   arch: string;
   docker_available: boolean;
+  docker_status?: 'checking' | 'available' | 'unavailable';
+  docker_error?: string;
+  docker_checked_at?: string;
+  docker?: AgentDockerStatus;
   active_sessions: number;
+  reachable?: boolean;
+  error?: string;
 }
 
 export interface ServiceDefinition {

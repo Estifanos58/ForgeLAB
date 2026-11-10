@@ -269,9 +269,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   // References for cancellation and polling cleanup
   const abortControllerRef = useRef<AbortController | null>(null);
   const folderPickerAbortRef = useRef<AbortController | null>(null);
+  const agentStatusAbortRef = useRef<AbortController | null>(null);
+  const agentStatusRecheckTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const agentModalOpenRef = useRef<boolean>(isOpen);
+  const agentRequestSeqRef = useRef<number>(0);
   const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const agentPollTimerRef = useRef<NodeJS.Timeout | null>(null);
   const importPollTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    agentModalOpenRef.current = isOpen;
+  }, [isOpen]);
 
   // Project configuration state
   const [projectName, setProjectName] = useState('');
@@ -293,9 +301,26 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   useEffect(() => {
     if (isOpen) {
       if (sourceTab === 'github') {
+        if (agentStatusAbortRef.current) {
+          agentStatusAbortRef.current.abort();
+          agentStatusAbortRef.current = null;
+        }
+        if (agentStatusRecheckTimerRef.current) {
+          clearTimeout(agentStatusRecheckTimerRef.current);
+          agentStatusRecheckTimerRef.current = null;
+        }
         checkGitHubStatus();
       } else if (sourceTab === 'local' && localMode === 'agent') {
-        checkAgentStatus();
+        checkAgentStatus(false);
+      } else {
+        if (agentStatusAbortRef.current) {
+          agentStatusAbortRef.current.abort();
+          agentStatusAbortRef.current = null;
+        }
+        if (agentStatusRecheckTimerRef.current) {
+          clearTimeout(agentStatusRecheckTimerRef.current);
+          agentStatusRecheckTimerRef.current = null;
+        }
       }
     }
   }, [isOpen, sourceTab, localMode, user]);
@@ -303,10 +328,19 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   // Cancel in-flight upload, stop agent/import polling, and reset local-agent state when modal closes
   useEffect(() => {
     if (!isOpen) {
+      agentRequestSeqRef.current++;
       handleCancelUpload();
       if (folderPickerAbortRef.current) {
         folderPickerAbortRef.current.abort();
         folderPickerAbortRef.current = null;
+      }
+      if (agentStatusAbortRef.current) {
+        agentStatusAbortRef.current.abort();
+        agentStatusAbortRef.current = null;
+      }
+      if (agentStatusRecheckTimerRef.current) {
+        clearTimeout(agentStatusRecheckTimerRef.current);
+        agentStatusRecheckTimerRef.current = null;
       }
       if (agentPollTimerRef.current) {
         clearInterval(agentPollTimerRef.current);
@@ -316,6 +350,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         clearInterval(importPollTimerRef.current);
         importPollTimerRef.current = null;
       }
+      setCheckingAgent(false);
       setAgentStage('idle');
       setAgentSession(null);
       setAgentAuthSession(null);
@@ -339,6 +374,14 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         folderPickerAbortRef.current.abort();
         folderPickerAbortRef.current = null;
       }
+      if (agentStatusAbortRef.current) {
+        agentStatusAbortRef.current.abort();
+        agentStatusAbortRef.current = null;
+      }
+      if (agentStatusRecheckTimerRef.current) {
+        clearTimeout(agentStatusRecheckTimerRef.current);
+        agentStatusRecheckTimerRef.current = null;
+      }
       if (pollingTimerRef.current) {
         clearInterval(pollingTimerRef.current);
         pollingTimerRef.current = null;
@@ -350,23 +393,65 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     };
   }, [isOpen]);
 
-  const checkAgentStatus = async () => {
-    setCheckingAgent(true);
+  const checkAgentStatus = async (backgroundArg: boolean | unknown = false, recheckAttempt = 0) => {
+    const background = backgroundArg === true;
+
+    if (agentStatusAbortRef.current) {
+      agentStatusAbortRef.current.abort();
+    }
+    if (agentStatusRecheckTimerRef.current) {
+      clearTimeout(agentStatusRecheckTimerRef.current);
+      agentStatusRecheckTimerRef.current = null;
+    }
+
+    const controller = new AbortController();
+    agentStatusAbortRef.current = controller;
+
+    if (!background) {
+      setCheckingAgent(true);
+    }
+
     try {
-      const status = await api.agent.getStatus();
+      const status = await api.agent.getStatus(undefined, controller.signal);
+      if (controller.signal.aborted) {
+        return;
+      }
       setAgentStatus(status);
-    } catch {
+      if (
+        status.status === 'online' &&
+        status.docker_status === 'checking' &&
+        agentModalOpenRef.current &&
+        recheckAttempt < 5
+      ) {
+        agentStatusRecheckTimerRef.current = setTimeout(() => {
+          if (agentModalOpenRef.current) {
+            void checkAgentStatus(true, recheckAttempt + 1);
+          }
+        }, 1000);
+      }
+    } catch (err: any) {
+      if (controller.signal.aborted || err?.name === 'AbortError') {
+        return;
+      }
       setAgentStatus({
         status: 'offline',
+        reachable: false,
         agent_id: '',
         version: '',
         os: '',
         arch: '',
         docker_available: false,
+        docker_status: 'unavailable',
         active_sessions: 0,
+        error: err?.message || 'Unable to reach ForgeLAB Local Agent',
       });
     } finally {
-      setCheckingAgent(false);
+      if (agentStatusAbortRef.current === controller) {
+        agentStatusAbortRef.current = null;
+      }
+      if (!background) {
+        setCheckingAgent(false);
+      }
     }
   };
 
@@ -473,6 +558,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   };
 
   const handleCancelSelecting = () => {
+    agentRequestSeqRef.current++;
     if (folderPickerAbortRef.current) {
       folderPickerAbortRef.current.abort();
       folderPickerAbortRef.current = null;
@@ -480,6 +566,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
     setAgentAuthSession(null);
     setAgentSession(null);
     setAgentStage('idle');
+    setError(null);
   };
 
   const handleSelectLocalFolder = async () => {
@@ -488,6 +575,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       return;
     }
 
+    const reqSeq = ++agentRequestSeqRef.current;
     if (folderPickerAbortRef.current) {
       folderPickerAbortRef.current.abort();
     }
@@ -507,11 +595,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
     try {
       // 1. Obtain short-lived authenticated session from ForgeLAB backend
-      const authSession = await api.sources.createAgentSession(agentStatus?.agent_id);
+      const authSession = await api.sources.createAgentSession(agentStatus?.agent_id, abortController.signal);
+      if (abortController.signal.aborted || reqSeq !== agentRequestSeqRef.current) {
+        return;
+      }
       setAgentAuthSession(authSession);
 
       // 2. Invoke local agent with the authenticated session token and abort signal
       const res = await api.agent.selectFolder('Select Project Folder for ForgeLAB', authSession.token, abortController.signal);
+      if (abortController.signal.aborted || reqSeq !== agentRequestSeqRef.current) {
+        return;
+      }
       if ('cancelled' in res && res.cancelled) {
         setAgentStage('idle');
         return;
@@ -542,21 +636,33 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         pollAgentSession(session.source_id, authSession.token);
       }
     } catch (err: any) {
-      if (err.name === 'AbortError' || err.message?.includes('aborted') || err.message?.includes('cancelled')) {
+      if (reqSeq !== agentRequestSeqRef.current) {
+        return;
+      }
+      const isUserCancellation =
+        abortController.signal.aborted ||
+        (err?.name === 'AbortError' && !err?.data?.timeout && err?.status !== 408);
+      if (isUserCancellation) {
         setAgentStage('idle');
         return;
       }
-      if (err.status === 409 || err.message?.includes('already in progress')) {
+      if (err?.status === 409 || err?.message?.includes('already in progress')) {
         setError('Folder picker dialog is already open on your computer.');
         setAgentStage('idle');
         return;
       }
+      if (err?.status === 408 || err?.data?.timeout || err?.data?.reason === 'timeout') {
+        setError(err?.message || 'Folder selection timed out before a directory was chosen. Please try again or enter the directory path manually.');
+        setAgentStage('failed');
+        return;
+      }
       setAgentStage('failed');
-      setError(err.message || 'Failed to select and analyze directory via ForgeLAB Agent');
+      setError(err?.message || 'Failed to select and analyze directory via ForgeLAB Agent');
     } finally {
       if (folderPickerAbortRef.current === abortController) {
         folderPickerAbortRef.current = null;
       }
+      setAgentStage((prev) => (prev === 'selecting' && reqSeq === agentRequestSeqRef.current ? 'failed' : prev));
     }
   };
 
@@ -567,10 +673,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       return;
     }
 
+    const reqSeq = ++agentRequestSeqRef.current;
+    if (folderPickerAbortRef.current) {
+      folderPickerAbortRef.current.abort();
+    }
     if (agentPollTimerRef.current) {
       clearInterval(agentPollTimerRef.current);
       agentPollTimerRef.current = null;
     }
+
+    const abortController = new AbortController();
+    folderPickerAbortRef.current = abortController;
 
     // Reset previous session state so fresh session and token are used
     setAgentAuthSession(null);
@@ -580,11 +693,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
 
     try {
       // 1. Obtain short-lived authenticated session from ForgeLAB backend
-      const authSession = await api.sources.createAgentSession(agentStatus?.agent_id);
+      const authSession = await api.sources.createAgentSession(agentStatus?.agent_id, abortController.signal);
+      if (abortController.signal.aborted || reqSeq !== agentRequestSeqRef.current) {
+        return;
+      }
       setAgentAuthSession(authSession);
 
       // 2. Validate path with local agent using authenticated session token
-      const session = await api.agent.selectPath(p, authSession.token);
+      const session = await api.agent.selectPath(p, authSession.token, abortController.signal);
+      if (abortController.signal.aborted || reqSeq !== agentRequestSeqRef.current) {
+        return;
+      }
       if (isSessionReady(session)) {
         if (agentPollTimerRef.current) {
           clearInterval(agentPollTimerRef.current);
@@ -610,8 +729,20 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
         pollAgentSession(session.source_id, authSession.token);
       }
     } catch (err: any) {
+      if (reqSeq !== agentRequestSeqRef.current) {
+        return;
+      }
+      if (abortController.signal.aborted || (err?.name === 'AbortError' && !err?.data?.timeout && err?.status !== 408)) {
+        setAgentStage('idle');
+        return;
+      }
       setAgentStage('failed');
-      setError(err.message || 'Failed to validate and inspect path via ForgeLAB Agent');
+      setError(err?.message || 'Failed to validate and inspect path via ForgeLAB Agent');
+    } finally {
+      if (folderPickerAbortRef.current === abortController) {
+        folderPickerAbortRef.current = null;
+      }
+      setAgentStage((prev) => (prev === 'selecting' && reqSeq === agentRequestSeqRef.current ? 'failed' : prev));
     }
   };
 
@@ -651,6 +782,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   };
 
   const handleResetAgentSession = () => {
+    agentRequestSeqRef.current++;
     if (folderPickerAbortRef.current) {
       folderPickerAbortRef.current.abort();
       folderPickerAbortRef.current = null;
@@ -1607,16 +1739,34 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 </div>
 
                 {localMode === 'agent' && (
-                  <div className="flex items-center gap-2 text-xs">
+                  <div className="flex items-center gap-2 text-xs flex-wrap justify-end">
                     {checkingAgent ? (
                       <span className="flex items-center gap-1.5 text-neutral-400 font-mono text-[11px]">
                         <RefreshCw className="w-3 h-3 animate-spin" /> Checking agent...
                       </span>
                     ) : isLocalAgentOnline ? (
-                      <span className="flex items-center gap-1.5 text-emerald-400 font-mono text-[11px] bg-emerald-500/10 px-2 py-1 rounded border border-emerald-500/20">
-                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                        Agent Online (v{agentStatus?.version})
-                      </span>
+                      <>
+                        <span className="flex items-center gap-1.5 text-emerald-400 font-mono text-[11px] bg-emerald-500/10 px-2 py-1 rounded border border-emerald-500/20">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                          Agent Online (v{agentStatus?.version})
+                        </span>
+                        {agentStatus?.docker_status === 'checking' ? (
+                          <span className="flex items-center gap-1.5 text-neutral-300 font-mono text-[11px] bg-neutral-500/10 px-2 py-1 rounded border border-surface-border">
+                            <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                            Checking Docker
+                          </span>
+                        ) : !agentStatus?.docker_available ? (
+                          <span className="flex items-center gap-1.5 text-amber-400 font-mono text-[11px] bg-amber-500/10 px-2 py-1 rounded border border-amber-500/20">
+                            <span className="w-2 h-2 rounded-full bg-amber-500" />
+                            Docker Unavailable
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1.5 text-emerald-400/90 font-mono text-[11px] bg-emerald-500/10 px-2 py-1 rounded border border-emerald-500/20">
+                            <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                            Docker Ready
+                          </span>
+                        )}
+                      </>
                     ) : (
                       <span className="flex items-center gap-1.5 text-amber-400 font-mono text-[11px] bg-amber-500/10 px-2 py-1 rounded border border-amber-500/20">
                         <span className="w-2 h-2 rounded-full bg-amber-500" />
@@ -1625,7 +1775,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                     )}
                     <button
                       type="button"
-                      onClick={checkAgentStatus}
+                      onClick={() => checkAgentStatus(false)}
                       className="text-neutral-400 hover:text-white transition-colors p-1"
                       title="Refresh Agent Status"
                     >
@@ -1650,7 +1800,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                   setShowManualPath={setShowManualPath}
                   manualPathInput={manualPathInput}
                   setManualPathInput={setManualPathInput}
-                  onCheckAgentStatus={checkAgentStatus}
+                  onCheckAgentStatus={() => checkAgentStatus(false)}
                   onSelectLocalFolder={handleSelectLocalFolder}
                   onManualPathSelect={handleManualPathSelect}
                   onCancelSelecting={handleCancelSelecting}

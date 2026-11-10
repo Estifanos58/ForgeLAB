@@ -110,10 +110,10 @@ fi
 
 echo -e "\033[32m====================================================\033[0m"
 echo -e "\033[32m   ForgeLAB Local Agent for Linux/macOS\033[0m"
-echo -e "\033[36m   Listening on: http://${HOST_ADDR}:${PORT} (browser access: http://127.0.0.1:${PORT})\033[0m"
+echo -e "\033[36m   Target Addr:  http://${HOST_ADDR}:${PORT} (browser access: http://127.0.0.1:${PORT})\033[0m"
 echo -e "\033[32m   Backend URL:  ${BACKEND_URL}\033[0m"
 echo -e "\033[90m   Binary Path:  ${AGENT_BIN}\033[0m"
-echo -e "\033[36m   Ready for ForgeLAB browser import requests.\033[0m"
+echo -e "\033[36m   Starting HTTP listener; readiness will be confirmed once bound.\033[0m"
 echo -e "\033[33m   Press Ctrl+C to stop the agent.\033[0m"
 echo -e "\033[32m====================================================\033[0m"
 

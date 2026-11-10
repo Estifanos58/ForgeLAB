@@ -59,6 +59,14 @@ When deploying local repositories (`source_type: "local_directory"`):
 - **Security Boundary:** ForgeLAB strictly verifies that the translated directory is inside configured `FORGELAB_ALLOWED_SOURCE_ROOTS` and is not a restricted system directory.
 - **Direct Build Streaming:** Build context is streamed concurrently into Docker with early `.dockerignore` directory pruning. Files are never duplicated to `data/builds/<deployment-id>`.
 
+### Host Local Agent Daemon (`forgelab-agent`)
+To import host folders seamlessly from the browser using a native OS folder picker without mounting entire drives into Docker:
+- **Windows Startup (`.\start-agent.ps1`):** Run `.\start-agent.ps1` from an interactive PowerShell or Windows Terminal window while signed in to your Windows desktop session.
+- **Interactive Desktop Requirement:** The agent **must** run inside the logged-in interactive user's Windows session (`SessionId != 0` and `[Environment]::UserInteractive = true`). Do not run it from a headless Windows service or Session 0, where GUI dialogs cannot open.
+- **Linux / macOS Startup (`./start-agent.sh`):** Launch from an active desktop terminal session (`X11`/`Wayland`/`macOS Aqua`).
+- **Listener-Bound Readiness:** `forgelab-agent` binds its TCP listener (`127.0.0.1:4142` by default) synchronously via `net.Listen` **before** printing `Ready on http://127.0.0.1:4142`. If port `4142` is busy, it exits non-zero with port conflict diagnostics and does not announce readiness.
+- **Docker Independence:** `/api/agent/status` reports `status: "online"` as soon as the agent binds its listener even if Docker Desktop is stopped; Docker health is monitored asynchronously in the background and exposed separately via `docker_status` (`checking`, `available`, `unavailable`). Folder picking works immediately without waiting for Docker, while Docker Desktop only needs to be running before deployment.
+
 ---
 
 ## 3. Host Port Allocations & Authoritative Range

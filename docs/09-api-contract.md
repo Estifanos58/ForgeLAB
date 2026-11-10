@@ -1463,6 +1463,64 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
+### Local Agent Daemon: `GET /api/agent/status`
+- **Daemon URL:** `http://127.0.0.1:4142` (Loopback default)
+- **Authentication:** Optional (Scrubbed response when unauthenticated; full `active_sessions` and identity details when authenticated or matching `X-Expected-Agent-ID`)
+- **CORS / Request Headers:** Unauthenticated GET requests omit `Content-Type` so browsers do not issue unnecessary CORS preflight requests.
+- **Purpose:** Returns local agent process health independently of Docker Engine availability. Docker availability is probed asynchronously by a background monitor and exposed from cache without blocking `/api/agent/status`.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "status": "online",
+    "version": "1.0.0",
+    "commit": "dev",
+    "os": "windows",
+    "arch": "amd64",
+    "docker_available": false,
+    "docker_status": "unavailable",
+    "docker_error": "Docker daemon is unreachable (start Docker Desktop or the Docker service)",
+    "docker_checked_at": "2026-11-10T09:00:00Z",
+    "docker": {
+      "available": false,
+      "status": "unavailable",
+      "error": "Docker daemon is unreachable (start Docker Desktop or the Docker service)",
+      "last_checked_at": "2026-11-10T09:00:00Z"
+    },
+    "agent_id": "",
+    "agent_id_verified": false,
+    "active_sessions": 0
+  }
+  ```
+- **Notes:** `docker_status` is `"checking"` immediately after startup until the first background ping completes, then transitions to `"available"` or `"unavailable"`.
+
+---
+
+### Local Agent Daemon: `POST /api/agent/select-folder`
+- **Daemon URL:** `http://127.0.0.1:4142`
+- **Authentication:** Required (`Authorization: Bearer <session_token>` or `X-Agent-Session-Token: <session_token>`)
+- **Purpose:** Launches the host OS native directory picker (Windows STA PowerShell `FolderBrowserDialog` owned by an invisible interactive WinForms window, macOS `osascript`, Linux `zenity`/`kdialog`) from the logged-in user's interactive desktop session and registers the selected directory session.
+- **Request Body:**
+  ```json
+  {
+    "title": "Select Project Folder for ForgeLAB"
+  }
+  ```
+- **Success Response (Folder Selected):** `200 OK` returning `AgentSourceSession` metadata (never exposing raw `CanonicalPath`).
+- **Success Response (User Cancelled Dialog):** `200 OK`
+  ```json
+  {
+    "cancelled": true
+  }
+  ```
+- **Error Responses:**
+  - `400 Bad Request`: Selected directory failed `PathValidator` checks.
+  - `401 Unauthorized`: Missing or invalid session token.
+  - `408 Request Timeout`: Dialog timed out waiting for user input (`reason: "timeout"`).
+  - `409 Conflict`: Another folder picker dialog is already open (`reason: "busy"`).
+  - `503 Service Unavailable`: Agent is running in a non-interactive desktop session / Session 0 service (`reason: "non_interactive_session"`).
+
+---
+
 ### Local Agent Daemon: `POST /api/agent/verify-identity`
 - **Daemon URL:** `http://localhost:8081` (or `host.docker.internal:8081`)
 - **Authentication:** None (Preflight identity verification probe)

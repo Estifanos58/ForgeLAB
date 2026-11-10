@@ -1,5 +1,5 @@
 # ForgeLAB Local Agent Startup Script for Windows
-# Launches the ForgeLAB Local Agent on http://127.0.0.1:4142
+# Launches the ForgeLAB Local Agent in the interactive logged-in user desktop session on http://127.0.0.1:4142
 
 param(
     [string]$HostAddr = "127.0.0.1",
@@ -7,10 +7,27 @@ param(
     [string]$Backend = "http://localhost:8080",
     [string]$AllowedRoots = "",
     [switch]$ForceRebuild,
-    [switch]$NoRebuild
+    [switch]$NoRebuild,
+    [switch]$AllowNonInteractive
 )
 
 $ErrorActionPreference = "Stop"
+
+# Verify interactive logged-in desktop session (Session != 0 and UserInteractive = true)
+# so WinForms FolderBrowserDialog can attach reliably to the user's desktop.
+$currentSessionId = (Get-Process -Id $PID).SessionId
+$isUserInteractive = [Environment]::UserInteractive
+if (-not $AllowNonInteractive -and ($currentSessionId -eq 0 -or -not $isUserInteractive)) {
+    Write-Host "====================================================" -ForegroundColor Red
+    Write-Host "   [ForgeLAB] Startup Error: Non-Interactive Session" -ForegroundColor Red
+    Write-Host "   Current Windows SessionId: $currentSessionId | UserInteractive: $isUserInteractive" -ForegroundColor Yellow
+    Write-Host "   The ForgeLAB Local Agent must run inside the interactive logged-in user's desktop session" -ForegroundColor Cyan
+    Write-Host "   so native folder picker dialogs can open cleanly (Session 0 services cannot display UI)." -ForegroundColor Cyan
+    Write-Host "   Action: Open a normal PowerShell / Windows Terminal window while signed into Windows" -ForegroundColor Cyan
+    Write-Host "           and run .\start-agent.ps1 (or pass -AllowNonInteractive for headless -AllowedRoots mode)." -ForegroundColor Cyan
+    Write-Host "====================================================" -ForegroundColor Red
+    exit 1
+}
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $backendDir = Join-Path $scriptDir "backend"
@@ -36,9 +53,9 @@ if ($ForceRebuild) {
     # Check if any Go source file or dependency definition in backend is newer than the executable
     $exeTime = (Get-Item $agentExe).LastWriteTime
     $newestSource = Get-ChildItem -Path $backendDir -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { 
-            ($_.Extension -eq ".go" -or $_.Name -eq "go.mod" -or $_.Name -eq "go.sum") -and 
-            ($_.FullName -notmatch "[\\/](\.git|vendor)[\\/]") 
+        Where-Object {
+            ($_.Extension -eq ".go" -or $_.Name -eq "go.mod" -or $_.Name -eq "go.sum") -and
+            ($_.FullName -notmatch "[\\/](\.git|vendor)[\\/]")
         } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
@@ -86,45 +103,23 @@ if (-not (Test-Path $agentExe)) {
 }
 
 # Preflight check: verify port is not already bound
-try {
-    $activeTcp = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' }
-    if ($activeTcp) {
-        $conflictingPid = $activeTcp[0].OwningProcess
-        $procInfo = Get-Process -Id $conflictingPid -ErrorAction SilentlyContinue
-        $procName = if ($procInfo) { $procInfo.ProcessName } else { "Unknown" }
-        Write-Host "====================================================" -ForegroundColor Red
-        Write-Host "   [ForgeLAB] Startup Error: Port $Port is already in use!" -ForegroundColor Red
-        Write-Host "   Conflicting Process: $procName (PID: $conflictingPid)" -ForegroundColor Yellow
-        Write-Host "   Action: Terminate PID $conflictingPid or launch with another port:" -ForegroundColor Cyan
-        Write-Host "           .\start-agent.ps1 -Port $($Port + 1)" -ForegroundColor Cyan
-        Write-Host "====================================================" -ForegroundColor Red
-        exit 1
-    }
-} catch {}
-
-# Determine binary info for startup announcement
-$binaryInfo = ""
-try {
-    $verOutput = & $agentExe -version 2>$null
-    if ($LASTEXITCODE -eq 0 -and $verOutput) {
-        $binaryInfo = $verOutput.Trim()
-    }
-} catch {}
-
-if (-not $binaryInfo) {
-    $exeItem = Get-Item $agentExe
-    $binaryInfo = "Binary built: $($exeItem.LastWriteTime)"
+if ($Port -gt 0) {
+    try {
+        $activeTcp = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' }
+        if ($activeTcp) {
+            $conflictingPid = $activeTcp[0].OwningProcess
+            $procInfo = Get-Process -Id $conflictingPid -ErrorAction SilentlyContinue
+            $procName = if ($procInfo) { $procInfo.ProcessName } else { "Unknown" }
+            Write-Host "====================================================" -ForegroundColor Red
+            Write-Host "   [ForgeLAB] Startup Error: Port $Port is already in use!" -ForegroundColor Red
+            Write-Host "   Conflicting Process: $procName (PID: $conflictingPid)" -ForegroundColor Yellow
+            Write-Host "   Action: Terminate PID $conflictingPid or launch with another port:" -ForegroundColor Cyan
+            Write-Host "           .\start-agent.ps1 -Port $($Port + 1)" -ForegroundColor Cyan
+            Write-Host "====================================================" -ForegroundColor Red
+            exit 1
+        }
+    } catch {}
 }
-
-Write-Host "====================================================" -ForegroundColor Green
-Write-Host "   ForgeLAB Local Agent for Windows" -ForegroundColor Green
-Write-Host "   Build:        $binaryInfo" -ForegroundColor Cyan
-Write-Host "   Listening on: http://$HostAddr`:$Port" -ForegroundColor Green
-Write-Host "   Backend URL:  $Backend" -ForegroundColor Green
-Write-Host "   Binary Path:  $agentExe" -ForegroundColor Gray
-Write-Host "   Ready for ForgeLAB browser import requests." -ForegroundColor Cyan
-Write-Host "   Press Ctrl+C to stop the agent." -ForegroundColor Yellow
-Write-Host "====================================================" -ForegroundColor Green
 
 $agentArgs = @("-host", $HostAddr, "-port", $Port, "-backend", $Backend)
 if ($AllowedRoots) {
@@ -139,13 +134,16 @@ try {
     }
 } catch {}
 
+Write-Host "[ForgeLAB] Starting ForgeLAB Local Agent (target http://$HostAddr`:$Port, session $currentSessionId)..." -ForegroundColor Cyan
+Write-Host "[ForgeLAB] Readiness will be confirmed once the HTTP listener binds. Press Ctrl+C to stop." -ForegroundColor Gray
+
 $exitCode = 0
 if ($canDirectRun) {
     & $agentExe @agentArgs
     $exitCode = $LASTEXITCODE
 } else {
     Write-Host "[ForgeLAB] Notice: Direct binary execution was restricted by Windows Application Control." -ForegroundColor Yellow
-    Write-Host "[ForgeLAB] Running agent using 'go run ./cmd/agent' from current source..." -ForegroundColor Cyan
+    Write-Host "[ForgeLAB] Launching agent via 'go run ./cmd/agent' from current source..." -ForegroundColor Cyan
     Push-Location $backendDir
     try {
         go run ./cmd/agent @agentArgs
@@ -158,5 +156,5 @@ if ($canDirectRun) {
 if ($exitCode -ne 0) {
     Write-Host "[ForgeLAB] Local agent process exited with status code $exitCode." -ForegroundColor Yellow
     Write-Host "[ForgeLAB] If this was unexpected, verify that port $Port is free and backend at $Backend is reachable." -ForegroundColor Cyan
+    exit $exitCode
 }
-

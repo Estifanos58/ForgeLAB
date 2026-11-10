@@ -70,14 +70,14 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Extend session TTL on active access
-	session.ExpiresAt = time.Now().Add(s.sessionTTL)
-
-	// Verify token match
+	// Extend session TTL and verify token match under session lock
 	token, _ := r.Context().Value("agent_token").(string)
+	session.mu.Lock()
+	session.ExpiresAt = time.Now().Add(s.sessionTTL)
 	if session.Token == "" && token != "" {
 		session.Token = token
 	} else if session.Token != "" && token != "" && session.Token != token {
+		session.mu.Unlock()
 		slog.Warn("agent source session token mismatch",
 			"source_id", sourceUUID.String(),
 			"agent_id", s.agentID,
@@ -88,6 +88,7 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		})
 		return
 	}
+	session.mu.Unlock()
 
 	if len(parts) == 1 {
 		if r.Method == http.MethodGet {
@@ -113,11 +114,11 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		s.mu.Lock()
+		session.mu.Lock()
 		session.Status = "consumed"
 		session.Phase = "consumed"
 		session.UpdatedAt = time.Now()
-		s.mu.Unlock()
+		session.mu.Unlock()
 		s.renderSessionResponse(w, session)
 
 	case "discovery":
@@ -172,18 +173,21 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		analysis, err := analyzer.AnalyzeRepository(session.CanonicalPath)
+		session.mu.RLock()
+		canonPath := session.CanonicalPath
+		session.mu.RUnlock()
+		analysis, err := analyzer.AnalyzeRepository(canonPath)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("re-analysis failed: %v", err), http.StatusInternalServerError)
 			return
 		}
-		s.mu.Lock()
+		session.mu.Lock()
 		session.Analysis = analysis
 		if analysis.Discovery != nil {
 			session.Discovery = analysis.Discovery
 		}
 		session.UpdatedAt = time.Now()
-		s.mu.Unlock()
+		session.mu.Unlock()
 		s.renderSessionResponse(w, session)
 
 	case "path", "source-path":
@@ -213,6 +217,11 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			return
 		}
 
+		session.mu.RLock()
+		canonPath := session.CanonicalPath
+		sessionID := session.SourceID
+		session.mu.RUnlock()
+
 		serviceRelPath := r.URL.Query().Get("service_path")
 		cleanRelPath, pathErr := security.ValidateRelativeServicePath(serviceRelPath)
 		if pathErr != nil {
@@ -220,13 +229,13 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		serviceDir := filepath.Join(session.CanonicalPath, filepath.FromSlash(cleanRelPath))
+		serviceDir := filepath.Join(canonPath, filepath.FromSlash(cleanRelPath))
 		evalServiceDir, err := filepath.EvalSymlinks(serviceDir)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("invalid service directory: %v", err), http.StatusBadRequest)
 			return
 		}
-		relCheck, err := filepath.Rel(session.CanonicalPath, evalServiceDir)
+		relCheck, err := filepath.Rel(canonPath, evalServiceDir)
 		if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
 			http.Error(w, "invalid service path traversal", http.StatusForbidden)
 			return
@@ -312,7 +321,7 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 
 		matcher, dErr := dockerignore.LoadDockerignore(evalServiceDir)
 		if dErr != nil {
-			slog.Error("error loading .dockerignore", "source_id", session.SourceID, "error", dErr)
+			slog.Error("error loading .dockerignore", "source_id", sessionID, "error", dErr)
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error":  "failed to read or parse .dockerignore",
 				"reason": dErr.Error(),
@@ -329,7 +338,7 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		// Generate completed, validated archive to disk first before sending any HTTP response headers
 		tmpFile, err := tararchive.CreateCompletedArchiveFile(r.Context(), os.TempDir(), bOpts, expectedDockerfile)
 		if err != nil {
-			slog.Error("error creating agent build context archive", "source_id", session.SourceID, "error", err)
+			slog.Error("error creating agent build context archive", "source_id", sessionID, "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
 				"error":  "failed to generate build context archive",
 				"reason": err.Error(),
@@ -364,7 +373,7 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusOK)
 
 		if _, copyErr := io.Copy(w, tmpFile); copyErr != nil {
-			slog.Error("error streaming completed archive to client", "source_id", session.SourceID, "error", copyErr)
+			slog.Error("error streaming completed archive to client", "source_id", sessionID, "error", copyErr)
 		}
 
 	default:
@@ -380,15 +389,20 @@ type SourceEnvironmentResponse struct {
 }
 
 func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Request, session *LocalSourceSession) {
+	session.mu.RLock()
+	sessionID := session.SourceID
+	canonPath := session.CanonicalPath
+	session.mu.RUnlock()
+
 	resp := SourceEnvironmentResponse{
-		SourceID: session.SourceID,
+		SourceID: sessionID,
 		Root:     make(map[string]string),
 		Services: make(map[string]map[string]string),
 	}
 
 	// 1. Compose file declarations (docker-compose.yml / compose.yaml)
-	if composePath, found := discovery.FindComposeFile(session.CanonicalPath); found {
-		if _, composeSvcs, err := discovery.ParseComposeFile(composePath, session.CanonicalPath); err == nil {
+	if composePath, found := discovery.FindComposeFile(canonPath); found {
+		if _, composeSvcs, err := discovery.ParseComposeFile(composePath, canonPath); err == nil {
 			for _, cs := range composeSvcs {
 				if len(cs.Environment) > 0 {
 					if _, ok := resp.Services[cs.Name]; !ok {
@@ -420,17 +434,17 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 				}
 			}
 		} else {
-			slog.Warn("error parsing compose file for environment", "source_id", session.SourceID, "path", composePath, "error", err)
+			slog.Warn("error parsing compose file for environment", "source_id", sessionID, "path", composePath, "error", err)
 		}
 	}
 
 	// 2. Root .env
-	rootEnvPath := filepath.Join(session.CanonicalPath, ".env")
+	rootEnvPath := filepath.Join(canonPath, ".env")
 	if fi, err := os.Stat(rootEnvPath); err == nil && !fi.IsDir() {
 		if rootVars, err := envparser.ParseFile(rootEnvPath); err == nil {
 			resp.Root = rootVars
 		} else {
-			slog.Warn("error parsing root .env", "source_id", session.SourceID, "error", err)
+			slog.Warn("error parsing root .env", "source_id", sessionID, "error", err)
 		}
 	}
 
@@ -454,12 +468,12 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 			if err != nil {
 				continue
 			}
-			svcDir := filepath.Join(session.CanonicalPath, filepath.FromSlash(cleanRel))
+			svcDir := filepath.Join(canonPath, filepath.FromSlash(cleanRel))
 			evalSvcDir, err := filepath.EvalSymlinks(svcDir)
 			if err != nil {
 				continue
 			}
-			relCheck, err := filepath.Rel(session.CanonicalPath, evalSvcDir)
+			relCheck, err := filepath.Rel(canonPath, evalSvcDir)
 			if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
 				continue
 			}
@@ -473,18 +487,18 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 		}
 	} else {
 		// Discover immediate subdirectories under root for .env
-		entries, err := os.ReadDir(session.CanonicalPath)
+		entries, err := os.ReadDir(canonPath)
 		if err == nil {
 			for _, entry := range entries {
 				if !entry.IsDir() || analyzer.IsPrunedDir(entry.Name()) {
 					continue
 				}
-				subDir := filepath.Join(session.CanonicalPath, entry.Name())
+				subDir := filepath.Join(canonPath, entry.Name())
 				evalSubDir, err := filepath.EvalSymlinks(subDir)
 				if err != nil {
 					continue
 				}
-				relCheck, err := filepath.Rel(session.CanonicalPath, evalSubDir)
+				relCheck, err := filepath.Rel(canonPath, evalSubDir)
 				if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
 					continue
 				}

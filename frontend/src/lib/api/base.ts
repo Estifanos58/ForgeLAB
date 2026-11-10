@@ -126,25 +126,155 @@ export function getAgentToken(): string | null {
   return currentAgentToken;
 }
 
-export async function agentFetch<T>(endpoint: string, options: RequestInit = {}, token?: string): Promise<T> {
+export interface AgentFetchOptions extends RequestInit {
+  timeoutMs?: number;
+}
+
+function normalizeHeaders(input?: HeadersInit): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!input) {
+    return result;
+  }
+  if (typeof Headers !== 'undefined' && input instanceof Headers) {
+    input.forEach((value, key) => {
+      result[key] = value;
+    });
+    return result;
+  }
+  if (Array.isArray(input)) {
+    for (const [key, value] of input) {
+      result[key] = value;
+    }
+    return result;
+  }
+  return { ...(input as Record<string, string>) };
+}
+
+function hasHeaderCaseInsensitive(headers: Record<string, string>, name: string): boolean {
+  const lower = name.toLowerCase();
+  return Object.keys(headers).some((k) => k.toLowerCase() === lower);
+}
+
+function createAbortError(message = 'The operation was aborted'): Error {
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
+}
+
+export async function agentFetch<T>(
+  endpoint: string,
+  options: AgentFetchOptions = {},
+  token?: string
+): Promise<T> {
   const url = `${AGENT_URL}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
   const authToken = token || currentAgentToken;
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string>),
-  };
-  if (authToken) {
+  const { timeoutMs, signal: callerSignal, headers: rawHeaders, ...fetchOptions } = options;
+
+  if (callerSignal?.aborted) {
+    throw createAbortError();
+  }
+
+  const headers = normalizeHeaders(rawHeaders);
+  const hasBody = fetchOptions.body !== undefined && fetchOptions.body !== null;
+  const isFormData = typeof FormData !== 'undefined' && fetchOptions.body instanceof FormData;
+  if (hasBody && !isFormData && !hasHeaderCaseInsensitive(headers, 'Content-Type')) {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (authToken && !hasHeaderCaseInsensitive(headers, 'Authorization')) {
     headers['Authorization'] = `Bearer ${authToken}`;
   }
-  const response = await fetch(url, {
-    ...options,
-    headers,
-  });
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new ApiClientError(errorText || `Agent request failed with status ${response.status}`, response.status);
+
+  const controller = new AbortController();
+  let timedOut = false;
+  let callerAborted = false;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  const onCallerAbort = () => {
+    callerAborted = true;
+    controller.abort();
+  };
+
+  if (callerSignal) {
+    callerSignal.addEventListener('abort', onCallerAbort, { once: true });
   }
-  return response.json();
+
+  if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+
+  try {
+    const response = await fetch(url, {
+      ...fetchOptions,
+      headers,
+      signal: controller.signal,
+    });
+
+    if (response.status === 204) {
+      return {} as T;
+    }
+
+    const rawText = await response.text();
+    let parsed: any;
+    if (rawText) {
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        parsed = undefined;
+      }
+    }
+
+    if (!response.ok) {
+      const errorMsg =
+        (typeof parsed === 'object' && parsed !== null && (parsed.error || parsed.message)) ||
+        rawText.trim() ||
+        `Agent request failed with status ${response.status}`;
+      throw new ApiClientError(
+        errorMsg,
+        response.status,
+        typeof parsed === 'object' && parsed !== null ? parsed : rawText
+      );
+    }
+
+    if (!rawText) {
+      return {} as T;
+    }
+    if (parsed !== undefined) {
+      return parsed as T;
+    }
+    throw new ApiClientError('Invalid JSON response from ForgeLAB Local Agent', response.status, rawText);
+  } catch (err: any) {
+    if (timedOut) {
+      throw new ApiClientError(
+        `Local Agent request timed out after ${timeoutMs}ms`,
+        408,
+        { timeout: true, reason: 'timeout' }
+      );
+    }
+    if (callerAborted || callerSignal?.aborted) {
+      if (err?.name === 'AbortError') {
+        throw err;
+      }
+      throw createAbortError();
+    }
+    if (err instanceof ApiClientError) {
+      throw err;
+    }
+    throw new ApiClientError(
+      err?.message || 'Unable to reach ForgeLAB Local Agent',
+      0,
+      { unreachable: true, reason: 'unreachable' }
+    );
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+    if (callerSignal) {
+      callerSignal.removeEventListener('abort', onCallerAbort);
+    }
+  }
 }
 
 export function buildLogQuery(options?: LogQueryOptions | string): string {

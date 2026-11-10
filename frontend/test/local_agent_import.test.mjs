@@ -1,5 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { ApiClientError, agentFetch } from '../src/lib/api/base.ts';
+import {
+  agentClient,
+  DEFAULT_AGENT_STATUS_TIMEOUT_MS,
+  DEFAULT_SELECT_FOLDER_TIMEOUT_MS,
+} from '../src/lib/api/agent-client.ts';
 
 // Simulated pollAgentSession implementation reflecting create-project-modal.tsx
 function createAgentSessionPoller({ getSourceFn, onProgress, onReady, onStage, onError }) {
@@ -286,4 +292,188 @@ test('Folder Picker - handles 409 Conflict when picker dialog already open', asy
 
   assert.equal(stage, 'idle');
   assert.equal(errorMsg, 'Folder picker dialog is already open on your computer.');
+});
+
+test('agentFetch & agentClient.getStatus - omits Content-Type on GET requests and uses >= 5s default timeout', async () => {
+  assert.ok(DEFAULT_AGENT_STATUS_TIMEOUT_MS >= 5000);
+  assert.ok(DEFAULT_SELECT_FOLDER_TIMEOUT_MS >= 120000);
+
+  const originalFetch = globalThis.fetch;
+  let capturedInit = null;
+  let capturedUrl = null;
+
+  globalThis.fetch = async (url, init) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return new Response(
+      JSON.stringify({
+        status: 'online',
+        version: '1.0.0',
+        os: 'windows',
+        arch: 'amd64',
+        docker_available: false,
+        docker_status: 'checking',
+        docker: { available: false, status: 'checking' },
+        agent_id: '',
+        active_sessions: 0,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+
+  try {
+    const status = await agentClient.getStatus();
+    assert.equal(capturedUrl, 'http://127.0.0.1:4142/api/agent/status');
+    assert.equal(capturedInit.headers['Content-Type'], undefined);
+    assert.equal(capturedInit.headers['content-type'], undefined);
+    assert.equal(status.status, 'online');
+    assert.equal(status.reachable, true);
+    assert.equal(status.docker_available, false);
+    assert.equal(status.docker_status, 'checking');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('agentFetch - attaches Content-Type: application/json and Authorization on JSON POST', async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedInit = null;
+
+  globalThis.fetch = async (_url, init) => {
+    capturedInit = init;
+    return new Response(
+      JSON.stringify({ cancelled: true }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+
+  try {
+    const res = await agentClient.selectFolder('Pick Folder', 'bearer-tok-xyz');
+    assert.deepEqual(res, { cancelled: true });
+    assert.equal(capturedInit.method, 'POST');
+    assert.equal(capturedInit.headers['Content-Type'], 'application/json');
+    assert.equal(capturedInit.headers['Authorization'], 'Bearer bearer-tok-xyz');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('agentFetch - distinguishes request timeout (408) from caller AbortSignal and network unreachable', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = (_url, init) =>
+    new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        const err = new Error('aborted');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    });
+
+  try {
+    // 1. Internal timeout triggers ApiClientError with status 408
+    await assert.rejects(
+      () => agentFetch('/api/agent/select-folder', { method: 'POST', body: '{}', timeoutMs: 25 }),
+      (err) =>
+        err instanceof ApiClientError &&
+        err.status === 408 &&
+        err.data?.timeout === true &&
+        err.data?.reason === 'timeout'
+    );
+
+    // 2. Explicit caller abort throws AbortError rather than 408 timeout
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 15);
+    await assert.rejects(
+      () =>
+        agentFetch('/api/agent/select-folder', {
+          method: 'POST',
+          body: '{}',
+          timeoutMs: 5000,
+          signal: controller.signal,
+        }),
+      (err) => err?.name === 'AbortError'
+    );
+
+    // 3. Network failure distinguishes offline/unreachable agent from online agent without Docker
+    globalThis.fetch = async () => {
+      throw new TypeError('fetch failed: ECONNREFUSED');
+    };
+    const offlineStatus = await agentClient.getStatus();
+    assert.equal(offlineStatus.status, 'offline');
+    assert.equal(offlineStatus.reachable, false);
+    assert.match(offlineStatus.error || '', /ECONNREFUSED/);
+
+    // 4. Agent online while Docker stopped stays reachable: true
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          status: 'online',
+          version: '1.0.0',
+          os: 'windows',
+          arch: 'amd64',
+          docker_available: false,
+          docker_status: 'unavailable',
+          docker_error: 'Docker daemon is unreachable',
+          agent_id: '',
+          active_sessions: 0,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    const noDockerStatus = await agentClient.getStatus();
+    assert.equal(noDockerStatus.status, 'online');
+    assert.equal(noDockerStatus.reachable, true);
+    assert.equal(noDockerStatus.docker_available, false);
+    assert.equal(noDockerStatus.docker_status, 'unavailable');
+    assert.equal(noDockerStatus.docker_error, 'Docker daemon is unreachable');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Folder Picker - error responses (408 timeout, 503 non-interactive) never leave stage stuck in selecting', async () => {
+  const originalFetch = globalThis.fetch;
+
+  async function runSelectTransition(mockFetch) {
+    globalThis.fetch = mockFetch;
+    let stage = 'selecting';
+    let error = null;
+    try {
+      await agentClient.selectFolder('Pick', 'tok-123');
+      stage = 'ready';
+    } catch (err) {
+      stage = 'failed';
+      error = err?.message || 'failed';
+    } finally {
+      if (stage === 'selecting') {
+        stage = 'failed';
+      }
+    }
+    return { stage, error };
+  }
+
+  try {
+    const res408 = await runSelectTransition(async () =>
+      new Response(JSON.stringify({ error: 'folder picker timed out', reason: 'timeout' }), {
+        status: 408,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+    assert.equal(res408.stage, 'failed');
+    assert.match(res408.error, /timed out/);
+
+    const res503 = await runSelectTransition(async () =>
+      new Response(
+        JSON.stringify({
+          error: 'native folder picker requires an interactive desktop session',
+          reason: 'non_interactive_session',
+        }),
+        { status: 503, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    assert.equal(res503.stage, 'failed');
+    assert.match(res503.error, /interactive desktop session/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

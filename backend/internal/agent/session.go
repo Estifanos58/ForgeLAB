@@ -63,6 +63,7 @@ type SessionManager struct {
 	sessions    map[uuid.UUID]*AgentSession
 	tokens      map[string]uuid.UUID // token -> session_id
 	stopCleanup chan struct{}
+	stopOnce    sync.Once
 }
 
 var (
@@ -91,7 +92,11 @@ func NewSessionManager() *SessionManager {
 
 // Stop terminates the background cleanup routine
 func (sm *SessionManager) Stop() {
-	close(sm.stopCleanup)
+	sm.stopOnce.Do(func() {
+		if sm.stopCleanup != nil {
+			close(sm.stopCleanup)
+		}
+	})
 }
 
 func (sm *SessionManager) cleanupLoop(interval time.Duration) {

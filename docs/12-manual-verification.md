@@ -100,6 +100,7 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Service Exposure Configuration & Isolation** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Explicit `public_exposed` selection in UI/API; database and infrastructure services default to internal; volume traversal validation error propagation |
 | **Secure Public Project Sharing** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests outbound Yamux tunnel, public gateway ingress, path traversal defense, frontend/backend routing, loopback port binding, and immediate revocation |
 | **WebSocket Compatibility & Deprecation Path** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Validates `?token=` query fallback with scrubbed deprecation warning while preferring single-use tickets (`POST /api/ws/ticket`) and HttpOnly cookies |
+| **Windows First-Launch Local Agent & Folder Picker** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests loopback bind readiness, offline-Docker agent status, port conflict diagnostics, interactive desktop STA `FolderBrowserDialog`, spaces/Unicode paths, and cancel/timeout recovery |
 
 ---
 
@@ -1955,4 +1956,64 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 - **Date:** 2026-11-08
 - **Environment:** Windows amd64 / Go 1.27 / Node.js v24.21.0 / PostgreSQL 16 & Redis 7 (Mocks / Isolated Test Harness)
 - **Notes:** Full regression suites passing for `middleware`, `tunnel`, `models`, `config`, and `frontend`. Manual verification checklist documented above for physical host execution.
+
+---
+
+### 40. Windows First-Launch Local Agent Startup & Folder Picker Reliability
+
+#### Purpose
+Verify cold-start reliability of the Windows Local Agent (`forgelab-agent.exe`), accurate separation between agent reachability and background Docker daemon health, port-conflict diagnostics, interactive desktop enforcement, native `FolderBrowserDialog` visibility and disposal, and Unicode/spaces path round-trips.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Prerequisites
+- Windows 10/11 desktop session signed in interactively (`SessionId != 0`).
+- ForgeLAB frontend (`http://localhost:3000`) and backend (`http://localhost:8080`) running.
+- Docker Desktop stopped initially (for Test Procedure 40.1), then started (for end-to-end deployment).
+
+#### Test Procedure 40.1 — First-Launch with Docker Desktop Stopped
+1. Ensure Docker Desktop is completely stopped on Windows (`docker info` fails).
+2. Open an interactive PowerShell terminal and run `.\start-agent.ps1` from the repository root.
+3. Observe terminal output:
+   - Script logs `Starting ForgeLAB Local Agent (target http://127.0.0.1:4142, session <N>)...`.
+   - Only after the TCP socket binds does the agent print `Desktop Session: interactive=true (session <N>, winsta WinSta0)` and `Ready on http://127.0.0.1:4142`.
+4. Open ForgeLAB in the browser (`http://localhost:3000`) → click **New Project** → **Local Agent**.
+5. Open Browser DevTools → Network tab and inspect `GET http://127.0.0.1:4142/api/agent/status`:
+   - Verify request completes quickly (`200 OK`) with **no** `Content-Type` header on the GET request and no failed CORS preflight.
+   - Verify modal displays **Agent Online** alongside a yellow **Docker Unavailable** indicator/notice explaining that folder selection works now and Docker is only needed for deployment.
+6. Start Docker Desktop and wait 3–10 seconds (or click **Recheck**); verify the background monitor updates the status pill cleanly to **Docker Ready** without restarting the agent.
+
+#### Test Procedure 40.2 — Port Conflict & Non-Interactive Session Guardrails
+1. With `forgelab-agent` already running on port `4142`, open a second interactive PowerShell terminal and run `.\start-agent.ps1`.
+2. Verify it exits non-zero with a port-conflict error identifying port `4142` (or run `go run ./cmd/agent -port 4142` directly and verify stderr prints the port-in-use error and **zero** `Ready on` banner appears).
+3. Test running without interactive UI (or via simulated non-interactive session check) and verify `.\start-agent.ps1` refuses Session 0 launches unless `-AllowNonInteractive` is supplied.
+
+#### Test Procedure 40.3 — Interactive Native Folder Picker, Cancel/Timeout, & Unicode Paths
+1. Prepare a test project directory containing spaces and Unicode characters in its path, for example:
+   `C:\Users\<user>\Desktop\ForgeLAB Test — 项目\My App` containing a `package.json`.
+2. In the **New Project → Local Agent** tab, click **Browse Computer Folder**.
+3. Verify the Windows native `FolderBrowserDialog` opens immediately in the foreground (on top of the browser window) on the active monitor.
+4. Click **Cancel** in the Windows dialog:
+   - Verify the UI returns promptly to the ready state (`idle`), never staying stuck on `selecting`, and no error banner appears.
+5. Click **Browse Computer Folder** again:
+   - Click the UI's cancel control while the dialog is open (if accessible) and confirm no stale request locks the picker; subsequent clicks open the dialog normally.
+6. Click **Browse Computer Folder** again, choose the Unicode/spaces folder `C:\Users\<user>\Desktop\ForgeLAB Test — 项目\My App`, and click **OK**:
+   - Verify the native dialog closes cleanly and `forgelab-agent` completes directory discovery and returns detected services without mojibake or errors.
+
+#### Expected Result
+- Agent status reports `online` immediately even when Docker Desktop is stopped or still booting.
+- Listener conflict exits non-zero without printing false readiness banners.
+- Windows `FolderBrowserDialog` always appears in front, handles cancel/abort cleanly without hanging UI state, and imports paths with spaces and Unicode losslessly.
+
+#### Verification Record (Section 40)
+- **Status:** NOT RECORDED (Awaiting physical interactive Windows desktop execution by project owner)
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated unit/subprocess tests verified `/api/agent/status` independence, `ListenAddr()`, PowerShell `-STA` + owner-form + `Dispose()` + UTF-8 Base64 output + cancel/timeout kill, port-conflict non-zero exit, and frontend `agentFetch` timeout/abort/CORS-header handling without a human clicking the physical WinForms modal dialog.
+
 
