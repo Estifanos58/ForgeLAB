@@ -10,10 +10,9 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/models"
@@ -276,29 +275,29 @@ func joinContainerPath(base, rel string) string {
 }
 
 // InspectBackendContainer inspects the running backend container JSON.
-func InspectBackendContainer(ctx context.Context, cli client.CommonAPIClient) (*types.ContainerJSON, error) {
+func InspectBackendContainer(ctx context.Context, cli client.APIClient) (*container.InspectResponse, error) {
 	if cli == nil {
 		return nil, errors.New("docker client is nil")
 	}
 
 	// 1. Try container hostname (Docker sets the container hostname to short container ID by default)
 	if hostname, err := os.Hostname(); err == nil && hostname != "" {
-		if inspect, err := cli.ContainerInspect(ctx, hostname); err == nil {
-			return &inspect, nil
+		if inspect, err := cli.ContainerInspect(ctx, hostname, client.ContainerInspectOptions{}); err == nil {
+			return &inspect.Container, nil
 		}
 	}
 
 	// 2. Try explicit container names defined by docker-compose.yml
 	for _, name := range []string{"forgelab-backend", "/forgelab-backend"} {
-		if inspect, err := cli.ContainerInspect(ctx, name); err == nil {
-			return &inspect, nil
+		if inspect, err := cli.ContainerInspect(ctx, name, client.ContainerInspectOptions{}); err == nil {
+			return &inspect.Container, nil
 		}
 	}
 
 	// 3. Fallback: inspect running containers matching backend service name or label
-	containers, err := cli.ContainerList(ctx, container.ListOptions{All: false})
+	containersRes, err := cli.ContainerList(ctx, client.ContainerListOptions{All: false})
 	if err == nil {
-		for _, c := range containers {
+		for _, c := range containersRes.Items {
 			isCandidate := false
 			if c.Labels != nil && c.Labels["com.docker.compose.service"] == "backend" {
 				isCandidate = true
@@ -312,8 +311,8 @@ func InspectBackendContainer(ctx context.Context, cli client.CommonAPIClient) (*
 				}
 			}
 			if isCandidate {
-				if inspect, err := cli.ContainerInspect(ctx, c.ID); err == nil {
-					return &inspect, nil
+				if inspect, err := cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{}); err == nil {
+					return &inspect.Container, nil
 				}
 			}
 		}
@@ -324,7 +323,7 @@ func InspectBackendContainer(ctx context.Context, cli client.CommonAPIClient) (*
 
 // DetectAllBackendContainerMounts queries the Docker daemon to return all volume/bind mounts
 // on the running ForgeLAB backend container.
-func DetectAllBackendContainerMounts(ctx context.Context, cli client.CommonAPIClient) ([]ContainerMountInfo, error) {
+func DetectAllBackendContainerMounts(ctx context.Context, cli client.APIClient) ([]ContainerMountInfo, error) {
 	inspect, err := InspectBackendContainer(ctx, cli)
 	if err != nil {
 		return nil, err
@@ -343,7 +342,7 @@ func DetectAllBackendContainerMounts(ctx context.Context, cli client.CommonAPICl
 
 // DetectBackendContainerMount queries the Docker daemon to locate the host mount corresponding
 // to containerTarget (defaulting to /host-projects) on the running ForgeLAB backend container.
-func DetectBackendContainerMount(ctx context.Context, cli client.CommonAPIClient, containerTarget string) (*ContainerMountInfo, error) {
+func DetectBackendContainerMount(ctx context.Context, cli client.APIClient, containerTarget string) (*ContainerMountInfo, error) {
 	if cli == nil {
 		return nil, errors.New("docker client is nil")
 	}
@@ -376,7 +375,7 @@ func DetectBackendContainerMount(ctx context.Context, cli client.CommonAPIClient
 
 // translateBackendPathToDaemon translates a path accessible inside the backend container to the corresponding
 // path acceptable to the Docker daemon on the host.
-func translateBackendPathToDaemon(ctx context.Context, cli client.CommonAPIClient, backendPath string, pv *security.PathValidator) string {
+func translateBackendPathToDaemon(ctx context.Context, cli client.APIClient, backendPath string, pv *security.PathValidator) string {
 	cleanBackend := filepath.Clean(backendPath)
 	if cleanBackend == "" || cleanBackend == "." {
 		return cleanBackend
@@ -431,13 +430,13 @@ func ResolveProjectSourcePaths(
 	project *models.Project,
 	sourceService *services.SourceService,
 	pathValidator *security.PathValidator,
-	dockerCli ...client.CommonAPIClient,
+	dockerCli ...client.APIClient,
 ) (ProjectSourcePaths, error) {
 	if project == nil {
 		return ProjectSourcePaths{}, nil
 	}
 
-	var cli client.CommonAPIClient
+	var cli client.APIClient
 	if len(dockerCli) > 0 && dockerCli[0] != nil {
 		cli = dockerCli[0]
 	}
@@ -707,7 +706,7 @@ func ResolveAndValidateVolumeMount(
 	vol models.VolumeMountConfig,
 	sourceService *services.SourceService,
 	pathValidator *security.PathValidator,
-	dockerCli ...client.CommonAPIClient,
+	dockerCli ...client.APIClient,
 ) (*ResolvedVolumeMount, error) {
 	// Container target must be an absolute path starting with '/'
 	cleanTarget := filepath.ToSlash(vol.Target)

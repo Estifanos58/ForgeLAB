@@ -1,6 +1,7 @@
 package models_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/forgelab/backend/internal/models"
@@ -12,37 +13,87 @@ func TestStateTransitions(t *testing.T) {
 		{models.DeployStatusQueued, models.DeployStatusCloning},
 		{models.DeployStatusQueued, models.DeployStatusBuilding},
 		{models.DeployStatusQueued, models.DeployStatusStarting},
+		{models.DeployStatusQueued, models.DeployStatusFailed},
+		{models.DeployStatusQueued, models.DeployStatusSkipped},
 		{models.DeployStatusCloning, models.DeployStatusBuilding},
+		{models.DeployStatusCloning, models.DeployStatusStarting},
+		{models.DeployStatusCloning, models.DeployStatusFailed},
+		{models.DeployStatusCloning, models.DeployStatusSkipped},
 		{models.DeployStatusBuilding, models.DeployStatusStarting},
 		{models.DeployStatusBuilding, models.DeployStatusRunning},
+		{models.DeployStatusBuilding, models.DeployStatusStopped},
+		{models.DeployStatusBuilding, models.DeployStatusFailed},
+		{models.DeployStatusBuilding, models.DeployStatusSkipped},
 		{models.DeployStatusStarting, models.DeployStatusHealthChecking},
 		{models.DeployStatusStarting, models.DeployStatusRunning},
 		{models.DeployStatusStarting, models.DeployStatusStopped},
+		{models.DeployStatusStarting, models.DeployStatusFailed},
 		{models.DeployStatusHealthChecking, models.DeployStatusRunning},
+		{models.DeployStatusHealthChecking, models.DeployStatusStopped},
+		{models.DeployStatusHealthChecking, models.DeployStatusFailed},
 		{models.DeployStatusRunning, models.DeployStatusStopped},
+		{models.DeployStatusRunning, models.DeployStatusCrashed},
+		{models.DeployStatusRunning, models.DeployStatusFailed},
+		{models.DeployStatusStopped, models.DeployStatusStarting},
 		{models.DeployStatusStopped, models.DeployStatusRunning},
-		{models.DeployStatusBuilding, models.DeployStatusFailed},
+		{models.DeployStatusStopped, models.DeployStatusFailed},
+		{models.DeployStatusCrashed, models.DeployStatusStarting},
+		{models.DeployStatusCrashed, models.DeployStatusRunning},
+		{models.DeployStatusCrashed, models.DeployStatusFailed},
 	}
 
 	for _, pair := range validPairs {
 		if err := models.ValidateStateTransition(pair[0], pair[1]); err != nil {
 			t.Errorf("expected valid transition from %s to %s, got error: %v", pair[0], pair[1], err)
 		}
+		if err := models.ValidateStateTransition(pair[0], pair[0]); err != nil {
+			t.Errorf("expected self-transition for %s to be valid, got error: %v", pair[0], err)
+		}
 	}
 
-	// Invalid transitions
+	// Invalid transitions (including terminal immutability & unknown statuses)
 	invalidPairs := [][2]string{
 		{models.DeployStatusQueued, models.DeployStatusRunning},
 		{models.DeployStatusCloning, models.DeployStatusRunning},
+		{models.DeployStatusCloning, models.DeployStatusStopped},
+		{models.DeployStatusFailed, models.DeployStatusQueued},
 		{models.DeployStatusFailed, models.DeployStatusRunning},
 		{models.DeployStatusFailed, models.DeployStatusBuilding},
-		{models.DeployStatusCloning, models.DeployStatusStopped},
+		{models.DeployStatusSkipped, models.DeployStatusQueued},
+		{models.DeployStatusSkipped, models.DeployStatusRunning},
+		{models.DeployStatusRunning, models.DeployStatusQueued},
+		{models.DeployStatusRunning, "unknown_state"},
+		{"unknown_state", models.DeployStatusQueued},
 	}
 
 	for _, pair := range invalidPairs {
-		if err := models.ValidateStateTransition(pair[0], pair[1]); err == nil {
+		err := models.ValidateStateTransition(pair[0], pair[1])
+		if err == nil {
 			t.Errorf("expected invalid transition error from %s to %s, got nil", pair[0], pair[1])
+		} else if !errors.Is(err, models.ErrInvalidStateTransition) {
+			t.Errorf("expected ErrInvalidStateTransition for %s -> %s, got %v", pair[0], pair[1], err)
 		}
+	}
+
+	allStatuses := []string{
+		models.DeployStatusQueued,
+		models.DeployStatusCloning,
+		models.DeployStatusBuilding,
+		models.DeployStatusStarting,
+		models.DeployStatusHealthChecking,
+		models.DeployStatusRunning,
+		models.DeployStatusStopped,
+		models.DeployStatusCrashed,
+		models.DeployStatusFailed,
+		models.DeployStatusSkipped,
+	}
+	for _, st := range allStatuses {
+		if !models.IsValidDeploymentStatus(st) {
+			t.Errorf("expected %s to be recognized as valid deployment status", st)
+		}
+	}
+	if models.IsValidDeploymentStatus("bogus") || models.IsValidDeploymentStatus("") {
+		t.Errorf("expected unknown/empty statuses to be rejected by IsValidDeploymentStatus")
 	}
 }
 

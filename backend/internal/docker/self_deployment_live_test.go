@@ -10,12 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	dockerimage "github.com/docker/docker/api/types/image"
-	dockernetwork "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
+	dockernetwork "github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -30,13 +28,13 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Skipf("Docker daemon not available: %v", err)
 	}
 	defer cli.Close()
 
-	if _, err := cli.Ping(ctx); err != nil {
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
 		t.Skipf("Docker daemon ping failed: %v", err)
 	}
 
@@ -44,17 +42,17 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 
 	// Create dedicated bridge network
 	testNetName := fmt.Sprintf("test-selfdeploy-%s", uuid.New().String()[:8])
-	_, err = cli.NetworkCreate(ctx, testNetName, dockernetwork.CreateOptions{Driver: "bridge"})
+	_, err = cli.NetworkCreate(ctx, testNetName, client.NetworkCreateOptions{Driver: "bridge"})
 	require.NoError(t, err)
 	defer func() {
-		_ = cli.NetworkRemove(context.Background(), testNetName)
+		_, _ = cli.NetworkRemove(context.Background(), testNetName, client.NetworkRemoveOptions{})
 	}()
 
 	var containersToClean []string
 	defer func() {
 		for _, cID := range containersToClean {
-			_ = cli.ContainerStop(context.Background(), cID, container.StopOptions{})
-			_ = cli.ContainerRemove(context.Background(), cID, container.RemoveOptions{Force: true})
+			_, _ = cli.ContainerStop(context.Background(), cID, client.ContainerStopOptions{})
+			_, _ = cli.ContainerRemove(context.Background(), cID, client.ContainerRemoveOptions{Force: true})
 		}
 	}()
 
@@ -70,12 +68,12 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	// Ensure required infrastructure and frontend images are locally available or pulled/built
 	ensureImageAvailable := func(img string) {
 		t.Logf("Checking image %s...", img)
-		_, _, inspectErr := cli.ImageInspectWithRaw(ctx, img)
+		_, inspectErr := cli.ImageInspect(ctx, img)
 		if inspectErr == nil {
 			return
 		}
 		t.Logf("Pulling image %s...", img)
-		reader, pullErr := cli.ImagePull(ctx, img, dockerimage.PullOptions{})
+		reader, pullErr := cli.ImagePull(ctx, img, client.ImagePullOptions{})
 		if pullErr == nil && reader != nil {
 			_, _ = io.Copy(io.Discard, reader)
 			_ = reader.Close()
@@ -85,7 +83,7 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	}
 
 	ensureFrontendImage := func() {
-		_, _, inspectErr := cli.ImageInspectWithRaw(ctx, "forgelab-frontend:latest")
+		_, inspectErr := cli.ImageInspect(ctx, "forgelab-frontend:latest")
 		if inspectErr == nil {
 			t.Log("Image forgelab-frontend:latest is already available.")
 			return
@@ -95,7 +93,7 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 		feTarData := createTarArchiveWithFiles(t, map[string][]byte{
 			"Dockerfile": []byte("FROM alpine:3.19\nRUN apk add --no-cache busybox-extras && mkdir -p /var/www && echo 'ok' > /var/www/index.html\nEXPOSE 3000\nCMD [\"httpd\", \"-f\", \"-p\", \"3000\", \"-h\", \"/var/www\"]\n"),
 		})
-		feOpts := types.ImageBuildOptions{
+		feOpts := client.ImageBuildOptions{
 			Tags:       []string{"forgelab-frontend:latest"},
 			Dockerfile: "Dockerfile",
 			Remove:     true,
@@ -121,8 +119,8 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	// 1a. postgres
 	pgHostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{})
 	require.NoError(t, err)
-	pgResp, err := cli.ContainerCreate(ctx,
-		&container.Config{
+	pgResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
 			Image: "postgres:16-alpine",
 			Env: []string{
 				"POSTGRES_USER=forgelab",
@@ -137,25 +135,24 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 				StartPeriod: 45 * time.Second,
 			},
 		},
-		pgHostConfig,
-		&dockernetwork.NetworkingConfig{
+		HostConfig: pgHostConfig,
+		NetworkingConfig: &dockernetwork.NetworkingConfig{
 			EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
 				testNetName: {Aliases: []string{"postgres"}},
 			},
 		},
-		nil,
-		fmt.Sprintf("test-pg-%s", uuid.New().String()[:8]),
-	)
+		Name: fmt.Sprintf("test-pg-%s", uuid.New().String()[:8]),
+	})
 	require.NoError(t, err)
 	containersToClean = append(containersToClean, pgResp.ID)
-	err = cli.ContainerStart(ctx, pgResp.ID, container.StartOptions{})
+	_, err = cli.ContainerStart(ctx, pgResp.ID, client.ContainerStartOptions{})
 	require.NoError(t, err)
 
 	// 1b. redis (verify nofile default does not trigger 10032 max open files failure)
 	redisHostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{})
 	require.NoError(t, err)
-	redisResp, err := cli.ContainerCreate(ctx,
-		&container.Config{
+	redisResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
 			Image: "redis:7-alpine",
 			Healthcheck: &container.HealthConfig{
 				Test:     []string{"CMD", "redis-cli", "ping"},
@@ -164,18 +161,17 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 				Retries:  5,
 			},
 		},
-		redisHostConfig,
-		&dockernetwork.NetworkingConfig{
+		HostConfig: redisHostConfig,
+		NetworkingConfig: &dockernetwork.NetworkingConfig{
 			EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
 				testNetName: {Aliases: []string{"redis"}},
 			},
 		},
-		nil,
-		fmt.Sprintf("test-redis-%s", uuid.New().String()[:8]),
-	)
+		Name: fmt.Sprintf("test-redis-%s", uuid.New().String()[:8]),
+	})
 	require.NoError(t, err)
 	containersToClean = append(containersToClean, redisResp.ID)
-	err = cli.ContainerStart(ctx, redisResp.ID, container.StartOptions{})
+	_, err = cli.ContainerStart(ctx, redisResp.ID, client.ContainerStartOptions{})
 	require.NoError(t, err)
 
 	// Verify Tier 1 health
@@ -219,13 +215,13 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	t.Logf("redis -> starts -> healthy (%s)", redisReason)
 
 	// Invariant: Postgres and Redis must remain running after health verification
-	pgInspect, err := cli.ContainerInspect(ctx, pgResp.ID)
+	pgInspect, err := cli.ContainerInspect(ctx, pgResp.ID, client.ContainerInspectOptions{})
 	require.NoError(t, err)
-	assert.True(t, pgInspect.State.Running, "postgres must remain running after health check")
+	assert.True(t, pgInspect.Container.State.Running, "postgres must remain running after health check")
 
-	redisInspect, err := cli.ContainerInspect(ctx, redisResp.ID)
+	redisInspect, err := cli.ContainerInspect(ctx, redisResp.ID, client.ContainerInspectOptions{})
 	require.NoError(t, err)
-	assert.True(t, redisInspect.State.Running, "redis must remain running after health check")
+	assert.True(t, redisInspect.Container.State.Running, "redis must remain running after health check")
 
 	// -------------------------------------------------------------------------
 	// TIER 2: migrate
@@ -254,7 +250,7 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 		},
 	})
 
-	buildOpts := types.ImageBuildOptions{
+	buildOpts := client.ImageBuildOptions{
 		Tags:       []string{"forgelab-backend:latest"},
 		Dockerfile: "Dockerfile",
 		Remove:     true,
@@ -269,34 +265,33 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	t.Log("--- Tier 2: Running migrate job ---")
 	migHostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{})
 	require.NoError(t, err)
-	migResp, err := cli.ContainerCreate(ctx,
-		&container.Config{
+	migResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
 			Image: "forgelab-backend:latest",
 			Cmd:   []string{"./forgelab-migrate", "up"},
 			Env: []string{
 				"DATABASE_URL=postgres://forgelab:forgelab_dev_password@postgres:5432/forgelab?sslmode=disable",
 			},
 		},
-		migHostConfig,
-		&dockernetwork.NetworkingConfig{
+		HostConfig: migHostConfig,
+		NetworkingConfig: &dockernetwork.NetworkingConfig{
 			EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
 				testNetName: {Aliases: []string{"migrate"}},
 			},
 		},
-		nil,
-		fmt.Sprintf("test-migrate-%s", uuid.New().String()[:8]),
-	)
+		Name: fmt.Sprintf("test-migrate-%s", uuid.New().String()[:8]),
+	})
 	require.NoError(t, err)
 	containersToClean = append(containersToClean, migResp.ID)
 
-	err = cli.ContainerStart(ctx, migResp.ID, container.StartOptions{})
+	_, err = cli.ContainerStart(ctx, migResp.ID, client.ContainerStartOptions{})
 	require.NoError(t, err)
 
-	statusCh, errCh := cli.ContainerWait(ctx, migResp.ID, container.WaitConditionNotRunning)
+	waitRes := cli.ContainerWait(ctx, migResp.ID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
-	case err := <-errCh:
+	case err := <-waitRes.Error:
 		require.NoError(t, err)
-	case status := <-statusCh:
+	case status := <-waitRes.Result:
 		require.Equal(t, int64(0), status.StatusCode, "migrate job must exit with code 0")
 		t.Logf("migrate -> runs -> exit code %d", status.StatusCode)
 	}
@@ -307,8 +302,8 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	t.Log("--- Tier 3: Starting backend service ---")
 	beHostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{})
 	require.NoError(t, err)
-	beResp, err := cli.ContainerCreate(ctx,
-		&container.Config{
+	beResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
 			Image: "forgelab-backend:latest",
 			Env: []string{
 				"SERVER_PORT=8080",
@@ -326,19 +321,18 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 				StartPeriod: 15 * time.Second,
 			},
 		},
-		beHostConfig,
-		&dockernetwork.NetworkingConfig{
+		HostConfig: beHostConfig,
+		NetworkingConfig: &dockernetwork.NetworkingConfig{
 			EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
 				testNetName: {Aliases: []string{"backend"}},
 			},
 		},
-		nil,
-		fmt.Sprintf("test-backend-%s", uuid.New().String()[:8]),
-	)
+		Name: fmt.Sprintf("test-backend-%s", uuid.New().String()[:8]),
+	})
 	require.NoError(t, err)
 	containersToClean = append(containersToClean, beResp.ID)
 
-	err = cli.ContainerStart(ctx, beResp.ID, container.StartOptions{})
+	_, err = cli.ContainerStart(ctx, beResp.ID, client.ContainerStartOptions{})
 	require.NoError(t, err)
 
 	t.Log("Verifying backend health...")
@@ -367,27 +361,26 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	t.Log("--- Tier 4: Starting frontend service ---")
 	feHostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{})
 	require.NoError(t, err)
-	feResp, err := cli.ContainerCreate(ctx,
-		&container.Config{
+	feResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
 			Image: "forgelab-frontend:latest",
 			Env: []string{
 				"PORT=3000",
 				"BACKEND_INTERNAL_URL=http://backend:8080",
 			},
 		},
-		feHostConfig,
-		&dockernetwork.NetworkingConfig{
+		HostConfig: feHostConfig,
+		NetworkingConfig: &dockernetwork.NetworkingConfig{
 			EndpointsConfig: map[string]*dockernetwork.EndpointSettings{
 				testNetName: {Aliases: []string{"frontend"}},
 			},
 		},
-		nil,
-		fmt.Sprintf("test-frontend-%s", uuid.New().String()[:8]),
-	)
+		Name: fmt.Sprintf("test-frontend-%s", uuid.New().String()[:8]),
+	})
 	require.NoError(t, err)
 	containersToClean = append(containersToClean, feResp.ID)
 
-	err = cli.ContainerStart(ctx, feResp.ID, container.StartOptions{})
+	_, err = cli.ContainerStart(ctx, feResp.ID, client.ContainerStartOptions{})
 	require.NoError(t, err)
 
 	t.Log("Verifying frontend health...")
@@ -411,13 +404,13 @@ func TestLive_SelfDeployment_FourTiers(t *testing.T) {
 	t.Logf("frontend -> starts -> healthy (%s)", feReason)
 
 	// Final Invariant Check: Postgres and Redis must STILL be running!
-	pgFinal, err := cli.ContainerInspect(ctx, pgResp.ID)
+	pgFinal, err := cli.ContainerInspect(ctx, pgResp.ID, client.ContainerInspectOptions{})
 	require.NoError(t, err)
-	assert.True(t, pgFinal.State.Running, "postgres MUST remain running throughout entire self-deployment")
+	assert.True(t, pgFinal.Container.State.Running, "postgres MUST remain running throughout entire self-deployment")
 
-	redisFinal, err := cli.ContainerInspect(ctx, redisResp.ID)
+	redisFinal, err := cli.ContainerInspect(ctx, redisResp.ID, client.ContainerInspectOptions{})
 	require.NoError(t, err)
-	assert.True(t, redisFinal.State.Running, "redis MUST remain running throughout entire self-deployment")
+	assert.True(t, redisFinal.Container.State.Running, "redis MUST remain running throughout entire self-deployment")
 
 	t.Log("====================================================")
 	t.Log("Release successfully deployed all 4 tiers!")

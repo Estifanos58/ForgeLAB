@@ -26,7 +26,7 @@ export function ProjectHeader({
   // Determine the primary preview URL across running services.
   // Preview is ONLY displayed when the corresponding public service or project is confirmed running.
   let primaryPreviewUrl: string | null = null;
-  const runningServices = services.filter((s) => s.status === 'running');
+  const runningServices = services.filter((s) => s.status === 'running' || s.status === 'degraded');
   if (services.length > 0) {
     const frontendSvc = runningServices.find(
       (s) =>
@@ -51,7 +51,7 @@ export function ProjectHeader({
   if (
     !primaryPreviewUrl &&
     services.length === 0 &&
-    project.status === 'running' &&
+    (project.status === 'running' || project.status === 'degraded' || project.status === 'partially_running') &&
     project.preview_url
   ) {
     primaryPreviewUrl = project.preview_url;

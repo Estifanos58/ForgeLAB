@@ -16,10 +16,37 @@ import (
 	"github.com/forgelab/backend/internal/security"
 )
 
+func isValidGitCommitSHA(sha string) bool {
+	if len(sha) != 40 {
+		return false
+	}
+	for i := 0; i < len(sha); i++ {
+		c := sha[i]
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			return false
+		}
+	}
+	return true
+}
+
 // CreateDeployment creates a new deployment record for a project transactionally.
 // This does NOT start the deployment — it only creates the record.
 // The deployment worker picks up QUEUED deployments.
 func (s *DeploymentService) CreateDeployment(ctx context.Context, project *models.Project) (*models.Deployment, error) {
+	return s.createDeploymentInternal(ctx, project, nil)
+}
+
+// CreateDeploymentWithCommit creates a queued deployment pinned to an explicit commit SHA (e.g. from a
+// verified push-to-deploy webhook), bypassing stale manual plan revision blocks while preserving plan topology.
+func (s *DeploymentService) CreateDeploymentWithCommit(ctx context.Context, project *models.Project, commitSHA *string) (*models.Deployment, error) {
+	if s.createDeploymentWithCommitForTest != nil {
+		return s.createDeploymentWithCommitForTest(ctx, project, commitSHA)
+	}
+	return s.createDeploymentInternal(ctx, project, commitSHA)
+}
+
+func (s *DeploymentService) createDeploymentInternal(ctx context.Context, project *models.Project, explicitCommit *string) (*models.Deployment, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
@@ -93,11 +120,13 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 			if err != nil {
 				return nil, fmt.Errorf("failed to supersede queued deployment: %w", err)
 			}
-			_, _ = tx.Exec(ctx,
-				`INSERT INTO deployment_logs (id, deployment_id, service_id, timestamp, phase, stream, message)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-				uuid.New(), *activeID, nil, now, models.LogPhaseStartup, models.LogStreamSystem, "Deployment superseded by newer queued deployment",
-			)
+			if _, logErr := tx.Exec(ctx,
+				`INSERT INTO deployment_logs (deployment_id, service_id, timestamp, phase, stream, message)
+				 VALUES ($1, $2, $3, $4, $5, $6)`,
+				*activeID, nil, now, models.LogPhaseStartup, models.LogStreamSystem, "Deployment superseded by newer queued deployment",
+			); logErr != nil {
+				return nil, fmt.Errorf("failed to log superseded deployment: %w", logErr)
+			}
 			slog.Info("superseded queued deployment", "deployment_id", *activeID, "project_id", project.ID)
 		} else {
 			return nil, ErrActiveDeployment
@@ -140,16 +169,27 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 		CreatedAt:      now,
 	}
 
-	sourceRevision, err := s.resolveSourceRevision(ctx, project, nil)
-	if err != nil {
-		return nil, err
-	}
-	if (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic) && (sourceRevision == nil || len(*sourceRevision) != 40) {
-		return nil, fmt.Errorf("failed to pin immutable 40-character commit SHA for GitHub deployment of project '%s'", project.Name)
-	}
-	deployment.SourceRevision = sourceRevision
-	if (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic) && sourceRevision != nil && len(*sourceRevision) == 40 {
+	var sourceRevision *string
+	if explicitCommit != nil && strings.TrimSpace(*explicitCommit) != "" {
+		pinned := strings.ToLower(strings.TrimSpace(*explicitCommit))
+		if !isValidGitCommitSHA(pinned) {
+			return nil, fmt.Errorf("%w: commit SHA must be a 40-character hexadecimal string", ErrValidationFailed)
+		}
+		sourceRevision = &pinned
+		deployment.SourceRevision = sourceRevision
 		deployment.CommitSHA = sourceRevision
+	} else {
+		sourceRevision, err = s.resolveSourceRevision(ctx, project, nil)
+		if err != nil {
+			return nil, err
+		}
+		if (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic) && (sourceRevision == nil || len(*sourceRevision) != 40) {
+			return nil, fmt.Errorf("failed to pin immutable 40-character commit SHA for GitHub deployment of project '%s'", project.Name)
+		}
+		deployment.SourceRevision = sourceRevision
+		if (project.SourceType == models.SourceTypeGitHub || project.SourceType == models.SourceTypeGitHubPublic) && sourceRevision != nil && len(*sourceRevision) == 40 {
+			deployment.CommitSHA = sourceRevision
+		}
 	}
 
 	if s.secretService != nil {
@@ -261,7 +301,9 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 
 	for _, svcItem := range svcList {
 		var svcMaxNumber *int
-		_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", svcItem.ID).Scan(&svcMaxNumber)
+		if err := tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", svcItem.ID).Scan(&svcMaxNumber); err != nil {
+			return nil, fmt.Errorf("failed to get max deploy number for service %s: %w", svcItem.Name, err)
+		}
 		svcDeployNum := 1
 		if svcMaxNumber != nil {
 			svcDeployNum = *svcMaxNumber + 1
@@ -279,17 +321,38 @@ func (s *DeploymentService) CreateDeployment(ctx context.Context, project *model
 			}
 		}
 
-		dependsOnBytes, _ := json.Marshal(svcItem.DependsOn)
-		safeVols, _ := security.SanitizeServiceVolumes(svcItem.Volumes)
-		volumesBytes, _ := json.Marshal(safeVols)
-		networksBytes, _ := json.Marshal(svcItem.Networks)
+		dependsOnBytes, err := json.Marshal(svcItem.DependsOn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode depends_on for service %s: %w", svcItem.Name, err)
+		}
+		safeVols, stripped, err := security.ValidateAndSanitizeServiceVolumes(svcItem.Volumes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to sanitize volumes for service %s: %w", svcItem.Name, err)
+		}
+		if stripped {
+			slog.Warn("stripped forbidden docker socket volume mount while creating service deployment", "project_id", project.ID, "service_id", svcItem.ID, "service_name", svcItem.Name)
+		}
+		volumesBytes, err := json.Marshal(safeVols)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode volumes for service %s: %w", svcItem.Name, err)
+		}
+		networksBytes, err := json.Marshal(svcItem.Networks)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode networks for service %s: %w", svcItem.Name, err)
+		}
 		var hcBytes []byte
 		if svcItem.HealthCheckConfig != nil {
-			hcBytes, _ = json.Marshal(svcItem.HealthCheckConfig)
+			hcBytes, err = json.Marshal(svcItem.HealthCheckConfig)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode healthcheck_config for service %s: %w", svcItem.Name, err)
+			}
 		} else {
 			hcBytes = []byte("{}")
 		}
-		dependsOnCondBytes, _ := json.Marshal(svcItem.DependsOnConditions)
+		dependsOnCondBytes, err := json.Marshal(svcItem.DependsOnConditions)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode depends_on_conditions for service %s: %w", svcItem.Name, err)
+		}
 
 		svcDeployID := uuid.New()
 		svcTag := fmt.Sprintf("forgelab/%s/%s:%d", project.ID, svcItem.Name, svcDeployNum)

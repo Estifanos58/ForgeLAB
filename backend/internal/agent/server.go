@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/analyzer"
 	"github.com/forgelab/backend/internal/discovery"
@@ -138,10 +138,10 @@ func NewAgentServer(cfg AgentServerConfig) *AgentServer {
 	pinger := cfg.DockerPinger
 	if pinger == nil {
 		var cliErr error
-		cli, cliErr = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		cli, cliErr = client.New(client.FromEnv)
 		if cliErr == nil && cli != nil {
 			pinger = func(ctx context.Context) error {
-				_, err := cli.Ping(ctx)
+				_, err := cli.Ping(ctx, client.PingOptions{})
 				return err
 			}
 		} else {

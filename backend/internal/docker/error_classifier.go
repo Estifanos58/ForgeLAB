@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/moby/moby/client"
 )
 
 // DockerErrorCategory defines the classified root cause of a Docker build error.
@@ -109,7 +111,7 @@ func (e *Engine) formatDockerDiagnostic(ctx context.Context, origErr error, cat 
 		sb.WriteString("\n--- Docker Diagnostics ---\n")
 
 		// 1. Ping
-		ping, err := e.dockerClient.Ping(diagCtx)
+		ping, err := e.dockerClient.Ping(diagCtx, client.PingOptions{})
 		if err != nil {
 			sb.WriteString(fmt.Sprintf("Daemon Reachable: NO (%v)\n", err))
 		} else {
@@ -117,14 +119,15 @@ func (e *Engine) formatDockerDiagnostic(ctx context.Context, origErr error, cat 
 		}
 
 		// 2. Server Version
-		ver, err := e.dockerClient.ServerVersion(diagCtx)
+		ver, err := e.dockerClient.ServerVersion(diagCtx, client.ServerVersionOptions{})
 		if err == nil {
 			sb.WriteString(fmt.Sprintf("Docker Server Version: %s (OS/Arch: %s/%s)\n", ver.Version, ver.Os, ver.Arch))
 		}
 
 		// 3. Info (safe telemetry only - no environment variables or credentials)
-		info, err := e.dockerClient.Info(diagCtx)
+		infoRes, err := e.dockerClient.Info(diagCtx, client.InfoOptions{})
 		if err == nil {
+			info := infoRes.Info
 			sb.WriteString(fmt.Sprintf("Storage Driver: %s\n", info.Driver))
 			sb.WriteString(fmt.Sprintf("Operating System: %s (%s)\n", info.OperatingSystem, info.OSType))
 			sb.WriteString(fmt.Sprintf("System Resources: %d CPUs, %.2f GB RAM\n", info.NCPU, float64(info.MemTotal)/(1024*1024*1024)))

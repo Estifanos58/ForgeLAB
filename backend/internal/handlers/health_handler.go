@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/forgelab/backend/internal/auth"
@@ -223,7 +223,7 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 			dep.Error = "docker engine client is uninitialized"
 		} else {
 			start := time.Now()
-			_, err := h.dockerClient.Ping(ctx)
+			_, err := h.dockerClient.Ping(ctx, client.PingOptions{})
 			latency := time.Since(start).Milliseconds()
 			if err != nil {
 				dep.Status = "down"

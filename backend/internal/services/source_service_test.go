@@ -357,17 +357,17 @@ func TestSourceService_IngestMultipartStream_ValidDirectory(t *testing.T) {
 	assert.FileExists(t, filepath.Join(path, "index.js"))
 	assert.NoDirExists(t, filepath.Join(path, "my-node-app"))
 
-	// Wait briefly for background detection
+	// Wait for asynchronous background detection with generous CI/Windows margin
 	var status *services.SourceUploadResult
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 100; i++ {
 		status, err = svc.GetSourceStatus(context.Background(), ownerID, res.SourceID)
 		require.NoError(t, err)
 		if status.Status == services.SourceStatusReady {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
-	assert.Equal(t, services.SourceStatusReady, status.Status)
+	require.Equal(t, services.SourceStatusReady, status.Status)
 	assert.Equal(t, "nodejs", status.Runtime)
 }
 

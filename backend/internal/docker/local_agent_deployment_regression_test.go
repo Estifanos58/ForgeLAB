@@ -15,9 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -162,10 +161,10 @@ func TestLocalAgent_DeploymentWorkflow_Regression(t *testing.T) {
 	}))
 	defer mockDockerServer.Close()
 
-	dockerCli, err := client.NewClientWithOpts(
+	dockerCli, err := client.New(
 		client.WithHost(mockDockerServer.URL),
 		client.WithHTTPClient(mockDockerServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer dockerCli.Close()
@@ -326,7 +325,7 @@ func TestLocalAgent_DeploymentWorkflow_Regression(t *testing.T) {
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
-		buildOpts := types.ImageBuildOptions{
+		buildOpts := client.ImageBuildOptions{
 			Tags:       []string{"forgelab/test/frontend:1"},
 			Dockerfile: "Dockerfile.forgelab",
 			Remove:     true,

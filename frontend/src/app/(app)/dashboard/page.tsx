@@ -241,7 +241,7 @@ export default function DashboardPage() {
                           </span>
                         </td>
                         <td className="py-3 px-4 whitespace-nowrap">
-                          {(p.status === 'running' || p.status === 'partially_running') && p.preview_url ? (
+                          {(p.status === 'running' || p.status === 'degraded' || p.status === 'partially_running') && p.preview_url ? (
                             <a
                               href={p.preview_url}
                               target="_blank"
@@ -263,7 +263,7 @@ export default function DashboardPage() {
                             const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(p.status);
                             const isRunning = p.status === 'running';
                             const isStopped = p.status === 'stopped';
-                            const wasDeployed = Boolean(p.current_deployment_id || p.status === 'stopped' || p.status === 'failed');
+                            const wasDeployed = Boolean(p.current_deployment_id || p.status === 'stopped' || p.status === 'failed' || p.status === 'degraded');
                             const loadingState = actionLoading[p.id] || null;
 
                             return (

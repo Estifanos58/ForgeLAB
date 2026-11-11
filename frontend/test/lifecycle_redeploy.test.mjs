@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 // Helper functions mirroring dashboard & service-card logic
 
 function getProjectPreviewUrl(project) {
-  const isRunning = project.status === 'running' || project.status === 'partially_running';
+  const isRunning = project.status === 'running' || project.status === 'degraded' || project.status === 'partially_running';
   if (isRunning && project.preview_url) {
     return project.preview_url;
   }
@@ -12,7 +12,7 @@ function getProjectPreviewUrl(project) {
 }
 
 function getServicePreviewUrl(service) {
-  const isRunning = service.status === 'running';
+  const isRunning = service.status === 'running' || service.status === 'degraded';
   if (!isRunning) {
     return null;
   }
@@ -26,7 +26,7 @@ function deriveProjectLifecycleActions(project) {
   const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(project.status);
   const isRunning = project.status === 'running';
   const isStopped = project.status === 'stopped';
-  const wasDeployed = Boolean(project.current_deployment_id || project.status === 'stopped' || project.status === 'failed');
+  const wasDeployed = Boolean(project.current_deployment_id || project.status === 'stopped' || project.status === 'failed' || project.status === 'degraded');
 
   return {
     isDeploying,
@@ -39,7 +39,7 @@ function deriveProjectLifecycleActions(project) {
 }
 
 function deriveServiceButtonLabel(service) {
-  const isRunning = service.status === 'running';
+  const isRunning = service.status === 'running' || service.status === 'degraded';
   const isServiceDeploying = [
     'deploying',
     'building',
@@ -69,10 +69,10 @@ function deriveServiceButtonLabel(service) {
   const wasServiceDeployed = Boolean(
     service.current_service_deployment_id ||
       service.status === 'stopped' ||
-      service.status === 'failed'
+      service.status === 'failed' || service.status === 'degraded'
   );
 
-  if (wasServiceDeployed && !isRunning) {
+  if (wasServiceDeployed && (!isRunning || service.status === 'degraded')) {
     return 'Redeploy';
   }
 
@@ -88,6 +88,9 @@ test('Preview URL — only displayed when project is confirmed running and autho
 
   const partiallyRunningProj = { status: 'partially_running', port: 8080, preview_url: 'http://localhost:8080' };
   assert.equal(getProjectPreviewUrl(partiallyRunningProj), 'http://localhost:8080');
+
+  const degradedProj = { status: 'degraded', port: 8080, preview_url: 'http://localhost:8080' };
+  assert.equal(getProjectPreviewUrl(degradedProj), 'http://localhost:8080');
 
   const stoppedProj = { status: 'stopped', port: 8080, preview_url: 'http://localhost:8080' };
   assert.equal(getProjectPreviewUrl(stoppedProj), null);
@@ -105,6 +108,9 @@ test('Preview URL — only displayed when service is confirmed running and autho
 
   const runningFrontendSvc = { status: 'running', role: 'frontend', public_exposed: false, host_port: 3001, preview_url: 'http://localhost:3001' };
   assert.equal(getServicePreviewUrl(runningFrontendSvc), 'http://localhost:3001');
+
+  const degradedSvc = { status: 'degraded', public_exposed: true, host_port: 3001, preview_url: 'http://localhost:3001' };
+  assert.equal(getServicePreviewUrl(degradedSvc), 'http://localhost:3001');
 
   const runningSvcWithoutPreview = { status: 'running', public_exposed: true, host_port: 3001, preview_url: null };
   assert.equal(getServicePreviewUrl(runningSvcWithoutPreview), null);
@@ -134,6 +140,12 @@ test('Project Lifecycle Actions — accurately distinguish Redeploy from Start',
   assert.equal(failedActions.showRedeploy, true, 'failed project should offer Redeploy');
   assert.equal(failedActions.isDeploying, false);
 
+  // Degraded project remains running cleanly while offering quick redeploy
+  const degradedProj = { status: 'degraded', current_deployment_id: 'dep-1' };
+  const degradedActions = deriveProjectLifecycleActions(degradedProj);
+  assert.equal(degradedActions.showStart, false);
+  assert.equal(degradedActions.showRedeploy, true, 'degraded project should offer Redeploy');
+
   // Active running project
   const runningProj = { status: 'running', current_deployment_id: 'dep-1' };
   const runningActions = deriveProjectLifecycleActions(runningProj);
@@ -156,7 +168,11 @@ test('Service Button Label — transitions accurately between Deploy, Redeploy, 
   assert.equal(deriveServiceButtonLabel({ status: 'stopped', current_service_deployment_id: 'sd-1' }), 'Redeploy');
 
   // Previously deployed, now failed
+  // Previously deployed, now failed
   assert.equal(deriveServiceButtonLabel({ status: 'failed', current_service_deployment_id: 'sd-1' }), 'Redeploy');
+
+  // Unhealthy / degraded service
+  assert.equal(deriveServiceButtonLabel({ status: 'degraded', current_service_deployment_id: 'sd-1' }), 'Redeploy');
 
   // In active deployment phases
   assert.equal(deriveServiceButtonLabel({ status: 'queued' }), 'Queued...');

@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/logging"
@@ -116,7 +116,14 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 
 	var allProjectServices []*models.Service
 	if e.serviceService != nil {
-		allProjectServices, _ = e.serviceService.ListServices(ctx, project.ID)
+		var svcErr error
+		allProjectServices, svcErr = e.serviceService.ListServices(ctx, project.ID)
+		if svcErr != nil {
+			reason := fmt.Sprintf("Failed to load project services: %v", svcErr)
+			updateReleaseStatus(models.DeployStatusFailed, &reason)
+			emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+			return fmt.Errorf("failed to list project services for release deployment %s: %w", deployment.ID, svcErr)
+		}
 	}
 
 	// Legacy single-container project fallback if 0 services defined
@@ -287,7 +294,17 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 					sd.FailureReason != nil &&
 					strings.Contains(*sd.FailureReason, "interrupted: backend restarted") {
 					slog.Info("recovering tier service deployment prematurely marked interrupted by backend restart", "service_deployment_id", sd.ID, "service", sd.ServiceName)
-					_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusQueued, nil)
+					if resetErr := e.deploymentService.ResetInterruptedServiceDeployment(ctx, sd.ID); resetErr != nil {
+						slog.Warn("failed to reset interrupted tier service deployment", "service_deployment_id", sd.ID, "service", sd.ServiceName, "error", resetErr)
+						mu.Lock()
+						allHealthy = false
+						failedServices[sd.ServiceName] = true
+						serviceExitCodes[sd.ServiceName] = 1
+						serviceHealthy[sd.ServiceName] = false
+						errList = append(errList, fmt.Sprintf("%s: failed to recover interrupted deployment (%v)", sd.ServiceName, resetErr))
+						mu.Unlock()
+						continue
+					}
 					sd.Status = models.DeployStatusQueued
 					sd.FailureReason = nil
 				} else {
@@ -367,7 +384,9 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 				errList = append(errList, fmt.Sprintf("%s: skipped because dependency '%s' failed condition '%s'", sd.ServiceName, failedDepName, failedCondition))
 				mu.Unlock()
 				reason := fmt.Sprintf("Skipped because dependency '%s' failed condition '%s'", failedDepName, failedCondition)
-				_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusSkipped, &reason)
+				if skipErr := e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusSkipped, &reason); skipErr != nil {
+					slog.Warn("failed to persist skipped status for service deployment", "service_deployment_id", sd.ID, "service", sd.ServiceName, "error", skipErr)
+				}
 				continue
 			}
 
@@ -396,7 +415,16 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 		tierWg.Wait()
 	}
 
-	newProjectStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
+	newProjectStatus, statusErr := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
+	if statusErr != nil {
+		slog.Warn("failed to recalculate project status after release execution", "project_id", project.ID, "deployment_id", deployment.ID, "error", statusErr)
+		newProjectStatus = models.ProjectStatusFailed
+		if allHealthy && anyHealthy {
+			newProjectStatus = models.ProjectStatusRunning
+		} else if anyHealthy {
+			newProjectStatus = models.ProjectStatusPartiallyRunning
+		}
+	}
 
 	// Guard against stale worker whose lease expired or context was cancelled
 	if ctx.Err() != nil {
@@ -412,18 +440,38 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 				prevCid := *svc.ContainerID
 				e.StopContainerLogCollector(prevCid)
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_ = e.dockerClient.ContainerStop(cleanupCtx, prevCid, container.StopOptions{})
-				_ = e.dockerClient.ContainerRemove(cleanupCtx, prevCid, container.RemoveOptions{Force: true})
+				_, _ = e.dockerClient.ContainerStop(cleanupCtx, prevCid, client.ContainerStopOptions{})
+				_, _ = e.dockerClient.ContainerRemove(cleanupCtx, prevCid, client.ContainerRemoveOptions{Force: true})
 				cleanupCancel()
 			}
 		}
-		_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
+		if setErr := e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus); setErr != nil {
+			slog.Warn("release deployment could not be promoted as current", "deployment_id", deployment.ID, "project_id", project.ID, "error", setErr)
+			if strings.Contains(setErr.Error(), "superseded") {
+				emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d superseded before final promotion; leaving newer release active.", deployment.DeployNumber))
+				return nil
+			}
+			reason := fmt.Sprintf("Failed to promote release deployment #%d: %v", deployment.DeployNumber, setErr)
+			updateReleaseStatus(models.DeployStatusFailed, &reason)
+			emitLog(models.LogPhaseRuntime, models.LogStreamStderr, reason)
+			return fmt.Errorf("failed to promote release deployment: %w", setErr)
+		}
 		updateReleaseStatus(models.DeployStatusRunning, nil)
 		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d successfully deployed all services!", deployment.DeployNumber))
 		return nil
 	} else if anyHealthy {
 		// Valid state transition: deployment status is Running (not partially_running!), while project status reflects partially_running
-		_ = e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus)
+		if setErr := e.deploymentService.SetCurrentDeployment(ctx, project.ID, deployment.ID, newProjectStatus); setErr != nil {
+			slog.Warn("partial release deployment could not be promoted as current", "deployment_id", deployment.ID, "project_id", project.ID, "error", setErr)
+			if strings.Contains(setErr.Error(), "superseded") {
+				emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d superseded before partial promotion; leaving newer release active.", deployment.DeployNumber))
+				return nil
+			}
+			reason := fmt.Sprintf("Failed to promote partial release deployment #%d: %v", deployment.DeployNumber, setErr)
+			updateReleaseStatus(models.DeployStatusFailed, &reason)
+			emitLog(models.LogPhaseRuntime, models.LogStreamStderr, reason)
+			return fmt.Errorf("failed to promote partial release deployment: %w", setErr)
+		}
 		updateReleaseStatus(models.DeployStatusRunning, nil)
 		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Release #%d finished with partial success (%s). Only individual healthy services were updated; full release rollback is not claimed.", deployment.DeployNumber, strings.Join(errList, "; ")))
 		return nil

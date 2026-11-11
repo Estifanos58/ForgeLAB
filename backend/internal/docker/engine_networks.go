@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"strings"
 
-	dockernetwork "github.com/docker/docker/api/types/network"
+	"github.com/moby/moby/client"
 )
 
 // NetworkEnsureOptions specifies configuration parameters when ensuring a Docker network.
@@ -40,7 +40,7 @@ func (e *Engine) EnsureNetworkWithOptions(ctx context.Context, networkName strin
 	}
 
 	// 1. Inspect check
-	_, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{})
+	_, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, client.NetworkInspectOptions{})
 	if inspectErr == nil {
 		return nil
 	}
@@ -51,7 +51,7 @@ func (e *Engine) EnsureNetworkWithOptions(ctx context.Context, networkName strin
 	}
 
 	// 2. Attempt creation with Driver, Internal, and Labels
-	createOpts := dockernetwork.CreateOptions{
+	createOpts := client.NetworkCreateOptions{
 		Driver:   driver,
 		Internal: opts.Internal,
 		Labels:   opts.Labels,
@@ -65,7 +65,7 @@ func (e *Engine) EnsureNetworkWithOptions(ctx context.Context, networkName strin
 	// 3. Handle conflict / already exists (concurrent worker created it)
 	errStr := strings.ToLower(err.Error())
 	if strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
-		if _, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{}); inspectErr == nil {
+		if _, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, client.NetworkInspectOptions{}); inspectErr == nil {
 			return nil
 		}
 	}
@@ -81,7 +81,7 @@ func (e *Engine) EnsureNetworkWithOptions(ctx context.Context, networkName strin
 			return nil
 		}
 		if strings.Contains(strings.ToLower(retryErr.Error()), "already exists") || strings.Contains(strings.ToLower(retryErr.Error()), "conflict") {
-			if _, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, dockernetwork.InspectOptions{}); inspectErr == nil {
+			if _, inspectErr := e.dockerClient.NetworkInspect(ctx, networkName, client.NetworkInspectOptions{}); inspectErr == nil {
 				return nil
 			}
 		}
@@ -97,12 +97,12 @@ func (e *Engine) PruneDanglingNetworks(ctx context.Context) error {
 		return nil
 	}
 
-	nets, err := e.dockerClient.NetworkList(ctx, dockernetwork.ListOptions{})
+	netsRes, err := e.dockerClient.NetworkList(ctx, client.NetworkListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list networks for pruning: %w", err)
 	}
 
-	for _, n := range nets {
+	for _, n := range netsRes.Items {
 		// Only touch networks created by ForgeLAB
 		isForgeLabNet := strings.HasPrefix(n.Name, "forgelab-net-") || (n.Labels != nil && n.Labels["forgelab.project_id"] != "")
 		if !isForgeLabNet {
@@ -110,12 +110,12 @@ func (e *Engine) PruneDanglingNetworks(ctx context.Context) error {
 		}
 
 		// Inspect network to verify no active containers are attached
-		insp, inspectErr := e.dockerClient.NetworkInspect(ctx, n.ID, dockernetwork.InspectOptions{})
+		insp, inspectErr := e.dockerClient.NetworkInspect(ctx, n.ID, client.NetworkInspectOptions{})
 		if inspectErr != nil {
 			continue
 		}
-		if len(insp.Containers) == 0 {
-			if removeErr := e.dockerClient.NetworkRemove(ctx, n.ID); removeErr == nil {
+		if len(insp.Network.Containers) == 0 {
+			if _, removeErr := e.dockerClient.NetworkRemove(ctx, n.ID, client.NetworkRemoveOptions{}); removeErr == nil {
 				shortID := n.ID
 				if len(shortID) > 12 {
 					shortID = shortID[:12]

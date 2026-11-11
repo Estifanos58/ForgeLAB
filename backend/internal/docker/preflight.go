@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/models"
@@ -48,7 +48,7 @@ type PreflightOptions struct {
 	ServicesMap         map[string]*models.Service
 	PathValidator       *security.PathValidator
 	SourceService       *services.SourceService
-	DockerClient        client.CommonAPIClient
+	DockerClient        client.APIClient
 	IsServiceDeployment bool
 }
 

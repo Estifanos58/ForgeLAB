@@ -14,6 +14,9 @@ import { LogsSection } from '@/features/projects/logs-section';
 import { DeploymentHistory } from '@/features/deployments/deployment-history';
 import { EnvManager } from '@/features/deployments/env-manager';
 import { TopologySection } from '@/features/projects/topology-section';
+import { RuntimeMetricsPanel } from '@/features/projects/runtime-metrics-panel';
+import { DomainsPanel } from '@/features/projects/domains-panel';
+import { WebhookSettingsPanel } from '@/features/projects/webhook-settings-panel';
 import { useDeploymentWS } from '@/lib/websocket/use-deployment-ws';
 import { sessionManager } from '@/lib/auth/session-manager';
 import {
@@ -22,6 +25,8 @@ import {
   History,
   Lock,
   Network,
+  Activity,
+  Globe,
   ArrowLeft,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
@@ -34,7 +39,7 @@ function derivePrimaryPreviewUrl(project: Project | null): string | null {
   if (!project) return null;
   const services = project.services || [];
   if (services.length > 0) {
-    const runningServices = services.filter((s) => s.status === 'running');
+    const runningServices = services.filter((s) => s.status === 'running' || s.status === 'degraded');
     const frontendSvc = runningServices.find(
       (s) =>
         (s.role === 'frontend' || s.name.toLowerCase() === 'frontend') &&
@@ -54,7 +59,7 @@ function derivePrimaryPreviewUrl(project: Project | null): string | null {
 
   // Fallback for single-service legacy projects without independent services
   if (
-    project.status === 'running' &&
+    (project.status === 'running' || project.status === 'degraded' || project.status === 'partially_running') &&
     project.preview_url
   ) {
     return project.preview_url;
@@ -62,7 +67,7 @@ function derivePrimaryPreviewUrl(project: Project | null): string | null {
   return null;
 }
 
-type TabType = 'overview' | 'deployments' | 'logs' | 'env' | 'topology';
+type TabType = 'overview' | 'deployments' | 'logs' | 'env' | 'topology' | 'metrics' | 'domains';
 
 export default function ProjectPage({ params }: ProjectPageProps) {
   const routeParams = useParams();
@@ -243,7 +248,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
         };
       });
 
-      const isTerminal = ['running', 'failed', 'stopped', 'partially_running'].includes(data.new_status);
+      const isTerminal = ['running', 'degraded', 'failed', 'stopped', 'partially_running'].includes(data.new_status);
       if (isTerminal) {
         loadData();
       }
@@ -261,7 +266,7 @@ export default function ProjectPage({ params }: ProjectPageProps) {
       });
 
       // Update project status directly
-      const isTerminal = ['running', 'failed', 'stopped', 'partially_running'].includes(data.new_status);
+      const isTerminal = ['running', 'degraded', 'failed', 'stopped', 'partially_running'].includes(data.new_status);
       if (!isTerminal) {
         setProject((prev) => (prev ? { ...prev, status: 'deploying' } : prev));
       } else {
@@ -659,6 +664,34 @@ export default function ProjectPage({ params }: ProjectPageProps) {
             <Network className="w-3.5 h-3.5" />
             <span>Topology & Diagnostics</span>
           </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('metrics')}
+            className={cn(
+              'px-3 py-2 border-b-2 flex items-center gap-1.5 transition-colors -mb-px',
+              activeTab === 'metrics'
+                ? 'border-white text-white'
+                : 'border-transparent text-neutral-400 hover:text-neutral-200'
+            )}
+          >
+            <Activity className="w-3.5 h-3.5" />
+            <span>Monitoring</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('domains')}
+            className={cn(
+              'px-3 py-2 border-b-2 flex items-center gap-1.5 transition-colors -mb-px',
+              activeTab === 'domains'
+                ? 'border-white text-white'
+                : 'border-transparent text-neutral-400 hover:text-neutral-200'
+            )}
+          >
+            <Globe className="w-3.5 h-3.5" />
+            <span>Domains &amp; Webhooks</span>
+          </button>
         </div>
 
         {/* Tab 1: Overview */}
@@ -788,6 +821,23 @@ export default function ProjectPage({ params }: ProjectPageProps) {
         {/* Tab 5: Service Topology & Connection Diagnostics */}
         {activeTab === 'topology' && (
           <TopologySection projectId={project.id} />
+        )}
+
+        {/* Tab 6: Live Runtime Monitoring & Health */}
+        {activeTab === 'metrics' && (
+          <RuntimeMetricsPanel projectId={project.id} />
+        )}
+
+        {/* Tab 7: Custom Domains, Automatic HTTPS & Push-to-Deploy Webhooks */}
+        {activeTab === 'domains' && (
+          <div className="flex-1 min-h-0 h-full overflow-y-auto max-w-4xl pr-2 space-y-4">
+            <DomainsPanel projectId={project.id} services={services} />
+            <WebhookSettingsPanel
+              projectId={project.id}
+              sourceType={project.source_type}
+              defaultBranch={project.branch}
+            />
+          </div>
         )}
       </main>
     </div>

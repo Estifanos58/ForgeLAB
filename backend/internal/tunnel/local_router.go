@@ -161,7 +161,7 @@ func (r *LocalRouter) HandleStream(stream net.Conn) {
 		return
 	}
 
-	if targetService.Status != models.ServiceStatusRunning {
+	if targetService.Status != models.ServiceStatusRunning && targetService.Status != models.ServiceStatusDegraded {
 		r.writeErrorResponse(stream, http.StatusServiceUnavailable, "Service Stopped",
 			fmt.Sprintf("Service '%s' is currently %s. Please start the service in ForgeLAB.", targetService.Name, targetService.Status))
 		return

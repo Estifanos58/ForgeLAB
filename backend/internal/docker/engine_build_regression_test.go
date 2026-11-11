@@ -14,9 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -147,10 +146,10 @@ func TestEngine_BuildImage_ContextRemainsActiveDuringStreamParsing(t *testing.T)
 	}))
 	defer mockDockerServer.Close()
 
-	dockerCli, err := client.NewClientWithOpts(
+	dockerCli, err := client.New(
 		client.WithHost(mockDockerServer.URL),
 		client.WithHTTPClient(mockDockerServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer dockerCli.Close()
@@ -171,7 +170,7 @@ func TestEngine_BuildImage_ContextRemainsActiveDuringStreamParsing(t *testing.T)
 	tarData := createSampleTarArchive(t)
 	tarRC := newTrackingReadCloser(bytes.NewReader(tarData))
 
-	buildOpts := types.ImageBuildOptions{
+	buildOpts := client.ImageBuildOptions{
 		Tags:       []string{"forgelab/test/ccms-backend:1"},
 		Dockerfile: "Dockerfile",
 		Remove:     true,
@@ -236,10 +235,10 @@ func TestEngine_BuildImage_BuggyLifecycle_DemonstratesContextCanceled(t *testing
 	}))
 	defer mockDockerServer.Close()
 
-	dockerCli, err := client.NewClientWithOpts(
+	dockerCli, err := client.New(
 		client.WithHost(mockDockerServer.URL),
 		client.WithHTTPClient(mockDockerServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer dockerCli.Close()
@@ -248,7 +247,7 @@ func TestEngine_BuildImage_BuggyLifecycle_DemonstratesContextCanceled(t *testing
 
 	// Simulate the PREVIOUS BUGGY LIFECYCLE:
 	buildCtx, buildCancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	buildResponse, err := dockerCli.ImageBuild(buildCtx, bytes.NewReader(tarData), types.ImageBuildOptions{
+	buildResponse, err := dockerCli.ImageBuild(buildCtx, bytes.NewReader(tarData), client.ImageBuildOptions{
 		Tags:       []string{"test:buggy"},
 		Dockerfile: "Dockerfile",
 	})
@@ -315,10 +314,10 @@ func TestEngine_BuildImage_LocalAgentStreamedTarArchive_RemainsOpenDuringBuildRe
 	}))
 	defer mockDockerServer.Close()
 
-	dockerCli, err := client.NewClientWithOpts(
+	dockerCli, err := client.New(
 		client.WithHost(mockDockerServer.URL),
 		client.WithHTTPClient(mockDockerServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer dockerCli.Close()
@@ -340,7 +339,7 @@ func TestEngine_BuildImage_LocalAgentStreamedTarArchive_RemainsOpenDuringBuildRe
 	assert.False(t, tarTracking.IsClosed(), "tar archive must be open initially")
 
 	var logs []string
-	buildErr := engine.buildImage(context.Background(), tarTracking, types.ImageBuildOptions{
+	buildErr := engine.buildImage(context.Background(), tarTracking, client.ImageBuildOptions{
 		Tags:       []string{"forgelab/agent-test:1"},
 		Dockerfile: "Dockerfile",
 	}, func(line string) {
@@ -376,7 +375,7 @@ func TestEngine_BuildImage_StructuredCleanup_OnError(t *testing.T) {
 		engine := &Engine{dockerClient: dockerCli}
 		tarRC := newTrackingReadCloser(bytes.NewReader(createSampleTarArchive(t)))
 
-		err = engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+		err = engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "Docker build failed:")
@@ -403,7 +402,7 @@ func TestEngine_BuildImage_StructuredCleanup_OnError(t *testing.T) {
 		engine := &Engine{dockerClient: dockerCli}
 		tarRC := newTrackingReadCloser(bytes.NewReader(createSampleTarArchive(t)))
 
-		err = engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+		err = engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "Docker build error:")
@@ -485,10 +484,10 @@ func TestEngine_ExecuteServiceDeployment_LocalAgent_BuildLifecycle(t *testing.T)
 	}))
 	defer mockDockerServer.Close()
 
-	dockerCli, err := client.NewClientWithOpts(
+	dockerCli, err := client.New(
 		client.WithHost(mockDockerServer.URL),
 		client.WithHTTPClient(mockDockerServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer dockerCli.Close()
@@ -545,7 +544,7 @@ func TestEngine_ExecuteServiceDeployment_LocalAgent_BuildLifecycle(t *testing.T)
 
 	clientTarRC := newTrackingReadCloser(resp.Body)
 
-	buildOpts := types.ImageBuildOptions{
+	buildOpts := client.ImageBuildOptions{
 		Tags:       []string{"forgelab/test/ccms-backend:1"},
 		Dockerfile: "Dockerfile",
 		Remove:     true,

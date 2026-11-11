@@ -41,6 +41,15 @@ func TestIntegrationHandler_DetectRepository_GET_AuthRequired(t *testing.T) {
 
 func TestIntegrationHandler_DetectRepository_InaccessibleRepo_Returns404NotFound(t *testing.T) {
 	ghSvc := services.NewGitHubService(nil, nil, config.OAuthConfig{}, nil)
+	ghSvc.SetHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader(`{"message":"Not Found"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	})
 	handler := handlers.NewIntegrationHandler(ghSvc, nil, nil, "http://localhost:3000")
 	testUser := uuid.New()
 

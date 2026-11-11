@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Service, ServiceDeployment } from '@/lib/api/types';
+import { DeploymentMode, Service, ServiceDeployment } from '@/lib/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { api } from '@/lib/api/client';
@@ -23,6 +23,7 @@ import {
   Cpu,
   Sliders,
   HardDrive,
+  ArrowLeftRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
@@ -60,11 +61,13 @@ export function ServiceCard({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyDeployments, setHistoryDeployments] = useState<ServiceDeployment[]>([]);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const [modeUpdating, setModeUpdating] = useState(false);
+  const [modeError, setModeError] = useState<string | null>(null);
 
   const isFrontend = service.role === 'frontend';
   const isBackend = service.role === 'backend';
   const isJob = service.classification === 'job';
-  const isRunning = service.status === 'running';
+  const isRunning = service.status === 'running' || service.status === 'degraded';
 
   const isServiceDeploying = [
     'deploying',
@@ -101,7 +104,7 @@ export function ServiceCard({
   const wasServiceDeployed = Boolean(
     service.current_service_deployment_id ||
       service.status === 'stopped' ||
-      service.status === 'failed'
+      service.status === 'failed' || service.status === 'degraded'
   );
 
   const internalEndpoint = `${service.name}:${service.internal_port}`;
@@ -124,6 +127,23 @@ export function ServiceCard({
       loadHistory();
     }
     setShowHistory((prev) => !prev);
+  };
+
+  const currentMode: DeploymentMode = service.deployment_mode === 'blue_green' ? 'blue_green' : 'standard';
+  const hasVolumes = Boolean(service.volumes && service.volumes.length > 0);
+
+  const handleChangeDeploymentMode = async (nextMode: DeploymentMode) => {
+    if (nextMode === currentMode || modeUpdating || isJob) return;
+    setModeUpdating(true);
+    setModeError(null);
+    try {
+      const updated = await api.services.updateDeploymentMode(projectId, service.id, nextMode);
+      onServiceUpdated?.(updated);
+    } catch (err: any) {
+      setModeError(err.message || 'Failed to update deployment mode');
+    } finally {
+      setModeUpdating(false);
+    }
   };
 
   return (
@@ -248,6 +268,58 @@ export function ServiceCard({
         </button>
       </div>
 
+      {/* Deployment Mode Selector */}
+      {!isJob && (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded bg-surface/50 border border-surface-border/50 text-xs font-mono">
+            <div className="flex items-center gap-1.5 text-[11px] text-neutral-400 min-w-0">
+              <ArrowLeftRight className="w-3 h-3 text-sky-400 shrink-0" />
+              <span>Deploy Strategy</span>
+              {hasVolumes && currentMode === 'blue_green' && (
+                <span
+                  className="text-[10px] text-amber-400 truncate"
+                  title="Stateful services with writable volumes safely fall back to recreate during deployment"
+                >
+                  (volume fallback)
+                </span>
+              )}
+            </div>
+            <div className="inline-flex rounded border border-surface-border bg-surface p-0.5 shrink-0">
+              <button
+                type="button"
+                disabled={modeUpdating || isServiceDeploying}
+                onClick={() => handleChangeDeploymentMode('standard')}
+                className={cn(
+                  'px-2 py-0.5 rounded text-[10px] font-mono transition-colors disabled:opacity-50',
+                  currentMode === 'standard'
+                    ? 'bg-surface-elevated text-white font-semibold'
+                    : 'text-neutral-400 hover:text-neutral-200'
+                )}
+              >
+                Standard
+              </button>
+              <button
+                type="button"
+                disabled={modeUpdating || isServiceDeploying}
+                onClick={() => handleChangeDeploymentMode('blue_green')}
+                title="Start healthy green container before switching traffic and draining old container"
+                className={cn(
+                  'px-2 py-0.5 rounded text-[10px] font-mono transition-colors disabled:opacity-50',
+                  currentMode === 'blue_green'
+                    ? 'bg-sky-500/20 text-sky-300 font-semibold border border-sky-500/30'
+                    : 'text-neutral-400 hover:text-neutral-200'
+                )}
+              >
+                {modeUpdating && currentMode !== 'blue_green' ? 'Saving...' : 'Blue-Green'}
+              </button>
+            </div>
+          </div>
+          {modeError && (
+            <div className="text-[11px] text-red-400 px-1">{modeError}</div>
+          )}
+        </div>
+      )}
+
       {/* Prominent Preview Banner for Running Public Services */}
       {isPublicOrExposed && isRunning && previewUrl && (
         <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-emerald-500/10 border border-emerald-500/20 text-xs">
@@ -281,8 +353,8 @@ export function ServiceCard({
             loading={isDeployPending}
             disabled={isDeployPending || isServiceDeploying}
             className="h-7 text-xs px-2.5"
-            icon={wasServiceDeployed && !isRunning ? <RotateCcw className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
-            title={isJob ? (wasServiceDeployed ? 'Re-run this job' : 'Run this job') : wasServiceDeployed && !isRunning ? 'Redeploy this service' : 'Deploy only this service concurrently'}
+            icon={wasServiceDeployed && (!isRunning || service.status === 'degraded') ? <RotateCcw className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
+            title={isJob ? (wasServiceDeployed ? 'Re-run this job' : 'Run this job') : wasServiceDeployed && (!isRunning || service.status === 'degraded') ? 'Redeploy this service' : 'Deploy only this service concurrently'}
           >
             {isServiceDeploying
               ? getDeployingLabel()
@@ -290,7 +362,7 @@ export function ServiceCard({
               ? wasServiceDeployed
                 ? 'Re-run Job'
                 : 'Run Job'
-              : wasServiceDeployed && !isRunning
+              : wasServiceDeployed && (!isRunning || service.status === 'degraded')
               ? 'Redeploy'
               : 'Deploy Service'}
           </Button>

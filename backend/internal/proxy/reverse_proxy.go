@@ -1,12 +1,18 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 var (
@@ -124,4 +130,158 @@ func GenerateCaddyfile(routes []ProxyRoute) string {
 	}
 
 	return sb.String()
+}
+
+// BuildCaddyConfigJSON renders a Caddy v2 JSON configuration payload suitable for POST /load.
+// Verified routes with TLSEnabled use automated ACME certificate issuance.
+func BuildCaddyConfigJSON(routes []ProxyRoute, acmeEmail string) ([]byte, error) {
+	sortedRoutes := make([]ProxyRoute, len(routes))
+	copy(sortedRoutes, routes)
+	sort.Slice(sortedRoutes, func(i, j int) bool {
+		return sortedRoutes[i].Domain < sortedRoutes[j].Domain
+	})
+
+	caddyRoutes := make([]map[string]any, 0, len(sortedRoutes))
+	tlsDomains := make([]string, 0, len(sortedRoutes))
+	skipHTTPSDomains := make([]string, 0)
+
+	for _, r := range sortedRoutes {
+		domain := strings.TrimSpace(strings.ToLower(r.Domain))
+		if domain == "" {
+			continue
+		}
+		targetHost := strings.TrimSpace(r.TargetHost)
+		if targetHost == "" {
+			targetHost = "127.0.0.1"
+		}
+		targetPort := r.TargetPort
+		if targetPort <= 0 {
+			targetPort = 8080
+		}
+
+		if r.TLSEnabled {
+			tlsDomains = append(tlsDomains, domain)
+		} else {
+			skipHTTPSDomains = append(skipHTTPSDomains, domain)
+		}
+
+		caddyRoutes = append(caddyRoutes, map[string]any{
+			"match": []map[string]any{
+				{"host": []string{domain}},
+			},
+			"handle": []map[string]any{
+				{
+					"handler": "reverse_proxy",
+					"upstreams": []map[string]any{
+						{"dial": net.JoinHostPort(targetHost, fmt.Sprintf("%d", targetPort))},
+					},
+					"headers": map[string]any{
+						"request": map[string]any{
+							"set": map[string][]string{
+								"X-Real-IP":         {"{http.request.remote.host}"},
+								"X-Forwarded-Proto": {"{http.request.scheme}"},
+							},
+						},
+					},
+				},
+			},
+			"terminal": true,
+		})
+	}
+
+	serverCfg := map[string]any{
+		"listen": []string{":80", ":443"},
+		"routes": caddyRoutes,
+	}
+	if len(skipHTTPSDomains) > 0 {
+		serverCfg["automatic_https"] = map[string]any{
+			"skip": skipHTTPSDomains,
+		}
+	}
+
+	apps := map[string]any{
+		"http": map[string]any{
+			"servers": map[string]any{
+				"forgelab": serverCfg,
+			},
+		},
+	}
+
+	if len(tlsDomains) > 0 {
+		issuer := map[string]any{
+			"module": "acme",
+		}
+		if trimmedEmail := strings.TrimSpace(acmeEmail); trimmedEmail != "" {
+			issuer["email"] = trimmedEmail
+		}
+		apps["tls"] = map[string]any{
+			"automation": map[string]any{
+				"policies": []map[string]any{
+					{
+						"subjects": tlsDomains,
+						"issuers":  []map[string]any{issuer},
+					},
+				},
+			},
+		}
+	}
+
+	payload := map[string]any{
+		"apps": apps,
+	}
+	return json.MarshalIndent(payload, "", "  ")
+}
+
+// CaddySyncer synchronizes verified custom domain routes with a Caddy Admin API endpoint.
+type CaddySyncer struct {
+	adminURL   string
+	acmeEmail  string
+	httpClient *http.Client
+}
+
+// NewCaddySyncer constructs a CaddySyncer. When adminURL is empty, SyncRoutes operates as a safe no-op.
+func NewCaddySyncer(adminURL, acmeEmail string, client *http.Client) *CaddySyncer {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	return &CaddySyncer{
+		adminURL:   strings.TrimRight(strings.TrimSpace(adminURL), "/"),
+		acmeEmail:  strings.TrimSpace(acmeEmail),
+		httpClient: client,
+	}
+}
+
+// IsConfigured returns true if a Caddy Admin API URL has been provided.
+func (c *CaddySyncer) IsConfigured() bool {
+	return c != nil && c.adminURL != ""
+}
+
+// SyncRoutes pushes the full verified route table to Caddy's /load endpoint.
+func (c *CaddySyncer) SyncRoutes(ctx context.Context, routes []ProxyRoute) error {
+	if !c.IsConfigured() {
+		return nil
+	}
+
+	cfgBytes, err := BuildCaddyConfigJSON(routes, c.acmeEmail)
+	if err != nil {
+		return fmt.Errorf("failed to build Caddy JSON config: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.adminURL+"/load", bytes.NewReader(cfgBytes))
+	if err != nil {
+		return fmt.Errorf("failed to build Caddy reload request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to contact Caddy admin API at %s: %w", c.adminURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("Caddy admin API returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+	return nil
 }

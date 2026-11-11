@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -791,6 +792,86 @@ func (h *ServiceHandler) UpdateResources(w http.ResponseWriter, r *http.Request)
 	}
 
 	svc.ResourceConfig = cfg
+	writeJSON(w, http.StatusOK, svc)
+}
+
+// UpdateDeploymentModeInput represents the JSON body for configuring a service's deployment mode.
+type UpdateDeploymentModeInput struct {
+	DeploymentMode string `json:"deployment_mode"`
+}
+
+// UpdateDeploymentMode handles PATCH /api/projects/{id}/services/{serviceId}/deployment-mode
+func (h *ServiceHandler) UpdateDeploymentMode(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service ID")
+		return
+	}
+
+	if h.projectService == nil || h.serviceService == nil {
+		writeError(w, http.StatusServiceUnavailable, "service management unavailable")
+		return
+	}
+
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	svc, err := h.serviceService.GetService(r.Context(), serviceID)
+	if err != nil {
+		if errors.Is(err, services.ErrServiceNotFound) {
+			writeError(w, http.StatusNotFound, "service not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get service")
+		return
+	}
+
+	if svc.ProjectID != projectID {
+		writeError(w, http.StatusBadRequest, "service does not belong to specified project")
+		return
+	}
+
+	var input UpdateDeploymentModeInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(input.DeploymentMode))
+	if !models.IsValidDeploymentMode(normalized) {
+		writeError(w, http.StatusBadRequest, "deployment_mode must be 'standard' or 'blue_green'")
+		return
+	}
+
+	if err := h.serviceService.UpdateServiceDeploymentMode(r.Context(), serviceID, normalized); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update service deployment mode: "+err.Error())
+		return
+	}
+
+	svc.DeploymentMode = normalized
 	writeJSON(w, http.StatusOK, svc)
 }
 

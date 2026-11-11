@@ -6,6 +6,7 @@ import {
   DeploymentLog,
   LogQueryOptions,
   Project,
+  ProjectRuntimeMetrics,
   ProjectTopology,
   PublicShare,
   ShareStatusResponse,
@@ -95,6 +96,10 @@ export const projectsClient = {
 
   async getTopology(id: string): Promise<ProjectTopology> {
     return apiFetch<ProjectTopology>(`/api/projects/${id}/topology`);
+  },
+
+  async getMetrics(id: string): Promise<ProjectRuntimeMetrics> {
+    return apiFetch<ProjectRuntimeMetrics>(`/api/projects/${id}/metrics`);
   },
 
   async getShare(projectId: string): Promise<ShareStatusResponse> {

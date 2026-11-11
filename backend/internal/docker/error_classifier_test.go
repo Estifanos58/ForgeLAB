@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -90,10 +90,10 @@ func TestEngine_FormatDockerDiagnostic_StorageFailure(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()

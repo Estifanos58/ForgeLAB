@@ -21,7 +21,7 @@ export function ProjectCard({
   const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(project.status);
   const isRunning = project.status === 'running';
   const isStopped = project.status === 'stopped';
-  const wasDeployed = Boolean(project.current_deployment_id || project.status === 'stopped' || project.status === 'failed');
+  const wasDeployed = Boolean(project.current_deployment_id || project.status === 'stopped' || project.status === 'failed' || project.status === 'degraded');
 
   return (
     <div className="p-4 rounded-md border border-surface-border bg-surface hover:border-neutral-700 transition-colors flex flex-col justify-between gap-3 text-xs">
@@ -54,7 +54,7 @@ export function ProjectCard({
       <div className="pt-2.5 border-t border-surface-border flex flex-col gap-2 font-mono text-[11px]">
         <div className="flex items-center justify-between">
           <div>
-            {(project.status === 'running' || project.status === 'partially_running') && project.preview_url ? (
+            {(project.status === 'running' || project.status === 'degraded' || project.status === 'partially_running') && project.preview_url ? (
               <a
                 href={project.preview_url}
                 target="_blank"

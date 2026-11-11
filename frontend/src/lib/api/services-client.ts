@@ -2,6 +2,7 @@ import { apiFetch, buildLogQuery } from './base';
 import {
   CreateShareInput,
   DeploymentLog,
+  DeploymentMode,
   LogQueryOptions,
   PublicShare,
   Service,
@@ -76,6 +77,17 @@ export const servicesClient = {
     return apiFetch<Service>(`/api/projects/${projectId}/services/${serviceId}/resources`, {
       method: 'PATCH',
       body: JSON.stringify(input),
+    });
+  },
+
+  async updateDeploymentMode(
+    projectId: string,
+    serviceId: string,
+    deploymentMode: DeploymentMode
+  ): Promise<Service> {
+    return apiFetch<Service>(`/api/projects/${projectId}/services/${serviceId}/deployment-mode`, {
+      method: 'PATCH',
+      body: JSON.stringify({ deployment_mode: deploymentMode }),
     });
   },
 

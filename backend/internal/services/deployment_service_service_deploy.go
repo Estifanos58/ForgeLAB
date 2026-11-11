@@ -100,11 +100,13 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 			if err != nil {
 				return nil, fmt.Errorf("failed to supersede queued service deployment: %w", err)
 			}
-			_, _ = tx.Exec(ctx,
-				`INSERT INTO deployment_logs (id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-				uuid.New(), nil, *activeID, targetService.ID, now, models.LogPhaseStartup, models.LogStreamSystem, "Deployment superseded by newer queued deployment",
-			)
+			if _, logErr := tx.Exec(ctx,
+				`INSERT INTO deployment_logs (deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+				nil, *activeID, targetService.ID, now, models.LogPhaseStartup, models.LogStreamSystem, "Deployment superseded by newer queued deployment",
+			); logErr != nil {
+				return nil, fmt.Errorf("failed to log superseded service deployment: %w", logErr)
+			}
 			slog.Info("superseded queued service deployment", "service_deployment_id", *activeID, "service_id", targetService.ID)
 		} else {
 			return nil, ErrActiveDeployment
@@ -282,7 +284,10 @@ func (s *DeploymentService) CreateServiceDeployment(ctx context.Context, project
 	}
 
 	// Update project status according to composite service states
-	allServices, _ := s.listServicesTx(ctx, tx, project.ID)
+	allServices, err := s.listServicesTx(ctx, tx, project.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list services for project status calculation: %w", err)
+	}
 	newProjectStatus := CalculateProjectStatus(allServices)
 	_, err = tx.Exec(ctx,
 		"UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",

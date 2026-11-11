@@ -253,25 +253,34 @@ func (s *DeploymentService) CancelServiceDeployment(ctx context.Context, project
 
 	// Restore service status if appropriate
 	var prevRunningID *uuid.UUID
-	_ = tx.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`SELECT id FROM service_deployments WHERE service_id = $1 AND status = $2 AND id != $3 ORDER BY deploy_number DESC LIMIT 1`,
 		serviceID, models.DeployStatusRunning, serviceDeploymentID,
 	).Scan(&prevRunningID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("failed to check prior running service deployment: %w", err)
+	}
 
 	if prevRunningID != nil {
-		_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
-			models.ServiceStatusRunning, now, serviceID)
+		if _, err := tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ServiceStatusRunning, now, serviceID); err != nil {
+			return fmt.Errorf("failed to restore running service status: %w", err)
+		}
 	} else {
-		_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
-			models.ServiceStatusFailed, now, serviceID)
+		if _, err := tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ServiceStatusFailed, now, serviceID); err != nil {
+			return fmt.Errorf("failed to mark service status failed: %w", err)
+		}
 	}
 
 	// Log the cancellation
-	_, _ = tx.Exec(ctx,
-		`INSERT INTO deployment_logs (id, deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		uuid.New(), nil, serviceDeploymentID, serviceID, now, models.LogPhaseStartup, models.LogStreamSystem, reason,
-	)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO deployment_logs (deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		nil, serviceDeploymentID, serviceID, now, models.LogPhaseStartup, models.LogStreamSystem, reason,
+	); err != nil {
+		return fmt.Errorf("failed to log service deployment cancellation: %w", err)
+	}
 
 	return tx.Commit(ctx)
 }
@@ -322,36 +331,47 @@ func (s *DeploymentService) CancelDeployment(ctx context.Context, projectID, dep
 	}
 
 	// Also mark any child service_deployments as failed if active
-	_, _ = tx.Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`UPDATE service_deployments SET
 		 status = $2, failure_reason = $3, finished_at = $4,
 		 duration_ms = EXTRACT(EPOCH FROM ($4 - COALESCE(started_at, created_at))) * 1000
 		 WHERE deployment_id = $1 AND status NOT IN ($5, $6, $7, $8)`,
 		deploymentID, models.DeployStatusFailed, reason, now,
 		models.DeployStatusRunning, models.DeployStatusStopped, models.DeployStatusCrashed, models.DeployStatusFailed,
-	)
+	); err != nil {
+		return fmt.Errorf("failed to cancel child service deployments: %w", err)
+	}
 
 	// Update project status
 	var prevRunningID *uuid.UUID
-	_ = tx.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`SELECT id FROM deployments WHERE project_id = $1 AND status = $2 AND id != $3 ORDER BY deploy_number DESC LIMIT 1`,
 		projectID, models.DeployStatusRunning, deploymentID,
 	).Scan(&prevRunningID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("failed to check prior running deployment: %w", err)
+	}
 
 	if prevRunningID != nil {
-		_, _ = tx.Exec(ctx, "UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
-			models.ProjectStatusRunning, now, projectID)
+		if _, err := tx.Exec(ctx, "UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ProjectStatusRunning, now, projectID); err != nil {
+			return fmt.Errorf("failed to restore running project status: %w", err)
+		}
 	} else {
-		_, _ = tx.Exec(ctx, "UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
-			models.ProjectStatusFailed, now, projectID)
+		if _, err := tx.Exec(ctx, "UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3",
+			models.ProjectStatusFailed, now, projectID); err != nil {
+			return fmt.Errorf("failed to mark project status failed: %w", err)
+		}
 	}
 
 	// Log the cancellation
-	_, _ = tx.Exec(ctx,
-		`INSERT INTO deployment_logs (id, deployment_id, service_id, timestamp, phase, stream, message)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		uuid.New(), deploymentID, nil, now, models.LogPhaseStartup, models.LogStreamSystem, reason,
-	)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO deployment_logs (deployment_id, service_id, timestamp, phase, stream, message)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		deploymentID, nil, now, models.LogPhaseStartup, models.LogStreamSystem, reason,
+	); err != nil {
+		return fmt.Errorf("failed to log deployment cancellation: %w", err)
+	}
 
 	return tx.Commit(ctx)
 }

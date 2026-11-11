@@ -11,10 +11,11 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/network"
+	"github.com/forgelab/backend/internal/proxy"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/services"
 	ws "github.com/forgelab/backend/internal/websocket"
@@ -29,6 +30,11 @@ type activeExecEntry struct {
 	done      chan struct{}
 }
 
+// RollbackJobEnqueuer enqueues automatic rollback deployments created by runtime health monitoring.
+type RollbackJobEnqueuer interface {
+	EnqueueServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) error
+}
+
 // ReconciliationState represents the operational reconciliation status between Docker daemon and database.
 type ReconciliationState struct {
 	Status         string     `json:"status"` // "pending", "completed", "failed", "unreachable"
@@ -38,39 +44,50 @@ type ReconciliationState struct {
 }
 
 type Engine struct {
-	clientMu             sync.Mutex // synchronizes streaming transport wrapping and client updates
-	dockerClient         *client.Client
-	projectService       *services.ProjectService
-	deploymentService    *services.DeploymentService
-	secretService        *services.SecretService
-	sourceService        *services.SourceService
-	githubService        *services.GitHubService
-	serviceService       *services.ServiceService
-	portManager          *network.PortManager
-	pathValidator        *security.PathValidator
-	wsHub                *ws.Hub
-	workDir              string
-	localBuildMode       string
-	maxConcurrentBuilds  int
-	buildSem             *BuildSemaphore
-	semMu                sync.Mutex
-	buildMaintenanceMu   sync.RWMutex          // synchronizes Docker image builds vs image pruning/maintenance
-	pruneFilterLabel     string                // optional label filter for scoped image pruning
-	activeLogCollectors  sync.Map              // map[string]context.CancelFunc — tracks running log collector goroutines
-	collectorRegistry    *LogCollectorRegistry // race-safe registry and operational diagnostics for runtime log collectors
-	activeCancels        sync.Map              // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
-	activeExecMu         sync.Mutex            // protects activeExecs map
-	activeExecs          map[uuid.UUID]*activeExecEntry
-	activeContainers     sync.Map                // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
-	sharedBuildArtifacts sync.Map                // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
-	sharedCoordMu        sync.Mutex              // protects initialization and mutation of sharedCoordinator
-	sharedCoordinator    *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
-	cachedBuilderVer     atomic.Value            // stores types.BuilderVersion advertised by Docker daemon
-	startTime            time.Time               // instance boot timestamp for tracking interrupted deployments
-	publicHost           string                  // host name or IP used for browser-facing URLs
-	appHostIP            string                  // host IP binding for application ports (defaults to 127.0.0.1)
-	reconcileMu          sync.RWMutex
-	reconcileState       ReconciliationState
+	clientMu              sync.Mutex // synchronizes streaming transport wrapping and client updates
+	dockerClient          *client.Client
+	projectService        *services.ProjectService
+	deploymentService     *services.DeploymentService
+	secretService         *services.SecretService
+	sourceService         *services.SourceService
+	githubService         *services.GitHubService
+	serviceService        *services.ServiceService
+	portManager           *network.PortManager
+	pathValidator         *security.PathValidator
+	wsHub                 *ws.Hub
+	workDir               string
+	localBuildMode        string
+	maxConcurrentBuilds   int
+	buildSem              *BuildSemaphore
+	semMu                 sync.Mutex
+	buildMaintenanceMu    sync.RWMutex          // synchronizes Docker image builds vs image pruning/maintenance
+	pruneFilterLabel      string                // optional label filter for scoped image pruning
+	activeLogCollectors   sync.Map              // map[string]context.CancelFunc — tracks running log collector goroutines
+	collectorRegistry     *LogCollectorRegistry // race-safe registry and operational diagnostics for runtime log collectors
+	activeCancels         sync.Map              // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	activeExecMu          sync.Mutex            // protects activeExecs map
+	activeExecs           map[uuid.UUID]*activeExecEntry
+	activeContainers      sync.Map                // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
+	sharedBuildArtifacts  sync.Map                // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
+	sharedCoordMu         sync.Mutex              // protects initialization and mutation of sharedCoordinator
+	sharedCoordinator     *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
+	cachedBuilderVer      atomic.Value            // stores build.BuilderVersion advertised by Docker daemon
+	streamingHookSet      atomic.Bool             // true when dockerClient is already configured with BuildStreamRequestHook
+	streamingCli          *client.Client          // cached streaming-hook Docker client built by ensureStreamingTransport
+	startTime             time.Time               // instance boot timestamp for tracking interrupted deployments
+	publicHost            string                  // host name or IP used for browser-facing URLs
+	appHostIP             string                  // host IP binding for application ports (defaults to 127.0.0.1)
+	reconcileMu           sync.RWMutex
+	reconcileState        ReconciliationState
+	queueEnqueuer         RollbackJobEnqueuer
+	healthStrikeMu        sync.Mutex
+	healthStrikes         map[uuid.UUID]int
+	lastAutoRollbackAt    map[uuid.UUID]time.Time
+	autoRollbackEnabled   bool
+	autoRollbackThreshold int
+	autoRollbackCooldown  time.Duration
+	trafficRouter         *proxy.TrafficRouter
+	onRouteChange         func(context.Context)
 }
 
 func (e *Engine) trackActiveContainer(id string) {
@@ -127,28 +144,81 @@ func NewEngine(
 	_ = os.MkdirAll(workDir, 0755)
 
 	return &Engine{
-		dockerClient:        dockerClient,
-		projectService:      projectService,
-		deploymentService:   deploymentService,
-		secretService:       secretService,
-		sourceService:       sourceService,
-		githubService:       githubService,
-		serviceService:      services.NewServiceService(nil),
-		portManager:         portManager,
-		pathValidator:       pathValidator,
-		wsHub:               wsHub,
-		workDir:             workDir,
-		localBuildMode:      "snapshot",
-		maxConcurrentBuilds: DefaultMaxConcurrentBuilds(),
-		buildSem:            NewBuildSemaphore(DefaultMaxConcurrentBuilds()),
-		sharedCoordinator:   NewSharedBuildCoordinator(),
-		activeExecs:         make(map[uuid.UUID]*activeExecEntry),
-		collectorRegistry:   NewLogCollectorRegistry(),
-		startTime:           time.Now(),
+		dockerClient:          dockerClient,
+		projectService:        projectService,
+		deploymentService:     deploymentService,
+		secretService:         secretService,
+		sourceService:         sourceService,
+		githubService:         githubService,
+		serviceService:        services.NewServiceService(nil),
+		portManager:           portManager,
+		pathValidator:         pathValidator,
+		wsHub:                 wsHub,
+		workDir:               workDir,
+		localBuildMode:        "snapshot",
+		maxConcurrentBuilds:   DefaultMaxConcurrentBuilds(),
+		buildSem:              NewBuildSemaphore(DefaultMaxConcurrentBuilds()),
+		sharedCoordinator:     NewSharedBuildCoordinator(),
+		activeExecs:           make(map[uuid.UUID]*activeExecEntry),
+		collectorRegistry:     NewLogCollectorRegistry(),
+		startTime:             time.Now(),
+		healthStrikes:         make(map[uuid.UUID]int),
+		lastAutoRollbackAt:    make(map[uuid.UUID]time.Time),
+		autoRollbackEnabled:   true,
+		autoRollbackThreshold: 3,
+		autoRollbackCooldown:  5 * time.Minute,
 		reconcileState: ReconciliationState{
 			Status:        "pending",
 			Authoritative: false,
 		},
+	}
+}
+
+// SetQueueEnqueuer configures the queue enqueuer used by automatic health rollback.
+func (e *Engine) SetQueueEnqueuer(q RollbackJobEnqueuer) {
+	e.queueEnqueuer = q
+}
+
+// SetTrafficRouter configures the blue-green upstream traffic router.
+func (e *Engine) SetTrafficRouter(router *proxy.TrafficRouter) {
+	e.trafficRouter = router
+}
+
+// GetTrafficRouter returns the configured blue-green traffic router, if any.
+func (e *Engine) GetTrafficRouter() *proxy.TrafficRouter {
+	return e.trafficRouter
+}
+
+// SetAutoRollbackConfig configures automatic rollback behavior on sustained unhealthy runtime checks.
+func (e *Engine) SetAutoRollbackConfig(enabled bool, threshold int, cooldown time.Duration) {
+	e.healthStrikeMu.Lock()
+	defer e.healthStrikeMu.Unlock()
+	e.autoRollbackEnabled = enabled
+	if threshold > 0 {
+		e.autoRollbackThreshold = threshold
+	} else if e.autoRollbackThreshold <= 0 {
+		e.autoRollbackThreshold = 3
+	}
+	if cooldown >= 0 {
+		e.autoRollbackCooldown = cooldown
+	}
+}
+
+// GetHealthStrikeCount returns the current consecutive unhealthy check count for a service.
+func (e *Engine) GetHealthStrikeCount(serviceID uuid.UUID) int {
+	e.healthStrikeMu.Lock()
+	defer e.healthStrikeMu.Unlock()
+	if e.healthStrikes == nil {
+		return 0
+	}
+	return e.healthStrikes[serviceID]
+}
+
+func (e *Engine) resetHealthStrike(serviceID uuid.UUID) {
+	e.healthStrikeMu.Lock()
+	defer e.healthStrikeMu.Unlock()
+	if e.healthStrikes != nil {
+		delete(e.healthStrikes, serviceID)
 	}
 }
 
@@ -410,4 +480,15 @@ func getDockerBuildTimeout() time.Duration {
 // SetServiceService configures the service management service.
 func (e *Engine) SetServiceService(ss *services.ServiceService) {
 	e.serviceService = ss
+}
+
+// SetStreamingHookConfigured marks whether the Engine's Docker client was already
+// constructed with BuildStreamRequestHook attached.
+func (e *Engine) SetStreamingHookConfigured(configured bool) {
+	e.streamingHookSet.Store(configured)
+}
+
+// SetOnRouteChange registers a callback invoked after a service route changes on cutover.
+func (e *Engine) SetOnRouteChange(fn func(context.Context)) {
+	e.onRouteChange = fn
 }

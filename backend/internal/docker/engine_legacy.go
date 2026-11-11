@@ -16,10 +16,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/go-connections/nat"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/build"
+	"github.com/moby/moby/api/types/container"
+	dockernetwork "github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/detector"
@@ -140,7 +141,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		}
 
 		if candidateImage != "" && e.dockerClient != nil {
-			if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, candidateImage); err == nil {
+			if inspect, err := e.dockerClient.ImageInspect(ctx, candidateImage); err == nil {
 				reusingExistingImage = true
 				runImage = candidateImage
 				idShort := inspect.ID
@@ -149,7 +150,10 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				}
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Execution path: reusing existing immutable image '%s' (image ID: %s). Skipping source cloning and image build.", candidateImage, idShort))
 				if deployment.ImageTag != nil && *deployment.ImageTag != "" && candidateImage != *deployment.ImageTag {
-					_ = e.dockerClient.ImageTag(ctx, candidateImage, *deployment.ImageTag)
+					_, _ = e.dockerClient.ImageTag(ctx, client.ImageTagOptions{
+						Source: candidateImage,
+						Target: *deployment.ImageTag,
+					})
 				}
 			} else {
 				if deployment.ExecutionMode == models.ExecutionModeReuseImage {
@@ -195,9 +199,9 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			return errors.New(reason)
 		}
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker daemon available")
-		if bv, ok := e.getCachedBuilderVersion(); ok && bv == types.BuilderBuildKit {
+		if bv, ok := e.getCachedBuilderVersion(); ok && bv == build.BuilderBuildKit {
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 2 / BuildKit")
-		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv == types.BuilderV1 {
+		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv == build.BuilderV1 {
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 1 / legacy")
 		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv != "" {
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Builder version: %s", bv))
@@ -481,7 +485,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Injected %d build argument(s) into builder stage.", len(buildArgs)))
 		}
 
-		buildOpts := types.ImageBuildOptions{
+		buildOpts := client.ImageBuildOptions{
 			Tags:        []string{*deployment.ImageTag},
 			Dockerfile:  relDockerPath,
 			BuildArgs:   buildArgs,
@@ -513,7 +517,7 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			return errors.New(reason)
 		}
 
-		if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, *deployment.ImageTag); err == nil {
+		if inspect, err := e.dockerClient.ImageInspect(ctx, *deployment.ImageTag); err == nil {
 			var digest string
 			if len(inspect.RepoDigests) > 0 {
 				digest = inspect.RepoDigests[0]
@@ -598,11 +602,12 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	}
 	envSlice = append(envSlice, fmt.Sprintf("PORT=%d", intPort))
 
+	targetPort := dockernetwork.MustParsePort(targetPortStr)
 	containerConfig := &container.Config{
 		Image: runImage,
 		Env:   envSlice,
-		ExposedPorts: nat.PortSet{
-			nat.Port(targetPortStr): struct{}{},
+		ExposedPorts: dockernetwork.PortSet{
+			targetPort: struct{}{},
 		},
 		Labels: map[string]string{
 			"forgelab.project_id":    project.ID.String(),
@@ -614,10 +619,10 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	}
 
 	hostConfig, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
-		PortBindings: nat.PortMap{
-			nat.Port(targetPortStr): []nat.PortBinding{
+		PortBindings: dockernetwork.PortMap{
+			targetPort: []dockernetwork.PortBinding{
 				{
-					HostIP:   e.GetAppHostIP(),
+					HostIP:   parseAppHostIP(e.GetAppHostIP()),
 					HostPort: fmt.Sprintf("%d", allocatedPort),
 				},
 			},
@@ -637,12 +642,16 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 	}
 
 	containerName := fmt.Sprintf("forgelab-%s-%d", project.Slug, deployment.DeployNumber)
-	_ = e.dockerClient.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
+	_, _ = e.dockerClient.ContainerRemove(ctx, containerName, client.ContainerRemoveOptions{Force: true})
 
 	var containerID string
 	maxLegacyPortRetries := 3
 	for attempt := 0; attempt <= maxLegacyPortRetries; attempt++ {
-		resp, err := e.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
+		resp, err := e.dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+			Config:     containerConfig,
+			HostConfig: hostConfig,
+			Name:       containerName,
+		})
 		if err != nil {
 			if isPortConflictError(err) && attempt < maxLegacyPortRetries {
 				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Host port %d conflict during container create: %v. Retrying with a new port (attempt %d/%d)...", allocatedPort, err, attempt+1, maxLegacyPortRetries))
@@ -650,9 +659,9 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 				newPort, allocErr := e.portManager.AllocatePort()
 				if allocErr == nil {
 					allocatedPort = newPort
-					containerConfig.ExposedPorts = nat.PortSet{nat.Port(targetPortStr): struct{}{}}
-					hostConfig.PortBindings = nat.PortMap{
-						nat.Port(targetPortStr): []nat.PortBinding{{HostIP: e.GetAppHostIP(), HostPort: fmt.Sprintf("%d", allocatedPort)}},
+					containerConfig.ExposedPorts = dockernetwork.PortSet{targetPort: struct{}{}}
+					hostConfig.PortBindings = dockernetwork.PortMap{
+						targetPort: []dockernetwork.PortBinding{{HostIP: parseAppHostIP(e.GetAppHostIP()), HostPort: fmt.Sprintf("%d", allocatedPort)}},
 					}
 					continue
 				}
@@ -666,17 +675,17 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 
 		containerID = resp.ID
 
-		if err := e.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-			_ = e.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+		if _, err := e.dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
+			_, _ = e.dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
 			if isPortConflictError(err) && attempt < maxLegacyPortRetries {
 				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Host port %d conflict during container start: %v. Retrying with a new port (attempt %d/%d)...", allocatedPort, err, attempt+1, maxLegacyPortRetries))
 				e.portManager.RegisterUsedPort(allocatedPort)
 				newPort, allocErr := e.portManager.AllocatePort()
 				if allocErr == nil {
 					allocatedPort = newPort
-					containerConfig.ExposedPorts = nat.PortSet{nat.Port(targetPortStr): struct{}{}}
-					hostConfig.PortBindings = nat.PortMap{
-						nat.Port(targetPortStr): []nat.PortBinding{{HostIP: e.GetAppHostIP(), HostPort: fmt.Sprintf("%d", allocatedPort)}},
+					containerConfig.ExposedPorts = dockernetwork.PortSet{targetPort: struct{}{}}
+					hostConfig.PortBindings = dockernetwork.PortMap{
+						targetPort: []dockernetwork.PortBinding{{HostIP: parseAppHostIP(e.GetAppHostIP()), HostPort: fmt.Sprintf("%d", allocatedPort)}},
 					}
 					continue
 				}
@@ -725,8 +734,8 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 		e.StopLogCollector(deployment.ID)
 		e.StopContainerLogCollector(containerID)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
-		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+		_, _ = e.dockerClient.ContainerStop(cleanupCtx, containerID, client.ContainerStopOptions{})
+		_, _ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true})
 		cleanupCancel()
 		e.portManager.ReleasePort(allocatedPort)
 		updateStatus(models.DeployStatusFailed, &detailedReason)
@@ -753,8 +762,8 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			e.StopLogCollector(oldDeploy.ID)
 			e.StopContainerLogCollector(*oldDeploy.ContainerID)
 			emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Stopping previous deployment %d container...", oldDeploy.DeployNumber))
-			_ = e.dockerClient.ContainerStop(ctx, *oldDeploy.ContainerID, container.StopOptions{})
-			_ = e.dockerClient.ContainerRemove(ctx, *oldDeploy.ContainerID, container.RemoveOptions{Force: true})
+			_, _ = e.dockerClient.ContainerStop(ctx, *oldDeploy.ContainerID, client.ContainerStopOptions{})
+			_, _ = e.dockerClient.ContainerRemove(ctx, *oldDeploy.ContainerID, client.ContainerRemoveOptions{Force: true})
 			_ = e.deploymentService.UpdateDeploymentStatus(ctx, oldDeploy.ID, models.DeployStatusStopped, nil)
 		}
 	}

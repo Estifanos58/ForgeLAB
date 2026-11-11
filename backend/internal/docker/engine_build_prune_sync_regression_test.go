@@ -11,8 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,10 +34,10 @@ func newTestDockerClient(t *testing.T, handler http.Handler) (*client.Client, fu
 		handler.ServeHTTP(w, r)
 	})
 	server := httptest.NewServer(wrapped)
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(server.URL),
 		client.WithHTTPClient(server.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 
@@ -86,7 +85,7 @@ func TestRegression_BuildPruneSync_TestA_PruneWaitsForActiveBuild(t *testing.T) 
 	buildDone := make(chan error, 1)
 	go func() {
 		tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
-		err := engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+		err := engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 		buildDone <- err
 	}()
 
@@ -182,7 +181,7 @@ func TestRegression_BuildPruneSync_TestB_BuildWaitsForActivePrune(t *testing.T) 
 	go func() {
 		close(buildStarted)
 		tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
-		err := engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+		err := engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 		buildDone <- err
 	}()
 	<-buildStarted
@@ -273,7 +272,7 @@ func TestRegression_BuildPruneSync_TestC_MultipleBuildsCompatibility(t *testing.
 		b1Done := make(chan error, 1)
 		go func() {
 			tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
-			b1Done <- engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+			b1Done <- engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 		}()
 		<-b1Started
 
@@ -281,7 +280,7 @@ func TestRegression_BuildPruneSync_TestC_MultipleBuildsCompatibility(t *testing.
 		b2Done := make(chan error, 1)
 		go func() {
 			tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
-			b2Done <- engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+			b2Done <- engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 		}()
 
 		// Wait deterministically until Build 2 has acquired RLock and is queued on BuildSemaphore
@@ -363,7 +362,7 @@ func TestRegression_BuildPruneSync_TestC_MultipleBuildsCompatibility(t *testing.
 			go func() {
 				defer wg.Done()
 				tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
-				err := engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+				err := engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 				assert.NoError(t, err)
 			}()
 		}
@@ -430,7 +429,7 @@ func TestRegression_BuildPruneSync_TestD_LongRunningBuildSchedulerSafety(t *test
 	buildDone := make(chan error, 1)
 	go func() {
 		tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
-		buildDone <- engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+		buildDone <- engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 	}()
 
 	<-buildInFlight

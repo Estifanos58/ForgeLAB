@@ -12,10 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	dockerclient "github.com/docker/docker/client"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	dockerclient "github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/auth"
 	"github.com/forgelab/backend/internal/config"
@@ -26,6 +27,7 @@ import (
 	"github.com/forgelab/backend/internal/middleware"
 	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/network"
+	"github.com/forgelab/backend/internal/proxy"
 	"github.com/forgelab/backend/internal/queue"
 	"github.com/forgelab/backend/internal/ratelimit"
 	"github.com/forgelab/backend/internal/security"
@@ -106,7 +108,7 @@ func main() {
 	}
 
 	// Initialize Docker Client
-	dockerCli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
+	dockerCli, err := dockerclient.New(dockerclient.FromEnv, dockerclient.WithHTTPRequestHook(docker.BuildStreamRequestHook))
 	if err != nil {
 		slog.Warn("docker client initialization warning", "error", err)
 	}
@@ -221,6 +223,7 @@ func main() {
 		cfg.Docker.WorkDir,
 	)
 	dockerEngine.SetServiceService(serviceService)
+	dockerEngine.SetStreamingHookConfigured(dockerCli != nil)
 	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
 	dockerEngine.SetMaxConcurrentBuilds(cfg.Docker.MaxConcurrentBuilds)
 	dockerEngine.SetPublicHost(cfg.App.PublicHostName())
@@ -230,6 +233,15 @@ func main() {
 	if cfg.Docker.PruneFilterLabel != "" {
 		dockerEngine.SetPruneFilterLabel(cfg.Docker.PruneFilterLabel)
 	}
+	trafficRouter := proxy.NewTrafficRouter()
+	dockerEngine.SetTrafficRouter(trafficRouter)
+	caddySyncer := proxy.NewCaddySyncer(cfg.Proxy.CaddyAdminURL, cfg.Proxy.ACMEEmail, nil)
+	domainService := services.NewDomainService(pool, serviceService, trafficRouter, caddySyncer, cfg.Proxy.IngressHost, cfg.Share.AppHostIP)
+	dockerEngine.SetOnRouteChange(func(syncCtx context.Context) {
+		if err := domainService.SyncAllVerifiedRoutes(syncCtx); err != nil {
+			slog.Warn("failed to sync custom domain routes after service cutover", "error", err)
+		}
+	})
 	defer dockerEngine.StopAllLogCollectors()
 
 	// Initialize Public Sharing Provider & Local Router
@@ -302,6 +314,7 @@ func main() {
 			return false, nil
 		})
 		defer deployQueue.Stop()
+		dockerEngine.SetQueueEnqueuer(deployQueue)
 	}
 
 	// Startup reconciliation for Docker containers and orphaned / missing deployments
@@ -347,6 +360,9 @@ func main() {
 	}
 	if err := dockerEngine.CheckContinuousRuntimeHealth(startupReconcileCtx); err != nil {
 		slog.Warn("initial runtime container health check failed", "error", err)
+	}
+	if err := domainService.SyncAllVerifiedRoutes(startupReconcileCtx); err != nil {
+		slog.Warn("initial custom domain Caddy route sync failed", "error", err)
 	}
 	startupCancel()
 	slog.Info("initial container and runtime status reconciliation complete")
@@ -462,12 +478,20 @@ func main() {
 	rateLimiter := ratelimit.NewLimiter(redisClient, cfg.RateLimit.Enabled, cfg.RateLimit.TrustedProxies...)
 	wsHub.SetRateLimiter(rateLimiter, cfg.RateLimit.WSSubscriptionLimit)
 
+	var deployEnqueuer services.DeploymentEnqueuer
+	if deployQueue != nil {
+		deployEnqueuer = deployQueue
+	}
+	webhookService := services.NewWebhookService(pool, encryptor, projectService, deploymentService, deployEnqueuer, "")
+
 	// Initialize handlers
 	oauthService := services.NewOAuthService(cfg.Google, cfg.GitHub, redisClient)
 	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	authHandler.SetAllowGuestMode(cfg.App.AllowGuestMode)
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
 	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, deploymentService, dockerEngine, deployQueue)
+	domainHandler := handlers.NewDomainHandler(domainService, projectService)
+	webhookHandler := handlers.NewWebhookHandler(webhookService, projectService)
 	envHandler := handlers.NewEnvHandler(secretService, projectService)
 	integrationHandler := handlers.NewIntegrationHandler(githubService, githubAppManager, repositoryImportService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
@@ -499,6 +523,25 @@ func main() {
 	r.Get("/health/queue", healthHandler.QueueDiagnostics)
 	r.Get("/health/logs", healthHandler.LogCollectorDiagnostics)
 
+	// Blue-Green Service Traffic Proxy
+	serveServiceProxy := func(w http.ResponseWriter, r *http.Request) {
+		serviceID, err := uuid.Parse(chi.URLParam(r, "serviceId"))
+		if err != nil {
+			http.Error(w, "invalid service ID", http.StatusBadRequest)
+			return
+		}
+		prefix := "/proxy/services/" + serviceID.String()
+		rCopy := r.Clone(r.Context())
+		trimmed := strings.TrimPrefix(r.URL.Path, prefix)
+		if trimmed == "" {
+			trimmed = "/"
+		}
+		rCopy.URL.Path = trimmed
+		trafficRouter.ServeServiceHTTP(serviceID, w, rCopy)
+	}
+	r.HandleFunc("/proxy/services/{serviceId}", serveServiceProxy)
+	r.HandleFunc("/proxy/services/{serviceId}/*", serveServiceProxy)
+
 	// Throttles for sensitive endpoints
 	authThrottle := ratelimit.Middleware(rateLimiter, "auth", cfg.RateLimit.AuthLimit, time.Minute)
 	sourceThrottle := ratelimit.Middleware(rateLimiter, "source", cfg.RateLimit.SourceLimit, time.Minute)
@@ -516,6 +559,9 @@ func main() {
 		// Public GitHub OAuth & GitHub App integration callbacks
 		r.Get("/integrations/github/callback", integrationHandler.GitHubCallback)
 		r.Get("/integrations/github/app/callback", integrationHandler.GitHubAppCallback)
+
+		// Public GitHub Push-to-Deploy Webhook Receiver (HMAC-SHA256 verified)
+		r.Post("/webhooks/github", webhookHandler.ReceiveGitHub)
 
 		// Agent session validation (token-authenticated by agent)
 		r.Post("/sources/agent/session/validate", sourceHandler.ValidateAgentSession)
@@ -596,6 +642,7 @@ func main() {
 				r.Get("/", projectHandler.List)
 				r.Get("/{id}", projectHandler.Get)
 				r.Get("/{id}/topology", projectHandler.GetTopology)
+				r.Get("/{id}/metrics", projectHandler.GetRuntimeMetrics)
 				r.Patch("/{id}", projectHandler.Update)
 				r.Delete("/{id}", projectHandler.Delete)
 
@@ -611,6 +658,7 @@ func main() {
 				r.Post("/{id}/services/{serviceId}/start", serviceHandler.Start)
 				r.Post("/{id}/services/{serviceId}/restart", serviceHandler.Restart)
 				r.Patch("/{id}/services/{serviceId}/resources", serviceHandler.UpdateResources)
+				r.Patch("/{id}/services/{serviceId}/deployment-mode", serviceHandler.UpdateDeploymentMode)
 
 				// Application Lifecycle Controls
 				r.Post("/{id}/stop", projectHandler.Stop)
@@ -631,6 +679,16 @@ func main() {
 				r.Get("/{id}/share", shareHandler.Get)
 				r.Post("/{id}/share", shareHandler.Create)
 				r.Delete("/{id}/share", shareHandler.Revoke)
+
+				// Custom Domains & Automatic HTTPS
+				r.Get("/{id}/domains", domainHandler.List)
+				r.Post("/{id}/domains", domainHandler.Add)
+				r.Delete("/{id}/domains/{domainId}", domainHandler.Remove)
+				r.Post("/{id}/domains/{domainId}/verify", domainHandler.Verify)
+
+				// Push-to-Deploy Webhook Settings
+				r.Get("/{id}/webhook", webhookHandler.GetConfig)
+				r.Patch("/{id}/webhook", webhookHandler.UpdateConfig)
 
 				// Deployments
 				r.With(deployThrottle).Post("/{id}/deployments", projectHandler.Deploy)

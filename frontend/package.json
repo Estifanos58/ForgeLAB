@@ -7,13 +7,13 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "test": "node --import tsx --test test/websocket.test.mjs test/local_agent_import.test.mjs test/lifecycle_redeploy.test.mjs test/trusted-proxy.test.mjs test/log_filters_pagination.test.mjs test/security-headers.test.mjs test/session-sync.test.mjs"
+    "test": "node --import tsx --test test/websocket.test.mjs test/local_agent_import.test.mjs test/lifecycle_redeploy.test.mjs test/trusted-proxy.test.mjs test/log_filters_pagination.test.mjs test/security-headers.test.mjs test/session-sync.test.mjs test/workstream3_features.test.mjs"
   },
   "dependencies": {
     "clsx": "^2.1.1",
     "geist": "^1.7.2",
     "lucide-react": "^0.475.0",
-    "next": "16.3.6",
+    "next": "16.4.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^3.0.1"
@@ -24,7 +24,7 @@
     "@types/react-dom": "^19.0.3",
     "autoprefixer": "^10.4.20",
     "eslint": "^9.20.1",
-    "eslint-config-next": "16.3.6",
+    "eslint-config-next": "16.4.6",
     "postcss": "^8.5.2",
     "tailwindcss": "^3.4.17",
     "tsx": "^4.23.15",

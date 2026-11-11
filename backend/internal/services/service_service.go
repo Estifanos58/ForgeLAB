@@ -21,15 +21,65 @@ var (
 )
 
 type ServiceService struct {
-	db *pgxpool.Pool
+	db                                 *pgxpool.Pool
+	listServicesForTest                func(ctx context.Context, projectID uuid.UUID) ([]*models.Service, error)
+	listServicesByProjectsForTest      func(ctx context.Context, projectIDs []uuid.UUID) (map[uuid.UUID][]*models.Service, error)
+	listActiveServicesForTest          func(ctx context.Context) ([]*models.Service, error)
+	getServiceForTest                  func(ctx context.Context, serviceID uuid.UUID) (*models.Service, error)
+	promoteServiceDeploymentForTest    func(ctx context.Context, serviceID, serviceDeploymentID uuid.UUID, containerID, imageTag string, hostPort *int) error
+	updateServiceStatusForTest         func(ctx context.Context, serviceID uuid.UUID, status string, containerID *string, imageTag *string, hostPort *int) error
+	updateServiceDeploymentModeForTest func(ctx context.Context, serviceID uuid.UUID, mode string) error
 }
 
 func NewServiceService(db *pgxpool.Pool) *ServiceService {
 	return &ServiceService{db: db}
 }
 
+// SetListServicesForTest configures a test hook for ListServices.
+func (s *ServiceService) SetListServicesForTest(fn func(ctx context.Context, projectID uuid.UUID) ([]*models.Service, error)) {
+	s.listServicesForTest = fn
+}
+
+// SetListServicesByProjectsForTest configures a test hook for ListServicesByProjectIDs.
+func (s *ServiceService) SetListServicesByProjectsForTest(fn func(ctx context.Context, projectIDs []uuid.UUID) (map[uuid.UUID][]*models.Service, error)) {
+	s.listServicesByProjectsForTest = fn
+}
+
+// SetListActiveServicesForTest configures a test hook for ListActiveServices.
+func (s *ServiceService) SetListActiveServicesForTest(fn func(ctx context.Context) ([]*models.Service, error)) {
+	s.listActiveServicesForTest = fn
+}
+
+// SetGetServiceForTest configures a test hook for GetService.
+func (s *ServiceService) SetGetServiceForTest(fn func(ctx context.Context, serviceID uuid.UUID) (*models.Service, error)) {
+	s.getServiceForTest = fn
+}
+
+// SetPromoteServiceDeploymentForTest configures a test hook for PromoteServiceDeployment.
+func (s *ServiceService) SetPromoteServiceDeploymentForTest(fn func(ctx context.Context, serviceID, serviceDeploymentID uuid.UUID, containerID, imageTag string, hostPort *int) error) {
+	s.promoteServiceDeploymentForTest = fn
+}
+
+// SetUpdateServiceStatusForTest configures a test hook for UpdateServiceStatus.
+func (s *ServiceService) SetUpdateServiceStatusForTest(fn func(ctx context.Context, serviceID uuid.UUID, status string, containerID *string, imageTag *string, hostPort *int) error) {
+	s.updateServiceStatusForTest = fn
+}
+
+// SetUpdateServiceDeploymentModeForTest configures a test hook for UpdateServiceDeploymentMode.
+func (s *ServiceService) SetUpdateServiceDeploymentModeForTest(fn func(ctx context.Context, serviceID uuid.UUID, mode string) error) {
+	s.updateServiceDeploymentModeForTest = fn
+}
+
+// HasTestHooks reports whether test service hooks are configured.
+func (s *ServiceService) HasTestHooks() bool {
+	return s.listServicesForTest != nil || s.listServicesByProjectsForTest != nil || s.listActiveServicesForTest != nil || s.getServiceForTest != nil || s.promoteServiceDeploymentForTest != nil || s.updateServiceStatusForTest != nil || s.updateServiceDeploymentModeForTest != nil
+}
+
 // ListServices retrieves all services configured for a project.
 func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) ([]*models.Service, error) {
+	if s.listServicesForTest != nil {
+		return s.listServicesForTest(ctx, projectID)
+	}
 	if s.db == nil {
 		return []*models.Service{}, nil
 	}
@@ -42,7 +92,8 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 		        COALESCE(classification, 'application'), COALESCE(image, ''), COALESCE(depends_on, '[]'::jsonb),
 		        COALESCE(depends_on_conditions, '{}'::jsonb),
-		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
+		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb),
+		        COALESCE(deployment_mode, 'standard')
 		 FROM services WHERE project_id = $1 ORDER BY created_at ASC`,
 		projectID,
 	)
@@ -65,6 +116,7 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 			&svc.CreatedAt, &svc.UpdatedAt,
 			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
 			&svc.Classification, &svc.Image, &dependsOnJSON, &depCondsJSON, &volumesJSON, &networksJSON, &hcJSON,
+			&svc.DeploymentMode,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan service: %w", err)
@@ -133,6 +185,9 @@ func (s *ServiceService) ListServices(ctx context.Context, projectID uuid.UUID) 
 
 // ListServicesByProjectIDs retrieves services for multiple projects in a single batch query (avoiding N+1).
 func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectIDs []uuid.UUID) (map[uuid.UUID][]*models.Service, error) {
+	if s.listServicesByProjectsForTest != nil {
+		return s.listServicesByProjectsForTest(ctx, projectIDs)
+	}
 	result := make(map[uuid.UUID][]*models.Service)
 	if s.db == nil || len(projectIDs) == 0 {
 		return result, nil
@@ -146,7 +201,8 @@ func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectID
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 		        COALESCE(classification, 'application'), COALESCE(image, ''), COALESCE(depends_on, '[]'::jsonb),
 		        COALESCE(depends_on_conditions, '{}'::jsonb),
-		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
+		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb),
+		        COALESCE(deployment_mode, 'standard')
 		 FROM services WHERE project_id = ANY($1) ORDER BY created_at ASC`,
 		projectIDs,
 	)
@@ -168,6 +224,7 @@ func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectID
 			&svc.CreatedAt, &svc.UpdatedAt,
 			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
 			&svc.Classification, &svc.Image, &dependsOnJSON, &depCondsJSON, &volumesJSON, &networksJSON, &hcJSON,
+			&svc.DeploymentMode,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan batch service: %w", err)
@@ -232,6 +289,9 @@ func (s *ServiceService) ListServicesByProjectIDs(ctx context.Context, projectID
 
 // ListActiveServices retrieves all services that are currently marked as running or deploying, or have an assigned container.
 func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Service, error) {
+	if s.listActiveServicesForTest != nil {
+		return s.listActiveServicesForTest(ctx)
+	}
 	if s.db == nil {
 		return []*models.Service{}, nil
 	}
@@ -242,8 +302,8 @@ func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Serv
 		        internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
 		        status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
-		        COALESCE(classification, 'application')
-		 FROM services WHERE status IN ('running', 'deploying', 'starting', 'health_checking', 'stopped') ORDER BY created_at ASC`,
+		        COALESCE(classification, 'application'), COALESCE(deployment_mode, 'standard')
+		 FROM services WHERE status IN ('running', 'degraded', 'deploying', 'starting', 'health_checking', 'stopped') ORDER BY created_at ASC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active services: %w", err)
@@ -263,7 +323,7 @@ func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Serv
 			&svc.Status, &svc.ContainerID, &svc.ImageTag, &svc.CurrentServiceDeploymentID,
 			&svc.CreatedAt, &svc.UpdatedAt,
 			&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
-			&svc.Classification,
+			&svc.Classification, &svc.DeploymentMode,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan active service: %w", err)
@@ -294,6 +354,9 @@ func (s *ServiceService) ListActiveServices(ctx context.Context) ([]*models.Serv
 
 // GetService retrieves a service by ID.
 func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*models.Service, error) {
+	if s.getServiceForTest != nil {
+		return s.getServiceForTest(ctx, serviceID)
+	}
 	if s.db == nil {
 		return nil, ErrServiceNotFound
 	}
@@ -309,7 +372,8 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 		        cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
 		        COALESCE(classification, 'application'), COALESCE(image, ''), COALESCE(depends_on, '[]'::jsonb),
 		        COALESCE(depends_on_conditions, '{}'::jsonb),
-		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb)
+		        COALESCE(volumes, '[]'::jsonb), COALESCE(networks, '[]'::jsonb), COALESCE(healthcheck_config, '{}'::jsonb),
+		        COALESCE(deployment_mode, 'standard')
 		 FROM services WHERE id = $1`,
 		serviceID,
 	).Scan(
@@ -321,6 +385,7 @@ func (s *ServiceService) GetService(ctx context.Context, serviceID uuid.UUID) (*
 		&svc.CreatedAt, &svc.UpdatedAt,
 		&svc.CpuMillicores, &svc.MemoryMB, &svc.PidsLimit, &svc.EphemeralStorageMB,
 		&svc.Classification, &svc.Image, &dependsOnJSON, &depCondsJSON, &volumesJSON, &networksJSON, &hcJSON,
+		&svc.DeploymentMode,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -394,7 +459,7 @@ func populateServicePreviewURL(svc *models.Service) {
 	isFrontend := !isInternal && (svc.Role == models.RoleFrontend || strings.Contains(strings.ToLower(svc.Name), "frontend"))
 	isPublic := !isInternal && (svc.PublicExposed || isFrontend)
 
-	if isPublic && svc.HostPort != nil && *svc.HostPort > 0 && svc.Status == models.ServiceStatusRunning {
+	if isPublic && svc.HostPort != nil && *svc.HostPort > 0 && (svc.Status == models.ServiceStatusRunning || svc.Status == models.ServiceStatusDegraded) {
 		host := ResolveAuthoritativeHost()
 		url := fmt.Sprintf("http://%s:%d", host, *svc.HostPort)
 		svc.PreviewURL = &url
@@ -427,6 +492,9 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 	}
 	if svc.Classification == "" {
 		svc.Classification = models.ClassificationApplication
+	}
+	if svc.DeploymentMode == "" {
+		svc.DeploymentMode = models.DeploymentModeStandard
 	}
 
 	candidatesJSON, _ := json.Marshal(svc.BuildCandidates)
@@ -464,14 +532,16 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 			internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
 			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
-			classification, image, depends_on, depends_on_conditions, volumes, networks, healthcheck_config
+			classification, image, depends_on, depends_on_conditions, volumes, networks, healthcheck_config,
+			deployment_mode
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $12, $13, $14, $15,
 			$16, $17, $18, $19, $20, $21,
 			$22, $23, $24, $25, $26, $27,
 			$28, $29, $30, $31,
-			$32, $33, $34, $35, $36, $37, $38
+			$32, $33, $34, $35, $36, $37, $38,
+			$39
 		)`,
 		svc.ID, svc.ProjectID, svc.SourceID, svc.Name, svc.Role, svc.SourcePath, svc.RuntimeType,
 		svc.Framework, svc.PackageManager, svc.BuildStrategy, candidatesJSON, svc.BuildCommand,
@@ -481,6 +551,7 @@ func (s *ServiceService) CreateService(ctx context.Context, svc *models.Service)
 		svc.CreatedAt, svc.UpdatedAt,
 		svc.CpuMillicores, svc.MemoryMB, svc.PidsLimit, svc.EphemeralStorageMB,
 		svc.Classification, svc.Image, dependsOnJSON, depCondsJSON, volumesJSON, networksJSON, hcJSON,
+		svc.DeploymentMode,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert service: %w", err)
@@ -514,6 +585,9 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 	}
 	if svc.Classification == "" {
 		svc.Classification = models.ClassificationApplication
+	}
+	if svc.DeploymentMode == "" {
+		svc.DeploymentMode = models.DeploymentModeStandard
 	}
 
 	candidatesJSON, _ := json.Marshal(svc.BuildCandidates)
@@ -551,14 +625,16 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 			internal_port, host_port, public_exposed, health_strategy, health_check_path, health_check_enabled,
 			status, container_id, image_tag, current_service_deployment_id, created_at, updated_at,
 			cpu_millicores, memory_mb, pids_limit, ephemeral_storage_mb,
-			classification, image, depends_on, depends_on_conditions, volumes, networks, healthcheck_config
+			classification, image, depends_on, depends_on_conditions, volumes, networks, healthcheck_config,
+			deployment_mode
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $12, $13, $14, $15,
 			$16, $17, $18, $19, $20, $21,
 			$22, $23, $24, $25, $26, $27,
 			$28, $29, $30, $31,
-			$32, $33, $34, $35, $36, $37, $38
+			$32, $33, $34, $35, $36, $37, $38,
+			$39
 		)`,
 		svc.ID, svc.ProjectID, svc.SourceID, svc.Name, svc.Role, svc.SourcePath, svc.RuntimeType,
 		svc.Framework, svc.PackageManager, svc.BuildStrategy, candidatesJSON, svc.BuildCommand,
@@ -568,6 +644,7 @@ func (s *ServiceService) CreateServiceTx(ctx context.Context, tx pgx.Tx, svc *mo
 		svc.CreatedAt, svc.UpdatedAt,
 		svc.CpuMillicores, svc.MemoryMB, svc.PidsLimit, svc.EphemeralStorageMB,
 		svc.Classification, svc.Image, dependsOnJSON, depCondsJSON, volumesJSON, networksJSON, hcJSON,
+		svc.DeploymentMode,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert service in tx: %w", err)
@@ -586,6 +663,9 @@ func (s *ServiceService) UpdateServiceStatus(
 	imageTag *string,
 	hostPort *int,
 ) error {
+	if s.updateServiceStatusForTest != nil {
+		return s.updateServiceStatusForTest(ctx, serviceID, status, containerID, imageTag, hostPort)
+	}
 	if s.db == nil {
 		return nil
 	}
@@ -616,6 +696,9 @@ func (s *ServiceService) PromoteServiceDeployment(
 	imageTag string,
 	hostPort *int,
 ) error {
+	if s.promoteServiceDeploymentForTest != nil {
+		return s.promoteServiceDeploymentForTest(ctx, serviceID, serviceDeploymentID, containerID, imageTag, hostPort)
+	}
 	if s.db == nil {
 		return nil
 	}
@@ -651,27 +734,32 @@ func (s *ServiceService) PromoteServiceDeployment(
 }
 
 // CalculateProjectStatus derives overall project state from individual service coarse statuses.
-// Valid coarse service statuses: ServiceStatusInactive, ServiceStatusDeploying, ServiceStatusRunning, ServiceStatusStopped, ServiceStatusFailed.
+// Valid coarse service statuses: ServiceStatusInactive, ServiceStatusDeploying, ServiceStatusRunning, ServiceStatusDegraded, ServiceStatusStopped, ServiceStatusFailed.
 func CalculateProjectStatus(services []*models.Service) string {
 	if len(services) == 0 {
 		return models.ProjectStatusInactive
 	}
 
-	var runningCount, failedCount, stoppedCount, deployingCount, inactiveCount int
-	var nonJobCount, nonJobRunningCount int
+	var runningCount, degradedCount, failedCount, stoppedCount, deployingCount, inactiveCount int
+	var nonJobCount, nonJobRunningCount, nonJobDegradedCount int
 
 	for _, svc := range services {
 		isJob := svc.Classification == models.ClassificationJob
 		if !isJob {
 			nonJobCount++
-			if svc.Status == models.ServiceStatusRunning {
-				nonJobRunningCount++
-			}
 		}
 
 		switch svc.Status {
 		case models.ServiceStatusRunning:
 			runningCount++
+			if !isJob {
+				nonJobRunningCount++
+			}
+		case models.ServiceStatusDegraded:
+			degradedCount++
+			if !isJob {
+				nonJobDegradedCount++
+			}
 		case models.ServiceStatusDeploying:
 			deployingCount++
 		case models.ServiceStatusFailed:
@@ -692,33 +780,41 @@ func CalculateProjectStatus(services []*models.Service) string {
 
 	// 2. Any failed service makes the project failed or partially_running
 	if failedCount > 0 {
-		if runningCount > 0 {
+		if runningCount > 0 || degradedCount > 0 {
 			return models.ProjectStatusPartiallyRunning
 		}
 		return models.ProjectStatusFailed
 	}
 
-	// 3. All non-job services running (and any jobs completed/stopped or no non-jobs) -> running
+	// 3. Any degraded service makes the project degraded (when remaining active services are running/degraded) or partially_running
+	if degradedCount > 0 {
+		if (nonJobCount > 0 && (nonJobRunningCount+nonJobDegradedCount) == nonJobCount) || (runningCount+degradedCount) == len(services) {
+			return models.ProjectStatusDegraded
+		}
+		return models.ProjectStatusPartiallyRunning
+	}
+
+	// 4. All non-job services running (and any jobs completed/stopped or no non-jobs) -> running
 	if nonJobCount > 0 && nonJobRunningCount == nonJobCount {
 		return models.ProjectStatusRunning
 	}
 
-	// 4. All running -> running (for cases with only jobs or uniform services)
+	// 5. All running -> running (for cases with only jobs or uniform services)
 	if runningCount == len(services) {
 		return models.ProjectStatusRunning
 	}
 
-	// 5. Partial running (some running, others stopped)
+	// 6. Partial running (some running, others stopped)
 	if runningCount > 0 {
 		return models.ProjectStatusPartiallyRunning
 	}
 
-	// 6. All stopped -> stopped
+	// 7. All stopped -> stopped
 	if stoppedCount == len(services) {
 		return models.ProjectStatusStopped
 	}
 
-	// 7. Inactive default
+	// 8. Inactive default
 	return models.ProjectStatusInactive
 }
 
@@ -762,5 +858,33 @@ func (s *ServiceService) UpdateServiceVolumes(ctx context.Context, serviceID uui
 	if err != nil {
 		return fmt.Errorf("failed to update service volumes: %w", err)
 	}
+	return nil
+}
+
+// UpdateServiceDeploymentMode updates a service's deployment mode ('standard' or 'blue_green').
+func (s *ServiceService) UpdateServiceDeploymentMode(ctx context.Context, serviceID uuid.UUID, mode string) error {
+	normalized := strings.ToLower(strings.TrimSpace(mode))
+	if !models.IsValidDeploymentMode(normalized) {
+		return fmt.Errorf("invalid deployment mode %q: must be 'standard' or 'blue_green'", mode)
+	}
+	if s.updateServiceDeploymentModeForTest != nil {
+		return s.updateServiceDeploymentModeForTest(ctx, serviceID, normalized)
+	}
+	if s.db == nil {
+		return nil
+	}
+
+	res, err := s.db.Exec(ctx,
+		`UPDATE services SET deployment_mode = $2, updated_at = NOW() WHERE id = $1`,
+		serviceID, normalized,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update service deployment mode: %w", err)
+	}
+	if res.RowsAffected() == 0 {
+		return ErrServiceNotFound
+	}
+
+	slog.Info("service deployment mode updated", "service_id", serviceID, "deployment_mode", normalized)
 	return nil
 }

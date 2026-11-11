@@ -46,47 +46,67 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID, pa
 		offset = pagination[1]
 	}
 
-	rows, err := s.db.Query(ctx,
-		`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
-		 dockerfile_path, build_context, build_strategy, build_command, start_command,
-		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
-		 status, current_deployment_id, port, created_at, updated_at,
-		 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb)
-		 FROM projects WHERE owner_id = $1 ORDER BY created_at DESC
-		 LIMIT $2 OFFSET $3`,
-		ownerID, limit, offset,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list projects: %w", err)
-	}
-	defer rows.Close()
-
 	var projects []*models.Project
 	var projectIDs []uuid.UUID
-	for rows.Next() {
-		p := &models.Project{}
-		err := rows.Scan(
-			&p.ID, &p.OwnerID, &p.SourceID, &p.Name, &p.Slug, &p.SourceType, &p.SourceReference, &p.RepositoryPath,
-			&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
-			&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
-			&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
-			&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan,
+	if s.projectsListerForTest != nil {
+		var err error
+		projects, err = s.projectsListerForTest(ctx, ownerID, limit, offset)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list projects: %w", err)
+		}
+		for _, p := range projects {
+			projectIDs = append(projectIDs, p.ID)
+		}
+	} else {
+		rows, err := s.db.Query(ctx,
+			`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
+			 dockerfile_path, build_context, build_strategy, build_command, start_command,
+			 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
+			 status, current_deployment_id, port, created_at, updated_at,
+			 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb),
+			 COALESCE(deployment_mode, 'standard'),
+			 COALESCE(auto_deploy, false), COALESCE(auto_deploy_branch, ''),
+			 (encrypted_webhook_secret IS NOT NULL)
+			 FROM projects WHERE owner_id = $1 ORDER BY created_at DESC
+			 LIMIT $2 OFFSET $3`,
+			ownerID, limit, offset,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan project: %w", err)
+			return nil, fmt.Errorf("failed to list projects: %w", err)
 		}
-		projects = append(projects, p)
-		projectIDs = append(projectIDs, p.ID)
-	}
+		defer rows.Close()
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error reading projects: %w", err)
+		for rows.Next() {
+			p := &models.Project{}
+			err := rows.Scan(
+				&p.ID, &p.OwnerID, &p.SourceID, &p.Name, &p.Slug, &p.SourceType, &p.SourceReference, &p.RepositoryPath,
+				&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
+				&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
+				&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
+				&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan, &p.DeploymentMode,
+				&p.AutoDeploy, &p.AutoDeployBranch, &p.HasWebhookSecret,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to scan project: %w", err)
+			}
+			projects = append(projects, p)
+			projectIDs = append(projectIDs, p.ID)
+		}
+
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("error reading projects: %w", err)
+		}
 	}
 
 	// Single batch query for all services across all fetched projects (resolves N+1 query issue)
+	svcSvc := s.getServiceService()
 	var servicesByProject map[uuid.UUID][]*models.Service
-	if s.db != nil && len(projectIDs) > 0 {
-		servicesByProject, _ = s.getServiceService().ListServicesByProjectIDs(ctx, projectIDs)
+	if len(projectIDs) > 0 && (s.db != nil || svcSvc.HasTestHooks()) {
+		var err error
+		servicesByProject, err = svcSvc.ListServicesByProjectIDs(ctx, projectIDs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list services for projects: %w", err)
+		}
 	}
 
 	for _, p := range projects {
@@ -116,6 +136,7 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID, pa
 					HealthStrategy:     p.HealthStrategy,
 					HealthCheckPath:    p.HealthCheckPath,
 					HealthCheckEnabled: p.HealthCheckEnabled,
+					DeploymentMode:     p.DeploymentMode,
 					Status:             p.Status,
 				},
 			}
@@ -149,8 +170,11 @@ func (s *ProjectService) ListActiveProjects(ctx context.Context) ([]*models.Proj
 		 dockerfile_path, build_context, build_strategy, build_command, start_command,
 		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
 		 status, current_deployment_id, port, created_at, updated_at,
-		 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb)
-		 FROM projects WHERE status IN ('running', 'partially_running', 'deploying') ORDER BY created_at DESC`,
+		 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb),
+		 COALESCE(deployment_mode, 'standard'),
+		 COALESCE(auto_deploy, false), COALESCE(auto_deploy_branch, ''),
+		 (encrypted_webhook_secret IS NOT NULL)
+		 FROM projects WHERE status IN ('running', 'degraded', 'partially_running', 'deploying') ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active projects: %w", err)
@@ -165,7 +189,8 @@ func (s *ProjectService) ListActiveProjects(ctx context.Context) ([]*models.Proj
 			&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
 			&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
 			&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
-			&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan,
+			&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan, &p.DeploymentMode,
+			&p.AutoDeploy, &p.AutoDeployBranch, &p.HasWebhookSecret,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan active project: %w", err)
@@ -263,6 +288,16 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 	if input.HealthStrategy != nil {
 		project.HealthStrategy = *input.HealthStrategy
 	}
+	if input.DeploymentMode != nil {
+		mode := strings.ToLower(strings.TrimSpace(*input.DeploymentMode))
+		if !models.IsValidDeploymentMode(mode) {
+			return nil, fmt.Errorf("%w: deployment_mode must be 'standard' or 'blue_green'", ErrValidationFailed)
+		}
+		project.DeploymentMode = mode
+	}
+	if project.DeploymentMode == "" {
+		project.DeploymentMode = models.DeploymentModeStandard
+	}
 
 	project.UpdatedAt = time.Now()
 
@@ -271,12 +306,12 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID, ownerID u
 		 name = $1, slug = $2, source_reference = $3, repository_path = $4, branch = $5,
 		 dockerfile_path = $6, build_context = $7, build_strategy = $8, build_command = $9,
 		 start_command = $10, runtime_type = $11, internal_port = $12, health_check_path = $13,
-		 health_check_enabled = $14, health_strategy = $15, updated_at = $16
-		 WHERE id = $17`,
+		 health_check_enabled = $14, health_strategy = $15, deployment_mode = $16, updated_at = $17
+		 WHERE id = $18`,
 		project.Name, project.Slug, project.SourceReference, project.RepositoryPath, project.Branch,
 		project.DockerfilePath, project.BuildContext, project.BuildStrategy, project.BuildCommand,
 		project.StartCommand, project.RuntimeType, project.InternalPort, project.HealthCheckPath,
-		project.HealthCheckEnabled, project.HealthStrategy, project.UpdatedAt, project.ID,
+		project.HealthCheckEnabled, project.HealthStrategy, project.DeploymentMode, project.UpdatedAt, project.ID,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "uq_projects_owner_slug") {
@@ -365,34 +400,51 @@ func (s *ProjectService) DeleteProject(ctx context.Context, projectID, ownerID u
 
 // GetProjectByIDWithoutOwnership retrieves a project by ID without ownership check.
 func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, projectID uuid.UUID) (*models.Project, error) {
-	if s.db == nil {
-		return nil, ErrProjectNotFound
-	}
-
 	p := &models.Project{}
-	err := s.db.QueryRow(ctx,
-		`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
-		 dockerfile_path, build_context, build_strategy, build_command, start_command,
-		 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
-		 status, current_deployment_id, port, created_at, updated_at,
-		 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb)
-		 FROM projects WHERE id = $1`,
-		projectID,
-	).Scan(
-		&p.ID, &p.OwnerID, &p.SourceID, &p.Name, &p.Slug, &p.SourceType, &p.SourceReference, &p.RepositoryPath,
-		&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
-		&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
-		&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
-		&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan,
-	)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	if s.projectByIDForTest != nil {
+		var err error
+		p, err = s.projectByIDForTest(ctx, projectID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if s.db == nil {
 			return nil, ErrProjectNotFound
 		}
-		return nil, fmt.Errorf("failed to get project: %w", err)
+
+		err := s.db.QueryRow(ctx,
+			`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
+			 dockerfile_path, build_context, build_strategy, build_command, start_command,
+			 runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
+			 status, current_deployment_id, port, created_at, updated_at,
+			 COALESCE(deployment_strategy, 'auto'), COALESCE(deployment_plan, '{}'::jsonb),
+			 COALESCE(deployment_mode, 'standard'),
+			 COALESCE(auto_deploy, false), COALESCE(auto_deploy_branch, ''),
+			 (encrypted_webhook_secret IS NOT NULL)
+			 FROM projects WHERE id = $1`,
+			projectID,
+		).Scan(
+			&p.ID, &p.OwnerID, &p.SourceID, &p.Name, &p.Slug, &p.SourceType, &p.SourceReference, &p.RepositoryPath,
+			&p.Branch, &p.DockerfilePath, &p.BuildContext, &p.BuildStrategy, &p.BuildCommand,
+			&p.StartCommand, &p.RuntimeType, &p.InternalPort, &p.HealthCheckPath,
+			&p.HealthCheckEnabled, &p.HealthStrategy, &p.Status, &p.CurrentDeploymentID, &p.Port,
+			&p.CreatedAt, &p.UpdatedAt, &p.DeploymentStrategy, &p.DeploymentPlan, &p.DeploymentMode,
+			&p.AutoDeploy, &p.AutoDeployBranch, &p.HasWebhookSecret,
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrProjectNotFound
+			}
+			return nil, fmt.Errorf("failed to get project: %w", err)
+		}
 	}
-	if s.db != nil {
-		svcs, _ := s.getServiceService().ListServices(ctx, p.ID)
+
+	svcSvc := s.getServiceService()
+	if s.db != nil || svcSvc.HasTestHooks() {
+		svcs, err := svcSvc.ListServices(ctx, p.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list services for project %s: %w", p.ID, err)
+		}
 		if len(svcs) == 0 {
 			svcs = []*models.Service{
 				{
@@ -415,6 +467,7 @@ func (s *ProjectService) GetProjectByIDWithoutOwnership(ctx context.Context, pro
 					HealthStrategy:     p.HealthStrategy,
 					HealthCheckPath:    p.HealthCheckPath,
 					HealthCheckEnabled: p.HealthCheckEnabled,
+					DeploymentMode:     p.DeploymentMode,
 					Status:             p.Status,
 				},
 			}

@@ -206,6 +206,61 @@ jobs:
         run: |
           docker compose down -v
 
+  windows-agent:
+    name: Windows Local Agent & Folder Picker
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v5.3.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Validate PowerShell Startup Scripts Syntax
+        shell: pwsh
+        run: |
+          $scripts = @("start-agent.ps1", "backend/start-agent.ps1")
+          foreach ($s in $scripts) {
+            $tokens = $null
+            $errors = $null
+            $resolved = (Resolve-Path $s).Path
+            [void][System.Management.Automation.Language.Parser]::ParseFile($resolved, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              Write-Error "PowerShell syntax errors in $s`:"
+              $errors | ForEach-Object { Write-Error $_.ToString() }
+              exit 1
+            }
+            Write-Host "Validated PowerShell AST cleanly: $s"
+          }
+
+      - name: Verify Non-Interactive Session Guard in Startup Script
+        shell: pwsh
+        run: |
+          $content = Get-Content -Raw "start-agent.ps1"
+          if ($content -notmatch "AllowNonInteractive" -or $content -notmatch "forgelab-agent\.exe") {
+            Write-Error "start-agent.ps1 missing required non-interactive guard or agent binary invocation"
+            exit 1
+          }
+
+      - name: Run Windows Local Agent & Folder Picker Tests
+        run: |
+          cd backend
+          go test -v ./internal/agent/... ./cmd/agent/...
+
+      - name: Build and Smoke-Test Agent Binary
+        shell: pwsh
+        run: |
+          cd backend
+          $outExe = Join-Path $env:RUNNER_TEMP "forgelab-agent.exe"
+          go build -o $outExe ./cmd/agent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $outExe -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   security-govulncheck:
     name: Go Security Scanning (govulncheck)
     runs-on: ubuntu-latest
@@ -253,7 +308,7 @@ jobs:
         uses: actions/checkout@v4.2.2
 
       - name: Run Trivy Vulnerability Scanner (Repo & FS)
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           scan-type: 'fs'
           ignore-unfixed: true

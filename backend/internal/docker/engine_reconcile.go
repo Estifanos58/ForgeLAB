@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/models"
 )
@@ -29,7 +29,7 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 		return nil
 	}
 
-	containers, err := e.dockerClient.ContainerList(ctx, container.ListOptions{All: true})
+	containersRes, err := e.dockerClient.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		e.reconcileMu.Lock()
 		e.reconcileState = ReconciliationState{
@@ -41,7 +41,8 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 		return fmt.Errorf("failed to list docker containers for reconciliation: %w", err)
 	}
 
-	containerMap := make(map[string]types.Container, len(containers))
+	containers := containersRes.Items
+	containerMap := make(map[string]container.Summary, len(containers))
 	var runningPorts []int
 
 	for _, c := range containers {
@@ -51,7 +52,7 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 			containerMap[c.ID[:12]] = c
 		}
 
-		if c.State == "running" || c.State == "restarting" || c.State == "created" || c.State == "paused" {
+		if c.State == container.StateRunning || c.State == container.StateRestarting || c.State == container.StateCreated || c.State == container.StatePaused {
 			for _, p := range c.Ports {
 				if p.PublicPort > 0 {
 					runningPorts = append(runningPorts, int(p.PublicPort))
@@ -79,7 +80,7 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 			for _, svc := range services {
 				touchedProjects[svc.ProjectID] = true
 				if svc.ContainerID == nil || *svc.ContainerID == "" {
-					if svc.Status == models.ServiceStatusRunning {
+					if svc.Status == models.ServiceStatusRunning || svc.Status == models.ServiceStatusDegraded {
 						_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusStopped, nil, nil, nil)
 						slog.Info("reconciliation: service has no container, marked stopped", "service_id", svc.ID)
 					}
@@ -99,11 +100,14 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 						e.StopLogCollector(*svc.CurrentServiceDeploymentID)
 					}
 					_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+					if e.trafficRouter != nil {
+						e.trafficRouter.RemoveRoute(svc.ID)
+					}
 					if svc.CurrentServiceDeploymentID != nil {
 						_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, "Container disappeared from Docker daemon while backend was offline")
 					}
 					slog.Warn("reconciliation: service container missing, marked failed", "service_id", svc.ID, "container_id", cID)
-				} else if dockCont.State != "running" {
+				} else if dockCont.State != container.StateRunning {
 					if svc.Status == models.ServiceStatusStopped || svc.Classification == models.ClassificationJob {
 						// Service was intentionally stopped or is a completed job; preserve its stopped container
 						legitimateContainers[dockCont.ID] = true
@@ -118,6 +122,9 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 							e.StopLogCollector(*svc.CurrentServiceDeploymentID)
 						}
 						_ = e.serviceService.UpdateServiceStatus(ctx, svc.ID, models.ServiceStatusFailed, nil, nil, nil)
+						if e.trafficRouter != nil {
+							e.trafficRouter.RemoveRoute(svc.ID)
+						}
 						if svc.CurrentServiceDeploymentID != nil {
 							_ = e.deploymentService.FailServiceDeployment(ctx, *svc.CurrentServiceDeploymentID, fmt.Sprintf("Container stopped with state '%s' while backend was offline", dockCont.State))
 						}
@@ -141,6 +148,9 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 							Redactor:            redactor,
 						})
 						slog.Info("reconciliation: restored runtime log collector for running service", "service_id", svc.ID, "container_id", dockCont.ID[:12])
+					}
+					if e.trafficRouter != nil && svc.HostPort != nil && *svc.HostPort > 0 && svc.Classification != models.ClassificationJob && svc.Classification != models.ClassificationInfrastructure {
+						_, _, _ = e.trafficRouter.EnsureRoute(svc.ID, svc.ProjectID, svc.Name, e.GetAppHostIP(), *svc.HostPort, dockCont.ID)
 					}
 				}
 			}
@@ -252,12 +262,12 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 				}
 				cID := *d.ContainerID
 				dockCont, exists := containerMap[cID]
-				if !exists || dockCont.State != "running" {
+				if !exists || dockCont.State != container.StateRunning {
 					e.StopLogCollector(d.ID)
 					e.StopContainerLogCollector(cID)
 					stateMsg := "missing"
 					if exists {
-						stateMsg = dockCont.State
+						stateMsg = string(dockCont.State)
 					}
 					reason := fmt.Sprintf("Container %s while backend was offline", stateMsg)
 					_ = e.deploymentService.UpdateDeploymentStatus(ctx, d.ID, models.DeployStatusFailed, &reason)
@@ -329,8 +339,8 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 			}
 			slog.Info("reconciliation: removing orphaned container", "container_id", cShort, "labels", c.Labels)
 			e.StopContainerLogCollector(c.ID)
-			_ = e.dockerClient.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &stopTimeout})
-			_ = e.dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: false})
+			_, _ = e.dockerClient.ContainerStop(ctx, c.ID, client.ContainerStopOptions{Timeout: &stopTimeout})
+			_, _ = e.dockerClient.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true, RemoveVolumes: false})
 			orphansCleaned++
 		}
 	}

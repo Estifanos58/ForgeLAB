@@ -12,9 +12,9 @@ import (
 
 	"os"
 
-	"github.com/docker/docker/api/types"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -53,25 +53,21 @@ func TestCheckContinuousRuntimeHealth_PreservesStoppedStatus(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(r.URL.Path, containerStoppedID) {
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					ID: containerStoppedID,
-					State: &types.ContainerState{
-						Running:  false,
-						ExitCode: 137, // SIGKILL on container stop
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				ID: containerStoppedID,
+				State: &container.State{
+					Running:  false,
+					ExitCode: 137, // SIGKILL on container stop
 				},
 			})
 			return
 		}
 		if strings.Contains(r.URL.Path, containerCrashedID) {
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					ID: containerCrashedID,
-					State: &types.ContainerState{
-						Running:  false,
-						ExitCode: 1, // Crash
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				ID: containerCrashedID,
+				State: &container.State{
+					Running:  false,
+					ExitCode: 1, // Crash
 				},
 			})
 			return

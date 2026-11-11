@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -237,7 +238,7 @@ func (s *UserService) Login(ctx context.Context, input LoginInput) (*models.User
 }
 
 func (s *UserService) cacheRotation(ctx context.Context, oldTokenHash string, tokens *AuthTokens) {
-	if s.gracePeriod <= 0 {
+	if s.gracePeriod <= 0 || tokens == nil {
 		return
 	}
 	grace := s.gracePeriod
@@ -249,15 +250,24 @@ func (s *UserService) cacheRotation(ctx context.Context, oldTokenHash string, to
 	})
 
 	if s.redis != nil {
+		// Fail closed: never store plaintext credentials in Redis when encryption is unconfigured or fails.
+		if s.encryptor == nil {
+			slog.Warn("skipping redis refresh rotation cache: encryptor not configured (failing closed)")
+			return
+		}
 		payload, err := json.Marshal(tokens)
-		if err == nil {
-			dataToStore := string(payload)
-			if s.encryptor != nil {
-				if encrypted, encErr := s.encryptor.Encrypt(payload); encErr == nil {
-					dataToStore = string(encrypted)
-				}
-			}
-			_ = s.redis.Set(ctx, "forgelab:refresh_rotation:"+oldTokenHash, dataToStore, grace).Err()
+		if err != nil {
+			slog.Warn("skipping redis refresh rotation cache: failed to marshal tokens", "error", err)
+			return
+		}
+		encrypted, encErr := s.encryptor.Encrypt(payload)
+		if encErr != nil || len(encrypted) == 0 {
+			slog.Warn("skipping redis refresh rotation cache: encryption failed (failing closed)", "error", encErr)
+			return
+		}
+		encoded := "enc:v1:" + base64.StdEncoding.EncodeToString(encrypted)
+		if setErr := s.redis.Set(ctx, "forgelab:refresh_rotation:"+oldTokenHash, encoded, grace).Err(); setErr != nil {
+			slog.Warn("failed to cache encrypted refresh rotation in redis", "error", setErr)
 		}
 	}
 }
@@ -278,19 +288,30 @@ func (s *UserService) getCachedRotation(ctx context.Context, oldTokenHash string
 	}
 
 	if s.redis != nil {
-		rawBytes, err := s.redis.Get(ctx, "forgelab:refresh_rotation:"+oldTokenHash).Bytes()
-		if err == nil && len(rawBytes) > 0 {
-			dataToDecode := rawBytes
-			if s.encryptor != nil {
-				if decrypted, decErr := s.encryptor.Decrypt(rawBytes); decErr == nil {
-					dataToDecode = decrypted
-				} else {
-					// Fallback to raw bytes in case plaintext was stored by legacy instance
-					dataToDecode = rawBytes
-				}
+		// Fail closed: never read or trust cached refresh tokens from Redis without active decryption.
+		if s.encryptor == nil {
+			slog.Warn("ignoring redis refresh rotation cache: encryptor not configured (failing closed)")
+			return nil
+		}
+		rawVal, err := s.redis.Get(ctx, "forgelab:refresh_rotation:"+oldTokenHash).Result()
+		if err == nil && len(rawVal) > 0 {
+			const encPrefix = "enc:v1:"
+			if !strings.HasPrefix(rawVal, encPrefix) {
+				slog.Warn("rejecting unencrypted refresh rotation cache entry in redis (failing closed)")
+				return nil
+			}
+			cipherBytes, decB64Err := base64.StdEncoding.DecodeString(strings.TrimPrefix(rawVal, encPrefix))
+			if decB64Err != nil {
+				slog.Warn("rejecting malformed refresh rotation cache entry in redis (failing closed)", "error", decB64Err)
+				return nil
+			}
+			decrypted, decErr := s.encryptor.Decrypt(cipherBytes)
+			if decErr != nil {
+				slog.Warn("rejecting undecryptable refresh rotation cache entry in redis (failing closed)", "error", decErr)
+				return nil
 			}
 			var tokens AuthTokens
-			if err := json.NewDecoder(strings.NewReader(string(dataToDecode))).Decode(&tokens); err == nil && tokens.RefreshToken != "" {
+			if err := json.NewDecoder(strings.NewReader(string(decrypted))).Decode(&tokens); err == nil && tokens.RefreshToken != "" {
 				s.rotationCache.Store(oldTokenHash, &cachedRotation{
 					tokens:    &tokens,
 					expiresAt: now.Add(15 * time.Second),

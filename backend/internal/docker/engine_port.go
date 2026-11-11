@@ -1,8 +1,20 @@
 package docker
 
 import (
+	"net/netip"
 	"strings"
 )
+
+// parseAppHostIP parses an application host IP string into netip.Addr, defaulting to 127.0.0.1.
+func parseAppHostIP(ip string) netip.Addr {
+	trimmed := strings.TrimSpace(ip)
+	if trimmed != "" {
+		if addr, err := netip.ParseAddr(trimmed); err == nil {
+			return addr
+		}
+	}
+	return netip.AddrFrom4([4]byte{127, 0, 0, 1})
+}
 
 // isPortConflictError returns true if the error indicates a host port allocation conflict.
 func isPortConflictError(err error) bool {

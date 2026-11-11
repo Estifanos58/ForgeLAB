@@ -75,9 +75,9 @@ export function LifecycleControls({ project, onActionComplete, onError, onDeploy
   };
 
   const isDeploying = ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(project.status);
-  const isRunning = project.status === 'running' || project.status === 'partially_running';
+  const isRunning = project.status === 'running' || project.status === 'partially_running' || project.status === 'degraded';
   const isStopped = project.status === 'stopped';
-  const wasDeployed = Boolean(project.current_deployment_id || project.status === 'stopped' || project.status === 'failed');
+  const wasDeployed = Boolean(project.current_deployment_id || project.status === 'stopped' || project.status === 'failed' || project.status === 'degraded');
 
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -88,10 +88,10 @@ export function LifecycleControls({ project, onActionComplete, onError, onDeploy
         disabled={isDeploying || loadingAction !== null}
         loading={loadingAction === 'deploy' || isDeploying}
         onClick={handleDeploy}
-        icon={wasDeployed && !isRunning ? <RotateCcw className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
-        title={wasDeployed && !isRunning ? 'Trigger a full project redeployment' : 'Deploy project'}
+        icon={wasDeployed && (!isRunning || project.status === 'degraded') ? <RotateCcw className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
+        title={wasDeployed && (!isRunning || project.status === 'degraded') ? 'Trigger a full project redeployment' : 'Deploy project'}
       >
-        {isDeploying ? 'Deploying...' : wasDeployed && !isRunning ? 'Redeploy Project' : 'Deploy Project'}
+        {isDeploying ? 'Deploying...' : wasDeployed && (!isRunning || project.status === 'degraded') ? 'Redeploy Project' : 'Deploy Project'}
       </Button>
 
       {/* Conditional Lifecycle Controls */}

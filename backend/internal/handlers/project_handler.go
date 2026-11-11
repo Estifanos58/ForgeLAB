@@ -184,6 +184,54 @@ func (h *ProjectHandler) GetTopology(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, topology)
 }
 
+// GetRuntimeMetrics handles GET /api/projects/{id}/metrics
+func (h *ProjectHandler) GetRuntimeMetrics(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	if h.projectService == nil {
+		writeError(w, http.StatusServiceUnavailable, "project service unavailable")
+		return
+	}
+
+	// Verify project access
+	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	if h.dockerEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "execution engine unavailable")
+		return
+	}
+
+	metrics, err := h.dockerEngine.GetProjectRuntimeMetrics(r.Context(), projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to collect runtime metrics: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, metrics)
+}
+
 // Update handles PATCH /api/projects/{id}
 func (h *ProjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 	userID, ok := getUserIDFromContext(r)
@@ -212,6 +260,10 @@ func (h *ProjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, services.ErrProjectNotOwned) {
 			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		if errors.Is(err, services.ErrValidationFailed) {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if errors.Is(err, services.ErrProjectSlugTaken) {

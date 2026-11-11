@@ -30,15 +30,18 @@ var (
 
 // ProjectService handles project-related business logic.
 type ProjectService struct {
-	db                   *pgxpool.Pool
-	pathValidator        *security.PathValidator
-	sourceService        *SourceService
-	githubService        *GitHubService
-	serviceService       *ServiceService
-	secretService        *SecretService
-	deploymentService    *DeploymentService
-	importService        *RepositoryImportService
-	projectGetterForTest func(ctx context.Context, projectID, ownerID uuid.UUID) (*models.Project, error)
+	db                         *pgxpool.Pool
+	pathValidator              *security.PathValidator
+	sourceService              *SourceService
+	githubService              *GitHubService
+	serviceService             *ServiceService
+	secretService              *SecretService
+	deploymentService          *DeploymentService
+	importService              *RepositoryImportService
+	projectGetterForTest       func(ctx context.Context, projectID, ownerID uuid.UUID) (*models.Project, error)
+	projectsListerForTest      func(ctx context.Context, ownerID uuid.UUID, limit, offset int) ([]*models.Project, error)
+	projectByIDForTest         func(ctx context.Context, projectID uuid.UUID) (*models.Project, error)
+	updateProjectStatusForTest func(ctx context.Context, projectID uuid.UUID, status string) error
 }
 
 // NewProjectService creates a new ProjectService.
@@ -85,6 +88,21 @@ func (s *ProjectService) SetProjectGetterForTest(fn func(ctx context.Context, pr
 	s.projectGetterForTest = fn
 }
 
+// SetProjectsListerForTest sets a test hook for ListProjects.
+func (s *ProjectService) SetProjectsListerForTest(fn func(ctx context.Context, ownerID uuid.UUID, limit, offset int) ([]*models.Project, error)) {
+	s.projectsListerForTest = fn
+}
+
+// SetProjectByIDForTest sets a test hook for GetProjectByIDWithoutOwnership.
+func (s *ProjectService) SetProjectByIDForTest(fn func(ctx context.Context, projectID uuid.UUID) (*models.Project, error)) {
+	s.projectByIDForTest = fn
+}
+
+// SetUpdateProjectStatusForTest sets a test hook for UpdateProjectStatus.
+func (s *ProjectService) SetUpdateProjectStatusForTest(fn func(ctx context.Context, projectID uuid.UUID, status string) error) {
+	s.updateProjectStatusForTest = fn
+}
+
 type CreateServiceInput struct {
 	Name                string                     `json:"name"`
 	Role                string                     `json:"role"`
@@ -112,6 +130,7 @@ type CreateServiceInput struct {
 	Volumes             []models.VolumeMountConfig `json:"volumes,omitempty"`
 	Networks            []string                   `json:"networks,omitempty"`
 	User                string                     `json:"user,omitempty"`
+	DeploymentMode      string                     `json:"deployment_mode,omitempty"`
 }
 
 // CreateProjectInput holds the data needed to create a project.
@@ -123,6 +142,7 @@ type CreateProjectInput struct {
 	RepositoryPath     string               `json:"repository_path"` // legacy/optional host path
 	Branch             string               `json:"branch"`
 	DeploymentStrategy string               `json:"deployment_strategy"` // "compose", "dockerfile", "auto", "custom"
+	DeploymentMode     string               `json:"deployment_mode,omitempty"`
 	DeploymentPlan     json.RawMessage      `json:"deployment_plan,omitempty"`
 	DockerfilePath     string               `json:"dockerfile_path"`
 	BuildContext       string               `json:"build_context"`
@@ -153,6 +173,7 @@ type UpdateProjectInput struct {
 	HealthCheckPath    *string `json:"health_check_path"`
 	HealthCheckEnabled *bool   `json:"health_check_enabled"`
 	HealthStrategy     *string `json:"health_strategy"`
+	DeploymentMode     *string `json:"deployment_mode"`
 }
 
 // CreateProject creates a new project for the authenticated user.
@@ -444,6 +465,12 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 	if deploymentStrategy == "" {
 		deploymentStrategy = "auto"
 	}
+	deploymentMode := strings.ToLower(strings.TrimSpace(input.DeploymentMode))
+	if deploymentMode == "" {
+		deploymentMode = models.DeploymentModeStandard
+	} else if !models.IsValidDeploymentMode(deploymentMode) {
+		return nil, fmt.Errorf("%w: invalid deployment_mode %q (must be 'standard' or 'blue_green')", ErrValidationFailed, input.DeploymentMode)
+	}
 	deploymentPlan := input.DeploymentPlan
 	if len(deploymentPlan) == 0 {
 		deploymentPlan = json.RawMessage("{}")
@@ -460,6 +487,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		RepositoryPath:     repoPath,
 		Branch:             branch,
 		DeploymentStrategy: deploymentStrategy,
+		DeploymentMode:     deploymentMode,
 		DeploymentPlan:     deploymentPlan,
 		DockerfilePath:     dockerfilePath,
 		BuildContext:       buildContext,
@@ -569,6 +597,13 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				return nil, fmt.Errorf("%w: invalid volume configuration for service %q: %v", ErrValidationFailed, svcName, err)
 			}
 
+			svcMode := strings.ToLower(strings.TrimSpace(svcIn.DeploymentMode))
+			if svcMode == "" {
+				svcMode = project.DeploymentMode
+			} else if !models.IsValidDeploymentMode(svcMode) {
+				return nil, fmt.Errorf("%w: invalid deployment_mode %q for service %q", ErrValidationFailed, svcIn.DeploymentMode, svcName)
+			}
+
 			svc := &models.Service{
 				ID:                  uuid.New(),
 				ProjectID:           project.ID,
@@ -599,6 +634,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 				HealthStrategy:      svcHealthStrat,
 				HealthCheckPath:     &svcHealthPath,
 				HealthCheckEnabled:  true,
+				DeploymentMode:      svcMode,
 				Status:              models.ProjectStatusInactive,
 			}
 			servicesToCreate = append(servicesToCreate, svc)
@@ -640,6 +676,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			HealthStrategy:     project.HealthStrategy,
 			HealthCheckPath:    project.HealthCheckPath,
 			HealthCheckEnabled: project.HealthCheckEnabled,
+			DeploymentMode:     project.DeploymentMode,
 			Status:             project.Status,
 		}
 		servicesToCreate = append(servicesToCreate, svc)
@@ -736,18 +773,18 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 			id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,
 			dockerfile_path, build_context, build_strategy, build_command, start_command,
 			runtime_type, internal_port, health_check_path, health_check_enabled, health_strategy,
-			status, deployment_strategy, deployment_plan, created_at, updated_at
+			status, deployment_strategy, deployment_plan, deployment_mode, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $12, $13, $14,
 			$15, $16, $17, $18, $19,
-			$20, $21, $22, $23, $24
+			$20, $21, $22, $23, $24, $25
 		)`,
 		project.ID, project.OwnerID, project.SourceID, project.Name, project.Slug, project.SourceType, project.SourceReference,
 		project.RepositoryPath, project.Branch, project.DockerfilePath, project.BuildContext,
 		project.BuildStrategy, project.BuildCommand, project.StartCommand,
 		project.RuntimeType, project.InternalPort, project.HealthCheckPath, project.HealthCheckEnabled,
-		project.HealthStrategy, project.Status, project.DeploymentStrategy, project.DeploymentPlan,
+		project.HealthStrategy, project.Status, project.DeploymentStrategy, project.DeploymentPlan, project.DeploymentMode,
 		project.CreatedAt, project.UpdatedAt,
 	)
 	if err != nil {

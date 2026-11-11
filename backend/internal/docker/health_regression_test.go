@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -22,11 +22,9 @@ import (
 func TestRegression_HealthCheck_InspectContextCanceled_ReportsCancellation(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-			ContainerJSONBase: &types.ContainerJSONBase{
-				State: &types.ContainerState{
-					Running: true,
-				},
+		_ = json.NewEncoder(w).Encode(container.InspectResponse{
+			State: &container.State{
+				Running: true,
 			},
 		})
 	})
@@ -83,13 +81,11 @@ func TestRegression_HealthCheck_InspectTemporaryError_Retries(t *testing.T) {
 
 			// Success on 3rd attempt
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-						Health: &types.Health{
-							Status: "healthy",
-						},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
+					Health: &container.Health{
+						Status: container.Healthy,
 					},
 				},
 			})
@@ -145,20 +141,18 @@ func TestRegression_HealthCheck_ContainerActuallyStopped_ReportsDiagnostics(t *t
 
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running:    false,
-						ExitCode:   137,
-						Status:     "exited",
-						OOMKilled:  true,
-						Error:      "out of memory kill",
-						FinishedAt: "2026-10-07T08:00:00Z",
-						Health: &types.Health{
-							Status: "unhealthy",
-							Log: []*types.HealthcheckResult{
-								{Output: "health check timeout\n", ExitCode: 1},
-							},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running:    false,
+					ExitCode:   137,
+					Status:     container.StateExited,
+					OOMKilled:  true,
+					Error:      "out of memory kill",
+					FinishedAt: "2026-10-07T08:00:00Z",
+					Health: &container.Health{
+						Status: container.Unhealthy,
+						Log: []*container.HealthcheckResult{
+							{Output: "health check timeout\n", ExitCode: 1},
 						},
 					},
 				},
@@ -199,13 +193,11 @@ func TestRegression_HealthCheck_DockerHealthStarting_NeverPromotesToHealthy(t *t
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-						Health: &types.Health{
-							Status: "starting",
-						},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
+					Health: &container.Health{
+						Status: container.Starting,
 					},
 				},
 			})
@@ -251,15 +243,13 @@ func TestRegression_HealthCheck_DockerHealthUnhealthy_PreservesDiagnostics(t *te
 
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-						Health: &types.Health{
-							Status: "unhealthy",
-							Log: []*types.HealthcheckResult{
-								{Output: "pg_isready failed: connection refused\n", ExitCode: 2},
-							},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
+					Health: &container.Health{
+						Status: container.Unhealthy,
+						Log: []*container.HealthcheckResult{
+							{Output: "pg_isready failed: connection refused\n", ExitCode: 2},
 						},
 					},
 				},
@@ -297,13 +287,11 @@ func TestRegression_HealthCheck_DockerHealthHealthy_Succeeds(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-						Health: &types.Health{
-							Status: "healthy",
-						},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
+					Health: &container.Health{
+						Status: container.Healthy,
 					},
 				},
 			})
@@ -347,13 +335,11 @@ func TestRegression_HealthCheck_NativeDockerHealthcheckCannotBeBypassedByTCPHTTP
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-						Health: &types.Health{
-							Status: "starting",
-						},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
+					Health: &container.Health{
+						Status: container.Starting,
 					},
 				},
 			})
@@ -394,26 +380,22 @@ func TestRegression_HealthCheck_RespectsStartupTiming(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			if attempt < 3 {
 				// Simulating startup initialization during start_period
-				_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						State: &types.ContainerState{
-							Running: true,
-							Health: &types.Health{
-								Status: "starting",
-							},
+				_ = json.NewEncoder(w).Encode(container.InspectResponse{
+					State: &container.State{
+						Running: true,
+						Health: &container.Health{
+							Status: container.Starting,
 						},
 					},
 				})
 				return
 			}
 			// Became healthy on attempt 3
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-						Health: &types.Health{
-							Status: "healthy",
-						},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
+					Health: &container.Health{
+						Status: container.Healthy,
 					},
 				},
 			})
@@ -569,13 +551,11 @@ func TestRegression_HealthCheck_ContainerDefinitivelyNotFound_FailsImmediately(t
 func TestRegression_HealthCheck_RestartingState_ReportsCrashLoop(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-			ContainerJSONBase: &types.ContainerJSONBase{
-				RestartCount: 3,
-				State: &types.ContainerState{
-					Running:    false,
-					Restarting: true,
-				},
+		_ = json.NewEncoder(w).Encode(container.InspectResponse{
+			RestartCount: 3,
+			State: &container.State{
+				Running:    false,
+				Restarting: true,
 			},
 		})
 	})
@@ -631,11 +611,9 @@ func TestRegression_HealthCheck_HTTP_Rejects404_NeverFallsBackToTCP(t *testing.T
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
 				},
 			})
 			return
@@ -690,11 +668,9 @@ func TestRegression_HealthCheck_HTTP_Rejects500(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
 				},
 			})
 			return
@@ -745,11 +721,9 @@ func TestRegression_HealthCheck_HTTP_SucceedsOn200(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
 				},
 			})
 			return
@@ -796,11 +770,9 @@ func TestRegression_HealthCheck_TCP_VerifiesListeningPortWithoutHTTPProbe(t *tes
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
 				},
 			})
 			return
@@ -837,11 +809,9 @@ func TestRegression_HealthCheck_None_VerifiesRunningContainer(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
 				},
 			})
 			return

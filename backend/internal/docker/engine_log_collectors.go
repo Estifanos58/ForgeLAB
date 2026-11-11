@@ -9,8 +9,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/logging"
 	"github.com/forgelab/backend/internal/models"
@@ -190,7 +190,7 @@ func (e *Engine) StartRuntimeLogCollector(p RuntimeCollectorParams) {
 				return
 			}
 
-			reader, err := e.dockerClient.ContainerLogs(logCtx, p.ContainerID, container.LogsOptions{
+			reader, err := e.dockerClient.ContainerLogs(logCtx, p.ContainerID, client.ContainerLogsOptions{
 				ShowStdout: true,
 				ShowStderr: true,
 				Follow:     true,
@@ -202,8 +202,8 @@ func (e *Engine) StartRuntimeLogCollector(p RuntimeCollectorParams) {
 					return
 				}
 				e.getCollectorRegistry().RecordCollectionError(instanceID, err)
-				insp, inspErr := e.dockerClient.ContainerInspect(logCtx, p.ContainerID)
-				if inspErr != nil || !insp.State.Running {
+				insp, inspErr := e.dockerClient.ContainerInspect(logCtx, p.ContainerID, client.ContainerInspectOptions{})
+				if inspErr != nil || insp.Container.State == nil || !insp.Container.State.Running {
 					cid := p.ContainerID
 					if len(cid) > 12 {
 						cid = cid[:12]
@@ -249,8 +249,8 @@ func (e *Engine) StartRuntimeLogCollector(p RuntimeCollectorParams) {
 			}
 
 			// Stream closed; check if container is still running
-			insp, inspErr := e.dockerClient.ContainerInspect(logCtx, p.ContainerID)
-			if inspErr != nil || !insp.State.Running {
+			insp, inspErr := e.dockerClient.ContainerInspect(logCtx, p.ContainerID, client.ContainerInspectOptions{})
+			if inspErr != nil || insp.Container.State == nil || !insp.Container.State.Running {
 				cid := p.ContainerID
 				if len(cid) > 12 {
 					cid = cid[:12]

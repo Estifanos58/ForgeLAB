@@ -460,3 +460,53 @@ func TestHealthHandler_Readiness_WithReconciliationDiagnostics(t *testing.T) {
 		t.Errorf("expected authoritative reconciliation in response")
 	}
 }
+
+func TestHealthHandler_QueueDiagnostics_IncludesActiveLeasesRetriesAndDLQ(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis error: %v", err)
+	}
+	defer mr.Close()
+
+	redisCli := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer redisCli.Close()
+
+	q := queue.NewDeploymentQueue(redisCli)
+	q.SetMaxRetries(3)
+	q.SetLeaseTTL(30 * time.Second)
+	ctx := context.Background()
+
+	jobID := uuid.New()
+	job := queue.Job{Type: queue.JobTypeServiceDeployment, ID: jobID, ServiceDeploymentID: jobID}
+	redisCli.LPush(ctx, queue.ProcessingQueueKey, job.Encode())
+	redisCli.Set(ctx, queue.JobLeasePrefix+jobID.String(), "worker-diag:"+uuid.New().String(), 30*time.Second)
+	redisCli.Set(ctx, queue.JobAttemptsPrefix+jobID.String(), 1, time.Hour)
+
+	dlqID := uuid.New()
+	dlqJob := queue.Job{Type: queue.JobTypeDeployment, ID: dlqID, DeploymentID: &dlqID}
+	redisCli.LPush(ctx, queue.DeadLetterQueueKey, dlqJob.Encode())
+	redisCli.Set(ctx, queue.JobAttemptsPrefix+dlqID.String(), 3, time.Hour)
+
+	h := NewHealthHandler(nil, redisCli, nil)
+	h.SetQueueDiagnosticsProvider(q)
+
+	req := httptest.NewRequest("GET", "/health/queue", nil)
+	req.RemoteAddr = "127.0.0.1:4321"
+	rec := httptest.NewRecorder()
+	h.QueueDiagnostics(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var diag queue.QueueDiagnostics
+	if err := json.Unmarshal(rec.Body.Bytes(), &diag); err != nil {
+		t.Fatalf("failed to decode queue diagnostics: %v", err)
+	}
+	if diag.RetryingJobs != 2 || diag.DeadLetterJobs != 1 || len(diag.ActiveLeases) != 1 || len(diag.DeadLetterEntries) != 1 {
+		t.Fatalf("unexpected diagnostics payload: %+v", diag)
+	}
+	if diag.ActiveLeases[0].WorkerID != "worker-diag" {
+		t.Errorf("expected worker-diag, got %q", diag.ActiveLeases[0].WorkerID)
+	}
+}

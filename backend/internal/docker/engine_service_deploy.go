@@ -18,19 +18,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	dockerimage "github.com/docker/docker/api/types/image"
-	dockernetwork "github.com/docker/docker/api/types/network"
-	dockervolume "github.com/docker/docker/api/types/volume"
-	"github.com/docker/go-connections/nat"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/build"
+	"github.com/moby/moby/api/types/container"
+	dockernetwork "github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/detector"
 	"github.com/forgelab/backend/internal/discovery"
 	"github.com/forgelab/backend/internal/logging"
 	"github.com/forgelab/backend/internal/models"
+	"github.com/forgelab/backend/internal/proxy"
 	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/tararchive"
 	ws "github.com/forgelab/backend/internal/websocket"
@@ -55,8 +54,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			serviceDeploy.DeploymentID != nil &&
 			e.IsActiveExecution(*serviceDeploy.DeploymentID) {
 			slog.Info("recovering service deployment prematurely marked interrupted by backend restart", "service_deployment_id", serviceDeploymentID)
-			_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploymentID, models.DeployStatusQueued, nil)
+			if resetErr := e.deploymentService.ResetInterruptedServiceDeployment(ctx, serviceDeploymentID); resetErr != nil {
+				return fmt.Errorf("failed to reset interrupted service deployment %s: %w", serviceDeploymentID, resetErr)
+			}
 			serviceDeploy.Status = models.DeployStatusQueued
+			serviceDeploy.FailureReason = nil
 		} else {
 			slog.Info("service deployment already in terminal state; skipping execution", "service_deployment_id", serviceDeploymentID, "status", serviceDeploy.Status)
 			if serviceDeploy.Status == models.DeployStatusRunning {
@@ -110,7 +112,17 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	previousServiceStatus := service.Status
 	previousContainerID := service.ContainerID
 	previousDeploymentID := service.CurrentServiceDeploymentID
-	hasPreviousHealthy := (previousServiceStatus == models.ServiceStatusRunning && previousContainerID != nil && *previousContainerID != "")
+	previousHostPort := service.HostPort
+	hasPreviousHealthy := ((previousServiceStatus == models.ServiceStatusRunning || previousServiceStatus == models.ServiceStatusDegraded) && previousContainerID != nil && *previousContainerID != "")
+
+	deployMode := strings.ToLower(strings.TrimSpace(service.DeploymentMode))
+	if deployMode == "" && project != nil {
+		deployMode = strings.ToLower(strings.TrimSpace(project.DeploymentMode))
+	}
+	if deployMode == "" {
+		deployMode = models.DeploymentModeStandard
+	}
+	isBlueGreen := deployMode == models.DeploymentModeBlueGreen
 
 	redactor := logging.NewLogRedactor()
 
@@ -177,8 +189,13 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			return
 		}
 		coarseStatus := toCoarseServiceStatus(newStatus, hasPreviousHealthy)
-		_ = e.serviceService.UpdateServiceStatus(ctx, service.ID, coarseStatus, nil, nil, nil)
-		newProjStatus, _ := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
+		if err := e.serviceService.UpdateServiceStatus(ctx, service.ID, coarseStatus, nil, nil, nil); err != nil {
+			slog.Warn("failed to update coarse service status", "service_id", service.ID, "status", coarseStatus, "error", err)
+		}
+		newProjStatus, err := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
+		if err != nil {
+			slog.Warn("failed to recalculate project status", "project_id", project.ID, "error", err)
+		}
 
 		if e.wsHub != nil {
 			data := map[string]interface{}{
@@ -280,7 +297,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	allProjectServices, err := e.serviceService.ListServices(execCtx, project.ID)
 	if err != nil {
-		allProjectServices = []*models.Service{service}
+		reason := fmt.Sprintf("Failed to load services for project '%s': %v", project.Name, err)
+		emitLog(models.LogPhaseSource, models.LogStreamStderr, reason)
+		emitStatus(models.DeployStatusFailed, nil, &reason)
+		return fmt.Errorf("failed to list services for project %s: %w", project.ID, err)
 	}
 	servicesMap := make(map[string]*models.Service, len(allProjectServices))
 	for _, s := range allProjectServices {
@@ -333,7 +353,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 
 		if candidateImage != "" && e.dockerClient != nil {
-			if inspect, _, err := e.dockerClient.ImageInspectWithRaw(execCtx, candidateImage); err == nil {
+			if inspect, err := e.dockerClient.ImageInspect(execCtx, candidateImage); err == nil {
 				reusingExistingImage = true
 				runImage = candidateImage
 				idShort := inspect.ID
@@ -341,7 +361,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					idShort = idShort[:12]
 				}
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Execution path: reusing existing immutable image '%s' (image ID: %s). Skipping source cloning and image build.", candidateImage, idShort))
-				_ = e.dockerClient.ImageTag(execCtx, candidateImage, svcTag)
+				_, _ = e.dockerClient.ImageTag(execCtx, client.ImageTagOptions{
+					Source: candidateImage,
+					Target: svcTag,
+				})
 			} else {
 				// If explicitly in reuse_image mode (rollback), fail closed; do not silently rebuild from current source!
 				if serviceDeploy.ExecutionMode == models.ExecutionModeReuseImage {
@@ -410,14 +433,14 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Infrastructure / pre-built image '%s' detected for service '%s'. Pulling/verifying image...", targetImage, service.Name))
 		runImage = targetImage
 		if e.dockerClient != nil {
-			reader, pullErr := e.dockerClient.ImagePull(execCtx, targetImage, dockerimage.PullOptions{})
+			reader, pullErr := e.dockerClient.ImagePull(execCtx, targetImage, client.ImagePullOptions{})
 			if pullErr == nil && reader != nil {
 				_, _ = io.Copy(io.Discard, reader)
 				_ = reader.Close()
 				emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Image '%s' ready. Skipping source build.", targetImage))
 			} else {
 				// Image pull failed: check if image is available in local cache
-				_, _, inspectErr := e.dockerClient.ImageInspectWithRaw(execCtx, targetImage)
+				_, inspectErr := e.dockerClient.ImageInspect(execCtx, targetImage)
 				if inspectErr != nil {
 					reason := fmt.Sprintf("Infrastructure image '%s' could not be pulled and is not available in local cache: %v", targetImage, pullErr)
 					emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
@@ -508,10 +531,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					if tag != "" {
 						runImage = tag
 						if e.dockerClient != nil {
-							_ = e.dockerClient.ImageTag(execCtx, tag, svcTag)
+							_, _ = e.dockerClient.ImageTag(execCtx, client.ImageTagOptions{
+								Source: tag,
+								Target: svcTag,
+							})
 							runImage = svcTag
 							if service.Image != "" {
-								_ = e.dockerClient.ImageTag(execCtx, tag, service.Image)
+								_, _ = e.dockerClient.ImageTag(execCtx, client.ImageTagOptions{
+									Source: tag,
+									Target: service.Image,
+								})
 							}
 						}
 						if dig != "" && e.deploymentService != nil {
@@ -572,9 +601,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			return errors.New(reason)
 		}
 		emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Docker daemon available")
-		if bv, ok := e.getCachedBuilderVersion(); ok && bv == types.BuilderBuildKit {
+		if bv, ok := e.getCachedBuilderVersion(); ok && bv == build.BuilderBuildKit {
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 2 / BuildKit")
-		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv == types.BuilderV1 {
+		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv == build.BuilderV1 {
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, "Builder version: 1 / legacy")
 		} else if bv, ok := e.getCachedBuilderVersion(); ok && bv != "" {
 			emitLog(models.LogPhaseBuild, models.LogStreamSystem, fmt.Sprintf("Builder version: %s", bv))
@@ -923,7 +952,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			buildLabels["forgelab.deployment_id"] = serviceDeploy.DeploymentID.String()
 		}
 
-		buildOpts := types.ImageBuildOptions{
+		buildOpts := client.ImageBuildOptions{
 			Tags:        []string{svcTag},
 			Dockerfile:  relDockerPath,
 			BuildArgs:   buildArgs,
@@ -958,7 +987,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		// Inspect image to record immutable digest for rollback / reproducibility
 		var digest string
 		if e.dockerClient != nil {
-			if inspect, _, err := e.dockerClient.ImageInspectWithRaw(ctx, svcTag); err == nil {
+			if inspect, err := e.dockerClient.ImageInspect(ctx, svcTag); err == nil {
 				if len(inspect.RepoDigests) > 0 {
 					digest = inspect.RepoDigests[0]
 				} else if inspect.ID != "" {
@@ -973,7 +1002,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			sharedPromise.Complete(svcTag, digest)
 		}
 		if service.Image != "" && e.dockerClient != nil {
-			_ = e.dockerClient.ImageTag(ctx, svcTag, service.Image)
+			_, _ = e.dockerClient.ImageTag(ctx, client.ImageTagOptions{
+				Source: svcTag,
+				Target: service.Image,
+			})
 		}
 		runImage = svcTag
 		doReleaseSlot() // Release Docker build slot immediately after image build completes
@@ -989,8 +1021,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	var hostPort *int
-	var portBindings nat.PortMap
+	var portBindings dockernetwork.PortMap
 	targetPortStr := fmt.Sprintf("%d/tcp", intPort)
+	targetPort := dockernetwork.MustParsePort(targetPortStr)
 
 	allProjectServices, _ = e.serviceService.ListServices(ctx, project.ID)
 	// Internal infrastructure, workers, and non-public services do not allocate host ports when part of multi-service project
@@ -1006,6 +1039,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	shouldExposePort := !isInternalService && (service.PublicExposed || service.Role == models.RoleFrontend || len(allProjectServices) <= 1)
 
 	if shouldExposePort {
+		if e.portManager == nil {
+			reason := fmt.Sprintf("Failed to allocate host port for exposed service '%s': port manager is not configured", service.Name)
+			emitLog(models.LogPhaseStartup, models.LogStreamStderr, reason)
+			emitStatus(models.DeployStatusFailed, nil, &reason)
+			return errors.New(reason)
+		}
 		allocated, err := e.portManager.AllocatePort()
 		if err != nil {
 			reason := fmt.Sprintf("Failed to allocate host port for exposed service '%s': %v", service.Name, err)
@@ -1014,10 +1053,10 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			return errors.New(reason)
 		}
 		hostPort = &allocated
-		portBindings = nat.PortMap{
-			nat.Port(targetPortStr): []nat.PortBinding{
+		portBindings = dockernetwork.PortMap{
+			targetPort: []dockernetwork.PortBinding{
 				{
-					HostIP:   e.GetAppHostIP(),
+					HostIP:   parseAppHostIP(e.GetAppHostIP()),
 					HostPort: fmt.Sprintf("%d", allocated),
 				},
 			},
@@ -1195,8 +1234,8 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	containerConfig := &container.Config{
 		Image: runImage,
 		Env:   svcEnv,
-		ExposedPorts: nat.PortSet{
-			nat.Port(targetPortStr): struct{}{},
+		ExposedPorts: dockernetwork.PortSet{
+			targetPort: struct{}{},
 		},
 		Labels: map[string]string{
 			"forgelab.project_id":            project.ID.String(),
@@ -1326,7 +1365,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if resolvedVol.IsNamedVolume {
 			volName := fmt.Sprintf("forgelab-vol-%s-%s", project.ID.String()[:8], resolvedVol.VolumeName)
 			if e.dockerClient != nil {
-				_, _ = e.dockerClient.VolumeCreate(execCtx, dockervolume.CreateOptions{
+				_, _ = e.dockerClient.VolumeCreate(execCtx, client.VolumeCreateOptions{
 					Name: volName,
 					Labels: map[string]string{
 						"forgelab.project_id":  project.ID.String(),
@@ -1425,7 +1464,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_ = e.dockerClient.ContainerRemove(cleanupCtx, containerName, container.RemoveOptions{Force: true})
+	_, _ = e.dockerClient.ContainerRemove(cleanupCtx, containerName, client.ContainerRemoveOptions{Force: true})
 	cleanupCancel()
 
 	hasWritableVolume := false
@@ -1435,19 +1474,36 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			break
 		}
 	}
+	if !hasWritableVolume {
+		for _, v := range serviceDeploy.Volumes {
+			if !v.ReadOnly {
+				hasWritableVolume = true
+				break
+			}
+		}
+	}
 	isStateful := hasWritableVolume || len(binds) > 0 || service.Classification == models.ClassificationInfrastructure
+
+	if isBlueGreen && hasPreviousHealthy && e.trafficRouter != nil && previousHostPort != nil && *previousHostPort > 0 && !isInternalService {
+		_, _, _ = e.trafficRouter.EnsureRoute(service.ID, project.ID, service.Name, e.GetAppHostIP(), *previousHostPort, *previousContainerID)
+	}
 
 	var stoppedPreviousForStateful bool
 	if isStateful && hasPreviousHealthy && previousContainerID != nil && *previousContainerID != "" {
-		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for stateful service '%s' to release volume locks...", (*previousContainerID)[:12], service.Name))
+		if isBlueGreen {
+			emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("BLUE-GREEN: Service '%s' has writable storage/infrastructure state; using safe stop-before-start fallback with automatic restore-on-failure.", service.Name))
+		}
+		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for stateful service '%s' to release volume locks...", (*previousContainerID)[:min(12, len(*previousContainerID))], service.Name))
 		if previousDeploymentID != nil {
 			e.StopLogCollector(*previousDeploymentID)
 		}
 		stopTimeoutSec := 15
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		_ = e.dockerClient.ContainerStop(stopCtx, *previousContainerID, container.StopOptions{Timeout: &stopTimeoutSec})
+		_, _ = e.dockerClient.ContainerStop(stopCtx, *previousContainerID, client.ContainerStopOptions{Timeout: &stopTimeoutSec})
 		stopCancel()
 		stoppedPreviousForStateful = true
+	} else if isBlueGreen && hasPreviousHealthy && !isStateful && previousContainerID != nil && *previousContainerID != "" {
+		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("BLUE-GREEN: Keeping previous Blue container %s for service '%s' live while provisioning Green replacement (%s)...", (*previousContainerID)[:min(12, len(*previousContainerID))], service.Name, containerName))
 	}
 
 	restorePreviousIfNeeded := func(failureReason, phase string) string {
@@ -1466,7 +1522,12 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	var containerID string
 	maxPortRetries := 3
 	for attempt := 0; attempt <= maxPortRetries; attempt++ {
-		resp, err := e.dockerClient.ContainerCreate(execCtx, containerConfig, hostConfig, netConfig, nil, containerName)
+		resp, err := e.dockerClient.ContainerCreate(execCtx, client.ContainerCreateOptions{
+			Config:           containerConfig,
+			HostConfig:       hostConfig,
+			NetworkingConfig: netConfig,
+			Name:             containerName,
+		})
 		if err != nil {
 			if isPortConflictError(err) && hostPort != nil && attempt < maxPortRetries {
 				emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Host port %d conflict during container create: %v. Retrying with a new port (attempt %d/%d)...", *hostPort, err, attempt+1, maxPortRetries))
@@ -1474,7 +1535,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				newPort, allocErr := e.portManager.AllocatePort()
 				if allocErr == nil {
 					hostPort = &newPort
-					portBindings[nat.Port(targetPortStr)] = []nat.PortBinding{{HostIP: e.GetAppHostIP(), HostPort: fmt.Sprintf("%d", newPort)}}
+					portBindings[targetPort] = []dockernetwork.PortBinding{{HostIP: parseAppHostIP(e.GetAppHostIP()), HostPort: fmt.Sprintf("%d", newPort)}}
 					hostConfig.PortBindings = portBindings
 					continue
 				}
@@ -1508,8 +1569,11 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					}
 				}
 
-				if netConnErr := e.dockerClient.NetworkConnect(execCtx, secNet, resp.ID, &dockernetwork.EndpointSettings{
-					Aliases: secAliases,
+				if _, netConnErr := e.dockerClient.NetworkConnect(execCtx, secNet, client.NetworkConnectOptions{
+					Container: resp.ID,
+					EndpointConfig: &dockernetwork.EndpointSettings{
+						Aliases: secAliases,
+					},
 				}); netConnErr != nil {
 					secNetErr = fmt.Errorf("failed to attach required network '%s' to service '%s': %w", secNet, service.Name, netConnErr)
 					break
@@ -1522,7 +1586,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				e.portManager.ReleasePort(*hostPort)
 			}
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = e.dockerClient.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
+			_, _ = e.dockerClient.ContainerRemove(cleanupCtx, resp.ID, client.ContainerRemoveOptions{Force: true})
 			cleanupCancel()
 			reason := secNetErr.Error()
 			reason = restorePreviousIfNeeded(reason, models.LogPhaseStartup)
@@ -1531,9 +1595,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			return errors.New(reason)
 		}
 
-		if err := e.dockerClient.ContainerStart(execCtx, containerID, container.StartOptions{}); err != nil {
+		if _, err := e.dockerClient.ContainerStart(execCtx, containerID, client.ContainerStartOptions{}); err != nil {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+			_, _ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true})
 			cleanupCancel()
 
 			if isPortConflictError(err) && hostPort != nil && attempt < maxPortRetries {
@@ -1542,7 +1606,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 				newPort, allocErr := e.portManager.AllocatePort()
 				if allocErr == nil {
 					hostPort = &newPort
-					portBindings[nat.Port(targetPortStr)] = []nat.PortBinding{{HostIP: e.GetAppHostIP(), HostPort: fmt.Sprintf("%d", newPort)}}
+					portBindings[targetPort] = []dockernetwork.PortBinding{{HostIP: parseAppHostIP(e.GetAppHostIP()), HostPort: fmt.Sprintf("%d", newPort)}}
 					hostConfig.PortBindings = portBindings
 					continue
 				}
@@ -1563,7 +1627,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	e.trackActiveContainer(containerID)
 	defer e.untrackActiveContainer(containerID)
-	_ = e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort)
+	if err := e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort); err != nil {
+		slog.Warn("failed to record service deployment container metadata", "service_deployment_id", serviceDeploy.ID, "container_id", containerID, "error", err)
+	}
 
 	emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Container %s started for service '%s'.", containerID[:12], service.Name))
 
@@ -1581,9 +1647,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	if isJob {
 		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("Service '%s' is a one-shot job (classification: %s). Waiting for container execution to complete...", service.Name, service.Classification))
 		if e.dockerClient != nil {
-			statusCh, errCh := e.dockerClient.ContainerWait(execCtx, containerID, container.WaitConditionNotRunning)
+			waitRes := e.dockerClient.ContainerWait(execCtx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 			select {
-			case err := <-errCh:
+			case err := <-waitRes.Error:
 				if err != nil {
 					e.StopLogCollector(serviceDeploy.ID)
 					e.StopContainerLogCollector(containerID)
@@ -1592,7 +1658,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 					emitStatus(models.DeployStatusFailed, nil, &reason)
 					return errors.New(reason)
 				}
-			case status := <-statusCh:
+			case status := <-waitRes.Result:
 				if status.Error != nil && status.Error.Message != "" {
 					e.StopLogCollector(serviceDeploy.ID)
 					e.StopContainerLogCollector(containerID)
@@ -1627,9 +1693,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			emitStatus(models.DeployStatusFailed, nil, &reason)
 			return fmt.Errorf("failed to promote job service deployment: %w", err)
 		}
-		_ = e.deploymentService.UpdateServiceDeploymentContainer(ctx, serviceDeploy.ID, containerID, nil)
-		_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, models.DeployStatusStopped, nil)
-		_ = e.serviceService.UpdateServiceStatus(ctx, service.ID, models.ServiceStatusStopped, &containerID, &runImage, nil)
+		if err := e.deploymentService.UpdateServiceDeploymentContainer(ctx, serviceDeploy.ID, containerID, nil); err != nil {
+			slog.Warn("failed to record job service deployment container", "service_deployment_id", serviceDeploy.ID, "error", err)
+		}
 		emitStatus(models.DeployStatusStopped, nil, nil)
 		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Job service '%s' deployment #%d completed successfully!", service.Name, serviceDeploy.DeployNumber))
 		return nil
@@ -1670,13 +1736,16 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		// Capture and log original health failure reason BEFORE stopping container / cleanup!
 		detailedReason := fmt.Sprintf("Health verification failed for service '%s': %s", service.Name, healthReason)
 		emitLog(models.LogPhaseHealth, models.LogStreamStderr, detailedReason)
+		if isBlueGreen && hasPreviousHealthy && !isStateful {
+			emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("BLUE-GREEN ABORTED: Green replacement for '%s' failed health verification; proxy traffic remains safely routed to Blue.", service.Name))
+		}
 
 		// Destroy newly spawned broken container and preserve previously healthy container intact!
 		e.StopLogCollector(serviceDeploy.ID)
 		e.StopContainerLogCollector(containerID)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
-		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+		_, _ = e.dockerClient.ContainerStop(cleanupCtx, containerID, client.ContainerStopOptions{})
+		_, _ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true})
 		cleanupCancel()
 		if hostPort != nil {
 			e.portManager.ReleasePort(*hostPort)
@@ -1694,17 +1763,39 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		return errors.New(reason)
 	}
 
-	// 5. Promote service
+	// 5. Safe Traffic Switch & Promote Service
+	var prevRoute proxy.UpstreamRoute
+	var hadPrevRoute bool
+	var switchedTraffic bool
+	if e.trafficRouter != nil && hostPort != nil && *hostPort > 0 && !isInternalService {
+		prevRoute, hadPrevRoute = e.trafficRouter.GetRoute(service.ID)
+		newRoute, switchErr := e.trafficRouter.SwitchTraffic(service.ID, project.ID, service.Name, e.GetAppHostIP(), *hostPort, containerID)
+		if switchErr != nil {
+			slog.Warn("failed to switch traffic router upstream", "service_id", service.ID, "error", switchErr)
+		} else {
+			switchedTraffic = true
+			if isBlueGreen {
+				emitLog(models.LogPhaseHealth, models.LogStreamSystem, fmt.Sprintf("BLUE-GREEN CUTOVER: Switched active proxy slot to '%s' (container %s on host port %d).", newRoute.ActiveSlot, containerID[:min(12, len(containerID))], *hostPort))
+			}
+		}
+	}
+
 	err = e.serviceService.PromoteServiceDeployment(execCtx, service.ID, serviceDeploy.ID, containerID, svcTag, hostPort)
 	if err != nil {
 		// Promotion failed - ENFORCE SAFETY INVARIANT:
-		// The new container must not replace the previous current deployment,
-		// the new deployment must become failed, and the old container must remain intact.
+		// Revert any traffic router switch, destroy new container, preserve previous container intact.
+		if switchedTraffic && e.trafficRouter != nil {
+			if hadPrevRoute {
+				_ = e.trafficRouter.RestoreRoute(prevRoute)
+			} else {
+				e.trafficRouter.RemoveRoute(service.ID)
+			}
+		}
 		e.StopLogCollector(serviceDeploy.ID)
 		e.StopContainerLogCollector(containerID)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = e.dockerClient.ContainerStop(cleanupCtx, containerID, container.StopOptions{})
-		_ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
+		_, _ = e.dockerClient.ContainerStop(cleanupCtx, containerID, client.ContainerStopOptions{})
+		_, _ = e.dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true})
 		cleanupCancel()
 		if hostPort != nil {
 			e.portManager.ReleasePort(*hostPort)
@@ -1717,38 +1808,53 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		return fmt.Errorf("failed to promote service deployment: %w", err)
 	}
 
-	_ = e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort)
-	_ = e.deploymentService.UpdateServiceDeploymentStatus(execCtx, serviceDeploy.ID, models.DeployStatusRunning, nil)
+	if err := e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort); err != nil {
+		slog.Warn("failed to update service deployment container on promotion", "service_deployment_id", serviceDeploy.ID, "error", err)
+	}
 	emitStatus(models.DeployStatusRunning, hostPort, nil)
 
 	// 6. Cleanup previous container for this service if different
 	if previousContainerID != nil && *previousContainerID != "" && *previousContainerID != containerID {
 		if serviceDeploy.DeploymentID == nil {
-			// Single service deployment: safe to clean up immediately upon promotion
+			// Single service deployment: safe to clean up immediately upon promotion and traffic cutover
 			if !stoppedPreviousForStateful {
-				emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for service '%s'...", (*previousContainerID)[:12], service.Name))
+				if isBlueGreen && hasPreviousHealthy {
+					emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("BLUE-GREEN: Draining active connections before decommissioning previous Blue container %s for service '%s'...", (*previousContainerID)[:min(12, len(*previousContainerID))], service.Name))
+					time.Sleep(50 * time.Millisecond)
+				} else {
+					emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Stopping previous container %s for service '%s'...", (*previousContainerID)[:min(12, len(*previousContainerID))], service.Name))
+				}
 				if previousDeploymentID != nil {
 					e.StopLogCollector(*previousDeploymentID)
 				}
 				e.StopContainerLogCollector(*previousContainerID)
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_ = e.dockerClient.ContainerStop(cleanupCtx, *previousContainerID, container.StopOptions{})
+				_, _ = e.dockerClient.ContainerStop(cleanupCtx, *previousContainerID, client.ContainerStopOptions{})
 				cleanupCancel()
 			} else {
 				e.StopContainerLogCollector(*previousContainerID)
 			}
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = e.dockerClient.ContainerRemove(cleanupCtx, *previousContainerID, container.RemoveOptions{Force: true})
+			_, _ = e.dockerClient.ContainerRemove(cleanupCtx, *previousContainerID, client.ContainerRemoveOptions{Force: true})
 			cleanupCancel()
+			if e.portManager != nil && previousHostPort != nil && *previousHostPort > 0 && (hostPort == nil || *previousHostPort != *hostPort) {
+				e.portManager.ReleasePort(*previousHostPort)
+			}
 		} else {
 			// Release deployment: preserve previous healthy container until full release promotion verification!
-			emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Preserving previous container %s for service '%s' until full release promotion verification.", (*previousContainerID)[:12], service.Name))
+			emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Preserving previous container %s for service '%s' until full release promotion verification.", (*previousContainerID)[:min(12, len(*previousContainerID))], service.Name))
 		}
 	}
 
 	// Update project port if this service is public or frontend
 	if hostPort != nil && (service.Role == models.RoleFrontend || service.PublicExposed) {
-		_, _ = e.projectService.UpdateProjectPort(execCtx, project.ID, *hostPort)
+		if _, err := e.projectService.UpdateProjectPort(execCtx, project.ID, *hostPort); err != nil {
+			slog.Warn("failed to update project port after service promotion", "project_id", project.ID, "host_port", *hostPort, "error", err)
+		}
+	}
+
+	if e.onRouteChange != nil {
+		e.onRouteChange(execCtx)
 	}
 
 	emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Service '%s' deployment #%d is now RUNNING and live!", service.Name, serviceDeploy.DeployNumber))

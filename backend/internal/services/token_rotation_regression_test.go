@@ -209,7 +209,7 @@ func TestUserService_RedisCachedRotationEncryption(t *testing.T) {
 	assert.Equal(t, newTokens.RefreshToken, cachedTokens.RefreshToken)
 	assert.Equal(t, newTokens.AccessToken, cachedTokens.AccessToken)
 
-	// Test backwards compatibility: if plaintext JSON is present in Redis, it is still decoded safely
+	// Fail-closed requirement: if unencrypted plaintext JSON is present in Redis, it MUST be rejected.
 	plainOldToken := "legacy-plain-token-" + uuid.New().String()
 	plainOldHash := auth.HashToken(plainOldToken)
 	plainKey := "forgelab:refresh_rotation:" + plainOldHash
@@ -220,8 +220,18 @@ func TestUserService_RedisCachedRotationEncryption(t *testing.T) {
 	plainJSON, _ := json.Marshal(expectedTokens)
 	require.NoError(t, rdb.Set(ctx, plainKey, string(plainJSON), time.Minute).Err())
 
-	// Insert active token record so DB verification succeeds
+	// Create valid user record so refresh_tokens foreign key constraint succeeds
 	uID := uuid.New()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO users (id, email, password_hash, display_name)
+		 VALUES ($1, $2, 'hash', 'Legacy Rejection Tester')`,
+		uID, "legacy-reject-"+uID.String()[:8]+"@example.com",
+	)
+	require.NoError(t, err)
+	defer func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM users WHERE id = $1", uID)
+	}()
+
 	_, err = pool.Exec(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, revoked, expires_at, created_at)
 		 VALUES ($1, $2, $3, true, $4, $5)`,
@@ -229,8 +239,6 @@ func TestUserService_RedisCachedRotationEncryption(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	retrievedTokens, err := userSvc.RefreshTokens(ctx, plainOldToken)
-	require.NoError(t, err)
-	assert.Equal(t, expectedTokens.RefreshToken, retrievedTokens.RefreshToken)
-	assert.Equal(t, expectedTokens.AccessToken, retrievedTokens.AccessToken)
+	_, err = userSvc.RefreshTokens(ctx, plainOldToken)
+	assert.ErrorIs(t, err, services.ErrTokenRevoked, "plaintext JSON in Redis must fail closed and be rejected")
 }

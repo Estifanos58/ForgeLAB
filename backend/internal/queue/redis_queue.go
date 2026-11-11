@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -216,26 +217,169 @@ func (q *DeploymentQueue) GetQueueStats(ctx context.Context) (pending, processin
 	return pending, processing, deadLetter, nil
 }
 
-// QueueDiagnostics provides diagnostic metrics for queue monitoring and recovery observability.
-type QueueDiagnostics struct {
-	PendingJobs        int64 `json:"pending_jobs"`
-	ProcessingJobs     int64 `json:"processing_jobs"`
-	DeadLetterJobs     int64 `json:"dead_letter_jobs"`
-	TotalRecoveredJobs int64 `json:"total_recovered_jobs"`
+// ActiveLeaseInfo describes a currently running job lease held by a worker.
+type ActiveLeaseInfo struct {
+	JobID               string `json:"job_id"`
+	JobType             string `json:"job_type,omitempty"`
+	WorkerID            string `json:"worker_id,omitempty"`
+	LeaseTTLRemainingMs int64  `json:"lease_ttl_remaining_ms"`
+	Attempts            int    `json:"attempts"`
 }
 
-// GetQueueDiagnostics returns comprehensive queue counts and recovery metrics.
+// DeadLetterEntry summarizes a job present in the dead-letter queue for diagnostics.
+type DeadLetterEntry struct {
+	JobID      string `json:"job_id,omitempty"`
+	JobType    string `json:"job_type,omitempty"`
+	Attempts   int    `json:"attempts"`
+	RawPayload string `json:"raw_payload,omitempty"`
+}
+
+// QueueDiagnostics provides diagnostic metrics for queue monitoring and recovery observability.
+type QueueDiagnostics struct {
+	PendingJobs        int64             `json:"pending_jobs"`
+	ProcessingJobs     int64             `json:"processing_jobs"`
+	DeadLetterJobs     int64             `json:"dead_letter_jobs"`
+	TotalRecoveredJobs int64             `json:"total_recovered_jobs"`
+	MaxRetries         int               `json:"max_retries"`
+	LeaseTTLSeconds    int64             `json:"lease_ttl_seconds"`
+	RetryingJobs       int64             `json:"retrying_jobs"`
+	ActiveLeases       []ActiveLeaseInfo `json:"active_leases,omitempty"`
+	DeadLetterEntries  []DeadLetterEntry `json:"dead_letter_entries,omitempty"`
+}
+
+func extractWorkerIDFromLeaseToken(token string) string {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(trimmed, ":"); idx > 0 {
+		suffix := trimmed[idx+1:]
+		if _, err := uuid.Parse(suffix); err == nil {
+			return trimmed[:idx]
+		}
+	}
+	return trimmed
+}
+
+func (q *DeploymentQueue) scanKeysBounded(ctx context.Context, pattern string, limit int) ([]string, error) {
+	var keys []string
+	var cursor uint64
+	for {
+		batch, nextCursor, err := q.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return keys, err
+		}
+		keys = append(keys, batch...)
+		if nextCursor == 0 || (limit > 0 && len(keys) >= limit) {
+			break
+		}
+		cursor = nextCursor
+	}
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+	return keys, nil
+}
+
+// GetQueueDiagnostics returns comprehensive queue counts, retry counters, active worker leases, and DLQ inspection.
 func (q *DeploymentQueue) GetQueueDiagnostics(ctx context.Context) (QueueDiagnostics, error) {
 	p, proc, dlq, err := q.GetQueueStats(ctx)
 	if err != nil {
 		return QueueDiagnostics{}, err
 	}
-	return QueueDiagnostics{
+
+	diag := QueueDiagnostics{
 		PendingJobs:        p,
 		ProcessingJobs:     proc,
 		DeadLetterJobs:     dlq,
 		TotalRecoveredJobs: atomic.LoadInt64(&q.totalRecoveredJobs),
-	}, nil
+		MaxRetries:         q.maxRetries,
+		LeaseTTLSeconds:    int64(q.leaseTTL.Seconds()),
+	}
+
+	// Index job types from processing queue so active leases include job_type
+	jobTypeByID := make(map[string]string)
+	if proc > 0 {
+		if procItems, lErr := q.client.LRange(ctx, ProcessingQueueKey, 0, 99).Result(); lErr == nil {
+			for _, item := range procItems {
+				if job, pErr := ParseJob(item); pErr == nil {
+					jobTypeByID[job.ID.String()] = string(job.Type)
+				}
+			}
+		}
+	}
+
+	// Scan attempt counters to measure retrying jobs and annotate leases/DLQ entries
+	attemptsByID := make(map[string]int)
+	if attemptKeys, sErr := q.scanKeysBounded(ctx, JobAttemptsPrefix+"*", 500); sErr == nil {
+		for _, k := range attemptKeys {
+			jobID := strings.TrimPrefix(k, JobAttemptsPrefix)
+			val, gErr := q.client.Get(ctx, k).Result()
+			if gErr != nil {
+				continue
+			}
+			n, cErr := strconv.Atoi(val)
+			if cErr != nil {
+				continue
+			}
+			attemptsByID[jobID] = n
+			if n > 0 {
+				diag.RetryingJobs++
+			}
+		}
+	}
+
+	// Inspect active leases and remaining TTLs
+	if leaseKeys, sErr := q.scanKeysBounded(ctx, JobLeasePrefix+"*", 200); sErr == nil {
+		for _, k := range leaseKeys {
+			jobID := strings.TrimPrefix(k, JobLeasePrefix)
+			token, gErr := q.client.Get(ctx, k).Result()
+			if gErr != nil {
+				continue
+			}
+			pttl, pErr := q.client.PTTL(ctx, k).Result()
+			var ttlMs int64
+			if pErr == nil && pttl > 0 {
+				ttlMs = pttl.Milliseconds()
+			}
+			diag.ActiveLeases = append(diag.ActiveLeases, ActiveLeaseInfo{
+				JobID:               jobID,
+				JobType:             jobTypeByID[jobID],
+				WorkerID:            extractWorkerIDFromLeaseToken(token),
+				LeaseTTLRemainingMs: ttlMs,
+				Attempts:            attemptsByID[jobID],
+			})
+		}
+	}
+
+	// Inspect up to 20 most recent dead-letter queue entries
+	if dlq > 0 {
+		if dlqItems, lErr := q.client.LRange(ctx, DeadLetterQueueKey, 0, 19).Result(); lErr == nil {
+			for _, item := range dlqItems {
+				entry := DeadLetterEntry{}
+				if job, pErr := ParseJob(item); pErr == nil {
+					idStr := job.ID.String()
+					entry.JobID = idStr
+					entry.JobType = string(job.Type)
+					if att, ok := attemptsByID[idStr]; ok {
+						entry.Attempts = att
+					} else if att, aErr := q.GetAttempts(ctx, job.ID); aErr == nil {
+						entry.Attempts = att
+					}
+				} else {
+					entry.JobType = "corrupt"
+					raw := item
+					if len(raw) > 256 {
+						raw = raw[:256] + "...[truncated]"
+					}
+					entry.RawPayload = raw
+				}
+				diag.DeadLetterEntries = append(diag.DeadLetterEntries, entry)
+			}
+		}
+	}
+
+	return diag, nil
 }
 
 // GetTotalRecoveredJobs returns the total count of abandoned jobs successfully recovered by this queue instance.

@@ -8,6 +8,7 @@ interface ProjectStatsProps {
 export function ProjectStats({ projects }: ProjectStatsProps) {
   const total = projects.length;
   const running = projects.filter((p) => p.status === 'running').length;
+  const degraded = projects.filter((p) => p.status === 'degraded').length;
   const deploying = projects.filter((p) => ['deploying', 'building', 'starting', 'health_checking', 'cloning', 'queued'].includes(p.status)).length;
   const failed = projects.filter((p) => ['failed', 'crashed'].includes(p.status)).length;
 
@@ -23,7 +24,12 @@ export function ProjectStats({ projects }: ProjectStatsProps) {
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
           <span>Running</span>
         </span>
-        <span className="font-mono text-sm font-semibold text-emerald-400">{running}</span>
+        <span className="font-mono text-sm font-semibold text-emerald-400 flex items-center gap-1.5">
+          <span>{running}</span>
+          {degraded > 0 && (
+            <span className="text-[10px] text-amber-400 font-medium">+{degraded} degraded</span>
+          )}
+        </span>
       </div>
 
       <div className="p-3 sm:px-4 flex items-center justify-between">

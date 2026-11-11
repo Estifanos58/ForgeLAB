@@ -73,13 +73,20 @@ func (s *DeploymentService) AddDeploymentServiceLog(
 		message = message[:maxLogMsgBytes] + " ... [truncated: exceeded 64KB log size limit]"
 	}
 
+	if s.addDeploymentServiceLogForTest != nil {
+		return s.addDeploymentServiceLogForTest(ctx, deploymentID, serviceDeploymentID, serviceID, phase, stream, message)
+	}
 	log := &models.DeploymentLog{
 		DeploymentID:        deploymentID,
 		ServiceDeploymentID: serviceDeploymentID,
 		ServiceID:           serviceID,
+		Timestamp:           time.Now(),
 		Phase:               phase,
 		Stream:              stream,
 		Message:             message,
+	}
+	if s.db == nil {
+		return log, nil
 	}
 	err := s.db.QueryRow(ctx,
 		`INSERT INTO deployment_logs (deployment_id, service_deployment_id, service_id, timestamp, phase, stream, message)

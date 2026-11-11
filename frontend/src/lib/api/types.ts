@@ -23,9 +23,11 @@ export interface AuthModeResponse {
   guest_user_id: string;
 }
 
-export type ProjectStatus = 'inactive' | 'deploying' | 'running' | 'partially_running' | 'stopped' | 'failed';
+export type ProjectStatus = 'inactive' | 'deploying' | 'running' | 'degraded' | 'partially_running' | 'stopped' | 'failed';
 
 export type ServiceRole = 'frontend' | 'backend' | 'worker' | 'other';
+
+export type DeploymentMode = 'standard' | 'blue_green';
 
 export interface BuildCandidate {
   id: string;
@@ -82,6 +84,7 @@ export interface Service {
   memory_mb?: number;
   pids_limit?: number;
   ephemeral_storage_mb?: number | null;
+  deployment_mode?: DeploymentMode;
   created_at: string;
   updated_at: string;
 }
@@ -222,6 +225,7 @@ export interface Project {
   health_check_path: string | null;
   health_check_enabled: boolean;
   deployment_strategy?: string;
+  deployment_mode?: DeploymentMode;
   deployment_plan?: any;
   status: ProjectStatus;
   current_deployment_id: string | null;
@@ -239,6 +243,7 @@ export type DeploymentStatus =
   | 'starting'
   | 'health_checking'
   | 'running'
+  | 'degraded'
   | 'partially_running'
   | 'stopped'
   | 'crashed'
@@ -317,6 +322,7 @@ export interface CreateProjectInput {
   health_strategy?: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path?: string;
   deployment_strategy?: string;
+  deployment_mode?: DeploymentMode;
   deployment_plan?: any;
   services?: Partial<Service>[];
   import_id?: string;
@@ -337,6 +343,7 @@ export interface UpdateProjectInput {
   health_strategy?: 'auto' | 'http' | 'tcp' | 'none';
   health_check_path?: string;
   health_check_enabled?: boolean;
+  deployment_mode?: DeploymentMode;
 }
 
 export interface SetEnvInput {
@@ -777,5 +784,84 @@ export interface ShareStatusResponse {
   reason?: string;
   install_guide?: string;
 }
+
+export interface ServiceRuntimeMetrics {
+  service_id: string;
+  service_name: string;
+  role: string;
+  classification: string;
+  status: string;
+  container_id?: string | null;
+  running: boolean;
+  restart_count: number;
+  oom_killed: boolean;
+  started_at?: string | null;
+  uptime_seconds: number;
+  health_status: 'healthy' | 'unhealthy' | 'starting' | 'none' | string;
+  health_failing_streak: number;
+  last_health_output?: string;
+  cpu_percent: number;
+  memory_used_bytes: number;
+  memory_limit_bytes: number;
+  memory_percent: number;
+  cpu_limit_millicores: number;
+  memory_limit_mb: number;
+  network_rx_bytes: number;
+  network_tx_bytes: number;
+  pids_current: number;
+  collected_at: string;
+  metric_error?: string;
+}
+
+export interface ProjectRuntimeMetrics {
+  project_id: string;
+  project_name: string;
+  status: string;
+  collected_at: string;
+  docker_available: boolean;
+  total_cpu_percent: number;
+  total_memory_used_bytes: number;
+  total_network_rx_bytes: number;
+  total_network_tx_bytes: number;
+  services: ServiceRuntimeMetrics[];
+}
+
+export interface CustomDomain {
+  id: string;
+  project_id: string;
+  service_id?: string | null;
+  domain: string;
+  verification_token: string;
+  verified: boolean;
+  tls_status: 'pending' | 'active' | 'error' | string;
+  target_port: number;
+  verification_record_name: string;
+  verification_record_value: string;
+  cname_instruction?: string;
+  last_checked_at?: string | null;
+  last_error?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateCustomDomainInput {
+  domain: string;
+  service_id?: string | null;
+}
+
+export interface WebhookConfig {
+  auto_deploy: boolean;
+  auto_deploy_branch: string;
+  has_webhook_secret: boolean;
+  webhook_url: string;
+  webhook_secret?: string;
+}
+
+export interface UpdateWebhookConfigInput {
+  auto_deploy?: boolean;
+  auto_deploy_branch?: string;
+  regenerate_secret?: boolean;
+}
+
 
 

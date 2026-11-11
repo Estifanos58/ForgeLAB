@@ -211,37 +211,42 @@ func (h *HealthCheckConfig) UnmarshalJSON(data []byte) error {
 // Project represents a registered project in ForgeLab.
 // A project is an application that ForgeLab manages, containing one or more services.
 type Project struct {
-	ID                    uuid.UUID       `json:"id"`
-	OwnerID               uuid.UUID       `json:"owner_id"`
-	SourceID              *uuid.UUID      `json:"source_id,omitempty"`
-	Name                  string          `json:"name"`
-	Slug                  string          `json:"slug"`
-	SourceType            string          `json:"source_type"`      // "local_agent", "local_directory", "local_upload", "github", or legacy "local"
-	SourceReference       string          `json:"source_reference"` // repo "owner/repo" or local upload source_id
-	RepositoryPath        string          `json:"repository_path"`  // host path for local_directory projects
-	Branch                string          `json:"branch"`
-	DeploymentStrategy    string          `json:"deployment_strategy"` // "auto", "compose", "dockerfile", "custom"
-	DeploymentPlan        json.RawMessage `json:"deployment_plan,omitempty"`
-	DockerfilePath        string          `json:"dockerfile_path"`
-	BuildContext          string          `json:"build_context"`
-	BuildStrategy         string          `json:"build_strategy"` // "auto" or "dockerfile"
-	BuildCommand          string          `json:"build_command"`
-	StartCommand          string          `json:"start_command"`
-	RuntimeType           string          `json:"runtime_type"`      // "nextjs", "nodejs", "python-fastapi", "go", etc.
-	InternalPort          int             `json:"internal_port"`     // 3000, 8000, 8080, etc.
-	HealthCheckPath       *string         `json:"health_check_path"` // Nullable
-	HealthCheckEnabled    bool            `json:"health_check_enabled"`
-	HealthStrategy        string          `json:"health_strategy"` // "auto", "http", "tcp", "none"
-	Status                string          `json:"status"`          // inactive, deploying, running, partially_running, stopped, failed
-	CurrentDeploymentID   *uuid.UUID      `json:"current_deployment_id"`
-	Port                  *int            `json:"port"`
-	PreviewURL            *string         `json:"preview_url,omitempty"`
-	CustomDomain          *string         `json:"custom_domain,omitempty"`
-	MaxTotalMemoryMB      *int            `json:"max_total_memory_mb,omitempty"`
-	MaxTotalCpuMillicores *int            `json:"max_total_cpu_millicores,omitempty"`
-	Services              []*Service      `json:"services,omitempty"`
-	CreatedAt             time.Time       `json:"created_at"`
-	UpdatedAt             time.Time       `json:"updated_at"`
+	ID                     uuid.UUID       `json:"id"`
+	OwnerID                uuid.UUID       `json:"owner_id"`
+	SourceID               *uuid.UUID      `json:"source_id,omitempty"`
+	Name                   string          `json:"name"`
+	Slug                   string          `json:"slug"`
+	SourceType             string          `json:"source_type"`      // "local_agent", "local_directory", "local_upload", "github", or legacy "local"
+	SourceReference        string          `json:"source_reference"` // repo "owner/repo" or local upload source_id
+	RepositoryPath         string          `json:"repository_path"`  // host path for local_directory projects
+	Branch                 string          `json:"branch"`
+	DeploymentStrategy     string          `json:"deployment_strategy"` // "auto", "compose", "dockerfile", "custom"
+	DeploymentMode         string          `json:"deployment_mode"`     // "standard" or "blue_green"
+	DeploymentPlan         json.RawMessage `json:"deployment_plan,omitempty"`
+	DockerfilePath         string          `json:"dockerfile_path"`
+	BuildContext           string          `json:"build_context"`
+	BuildStrategy          string          `json:"build_strategy"` // "auto" or "dockerfile"
+	BuildCommand           string          `json:"build_command"`
+	StartCommand           string          `json:"start_command"`
+	RuntimeType            string          `json:"runtime_type"`      // "nextjs", "nodejs", "python-fastapi", "go", etc.
+	InternalPort           int             `json:"internal_port"`     // 3000, 8000, 8080, etc.
+	HealthCheckPath        *string         `json:"health_check_path"` // Nullable
+	HealthCheckEnabled     bool            `json:"health_check_enabled"`
+	HealthStrategy         string          `json:"health_strategy"` // "auto", "http", "tcp", "none"
+	Status                 string          `json:"status"`          // inactive, deploying, running, degraded, partially_running, stopped, failed
+	CurrentDeploymentID    *uuid.UUID      `json:"current_deployment_id"`
+	Port                   *int            `json:"port"`
+	PreviewURL             *string         `json:"preview_url,omitempty"`
+	CustomDomain           *string         `json:"custom_domain,omitempty"`
+	AutoDeploy             bool            `json:"auto_deploy"`
+	AutoDeployBranch       string          `json:"auto_deploy_branch,omitempty"`
+	HasWebhookSecret       bool            `json:"has_webhook_secret"`
+	EncryptedWebhookSecret []byte          `json:"-"` // Encrypted HMAC secret; never serialized
+	MaxTotalMemoryMB       *int            `json:"max_total_memory_mb,omitempty"`
+	MaxTotalCpuMillicores  *int            `json:"max_total_cpu_millicores,omitempty"`
+	Services               []*Service      `json:"services,omitempty"`
+	CreatedAt              time.Time       `json:"created_at"`
+	UpdatedAt              time.Time       `json:"updated_at"`
 }
 
 // Source represents an abstracted code origin (local agent session, archive upload, or GitHub repo).
@@ -409,7 +414,8 @@ type Service struct {
 	HealthStrategy             string              `json:"health_strategy"`
 	HealthCheckPath            *string             `json:"health_check_path"`
 	HealthCheckEnabled         bool                `json:"health_check_enabled"`
-	Status                     string              `json:"status"` // inactive, deploying, running, stopped, failed
+	DeploymentMode             string              `json:"deployment_mode"` // "standard" or "blue_green"
+	Status                     string              `json:"status"`          // inactive, deploying, running, degraded, stopped, failed
 	ContainerID                *string             `json:"container_id"`
 	ImageTag                   *string             `json:"image_tag"`
 	PreviewURL                 *string             `json:"preview_url,omitempty"`
@@ -577,11 +583,27 @@ const (
 	ExecutionModeReuseImage = "reuse_image"
 )
 
+// Deployment mode constants
+const (
+	DeploymentModeStandard  = "standard"
+	DeploymentModeBlueGreen = "blue_green"
+)
+
+// IsValidDeploymentMode validates whether mode is "standard" or "blue_green".
+func IsValidDeploymentMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case DeploymentModeStandard, DeploymentModeBlueGreen:
+		return true
+	}
+	return false
+}
+
 // ProjectStatus constants (coarse states for display — derived from service states)
 const (
 	ProjectStatusInactive         = "inactive"
 	ProjectStatusDeploying        = "deploying"
 	ProjectStatusRunning          = "running"
+	ProjectStatusDegraded         = "degraded"
 	ProjectStatusPartiallyRunning = "partially_running"
 	ProjectStatusStopped          = "stopped"
 	ProjectStatusFailed           = "failed"
@@ -593,6 +615,7 @@ const (
 	ServiceStatusInactive  = "inactive"
 	ServiceStatusDeploying = "deploying"
 	ServiceStatusRunning   = "running"
+	ServiceStatusDegraded  = "degraded"
 	ServiceStatusStopped   = "stopped"
 	ServiceStatusFailed    = "failed"
 )
@@ -719,4 +742,45 @@ type RefreshToken struct {
 	ExpiresAt time.Time `json:"expires_at"`
 	CreatedAt time.Time `json:"created_at"`
 	Revoked   bool      `json:"revoked"`
+}
+
+// Custom domain TLS status constants.
+const (
+	DomainTLSStatusPending = "pending"
+	DomainTLSStatusActive  = "active"
+	DomainTLSStatusError   = "error"
+)
+
+// CustomDomain represents a verified or pending custom hostname bound to a project/service.
+type CustomDomain struct {
+	ID                      uuid.UUID  `json:"id"`
+	ProjectID               uuid.UUID  `json:"project_id"`
+	ServiceID               *uuid.UUID `json:"service_id,omitempty"`
+	Domain                  string     `json:"domain"`
+	VerificationToken       string     `json:"verification_token"`
+	Verified                bool       `json:"verified"`
+	TLSStatus               string     `json:"tls_status"`
+	TargetPort              int        `json:"target_port"`
+	VerificationRecordName  string     `json:"verification_record_name"`
+	VerificationRecordValue string     `json:"verification_record_value"`
+	CNAMEInstruction        string     `json:"cname_instruction,omitempty"`
+	LastCheckedAt           *time.Time `json:"last_checked_at,omitempty"`
+	LastError               *string    `json:"last_error,omitempty"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
+}
+
+// PopulateDNSInstructions fills computed DNS record guidance fields for UI and API consumers.
+func (d *CustomDomain) PopulateDNSInstructions(ingressHost string) {
+	if d == nil {
+		return
+	}
+	d.VerificationRecordName = "_forgelab-verify." + d.Domain
+	d.VerificationRecordValue = d.VerificationToken
+	host := strings.TrimSpace(ingressHost)
+	if host != "" {
+		d.CNAMEInstruction = fmt.Sprintf("CNAME %s -> %s", d.Domain, host)
+	} else {
+		d.CNAMEInstruction = fmt.Sprintf("Point A or CNAME record for %s to your ForgeLAB host", d.Domain)
+	}
 }

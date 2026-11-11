@@ -27,14 +27,86 @@ var (
 
 // DeploymentService handles deployment-related business logic.
 type DeploymentService struct {
-	db            *pgxpool.Pool
-	secretService *SecretService
-	githubService *GitHubService
+	db                                       *pgxpool.Pool
+	secretService                            *SecretService
+	githubService                            *GitHubService
+	getDeploymentForTest                     func(ctx context.Context, deploymentID uuid.UUID) (*models.Deployment, error)
+	getServiceDeploymentForTest              func(ctx context.Context, serviceDeploymentID uuid.UUID) (*models.ServiceDeployment, error)
+	listServiceDeploymentsForTest            func(ctx context.Context, deploymentID uuid.UUID) ([]*models.ServiceDeployment, error)
+	updateDeploymentStatusForTest            func(ctx context.Context, deploymentID uuid.UUID, newStatus string, failureReason *string) error
+	updateServiceDeploymentStatusForTest     func(ctx context.Context, serviceDeploymentID uuid.UUID, newStatus string, failureReason *string) error
+	resetInterruptedServiceDeploymentForTest func(ctx context.Context, serviceDeploymentID uuid.UUID) error
+	updateServiceDeploymentContainerForTest  func(ctx context.Context, serviceDeploymentID uuid.UUID, containerID string, hostPort *int) error
+	setCurrentDeploymentForTest              func(ctx context.Context, projectID, deploymentID uuid.UUID, projectStatus string) error
+	failServiceDeploymentForTest             func(ctx context.Context, serviceDeploymentID uuid.UUID, reason string) error
+	rollbackServiceDeploymentForTest         func(ctx context.Context, project *models.Project, targetService *models.Service) (*models.ServiceDeployment, error)
+	addDeploymentServiceLogForTest           func(ctx context.Context, deploymentID, serviceDeploymentID, serviceID *uuid.UUID, phase, stream, message string) (*models.DeploymentLog, error)
+	createDeploymentWithCommitForTest        func(ctx context.Context, project *models.Project, commitSHA *string) (*models.Deployment, error)
 }
 
 // NewDeploymentService creates a new DeploymentService.
 func NewDeploymentService(db *pgxpool.Pool) *DeploymentService {
 	return &DeploymentService{db: db}
+}
+
+// SetGetDeploymentForTest configures a test hook for GetDeployment.
+func (s *DeploymentService) SetGetDeploymentForTest(fn func(ctx context.Context, deploymentID uuid.UUID) (*models.Deployment, error)) {
+	s.getDeploymentForTest = fn
+}
+
+// SetGetServiceDeploymentForTest configures a test hook for GetServiceDeployment.
+func (s *DeploymentService) SetGetServiceDeploymentForTest(fn func(ctx context.Context, serviceDeploymentID uuid.UUID) (*models.ServiceDeployment, error)) {
+	s.getServiceDeploymentForTest = fn
+}
+
+// SetListServiceDeploymentsForTest configures a test hook for ListServiceDeployments.
+func (s *DeploymentService) SetListServiceDeploymentsForTest(fn func(ctx context.Context, deploymentID uuid.UUID) ([]*models.ServiceDeployment, error)) {
+	s.listServiceDeploymentsForTest = fn
+}
+
+// SetUpdateDeploymentStatusForTest configures a test hook for UpdateDeploymentStatus.
+func (s *DeploymentService) SetUpdateDeploymentStatusForTest(fn func(ctx context.Context, deploymentID uuid.UUID, newStatus string, failureReason *string) error) {
+	s.updateDeploymentStatusForTest = fn
+}
+
+// SetUpdateServiceDeploymentStatusForTest configures a test hook for UpdateServiceDeploymentStatus.
+func (s *DeploymentService) SetUpdateServiceDeploymentStatusForTest(fn func(ctx context.Context, serviceDeploymentID uuid.UUID, newStatus string, failureReason *string) error) {
+	s.updateServiceDeploymentStatusForTest = fn
+}
+
+// SetResetInterruptedServiceDeploymentForTest configures a test hook for ResetInterruptedServiceDeployment.
+func (s *DeploymentService) SetResetInterruptedServiceDeploymentForTest(fn func(ctx context.Context, serviceDeploymentID uuid.UUID) error) {
+	s.resetInterruptedServiceDeploymentForTest = fn
+}
+
+// SetUpdateServiceDeploymentContainerForTest configures a test hook for UpdateServiceDeploymentContainer.
+func (s *DeploymentService) SetUpdateServiceDeploymentContainerForTest(fn func(ctx context.Context, serviceDeploymentID uuid.UUID, containerID string, hostPort *int) error) {
+	s.updateServiceDeploymentContainerForTest = fn
+}
+
+// SetCurrentDeploymentForTest configures a test hook for SetCurrentDeployment.
+func (s *DeploymentService) SetCurrentDeploymentForTest(fn func(ctx context.Context, projectID, deploymentID uuid.UUID, projectStatus string) error) {
+	s.setCurrentDeploymentForTest = fn
+}
+
+// SetFailServiceDeploymentForTest configures a test hook for FailServiceDeployment.
+func (s *DeploymentService) SetFailServiceDeploymentForTest(fn func(ctx context.Context, serviceDeploymentID uuid.UUID, reason string) error) {
+	s.failServiceDeploymentForTest = fn
+}
+
+// SetRollbackServiceDeploymentForTest configures a test hook for RollbackServiceDeployment.
+func (s *DeploymentService) SetRollbackServiceDeploymentForTest(fn func(ctx context.Context, project *models.Project, targetService *models.Service) (*models.ServiceDeployment, error)) {
+	s.rollbackServiceDeploymentForTest = fn
+}
+
+// SetAddDeploymentServiceLogForTest configures a test hook for AddDeploymentServiceLog.
+func (s *DeploymentService) SetAddDeploymentServiceLogForTest(fn func(ctx context.Context, deploymentID, serviceDeploymentID, serviceID *uuid.UUID, phase, stream, message string) (*models.DeploymentLog, error)) {
+	s.addDeploymentServiceLogForTest = fn
+}
+
+// SetCreateDeploymentWithCommitForTest configures a test hook for CreateDeploymentWithCommit.
+func (s *DeploymentService) SetCreateDeploymentWithCommitForTest(fn func(ctx context.Context, project *models.Project, commitSHA *string) (*models.Deployment, error)) {
+	s.createDeploymentWithCommitForTest = fn
 }
 
 // SetSecretService sets the SecretService instance for env hash calculations.

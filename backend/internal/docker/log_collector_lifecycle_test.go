@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -61,12 +61,10 @@ func TestLogCollector_LifetimeAfterDeploymentCompletion(t *testing.T) {
 		if strings.Contains(r.URL.Path, "/json") {
 			atomic.AddInt32(&inspectCalled, 1)
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					ID: cID,
-					State: &types.ContainerState{
-						Running: true,
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				ID: cID,
+				State: &container.State{
+					Running: true,
 				},
 			})
 			return
@@ -149,12 +147,10 @@ func TestLogCollector_BoundedRetriesOnStreamDrop(t *testing.T) {
 		if strings.Contains(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
 			running := atomic.LoadInt32(&isRunning) == 1
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					ID: cID,
-					State: &types.ContainerState{
-						Running: running,
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				ID: cID,
+				State: &container.State{
+					Running: running,
 				},
 			})
 			return
@@ -254,10 +250,10 @@ func TestLogCollector_BackendRestartRecovery(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/containers/json") {
-			containers := []types.Container{
+			containers := []container.Summary{
 				{
 					ID:    runningSvcContainerID,
-					State: "running",
+					State: container.StateRunning,
 					Labels: map[string]string{
 						"forgelab.project_id":            projID.String(),
 						"forgelab.service_deployment_id": sdID.String(),
@@ -265,7 +261,7 @@ func TestLogCollector_BackendRestartRecovery(t *testing.T) {
 				},
 				{
 					ID:    runningLegacyContainerID,
-					State: "running",
+					State: container.StateRunning,
 					Labels: map[string]string{
 						"forgelab.project_id":    projID.String(),
 						"forgelab.deployment_id": legacyDeployID.String(),
@@ -276,11 +272,9 @@ func TestLogCollector_BackendRestartRecovery(t *testing.T) {
 			return
 		}
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{
-						Running: true,
-					},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{
+					Running: true,
 				},
 			})
 			return
@@ -667,10 +661,8 @@ func TestLogCollector_MultiServicePipeline_PersistenceAndWebSocket(t *testing.T)
 			return
 		}
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{Running: true},
-				},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{Running: true},
 			})
 			return
 		}

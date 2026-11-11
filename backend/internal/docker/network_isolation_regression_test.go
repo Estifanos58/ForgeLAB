@@ -9,10 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -31,10 +30,10 @@ func newDirectTestDockerClient(t *testing.T, handler http.Handler) (*client.Clie
 		handler.ServeHTTP(w, r)
 	})
 	server := httptest.NewServer(wrapped)
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(server.URL),
 		client.WithHTTPClient(server.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 
@@ -178,10 +177,8 @@ func TestNetwork_SecondaryNetworkAttachmentFailure_TreatedAsFatal(t *testing.T) 
 
 		// 1. ContainerInspect
 		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
-			_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-				ContainerJSONBase: &types.ContainerJSONBase{
-					State: &types.ContainerState{Running: true},
-				},
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				State: &container.State{Running: true},
 			})
 			return
 		}
@@ -213,12 +210,12 @@ func TestNetwork_SecondaryNetworkAttachmentFailure_TreatedAsFatal(t *testing.T) 
 	containerID := "test-container-sec-fail"
 	secNet := "forgelab-net-isolated"
 
-	netConnErr := cli.NetworkConnect(execCtx, secNet, containerID, nil)
+	_, netConnErr := cli.NetworkConnect(execCtx, secNet, client.NetworkConnectOptions{Container: containerID})
 	require.Error(t, netConnErr)
 
 	// In engine.go, when netConnErr != nil:
 	// Container is removed, port is released, and deployment fails with error
-	_ = cli.ContainerRemove(context.Background(), containerID, container.RemoveOptions{Force: true})
+	_, _ = cli.ContainerRemove(context.Background(), containerID, client.ContainerRemoveOptions{Force: true})
 
 	assert.Equal(t, int32(1), networkConnectCalls.Load())
 	assert.Equal(t, int32(1), containerRemoveCalls.Load(), "container must be destroyed when network connection fails")

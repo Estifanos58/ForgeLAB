@@ -16,6 +16,12 @@ import (
 
 // RollbackServiceDeployment rolls back an individual service to its previous successful deployment release.
 func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, project *models.Project, targetService *models.Service) (*models.ServiceDeployment, error) {
+	if s.rollbackServiceDeploymentForTest != nil {
+		return s.rollbackServiceDeploymentForTest(ctx, project, targetService)
+	}
+	if s.db == nil {
+		return nil, ErrNoDeploymentToRollback
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
@@ -61,10 +67,14 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 	// Determine the deployment number boundary to ensure we never select the current deployment
 	var beforeDeployNumber int
 	if targetService.CurrentServiceDeploymentID != nil {
-		_ = tx.QueryRow(ctx, "SELECT deploy_number FROM service_deployments WHERE id = $1", *targetService.CurrentServiceDeploymentID).Scan(&beforeDeployNumber)
+		if err := tx.QueryRow(ctx, "SELECT deploy_number FROM service_deployments WHERE id = $1", *targetService.CurrentServiceDeploymentID).Scan(&beforeDeployNumber); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("failed to resolve current service deployment number: %w", err)
+		}
 	}
 	if beforeDeployNumber <= 0 {
-		_ = tx.QueryRow(ctx, "SELECT COALESCE(MAX(deploy_number), 0) FROM service_deployments WHERE service_id = $1", targetService.ID).Scan(&beforeDeployNumber)
+		if err := tx.QueryRow(ctx, "SELECT COALESCE(MAX(deploy_number), 0) FROM service_deployments WHERE service_id = $1", targetService.ID).Scan(&beforeDeployNumber); err != nil {
+			return nil, fmt.Errorf("failed to resolve max service deployment number: %w", err)
+		}
 	}
 	if beforeDeployNumber <= 1 {
 		return nil, ErrNoDeploymentToRollback
@@ -112,38 +122,50 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 	}
 
 	if len(prevDependsOnJSON) > 0 {
-		_ = json.Unmarshal(prevDependsOnJSON, &prev.DependsOn)
+		if err := json.Unmarshal(prevDependsOnJSON, &prev.DependsOn); err != nil {
+			slog.Warn("failed to decode previous service deployment depends_on during rollback", "service_deployment_id", prev.ID, "error", err)
+		}
 	}
 	if prev.DependsOn == nil {
 		prev.DependsOn = []string{}
 	}
 	if len(prevVolumesJSON) > 0 {
-		_ = json.Unmarshal(prevVolumesJSON, &prev.Volumes)
+		if err := json.Unmarshal(prevVolumesJSON, &prev.Volumes); err != nil {
+			slog.Warn("failed to decode previous service deployment volumes during rollback", "service_deployment_id", prev.ID, "error", err)
+		}
 	}
 	if prev.Volumes == nil {
 		prev.Volumes = []models.VolumeMountConfig{}
 	}
 	if len(prevNetworksJSON) > 0 {
-		_ = json.Unmarshal(prevNetworksJSON, &prev.Networks)
+		if err := json.Unmarshal(prevNetworksJSON, &prev.Networks); err != nil {
+			slog.Warn("failed to decode previous service deployment networks during rollback", "service_deployment_id", prev.ID, "error", err)
+		}
 	}
 	if prev.Networks == nil {
 		prev.Networks = []string{}
 	}
 	if len(prevHcJSON) > 0 && string(prevHcJSON) != "{}" {
 		var hc models.HealthCheckConfig
-		if err := json.Unmarshal(prevHcJSON, &hc); err == nil {
+		if err := json.Unmarshal(prevHcJSON, &hc); err != nil {
+			slog.Warn("failed to decode previous service deployment healthcheck_config during rollback", "service_deployment_id", prev.ID, "error", err)
+		} else {
 			prev.HealthCheckConfig = &hc
 		}
 	}
 	if len(prevDocJSON) > 0 && string(prevDocJSON) != "{}" {
-		_ = json.Unmarshal(prevDocJSON, &prev.DependsOnConditions)
+		if err := json.Unmarshal(prevDocJSON, &prev.DependsOnConditions); err != nil {
+			slog.Warn("failed to decode previous service deployment depends_on_conditions during rollback", "service_deployment_id", prev.ID, "error", err)
+		}
 	}
 	if prev.DependsOnConditions == nil {
 		prev.DependsOnConditions = map[string]string{}
 	}
 
 	var maxNumber *int
-	_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", targetService.ID).Scan(&maxNumber)
+	if err := tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", targetService.ID).Scan(&maxNumber); err != nil {
+		return nil, fmt.Errorf("failed to resolve next service deploy number: %w", err)
+	}
 	deployNumber := 1
 	if maxNumber != nil {
 		deployNumber = *maxNumber + 1
@@ -191,16 +213,31 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		CreatedAt:           now,
 	}
 
-	dependsOnBytes, _ := json.Marshal(serviceDeployment.DependsOn)
-	volumesBytes, _ := json.Marshal(serviceDeployment.Volumes)
-	networksBytes, _ := json.Marshal(serviceDeployment.Networks)
+	dependsOnBytes, err := json.Marshal(serviceDeployment.DependsOn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal rollback service depends_on: %w", err)
+	}
+	volumesBytes, err := json.Marshal(serviceDeployment.Volumes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal rollback service volumes: %w", err)
+	}
+	networksBytes, err := json.Marshal(serviceDeployment.Networks)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal rollback service networks: %w", err)
+	}
 	var hcBytes []byte
 	if serviceDeployment.HealthCheckConfig != nil {
-		hcBytes, _ = json.Marshal(serviceDeployment.HealthCheckConfig)
+		hcBytes, err = json.Marshal(serviceDeployment.HealthCheckConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal rollback service healthcheck_config: %w", err)
+		}
 	} else {
 		hcBytes = []byte("{}")
 	}
-	dependsOnCondBytes, _ := json.Marshal(serviceDeployment.DependsOnConditions)
+	dependsOnCondBytes, err := json.Marshal(serviceDeployment.DependsOnConditions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal rollback service depends_on_conditions: %w", err)
+	}
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO service_deployments (
@@ -239,9 +276,14 @@ func (s *DeploymentService) RollbackServiceDeployment(ctx context.Context, proje
 		return nil, fmt.Errorf("failed to update service status for rollback: %w", err)
 	}
 
-	allServices, _ := s.listServicesTx(ctx, tx, project.ID)
+	allServices, err := s.listServicesTx(ctx, tx, project.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list project services for rollback status recalculation: %w", err)
+	}
 	newProjectStatus := CalculateProjectStatus(allServices)
-	_, _ = tx.Exec(ctx, "UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3", newProjectStatus, now, project.ID)
+	if _, err := tx.Exec(ctx, "UPDATE projects SET status = $1, updated_at = $2 WHERE id = $3", newProjectStatus, now, project.ID); err != nil {
+		return nil, fmt.Errorf("failed to update project status for rollback: %w", err)
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("failed to commit service rollback: %w", err)
@@ -307,10 +349,14 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 	// Determine the deployment number boundary strictly before the current deployment
 	var beforeDeployNumber int
 	if project.CurrentDeploymentID != nil {
-		_ = tx.QueryRow(ctx, "SELECT deploy_number FROM deployments WHERE id = $1", *project.CurrentDeploymentID).Scan(&beforeDeployNumber)
+		if err := tx.QueryRow(ctx, "SELECT deploy_number FROM deployments WHERE id = $1", *project.CurrentDeploymentID).Scan(&beforeDeployNumber); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("failed to resolve current project deployment number: %w", err)
+		}
 	}
 	if beforeDeployNumber <= 0 {
-		_ = tx.QueryRow(ctx, "SELECT COALESCE(MAX(deploy_number), 0) FROM deployments WHERE project_id = $1", project.ID).Scan(&beforeDeployNumber)
+		if err := tx.QueryRow(ctx, "SELECT COALESCE(MAX(deploy_number), 0) FROM deployments WHERE project_id = $1", project.ID).Scan(&beforeDeployNumber); err != nil {
+			return nil, fmt.Errorf("failed to resolve max project deployment number: %w", err)
+		}
 	}
 	if beforeDeployNumber <= 1 {
 		return nil, ErrNoDeploymentToRollback
@@ -391,7 +437,9 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 	}
 
 	var maxNumber *int
-	_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM deployments WHERE project_id = $1", project.ID).Scan(&maxNumber)
+	if err := tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM deployments WHERE project_id = $1", project.ID).Scan(&maxNumber); err != nil {
+		return nil, fmt.Errorf("failed to resolve next project deploy number: %w", err)
+	}
 	deployNumber := 1
 	if maxNumber != nil {
 		deployNumber = *maxNumber + 1
@@ -471,40 +519,55 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 			&prevSvc.ImageDigest, &prevSvc.SourceRevision, &prevSvc.EnvConfigHash, &prevSvc.ExecutionMode, &prevSvc.EnvSnapshot,
 			&prevSvc.Classification, &prevSvc.Image, &prevDependsOnJSON, &prevVolumesJSON, &prevNetworksJSON, &prevHcJSON, &prevDocJSON,
 		)
+		if sErr != nil && !errors.Is(sErr, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("failed to find previous deployment for service %s: %w", svcItem.Name, sErr)
+		}
 
 		if len(prevDependsOnJSON) > 0 {
-			_ = json.Unmarshal(prevDependsOnJSON, &prevSvc.DependsOn)
+			if err := json.Unmarshal(prevDependsOnJSON, &prevSvc.DependsOn); err != nil {
+				slog.Warn("failed to decode service depends_on during project rollback", "service", svcItem.Name, "error", err)
+			}
 		}
 		if prevSvc.DependsOn == nil {
 			prevSvc.DependsOn = []string{}
 		}
 		if len(prevVolumesJSON) > 0 {
-			_ = json.Unmarshal(prevVolumesJSON, &prevSvc.Volumes)
+			if err := json.Unmarshal(prevVolumesJSON, &prevSvc.Volumes); err != nil {
+				slog.Warn("failed to decode service volumes during project rollback", "service", svcItem.Name, "error", err)
+			}
 		}
 		if prevSvc.Volumes == nil {
 			prevSvc.Volumes = []models.VolumeMountConfig{}
 		}
 		if len(prevNetworksJSON) > 0 {
-			_ = json.Unmarshal(prevNetworksJSON, &prevSvc.Networks)
+			if err := json.Unmarshal(prevNetworksJSON, &prevSvc.Networks); err != nil {
+				slog.Warn("failed to decode service networks during project rollback", "service", svcItem.Name, "error", err)
+			}
 		}
 		if prevSvc.Networks == nil {
 			prevSvc.Networks = []string{}
 		}
 		if len(prevHcJSON) > 0 && string(prevHcJSON) != "{}" {
 			var hc models.HealthCheckConfig
-			if err := json.Unmarshal(prevHcJSON, &hc); err == nil {
+			if err := json.Unmarshal(prevHcJSON, &hc); err != nil {
+				slog.Warn("failed to decode service healthcheck_config during project rollback", "service", svcItem.Name, "error", err)
+			} else {
 				prevSvc.HealthCheckConfig = &hc
 			}
 		}
 		if len(prevDocJSON) > 0 && string(prevDocJSON) != "{}" {
-			_ = json.Unmarshal(prevDocJSON, &prevSvc.DependsOnConditions)
+			if err := json.Unmarshal(prevDocJSON, &prevSvc.DependsOnConditions); err != nil {
+				slog.Warn("failed to decode service depends_on_conditions during project rollback", "service", svcItem.Name, "error", err)
+			}
 		}
 		if prevSvc.DependsOnConditions == nil {
 			prevSvc.DependsOnConditions = map[string]string{}
 		}
 
 		var svcMaxNum *int
-		_ = tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", svcItem.ID).Scan(&svcMaxNum)
+		if err := tx.QueryRow(ctx, "SELECT MAX(deploy_number) FROM service_deployments WHERE service_id = $1", svcItem.ID).Scan(&svcMaxNum); err != nil {
+			return nil, fmt.Errorf("failed to resolve next service deploy number for %s: %w", svcItem.Name, err)
+		}
 		svcDeployNum := 1
 		if svcMaxNum != nil {
 			svcDeployNum = *svcMaxNum + 1
@@ -557,16 +620,31 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 			sd.ResourceConfig = prevSvc.ResourceConfig
 		}
 
-		dependsOnBytes, _ := json.Marshal(sd.DependsOn)
-		volumesBytes, _ := json.Marshal(sd.Volumes)
-		networksBytes, _ := json.Marshal(sd.Networks)
+		dependsOnBytes, err := json.Marshal(sd.DependsOn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal depends_on for rollback service %s: %w", svcItem.Name, err)
+		}
+		volumesBytes, err := json.Marshal(sd.Volumes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal volumes for rollback service %s: %w", svcItem.Name, err)
+		}
+		networksBytes, err := json.Marshal(sd.Networks)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal networks for rollback service %s: %w", svcItem.Name, err)
+		}
 		var hcBytes []byte
 		if sd.HealthCheckConfig != nil {
-			hcBytes, _ = json.Marshal(sd.HealthCheckConfig)
+			hcBytes, err = json.Marshal(sd.HealthCheckConfig)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal healthcheck_config for rollback service %s: %w", svcItem.Name, err)
+			}
 		} else {
 			hcBytes = []byte("{}")
 		}
-		dependsOnCondBytes, _ := json.Marshal(sd.DependsOnConditions)
+		dependsOnCondBytes, err := json.Marshal(sd.DependsOnConditions)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal depends_on_conditions for rollback service %s: %w", svcItem.Name, err)
+		}
 
 		if _, insErr := tx.Exec(ctx,
 			`INSERT INTO service_deployments (
@@ -591,7 +669,9 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, project *mod
 			return nil, fmt.Errorf("failed to insert rollback service deployment for service %s: %w", svcItem.Name, insErr)
 		}
 
-		_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3", models.ServiceStatusDeploying, now, svcItem.ID)
+		if _, err := tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3", models.ServiceStatusDeploying, now, svcItem.ID); err != nil {
+			return nil, fmt.Errorf("failed to update service %s status for rollback: %w", svcItem.Name, err)
+		}
 		newDeploy.ServiceDeployments = append(newDeploy.ServiceDeployments, sd)
 	}
 

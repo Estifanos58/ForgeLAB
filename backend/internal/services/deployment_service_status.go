@@ -16,6 +16,12 @@ import (
 
 // UpdateDeploymentStatus updates the status of a deployment enforcing valid state transitions atomically.
 func (s *DeploymentService) UpdateDeploymentStatus(ctx context.Context, deploymentID uuid.UUID, newStatus string, failureReason *string) error {
+	if s.updateDeploymentStatusForTest != nil {
+		return s.updateDeploymentStatusForTest(ctx, deploymentID, newStatus, failureReason)
+	}
+	if s.db == nil {
+		return nil
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -113,6 +119,12 @@ func (s *DeploymentService) UpdateDeploymentContainer(ctx context.Context, deplo
 
 // SetCurrentDeployment updates the project's current deployment and status, guarding against stale workers overwriting newer deployments.
 func (s *DeploymentService) SetCurrentDeployment(ctx context.Context, projectID, deploymentID uuid.UUID, projectStatus string) error {
+	if s.setCurrentDeploymentForTest != nil {
+		return s.setCurrentDeploymentForTest(ctx, projectID, deploymentID, projectStatus)
+	}
+	if s.db == nil {
+		return nil
+	}
 	res, err := s.db.Exec(ctx,
 		`UPDATE projects SET
 		 current_deployment_id = $1, status = $2, updated_at = $3
@@ -138,6 +150,12 @@ func (s *DeploymentService) SetCurrentDeployment(ctx context.Context, projectID,
 
 // UpdateServiceDeploymentStatus updates status for an individual service deployment with state validation and atomic lock.
 func (s *DeploymentService) UpdateServiceDeploymentStatus(ctx context.Context, serviceDeploymentID uuid.UUID, newStatus string, failureReason *string) error {
+	if s.updateServiceDeploymentStatusForTest != nil {
+		return s.updateServiceDeploymentStatusForTest(ctx, serviceDeploymentID, newStatus, failureReason)
+	}
+	if s.db == nil {
+		return nil
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -208,6 +226,31 @@ func (s *DeploymentService) UpdateServiceDeploymentStatus(ctx context.Context, s
 	return tx.Commit(ctx)
 }
 
+// ResetInterruptedServiceDeployment safely resets a service deployment prematurely marked as
+// interrupted by backend restart reconciliation back to queued so an active release execution can run it.
+// Unlike normal transitions, this specifically requires status='failed' with the restart interruption marker.
+func (s *DeploymentService) ResetInterruptedServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) error {
+	if s.resetInterruptedServiceDeploymentForTest != nil {
+		return s.resetInterruptedServiceDeploymentForTest(ctx, serviceDeploymentID)
+	}
+	if s.db == nil {
+		return nil
+	}
+	res, err := s.db.Exec(ctx,
+		`UPDATE service_deployments
+		 SET status = $2, failure_reason = NULL, finished_at = NULL, duration_ms = NULL
+		 WHERE id = $1 AND status = $3 AND failure_reason LIKE '%interrupted: backend restarted%'`,
+		serviceDeploymentID, models.DeployStatusQueued, models.DeployStatusFailed,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to reset interrupted service deployment: %w", err)
+	}
+	if res.RowsAffected() == 0 {
+		return fmt.Errorf("service deployment %s is not eligible for interrupt recovery", serviceDeploymentID)
+	}
+	return nil
+}
+
 // UpdateServiceDeploymentStatusByDepAndSvc provides backward compatibility for release-level updates.
 func (s *DeploymentService) UpdateServiceDeploymentStatusByDepAndSvc(ctx context.Context, deploymentID, serviceID uuid.UUID, newStatus string, failureReason *string) error {
 	var sdID uuid.UUID
@@ -220,6 +263,12 @@ func (s *DeploymentService) UpdateServiceDeploymentStatusByDepAndSvc(ctx context
 
 // UpdateServiceDeploymentContainer records container ID and allocated host port for a service deployment.
 func (s *DeploymentService) UpdateServiceDeploymentContainer(ctx context.Context, serviceDeploymentID uuid.UUID, containerID string, hostPort *int) error {
+	if s.updateServiceDeploymentContainerForTest != nil {
+		return s.updateServiceDeploymentContainerForTest(ctx, serviceDeploymentID, containerID, hostPort)
+	}
+	if s.db == nil {
+		return nil
+	}
 	_, err := s.db.Exec(ctx,
 		`UPDATE service_deployments SET
 		 container_id = $2,
@@ -276,6 +325,12 @@ func (s *DeploymentService) UpdateDeploymentImageDigest(ctx context.Context, dep
 // FailServiceDeployment marks a service deployment as failed and restores the service status.
 // Used when enqueue fails or for cleanup of zombie records.
 func (s *DeploymentService) FailServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID, reason string) error {
+	if s.failServiceDeploymentForTest != nil {
+		return s.failServiceDeploymentForTest(ctx, serviceDeploymentID, reason)
+	}
+	if s.db == nil {
+		return nil
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return err
@@ -298,20 +353,30 @@ func (s *DeploymentService) FailServiceDeployment(ctx context.Context, serviceDe
 	// Restore the service status: if it was running before this deploy, restore to running.
 	// Otherwise set to failed.
 	var serviceID uuid.UUID
-	_ = tx.QueryRow(ctx, "SELECT service_id FROM service_deployments WHERE id = $1", serviceDeploymentID).Scan(&serviceID)
+	err = tx.QueryRow(ctx, "SELECT service_id FROM service_deployments WHERE id = $1", serviceDeploymentID).Scan(&serviceID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("failed to resolve service_id for failed service deployment: %w", err)
+	}
 	if serviceID != uuid.Nil {
 		var prevRunningID *uuid.UUID
-		_ = tx.QueryRow(ctx,
+		err = tx.QueryRow(ctx,
 			`SELECT id FROM service_deployments WHERE service_id = $1 AND status = $2 AND id != $3 ORDER BY deploy_number DESC LIMIT 1`,
 			serviceID, models.DeployStatusRunning, serviceDeploymentID,
 		).Scan(&prevRunningID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("failed to check prior running service deployment: %w", err)
+		}
 
 		if prevRunningID != nil {
-			_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
-				models.ServiceStatusRunning, now, serviceID)
+			if _, err := tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+				models.ServiceStatusRunning, now, serviceID); err != nil {
+				return fmt.Errorf("failed to restore running service status: %w", err)
+			}
 		} else {
-			_, _ = tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
-				models.ServiceStatusFailed, now, serviceID)
+			if _, err := tx.Exec(ctx, "UPDATE services SET status = $1, updated_at = $2 WHERE id = $3",
+				models.ServiceStatusFailed, now, serviceID); err != nil {
+				return fmt.Errorf("failed to mark service status failed: %w", err)
+			}
 		}
 	}
 

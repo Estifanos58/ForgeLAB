@@ -15,6 +15,9 @@ import (
 
 // UpdateProjectStatus updates the overall status of a project.
 func (s *ProjectService) UpdateProjectStatus(ctx context.Context, projectID uuid.UUID, status string) error {
+	if s.updateProjectStatusForTest != nil {
+		return s.updateProjectStatusForTest(ctx, projectID, status)
+	}
 	if s.db == nil {
 		return nil
 	}
@@ -24,6 +27,13 @@ func (s *ProjectService) UpdateProjectStatus(ctx context.Context, projectID uuid
 
 // UpdateProjectPort updates the assigned host port for a project.
 func (s *ProjectService) UpdateProjectPort(ctx context.Context, projectID uuid.UUID, port int) (*models.Project, error) {
+	if s.db == nil {
+		p, err := s.GetProjectByIDWithoutOwnership(ctx, projectID)
+		if p != nil {
+			p.Port = &port
+		}
+		return p, err
+	}
 	_, err := s.db.Exec(ctx,
 		"UPDATE projects SET port = $1, updated_at = $2 WHERE id = $3",
 		port, time.Now(), projectID,
@@ -70,7 +80,7 @@ func (s *ProjectService) PopulateProjectPreviewURL(p *models.Project) {
 			svc.Classification == models.ClassificationJob
 		isFrontend := !isInternal && (svc.Role == models.RoleFrontend || strings.Contains(strings.ToLower(svc.Name), "frontend"))
 		isPublic := !isInternal && (svc.PublicExposed || isFrontend)
-		if svc.Status == models.ServiceStatusRunning && svc.HostPort != nil && *svc.HostPort > 0 && isPublic {
+		if (svc.Status == models.ServiceStatusRunning || svc.Status == models.ServiceStatusDegraded) && svc.HostPort != nil && *svc.HostPort > 0 && isPublic {
 			urlStr := fmt.Sprintf("http://%s:%d", publicHost, *svc.HostPort)
 			svc.PreviewURL = &urlStr
 
@@ -88,7 +98,7 @@ func (s *ProjectService) PopulateProjectPreviewURL(p *models.Project) {
 		p.PreviewURL = frontendSvcURL
 	} else if primarySvcURL != nil {
 		p.PreviewURL = primarySvcURL
-	} else if len(p.Services) == 0 && (p.Status == models.ProjectStatusRunning || p.Status == models.ProjectStatusPartiallyRunning) && p.Port != nil && *p.Port > 0 {
+	} else if len(p.Services) == 0 && (p.Status == models.ProjectStatusRunning || p.Status == models.ProjectStatusDegraded || p.Status == models.ProjectStatusPartiallyRunning) && p.Port != nil && *p.Port > 0 {
 		urlStr := fmt.Sprintf("http://%s:%d", publicHost, *p.Port)
 		p.PreviewURL = &urlStr
 	} else {

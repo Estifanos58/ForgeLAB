@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/build"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -164,10 +164,10 @@ func TestRegression_ResolveBuilder_DaemonReportsBuilderVersion2_NormalDockerfile
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()
@@ -181,7 +181,7 @@ func TestRegression_ResolveBuilder_DaemonReportsBuilderVersion2_NormalDockerfile
 
 	// Normal classic Dockerfile with no explicit options
 	normalDF := []byte("FROM alpine:3.19\nCMD [\"echo\", \"hi\"]\n")
-	resolvedOpts, err := eng.resolveBuilder(context.Background(), normalDF, types.ImageBuildOptions{}, logFn)
+	resolvedOpts, err := eng.resolveBuilder(context.Background(), normalDF, client.ImageBuildOptions{}, logFn)
 	require.NoError(t, err)
 
 	// Since normal Dockerfile does not require BuildKit features, ForgeLAB leaves Version empty
@@ -213,10 +213,10 @@ func TestRegression_ResolveBuilder_DaemonReportsBuilderVersion1_HandlesCorrectly
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()
@@ -228,10 +228,10 @@ func TestRegression_ResolveBuilder_DaemonReportsBuilderVersion1_HandlesCorrectly
 		logFn := func(msg string) { loggedLines = append(loggedLines, msg) }
 
 		normalDF := []byte("FROM alpine:3.19\nCMD [\"echo\", \"hi\"]\n")
-		resolvedOpts, err := eng.resolveBuilder(context.Background(), normalDF, types.ImageBuildOptions{}, logFn)
+		resolvedOpts, err := eng.resolveBuilder(context.Background(), normalDF, client.ImageBuildOptions{}, logFn)
 		require.NoError(t, err, "normal Dockerfile must not error on legacy daemon")
 
-		assert.Equal(t, types.BuilderV1, resolvedOpts.Version, "must select legacy builder (v1) on Builder-Version: 1")
+		assert.Equal(t, build.BuilderV1, resolvedOpts.Version, "must select legacy builder (v1) on Builder-Version: 1")
 
 		allLogs := strings.Join(loggedLines, "\n")
 		assert.Contains(t, allLogs, "Docker daemon available")
@@ -247,7 +247,7 @@ func TestRegression_ResolveBuilder_DaemonReportsBuilderVersion1_HandlesCorrectly
 FROM golang:alpine
 RUN --mount=type=cache,target=/root/.cache/go-build go build ./cmd/server
 `)
-		_, err := eng.resolveBuilder(context.Background(), buildkitDF, types.ImageBuildOptions{}, logFn)
+		_, err := eng.resolveBuilder(context.Background(), buildkitDF, client.ImageBuildOptions{}, logFn)
 		require.Error(t, err, "must fail fast when BuildKit is required but daemon only supports Builder-Version: 1")
 
 		// Verify clear diagnostic message
@@ -290,10 +290,10 @@ func TestRegression_ImageBuildOptions_RequestsBuildKitWhenRequired(t *testing.T)
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()
@@ -313,7 +313,7 @@ CMD ["/app/server"]
 
 	var logLines []string
 	tarRC := io.NopCloser(bytes.NewReader(tarData))
-	buildOpts := types.ImageBuildOptions{
+	buildOpts := client.ImageBuildOptions{
 		Tags:       []string{"forgelab/test-service:1"},
 		Dockerfile: "Dockerfile",
 	}
@@ -324,7 +324,7 @@ CMD ["/app/server"]
 	require.NoError(t, buildErr)
 
 	// Verify Docker SDK ImageBuild was called with version=2 (BuildKit)
-	assert.Equal(t, string(types.BuilderBuildKit), requestedVersion.Load().(string),
+	assert.Equal(t, string(build.BuilderBuildKit), requestedVersion.Load().(string),
 		"Docker ImageBuild must receive query param version=2 (BuildKit)")
 }
 
@@ -455,13 +455,13 @@ func TestLive_BuildKit_BuildImage(t *testing.T) {
 	if testing.Short() || os.Getenv("SKIP_DOCKER_LIVE_TEST") != "" {
 		t.Skip("Skipping live Docker test")
 	}
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Skipf("Docker daemon not available: %v", err)
 	}
 	defer cli.Close()
 
-	if _, err := cli.Ping(context.Background()); err != nil {
+	if _, err := cli.Ping(context.Background(), client.PingOptions{}); err != nil {
 		t.Skipf("Docker daemon ping failed: %v", err)
 	}
 
@@ -481,7 +481,7 @@ func TestLive_BuildKit_BuildImage(t *testing.T) {
 		Matcher:         matcher,
 	})
 
-	opts := types.ImageBuildOptions{
+	opts := client.ImageBuildOptions{
 		Tags:       []string{"forgelab-test-buildimage:latest"},
 		Dockerfile: "Dockerfile",
 	}
@@ -523,10 +523,10 @@ func TestRegression_BuildImage_SetsContentLengthAndDisablesChunkedEncoding(t *te
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()
@@ -546,7 +546,7 @@ func TestRegression_BuildImage_SetsContentLengthAndDisablesChunkedEncoding(t *te
 	_, err = tmpFile.Seek(0, io.SeekStart)
 	require.NoError(t, err)
 
-	opts := types.ImageBuildOptions{
+	opts := client.ImageBuildOptions{
 		Tags:       []string{"forgelab/test-cl:latest"},
 		Dockerfile: "Dockerfile",
 	}
@@ -586,10 +586,10 @@ func TestRegression_BuildImage_BuildKitNoActiveSession_FallsBackToStandardBuilde
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()
@@ -609,10 +609,10 @@ func TestRegression_BuildImage_BuildKitNoActiveSession_FallsBackToStandardBuilde
 	require.NoError(t, err)
 
 	var logLines []string
-	opts := types.ImageBuildOptions{
+	opts := client.ImageBuildOptions{
 		Tags:       []string{"forgelab/test-fallback:latest"},
 		Dockerfile: "Dockerfile",
-		Version:    types.BuilderBuildKit,
+		Version:    build.BuilderBuildKit,
 	}
 
 	buildErr := eng.buildImage(context.Background(), tmpFile, opts, func(msg string) {
@@ -645,10 +645,10 @@ func TestRegression_BuildImage_BuildKitRequiresBuildKit_NeverFallsBackToStandard
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()
@@ -668,10 +668,10 @@ func TestRegression_BuildImage_BuildKitRequiresBuildKit_NeverFallsBackToStandard
 	_, err = tmpFile.Seek(0, io.SeekStart)
 	require.NoError(t, err)
 
-	opts := types.ImageBuildOptions{
+	opts := client.ImageBuildOptions{
 		Tags:       []string{"forgelab/test-no-fallback:latest"},
 		Dockerfile: "Dockerfile",
-		Version:    types.BuilderBuildKit,
+		Version:    build.BuilderBuildKit,
 	}
 
 	buildErr := eng.buildImage(context.Background(), tmpFile, opts, nil)
@@ -696,10 +696,9 @@ func TestRegression_EnsureStreamingTransport_NegotiatesAPIVersion(t *testing.T) 
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithAPIVersionNegotiation(),
 	)
 	require.NoError(t, err)
 	defer cli.Close()

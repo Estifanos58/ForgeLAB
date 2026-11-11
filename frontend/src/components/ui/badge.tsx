@@ -22,6 +22,7 @@ export function Badge({ status, variant, className, children, showDot = true }: 
         computedVariant = 'success';
         break;
       case 'partially_running':
+      case 'degraded':
         computedVariant = 'warning';
         break;
       case 'deploying':

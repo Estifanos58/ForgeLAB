@@ -115,7 +115,7 @@ func (r *ShareScopedRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	if targetService.Status != models.ServiceStatusRunning {
+	if targetService.Status != models.ServiceStatusRunning && targetService.Status != models.ServiceStatusDegraded {
 		r.renderError(w, http.StatusServiceUnavailable, "Service Stopped",
 			fmt.Sprintf("Service '%s' is currently %s. Please start the service in ForgeLAB.", targetService.Name, targetService.Status))
 		return

@@ -11,12 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	dockerimage "github.com/docker/docker/api/types/image"
-	dockernetwork "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 // CleanUpProjectContainers is a backward-compatible wrapper calling CleanUpProjectResources.
@@ -64,13 +62,13 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 		}
 	}
 
-	containers, err := e.dockerClient.ContainerList(ctx, container.ListOptions{All: true})
+	containersRes, err := e.dockerClient.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		return fmt.Errorf("failed to list containers for project cleanup: %w", err)
 	}
 
 	stopTimeout := 5
-	for _, c := range containers {
+	for _, c := range containersRes.Items {
 		// NEVER touch Docker Compose infrastructure containers
 		if _, isCompose := c.Labels["com.docker.compose.project"]; isCompose {
 			continue
@@ -89,11 +87,11 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 		if isOwned {
 			e.StopContainerLogCollector(c.ID)
 			// Stop container (ignore not found or already stopped)
-			_ = e.dockerClient.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &stopTimeout})
+			_, _ = e.dockerClient.ContainerStop(ctx, c.ID, client.ContainerStopOptions{Timeout: &stopTimeout})
 
 			// Remove container with RemoveVolumes: false (Never remove persistent volumes!)
-			remErr := e.dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: false})
-			if remErr != nil && !client.IsErrNotFound(remErr) {
+			_, remErr := e.dockerClient.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true, RemoveVolumes: false})
+			if remErr != nil && !cerrdefs.IsNotFound(remErr) {
 				slog.Error("failed to remove project container", "container_id", c.ID, "project_id", projIDStr, "error", remErr)
 				cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to remove container %s: %w", c.ID, remErr))
 			} else {
@@ -103,23 +101,26 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 	}
 
 	// 2. Remove project networks
-	nets, netListErr := e.dockerClient.NetworkList(ctx, dockernetwork.ListOptions{})
+	netsRes, netListErr := e.dockerClient.NetworkList(ctx, client.NetworkListOptions{})
 	if netListErr != nil {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to list networks: %w", netListErr))
 	} else {
 		projPrefix := fmt.Sprintf("forgelab-net-%s", projIDStr)
 		projShortPrefix := fmt.Sprintf("forgelab-net-%s", projIDStr[:8])
-		for _, n := range nets {
+		for _, n := range netsRes.Items {
 			isProjectNet := (n.Labels != nil && n.Labels["forgelab.project_id"] == projIDStr) ||
 				strings.HasPrefix(n.Name, projPrefix) ||
 				strings.HasPrefix(n.Name, projShortPrefix)
 
 			if isProjectNet {
 				if myHost := os.Getenv("HOSTNAME"); myHost != "" {
-					_ = e.dockerClient.NetworkDisconnect(ctx, n.ID, myHost, true)
+					_, _ = e.dockerClient.NetworkDisconnect(ctx, n.ID, client.NetworkDisconnectOptions{
+						Container: myHost,
+						Force:     true,
+					})
 				}
-				remErr := e.dockerClient.NetworkRemove(ctx, n.ID)
-				if remErr != nil && !client.IsErrNotFound(remErr) {
+				_, remErr := e.dockerClient.NetworkRemove(ctx, n.ID, client.NetworkRemoveOptions{})
+				if remErr != nil && !cerrdefs.IsNotFound(remErr) {
 					slog.Error("failed to remove project network", "network_id", n.ID, "name", n.Name, "error", remErr)
 					cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to remove network %s: %w", n.Name, remErr))
 				} else {
@@ -131,12 +132,12 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 
 	// 3. Remove project-owned images (including retained rollback images)
 	// Never use global image prune! Remove only images owned by this project.
-	images, imgListErr := e.dockerClient.ImageList(ctx, dockerimage.ListOptions{All: true})
+	imagesRes, imgListErr := e.dockerClient.ImageList(ctx, client.ImageListOptions{All: true})
 	if imgListErr != nil {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to list images: %w", imgListErr))
 	} else {
 		projTagPrefix := fmt.Sprintf("forgelab/%s", projIDStr)
-		for _, img := range images {
+		for _, img := range imagesRes.Items {
 			isProjectImage := false
 			if img.Labels != nil && img.Labels["forgelab.project_id"] == projIDStr {
 				isProjectImage = true
@@ -150,8 +151,8 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 			}
 
 			if isProjectImage {
-				_, remErr := e.dockerClient.ImageRemove(ctx, img.ID, dockerimage.RemoveOptions{Force: true, PruneChildren: true})
-				if remErr != nil && !client.IsErrNotFound(remErr) {
+				_, remErr := e.dockerClient.ImageRemove(ctx, img.ID, client.ImageRemoveOptions{Force: true, PruneChildren: true})
+				if remErr != nil && !cerrdefs.IsNotFound(remErr) {
 					slog.Warn("failed to remove project image", "image_id", img.ID, "error", remErr)
 					cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to remove image %s: %w", img.ID, remErr))
 				} else {
@@ -163,10 +164,10 @@ func (e *Engine) CleanUpProjectResources(ctx context.Context, projectID uuid.UUI
 
 	// 4. Release in-memory port allocations
 	if e.portManager != nil {
-		if activeContainers, err := e.dockerClient.ContainerList(ctx, container.ListOptions{}); err == nil {
+		if activeRes, err := e.dockerClient.ContainerList(ctx, client.ContainerListOptions{}); err == nil {
 			var runningPorts []int
-			for _, ac := range activeContainers {
-				if ac.State == "running" {
+			for _, ac := range activeRes.Items {
+				if ac.State == container.StateRunning {
 					for _, p := range ac.Ports {
 						if p.PublicPort > 0 {
 							runningPorts = append(runningPorts, int(p.PublicPort))
@@ -255,19 +256,18 @@ func (e *Engine) pruneDanglingImages(ctx context.Context) error {
 	defer e.buildMaintenanceMu.Unlock()
 
 	slog.Info("docker image prune started")
-	pruneFilters := filters.NewArgs()
-	pruneFilters.Add("dangling", "true")
+	pruneFilters := make(client.Filters).Add("dangling", "true")
 	if e.pruneFilterLabel != "" {
 		pruneFilters.Add("label", e.pruneFilterLabel)
 	}
 
-	report, err := e.dockerClient.ImagesPrune(ctx, pruneFilters)
+	pruneRes, err := e.dockerClient.ImagePrune(ctx, client.ImagePruneOptions{Filters: pruneFilters})
 	if err != nil {
 		slog.Warn("failed to prune dangling docker images", "error", err)
 		return fmt.Errorf("docker image prune failed: %w", err)
 	}
 
-	slog.Info("docker image prune completed", "deleted_count", len(report.ImagesDeleted), "space_reclaimed_bytes", report.SpaceReclaimed)
+	slog.Info("docker image prune completed", "deleted_count", len(pruneRes.Report.ImagesDeleted), "space_reclaimed_bytes", pruneRes.Report.SpaceReclaimed)
 	return nil
 }
 
@@ -281,17 +281,16 @@ func (e *Engine) PruneOldProjectImages(ctx context.Context, projectID string, ke
 		keepRecent = 3
 	}
 
-	opts := dockerimage.ListOptions{
-		Filters: filters.NewArgs(
-			filters.Arg("label", fmt.Sprintf("forgelab.project_id=%s", projectID)),
-		),
+	opts := client.ImageListOptions{
+		Filters: make(client.Filters).Add("label", fmt.Sprintf("forgelab.project_id=%s", projectID)),
 	}
 
-	images, err := e.dockerClient.ImageList(ctx, opts)
+	imagesRes, err := e.dockerClient.ImageList(ctx, opts)
 	if err != nil {
 		return 0, fmt.Errorf("failed to list project images for pruning: %w", err)
 	}
 
+	images := imagesRes.Items
 	if len(images) <= keepRecent {
 		return 0, nil
 	}
@@ -303,7 +302,7 @@ func (e *Engine) PruneOldProjectImages(ctx context.Context, projectID string, ke
 
 	prunedCount := 0
 	for _, img := range images[keepRecent:] {
-		_, pruneErr := e.dockerClient.ImageRemove(ctx, img.ID, dockerimage.RemoveOptions{
+		_, pruneErr := e.dockerClient.ImageRemove(ctx, img.ID, client.ImageRemoveOptions{
 			PruneChildren: true,
 		})
 		if pruneErr == nil {

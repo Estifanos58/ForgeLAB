@@ -8,11 +8,13 @@
 import { agentClient } from './agent-client';
 import { authClient } from './auth-client';
 import { discoveryClient } from './discovery-client';
+import { domainsClient } from './domains-client';
 import { envClient } from './env-client';
 import { integrationsClient } from './integrations-client';
 import { projectsClient } from './projects-client';
 import { servicesClient } from './services-client';
 import { sourcesClient } from './sources-client';
+import { webhooksClient } from './webhooks-client';
 
 export {
   ApiClientError,
@@ -30,6 +32,8 @@ export const api = {
   auth: authClient,
   projects: projectsClient,
   services: servicesClient,
+  domains: domainsClient,
+  webhooks: webhooksClient,
   env: envClient,
   integrations: integrationsClient,
   sources: sourcesClient,

@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/build"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/discovery"
@@ -26,19 +26,17 @@ import (
 
 type buildContextSizeKey struct{}
 
-type buildStreamRoundTripper struct {
-	base http.RoundTripper
-}
-
-func (rt *buildStreamRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if strings.Contains(req.URL.Path, "/build") {
+// BuildStreamRequestHook ensures Docker /build requests use an explicit Content-Length
+// instead of chunked Transfer-Encoding (required by Windows named pipe / BuildKit streams).
+func BuildStreamRequestHook(req *http.Request) error {
+	if req != nil && req.URL != nil && strings.Contains(req.URL.Path, "/build") {
 		if sz, ok := req.Context().Value(buildContextSizeKey{}).(int64); ok && sz > 0 {
 			req.ContentLength = sz
 			req.TransferEncoding = nil
 			req.Header.Del("Transfer-Encoding")
 		}
 	}
-	return rt.base.RoundTrip(req)
+	return nil
 }
 
 func (e *Engine) ensureStreamingTransport() *client.Client {
@@ -48,35 +46,40 @@ func (e *Engine) ensureStreamingTransport() *client.Client {
 	if e.dockerClient == nil {
 		return nil
 	}
-	httpClient := e.dockerClient.HTTPClient()
-	if httpClient == nil {
+	if e.streamingHookSet.Load() {
 		return e.dockerClient
 	}
-	if _, ok := httpClient.Transport.(*buildStreamRoundTripper); ok {
-		return e.dockerClient
+	if e.streamingCli != nil {
+		return e.streamingCli
 	}
-	base := httpClient.Transport
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	httpClient.Transport = &buildStreamRoundTripper{base: base}
+
 	origVersion := e.dockerClient.ClientVersion()
 	opts := []client.Opt{
-		client.WithHost(e.dockerClient.DaemonHost()),
-		client.WithHTTPClient(httpClient),
-		client.WithAPIVersionNegotiation(),
+		client.WithTLSClientConfigFromEnv(),
+		client.WithHTTPRequestHook(BuildStreamRequestHook),
 	}
-	streamingCli, err := client.NewClientWithOpts(opts...)
+	if host := e.dockerClient.DaemonHost(); host != "" {
+		opts = append(opts, client.WithHost(host))
+	}
+
+	streamingCli, err := client.New(opts...)
 	if err == nil {
 		negotiateCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		streamingCli.NegotiateAPIVersion(negotiateCtx)
+		pingRes, pingErr := streamingCli.Ping(negotiateCtx, client.PingOptions{
+			NegotiateAPIVersion: true,
+			ForceNegotiate:      true,
+		})
 		cancel()
 
-		// Protect against downgrade below Docker minimum for image prune (1.25)
-		// if mock daemon didn't supply an API-Version header (which defaults to fallbackAPIVersion 1.24)
-		if streamingCli.ClientVersion() == "1.24" && origVersion != "" && origVersion != "1.24" {
-			_ = client.WithVersion(origVersion)(streamingCli)
+		// Preserve original client API version when daemon did not report an Api-Version header
+		// or ping failed (for example against a mock endpoint without /_ping).
+		if (pingErr != nil || pingRes.APIVersion == "") && origVersion != "" && origVersion != client.MaxAPIVersion {
+			if restoredCli, rErr := client.New(append(opts, client.WithAPIVersion(origVersion))...); rErr == nil {
+				streamingCli = restoredCli
+			}
 		}
+		e.streamingCli = streamingCli
+		e.streamingHookSet.Store(true)
 		e.dockerClient = streamingCli
 	}
 	return e.dockerClient
@@ -236,7 +239,7 @@ func (e *Engine) resolveSourceDirectory(ctx context.Context, project *models.Pro
 func (e *Engine) buildImage(
 	ctx context.Context,
 	tarArchive io.ReadCloser,
-	options types.ImageBuildOptions,
+	options client.ImageBuildOptions,
 	onLogLine func(string),
 ) error {
 	var currentArchive io.ReadCloser = tarArchive
@@ -384,7 +387,7 @@ func (e *Engine) buildImage(
 		if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("Docker build timed out after %s: %w", buildTimeout.Round(time.Second), err)
 		}
-		if !requiresBuildKit && options.Version == types.BuilderBuildKit && (strings.Contains(strings.ToLower(err.Error()), "no active session") || strings.Contains(strings.ToLower(err.Error()), "no active sessions")) {
+		if !requiresBuildKit && options.Version == build.BuilderBuildKit && (strings.Contains(strings.ToLower(err.Error()), "no active session") || strings.Contains(strings.ToLower(err.Error()), "no active sessions")) {
 			slog.Warn("buildkit returned session error on ImageBuild; retrying with standard builder", "error", err)
 			if onLogLine != nil {
 				onLogLine("BuildKit session unavailable on Docker daemon. Retrying with standard Docker builder...")
@@ -393,7 +396,7 @@ func (e *Engine) buildImage(
 			if openErr == nil {
 				defer fallbackFile.Close()
 				fallbackOpts := options
-				fallbackOpts.Version = types.BuilderV1
+				fallbackOpts.Version = build.BuilderV1
 				retryCtx, retryCancel := context.WithTimeout(ctx, buildTimeout)
 				defer retryCancel()
 				retryCtx = context.WithValue(retryCtx, buildContextSizeKey{}, stat.Size())
@@ -435,7 +438,7 @@ func (e *Engine) buildImage(
 		// If BuildKit was used and failed with session error or rejected the tar header, attempt fallback
 		isSessionErr := strings.Contains(strings.ToLower(parseErr.Error()), "no active session") || strings.Contains(strings.ToLower(parseErr.Error()), "no active sessions")
 		isTarHeaderErr := strings.Contains(parseErr.Error(), "archive/tar: invalid tar header")
-		if !requiresBuildKit && options.Version == types.BuilderBuildKit && (isSessionErr || isTarHeaderErr) {
+		if !requiresBuildKit && options.Version == build.BuilderBuildKit && (isSessionErr || isTarHeaderErr) {
 			slog.Warn("buildkit rejected build context or session unavailable; retrying with standard builder", "error", parseErr)
 			if onLogLine != nil {
 				if isSessionErr {
@@ -448,7 +451,7 @@ func (e *Engine) buildImage(
 			if openErr == nil {
 				defer fallbackFile.Close()
 				fallbackOpts := options
-				fallbackOpts.Version = types.BuilderV1
+				fallbackOpts.Version = build.BuilderV1
 				retryCtx, retryCancel := context.WithTimeout(ctx, buildTimeout)
 				defer retryCancel()
 				retryCtx = context.WithValue(retryCtx, buildContextSizeKey{}, stat.Size())

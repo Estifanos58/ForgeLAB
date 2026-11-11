@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/models"
 )
@@ -49,7 +49,7 @@ func (e *Engine) RestorePreviousHealthyContainer(
 	restartCtx, restartCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer restartCancel()
 
-	if err := e.dockerClient.ContainerStart(restartCtx, cid, container.StartOptions{}); err != nil {
+	if _, err := e.dockerClient.ContainerStart(restartCtx, cid, client.ContainerStartOptions{}); err != nil {
 		errDetail := fmt.Sprintf("CRITICAL RECOVERY FAILURE: Failed to restart previous container %s for service '%s': %v", shortID, service.Name, err)
 		emitLog(models.LogPhaseHealth, models.LogStreamStderr, errDetail)
 		slog.Error("previous container restoration failed", "service", service.Name, "container_id", cid, "error", err)
@@ -62,7 +62,7 @@ func (e *Engine) RestorePreviousHealthyContainer(
 	}
 
 	// Confirm that previous container is actually running
-	inspect, err := e.dockerClient.ContainerInspect(restartCtx, cid)
+	inspectRes, err := e.dockerClient.ContainerInspect(restartCtx, cid, client.ContainerInspectOptions{})
 	if err != nil {
 		errDetail := fmt.Sprintf("CRITICAL RECOVERY FAILURE: Failed to inspect restored container %s for service '%s': %v", shortID, service.Name, err)
 		emitLog(models.LogPhaseHealth, models.LogStreamStderr, errDetail)
@@ -73,12 +73,13 @@ func (e *Engine) RestorePreviousHealthyContainer(
 			Message:   errDetail,
 		}
 	}
+	inspect := inspectRes.Container
 
 	if inspect.State == nil || !inspect.State.Running {
 		statusStr := "unknown"
 		exitCode := -1
 		if inspect.State != nil {
-			statusStr = inspect.State.Status
+			statusStr = string(inspect.State.Status)
 			exitCode = inspect.State.ExitCode
 		}
 		errDetail := fmt.Sprintf("CRITICAL RECOVERY FAILURE: Restored container %s for service '%s' is not running (status=%s, exit_code=%d)", shortID, service.Name, statusStr, exitCode)

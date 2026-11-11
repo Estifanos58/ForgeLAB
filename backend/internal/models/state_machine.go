@@ -61,8 +61,17 @@ var AllowedTransitions = map[string]map[string]bool{
 	DeployStatusSkipped: {}, // Terminal
 }
 
+// IsValidDeploymentStatus returns true if status is a recognized deployment status.
+func IsValidDeploymentStatus(status string) bool {
+	_, exists := AllowedTransitions[status]
+	return exists
+}
+
 // ValidateStateTransition checks whether transitioning from currentStatus to nextStatus is valid.
 func ValidateStateTransition(currentStatus, nextStatus string) error {
+	if !IsValidDeploymentStatus(nextStatus) {
+		return fmt.Errorf("%w: unknown target deployment status %q", ErrInvalidStateTransition, nextStatus)
+	}
 	if currentStatus == nextStatus {
 		return nil
 	}

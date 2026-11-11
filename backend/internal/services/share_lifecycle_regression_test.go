@@ -95,8 +95,8 @@ func TestShareLifecycle_ReplacementAndCleanup(t *testing.T) {
 	// Create test user and project with running service
 	userID := uuid.New()
 	_, err := pool.Exec(ctx, `
-		INSERT INTO users (id, email, password_hash, display_name, role)
-		VALUES ($1, $2, 'hash', 'Share Tester', 'user')
+		INSERT INTO users (id, email, password_hash, display_name)
+		VALUES ($1, $2, 'hash', 'Share Tester')
 		ON CONFLICT DO NOTHING
 	`, userID, "share-tester-"+userID.String()[:8]+"@example.com")
 	require.NoError(t, err)
@@ -110,7 +110,7 @@ func TestShareLifecycle_ReplacementAndCleanup(t *testing.T) {
 
 	serviceID := uuid.New()
 	_, err = pool.Exec(ctx, `
-		INSERT INTO services (id, project_id, name, role, port, status, created_at, updated_at)
+		INSERT INTO services (id, project_id, name, role, internal_port, status, created_at, updated_at)
 		VALUES ($1, $2, 'web', 'frontend', 3000, 'running', NOW(), NOW())
 	`, serviceID, projectID)
 	require.NoError(t, err)
@@ -166,7 +166,7 @@ func TestShareLifecycle_ReplacementAndCleanup(t *testing.T) {
 
 		svc2ID := uuid.New()
 		_, err = pool.Exec(ctx, `
-			INSERT INTO services (id, project_id, name, role, port, status, created_at, updated_at)
+			INSERT INTO services (id, project_id, name, role, internal_port, status, created_at, updated_at)
 			VALUES ($1, $2, 'api', 'backend', 8080, 'running', NOW(), NOW())
 		`, svc2ID, proj2ID)
 		require.NoError(t, err)

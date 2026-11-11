@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	dockerclient "github.com/docker/docker/client"
+	dockerclient "github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/models"
 )
@@ -47,27 +48,22 @@ func (r *DockerUpstreamResolver) ResolveUpstream(ctx context.Context, service *m
 	// to deployed tenant workloads.
 	if r.dockerCli != nil && service.ContainerID != nil && *service.ContainerID != "" {
 		inspectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		cJSON, err := r.dockerCli.ContainerInspect(inspectCtx, *service.ContainerID)
+		cRes, err := r.dockerCli.ContainerInspect(inspectCtx, *service.ContainerID, dockerclient.ContainerInspectOptions{})
 		cancel()
+		cJSON := cRes.Container
 		if err == nil && cJSON.NetworkSettings != nil {
 			for _, netSettings := range cJSON.NetworkSettings.Networks {
-				if netSettings != nil && netSettings.IPAddress != "" {
-					candidates = append(candidates, fmt.Sprintf("http://%s:%d", netSettings.IPAddress, intPort))
+				if netSettings != nil && netSettings.IPAddress.IsValid() && !netSettings.IPAddress.IsUnspecified() {
+					candidates = append(candidates, "http://"+net.JoinHostPort(netSettings.IPAddress.String(), strconv.Itoa(intPort)))
 				}
-			}
-			if cJSON.NetworkSettings.IPAddress != "" {
-				candidates = append(candidates, fmt.Sprintf("http://%s:%d", cJSON.NetworkSettings.IPAddress, intPort))
 			}
 
 			// Add bridge network gateway candidates for loopback-published ports in Docker Compose
 			if service.HostPort != nil && *service.HostPort > 0 {
 				hp := *service.HostPort
-				if cJSON.NetworkSettings.Gateway != "" {
-					candidates = append(candidates, fmt.Sprintf("http://%s:%d", cJSON.NetworkSettings.Gateway, hp))
-				}
 				for _, netSettings := range cJSON.NetworkSettings.Networks {
-					if netSettings != nil && netSettings.Gateway != "" {
-						candidates = append(candidates, fmt.Sprintf("http://%s:%d", netSettings.Gateway, hp))
+					if netSettings != nil && netSettings.Gateway.IsValid() && !netSettings.Gateway.IsUnspecified() {
+						candidates = append(candidates, "http://"+net.JoinHostPort(netSettings.Gateway.String(), strconv.Itoa(hp)))
 					}
 				}
 			}
@@ -80,8 +76,8 @@ func (r *DockerUpstreamResolver) ResolveUpstream(ctx context.Context, service *m
 							if isDockerEnv {
 								candidates = append(candidates, fmt.Sprintf("http://host.docker.internal:%s", b.HostPort))
 							}
-							if b.HostIP != "" && b.HostIP != "0.0.0.0" {
-								candidates = append(candidates, fmt.Sprintf("http://%s:%s", b.HostIP, b.HostPort))
+							if b.HostIP.IsValid() && !b.HostIP.IsUnspecified() {
+								candidates = append(candidates, "http://"+net.JoinHostPort(b.HostIP.String(), b.HostPort))
 							}
 							candidates = append(candidates, fmt.Sprintf("http://127.0.0.1:%s", b.HostPort))
 						}

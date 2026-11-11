@@ -8,9 +8,8 @@ import (
 	"testing"
 	"time"
 
-	dockernetwork "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -23,13 +22,13 @@ func TestEngine_EnsureNetwork_IdempotencyAndConcurrency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Skipf("Docker daemon not available: %v", err)
 	}
 	defer cli.Close()
 
-	if _, err := cli.Ping(ctx); err != nil {
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
 		t.Skipf("Docker daemon ping failed: %v", err)
 	}
 
@@ -41,7 +40,7 @@ func TestEngine_EnsureNetwork_IdempotencyAndConcurrency(t *testing.T) {
 	}
 
 	defer func() {
-		_ = cli.NetworkRemove(context.Background(), testNetName)
+		_, _ = cli.NetworkRemove(context.Background(), testNetName, client.NetworkRemoveOptions{})
 	}()
 
 	// 1. First EnsureNetwork call: should create the network
@@ -49,10 +48,10 @@ func TestEngine_EnsureNetwork_IdempotencyAndConcurrency(t *testing.T) {
 	require.NoError(t, err, "EnsureNetwork must successfully create new network")
 
 	// Verify it exists in Docker
-	inspectRes, err := cli.NetworkInspect(ctx, testNetName, dockernetwork.InspectOptions{})
+	inspectRes, err := cli.NetworkInspect(ctx, testNetName, client.NetworkInspectOptions{})
 	require.NoError(t, err)
-	assert.Equal(t, "bridge", inspectRes.Driver)
-	assert.Equal(t, labels["forgelab.managed"], inspectRes.Labels["forgelab.managed"])
+	assert.Equal(t, "bridge", inspectRes.Network.Driver)
+	assert.Equal(t, labels["forgelab.managed"], inspectRes.Network.Labels["forgelab.managed"])
 
 	// 2. Second EnsureNetwork call: must be idempotent and succeed without duplicate name error
 	err = eng.EnsureNetwork(ctx, testNetName, labels)
@@ -61,7 +60,7 @@ func TestEngine_EnsureNetwork_IdempotencyAndConcurrency(t *testing.T) {
 	// 3. Concurrent EnsureNetwork calls (simulating DAG Tier 1 concurrent services e.g. redis + postgres)
 	concurrentNetName := fmt.Sprintf("forgelab-net-conc-%s", uuid.New().String()[:8])
 	defer func() {
-		_ = cli.NetworkRemove(context.Background(), concurrentNetName)
+		_, _ = cli.NetworkRemove(context.Background(), concurrentNetName, client.NetworkRemoveOptions{})
 	}()
 
 	var wg sync.WaitGroup
@@ -91,13 +90,13 @@ func TestEngine_PruneDanglingNetworks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Skipf("Docker daemon not available: %v", err)
 	}
 	defer cli.Close()
 
-	if _, err := cli.Ping(ctx); err != nil {
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
 		t.Skipf("Docker daemon ping failed: %v", err)
 	}
 
@@ -115,13 +114,13 @@ func TestEngine_PruneDanglingNetworks(t *testing.T) {
 	eng.PruneDanglingNetworks(ctx)
 
 	// Inspect should fail because network was pruned
-	_, err = cli.NetworkInspect(ctx, danglingNetName, dockernetwork.InspectOptions{})
+	_, err = cli.NetworkInspect(ctx, danglingNetName, client.NetworkInspectOptions{})
 	assert.Error(t, err, "Dangling unattached ForgeLAB network must have been pruned")
 
 	// Ensure system networks like 'bridge' still exist
-	sysInspect, err := cli.NetworkInspect(ctx, "bridge", dockernetwork.InspectOptions{})
+	sysInspect, err := cli.NetworkInspect(ctx, "bridge", client.NetworkInspectOptions{})
 	require.NoError(t, err)
-	assert.Equal(t, "bridge", sysInspect.Name)
+	assert.Equal(t, "bridge", sysInspect.Network.Name)
 }
 
 func TestEngine_CleanUpProjectContainers_RemovesProjectNetworks(t *testing.T) {
@@ -132,13 +131,13 @@ func TestEngine_CleanUpProjectContainers_RemovesProjectNetworks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Skipf("Docker daemon not available: %v", err)
 	}
 	defer cli.Close()
 
-	if _, err := cli.Ping(ctx); err != nil {
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
 		t.Skipf("Docker daemon ping failed: %v", err)
 	}
 
@@ -155,6 +154,6 @@ func TestEngine_CleanUpProjectContainers_RemovesProjectNetworks(t *testing.T) {
 	// CleanUpProjectContainers should clean up project-associated networks
 	eng.CleanUpProjectContainers(ctx, projUUID)
 
-	_, err = cli.NetworkInspect(ctx, projNetName, dockernetwork.InspectOptions{})
+	_, err = cli.NetworkInspect(ctx, projNetName, client.NetworkInspectOptions{})
 	assert.Error(t, err, "Project network must be deleted during CleanUpProjectContainers")
 }

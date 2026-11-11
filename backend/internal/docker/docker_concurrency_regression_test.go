@@ -12,8 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -84,10 +83,10 @@ func TestRegression_SemaphoreReleaseAfterFailure(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()
@@ -98,7 +97,7 @@ func TestRegression_SemaphoreReleaseAfterFailure(t *testing.T) {
 	tarRC := newTrackingRC(bytes.NewReader([]byte("test")))
 
 	// Build fails due to server 500
-	err = engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+	err = engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 	require.Error(t, err)
 	assert.True(t, tarRC.IsClosed(), "tar archive must be closed on failure")
 
@@ -148,10 +147,10 @@ func TestRegression_NoDuplicateBuildExecutionWithConsumedTarStream(t *testing.T)
 	}))
 	defer mockServer.Close()
 
-	cli, err := client.NewClientWithOpts(
+	cli, err := client.New(
 		client.WithHost(mockServer.URL),
 		client.WithHTTPClient(mockServer.Client()),
-		client.WithVersion("1.41"),
+		client.WithAPIVersion("1.41"),
 	)
 	require.NoError(t, err)
 	defer cli.Close()
@@ -160,7 +159,7 @@ func TestRegression_NoDuplicateBuildExecutionWithConsumedTarStream(t *testing.T)
 	tarRC := newTrackingRC(bytes.NewReader(createSampleTarArchive(t)))
 
 	// Initial build attempt
-	err = engine.buildImage(context.Background(), tarRC, types.ImageBuildOptions{}, func(s string) {})
+	err = engine.buildImage(context.Background(), tarRC, client.ImageBuildOptions{}, func(s string) {})
 	require.Error(t, err)
 
 	// Stream was consumed and closed exactly once

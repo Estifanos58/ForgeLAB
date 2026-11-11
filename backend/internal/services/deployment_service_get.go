@@ -14,6 +14,12 @@ import (
 
 // GetDeployment retrieves a deployment by ID.
 func (s *DeploymentService) GetDeployment(ctx context.Context, deploymentID uuid.UUID) (*models.Deployment, error) {
+	if s.getDeploymentForTest != nil {
+		return s.getDeploymentForTest(ctx, deploymentID)
+	}
+	if s.db == nil {
+		return nil, ErrDeploymentNotFound
+	}
 	d := &models.Deployment{}
 	err := s.db.QueryRow(ctx,
 		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
@@ -39,7 +45,10 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, deploymentID uuid
 		return nil, fmt.Errorf("failed to get deployment: %w", err)
 	}
 
-	svcDeploys, _ := s.ListServiceDeployments(ctx, d.ID)
+	svcDeploys, err := s.ListServiceDeployments(ctx, d.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load service deployments for deployment %s: %w", d.ID, err)
+	}
 	d.ServiceDeployments = svcDeploys
 
 	return d, nil
@@ -90,6 +99,10 @@ func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.
 			return nil, fmt.Errorf("failed to scan deployment: %w", err)
 		}
 		deployments = append(deployments, d)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating deployments: %w", err)
 	}
 
 	if deployments == nil {
@@ -217,6 +230,12 @@ func (s *DeploymentService) GetPreviousSuccessfulDeployment(ctx context.Context,
 
 // GetServiceDeployment retrieves an individual service deployment record by ID.
 func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDeploymentID uuid.UUID) (*models.ServiceDeployment, error) {
+	if s.getServiceDeploymentForTest != nil {
+		return s.getServiceDeploymentForTest(ctx, serviceDeploymentID)
+	}
+	if s.db == nil {
+		return nil, ErrDeploymentNotFound
+	}
 	sd := &models.ServiceDeployment{}
 	var publicExposed bool
 	var dependsOnJSON, volumesJSON, networksJSON, hcJSON, docJSON []byte
@@ -417,6 +436,12 @@ func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context,
 
 // ListServiceDeployments retrieves all service deployment records for a release.
 func (s *DeploymentService) ListServiceDeployments(ctx context.Context, deploymentID uuid.UUID) ([]*models.ServiceDeployment, error) {
+	if s.listServiceDeploymentsForTest != nil {
+		return s.listServiceDeploymentsForTest(ctx, deploymentID)
+	}
+	if s.db == nil {
+		return []*models.ServiceDeployment{}, nil
+	}
 	rows, err := s.db.Query(ctx,
 		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, s.public_exposed, sd.deploy_number,
 		        sd.status, sd.image_tag, sd.container_id, sd.host_port, sd.internal_port,

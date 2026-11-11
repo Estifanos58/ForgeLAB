@@ -288,16 +288,16 @@ func (s *ShareService) CreateShare(ctx context.Context, projectID, userID uuid.U
 		return nil, errors.New("project has no services configured")
 	}
 
-	// Verify project has at least one running service
+	// Verify project has at least one running (or running-but-degraded) service
 	hasRunningService := false
 	servicesMap := make(map[uuid.UUID]*models.Service)
 	for _, svc := range services {
 		servicesMap[svc.ID] = svc
-		if svc.Status == models.ServiceStatusRunning {
+		if svc.Status == models.ServiceStatusRunning || svc.Status == models.ServiceStatusDegraded {
 			hasRunningService = true
 		}
 	}
-	if !hasRunningService && (project == nil || project.Status != models.ProjectStatusRunning) {
+	if !hasRunningService && (project == nil || (project.Status != models.ProjectStatusRunning && project.Status != models.ProjectStatusDegraded)) {
 		return nil, ErrServiceNotEligible
 	}
 

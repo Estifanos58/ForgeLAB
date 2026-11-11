@@ -13,7 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	"github.com/moby/moby/api/types/build"
+	"github.com/moby/moby/client"
 )
 
 // DetectDockerfileRequiresBuildKit inspects Dockerfile contents and determines whether
@@ -230,20 +231,20 @@ func peekDockerfileFromTar(tarArchive io.ReadCloser, targetDockerfile string) (i
 	return autoCleaningFile{tmp}, dfContent, nil
 }
 
-func (e *Engine) getCachedBuilderVersion() (types.BuilderVersion, bool) {
+func (e *Engine) getCachedBuilderVersion() (build.BuilderVersion, bool) {
 	val := e.cachedBuilderVer.Load()
 	if val == nil {
 		return "", false
 	}
-	v, ok := val.(types.BuilderVersion)
+	v, ok := val.(build.BuilderVersion)
 	return v, ok
 }
 
-func (e *Engine) setCachedBuilderVersion(v types.BuilderVersion) {
+func (e *Engine) setCachedBuilderVersion(v build.BuilderVersion) {
 	e.cachedBuilderVer.Store(v)
 }
 
-func (e *Engine) detectDaemonBuilderCapability(ctx context.Context) (types.BuilderVersion, error) {
+func (e *Engine) detectDaemonBuilderCapability(ctx context.Context) (build.BuilderVersion, error) {
 	if cached, ok := e.getCachedBuilderVersion(); ok && cached != "" {
 		return cached, nil
 	}
@@ -252,7 +253,7 @@ func (e *Engine) detectDaemonBuilderCapability(ctx context.Context) (types.Build
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	ping, err := e.dockerClient.Ping(pingCtx)
+	ping, err := e.dockerClient.Ping(pingCtx, client.PingOptions{})
 	if err != nil {
 		return "", err
 	}
@@ -263,15 +264,15 @@ func (e *Engine) detectDaemonBuilderCapability(ctx context.Context) (types.Build
 func (e *Engine) resolveBuilder(
 	ctx context.Context,
 	dfContent []byte,
-	options types.ImageBuildOptions,
+	options client.ImageBuildOptions,
 	onLogLine func(string),
-) (types.ImageBuildOptions, error) {
+) (client.ImageBuildOptions, error) {
 	daemonBuilderVer, pingErr := e.detectDaemonBuilderCapability(ctx)
 	if pingErr == nil && onLogLine != nil {
 		onLogLine("Docker daemon available")
-		if daemonBuilderVer == types.BuilderBuildKit {
+		if daemonBuilderVer == build.BuilderBuildKit {
 			onLogLine("Builder version: 2 / BuildKit")
-		} else if daemonBuilderVer == types.BuilderV1 {
+		} else if daemonBuilderVer == build.BuilderV1 {
 			onLogLine("Builder version: 1 / legacy")
 		} else if daemonBuilderVer != "" {
 			onLogLine(fmt.Sprintf("Builder version: %s", daemonBuilderVer))
@@ -284,14 +285,14 @@ func (e *Engine) resolveBuilder(
 
 	if requiresBuildKit {
 		// BuildKit is required by Dockerfile features (e.g. RUN --mount=type=cache)
-		if daemonBuilderVer == types.BuilderV1 {
+		if daemonBuilderVer == build.BuilderV1 {
 			errMsg := fmt.Sprintf("BuildKit is required by Dockerfile feature %s but the configured Docker daemon does not support BuildKit.", featureReason)
 			if onLogLine != nil {
 				onLogLine(errMsg)
 			}
 			return options, errors.New(errMsg)
 		}
-		options.Version = types.BuilderBuildKit
+		options.Version = build.BuilderBuildKit
 		if onLogLine != nil {
 			onLogLine(fmt.Sprintf("Using BuildKit builder for Docker image build (required by: %s)", featureReason))
 		}
@@ -300,7 +301,7 @@ func (e *Engine) resolveBuilder(
 
 	// Normal Dockerfile does not require BuildKit
 	if options.Version != "" {
-		if options.Version == types.BuilderBuildKit && daemonBuilderVer == types.BuilderV1 {
+		if options.Version == build.BuilderBuildKit && daemonBuilderVer == build.BuilderV1 {
 			errMsg := "BuildKit builder requested but the configured Docker daemon does not support BuildKit."
 			if onLogLine != nil {
 				onLogLine(errMsg)
@@ -308,7 +309,7 @@ func (e *Engine) resolveBuilder(
 			return options, errors.New(errMsg)
 		}
 		if onLogLine != nil {
-			if options.Version == types.BuilderBuildKit {
+			if options.Version == build.BuilderBuildKit {
 				onLogLine("Using BuildKit builder for Docker image build")
 			} else {
 				onLogLine("Using legacy builder for Docker image build")
@@ -322,8 +323,8 @@ func (e *Engine) resolveBuilder(
 	// without a BuildKit control session, returning "failed to read dockerfile: archive/tar: invalid tar header".
 	// For standard Dockerfiles that do not require BuildKit-specific features, leave options.Version empty
 	// (or BuilderV1 if legacy) so Docker Engine's standard builder natively consumes the TAR context.
-	if daemonBuilderVer == types.BuilderV1 {
-		options.Version = types.BuilderV1
+	if daemonBuilderVer == build.BuilderV1 {
+		options.Version = build.BuilderV1
 		if onLogLine != nil {
 			onLogLine("Using legacy builder for Docker image build")
 		}

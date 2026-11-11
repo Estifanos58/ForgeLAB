@@ -29,6 +29,14 @@ type Config struct {
 	GitHubApp  GitHubAppConfig
 	RateLimit  RateLimitConfig
 	Share      ShareConfig
+	Proxy      ProxyConfig
+}
+
+// ProxyConfig holds settings for custom domain ingress and automatic Caddy TLS configuration.
+type ProxyConfig struct {
+	CaddyAdminURL string
+	IngressHost   string
+	ACMEEmail     string
 }
 
 // ShareConfig holds settings for outbound public tunnel and sharing.
@@ -449,6 +457,11 @@ func Load() (*Config, error) {
 			GatewayAuthToken: gatewayAuth,
 			TLSSkipVerify:    getEnv("GATEWAY_TLS_SKIP_VERIFY", "false") == "true",
 			AppHostIP:        getEnv("FORGELAB_APP_HOST_IP", "127.0.0.1"),
+		},
+		Proxy: ProxyConfig{
+			CaddyAdminURL: strings.TrimRight(strings.TrimSpace(getEnv("CADDY_ADMIN_URL", "")), "/"),
+			IngressHost:   strings.TrimSpace(getEnv("FORGELAB_INGRESS_HOST", getEnv("FORGELAB_PUBLIC_HOST", getEnv("PUBLIC_HOST", "")))),
+			ACMEEmail:     strings.TrimSpace(getEnv("ACME_EMAIL", "")),
 		},
 	}
 

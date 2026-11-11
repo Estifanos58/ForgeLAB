@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -36,14 +36,12 @@ func TestEngine_RestorePreviousHealthyContainer(t *testing.T) {
 			case strings.HasSuffix(r.URL.Path, "/json"):
 				atomic.AddInt32(&inspectCalls, 1)
 				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID: "prev-container-1234567890",
-						State: &types.ContainerState{
-							Running:  true,
-							Status:   "running",
-							ExitCode: 0,
-						},
+				_ = json.NewEncoder(w).Encode(container.InspectResponse{
+					ID: "prev-container-1234567890",
+					State: &container.State{
+						Running:  true,
+						Status:   container.StateRunning,
+						ExitCode: 0,
 					},
 				})
 			default:
@@ -52,10 +50,10 @@ func TestEngine_RestorePreviousHealthyContainer(t *testing.T) {
 		}))
 		defer mockServer.Close()
 
-		cli, err := client.NewClientWithOpts(
+		cli, err := client.New(
 			client.WithHost(mockServer.URL),
 			client.WithHTTPClient(mockServer.Client()),
-			client.WithVersion("1.41"),
+			client.WithAPIVersion("1.41"),
 		)
 		require.NoError(t, err)
 		defer cli.Close()
@@ -102,10 +100,10 @@ func TestEngine_RestorePreviousHealthyContainer(t *testing.T) {
 		}))
 		defer mockServer.Close()
 
-		cli, err := client.NewClientWithOpts(
+		cli, err := client.New(
 			client.WithHost(mockServer.URL),
 			client.WithHTTPClient(mockServer.Client()),
-			client.WithVersion("1.41"),
+			client.WithAPIVersion("1.41"),
 		)
 		require.NoError(t, err)
 		defer cli.Close()
@@ -147,14 +145,12 @@ func TestEngine_RestorePreviousHealthyContainer(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			case strings.Contains(r.URL.Path, "/json"):
 				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID: "prev-container-crashed",
-						State: &types.ContainerState{
-							Running:  false,
-							Status:   "exited",
-							ExitCode: 137,
-						},
+				_ = json.NewEncoder(w).Encode(container.InspectResponse{
+					ID: "prev-container-crashed",
+					State: &container.State{
+						Running:  false,
+						Status:   container.StateExited,
+						ExitCode: 137,
 					},
 				})
 			default:
@@ -163,10 +159,10 @@ func TestEngine_RestorePreviousHealthyContainer(t *testing.T) {
 		}))
 		defer mockServer.Close()
 
-		cli, err := client.NewClientWithOpts(
+		cli, err := client.New(
 			client.WithHost(mockServer.URL),
 			client.WithHTTPClient(mockServer.Client()),
-			client.WithVersion("1.41"),
+			client.WithAPIVersion("1.41"),
 		)
 		require.NoError(t, err)
 		defer cli.Close()
@@ -246,13 +242,11 @@ func TestEngine_RestorePreviousLifecycle_Regression(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			case strings.HasSuffix(r.URL.Path, "/json"):
 				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID: "prev-postgres-1",
-						State: &types.ContainerState{
-							Running: true,
-							Status:  "running",
-						},
+				_ = json.NewEncoder(w).Encode(container.InspectResponse{
+					ID: "prev-postgres-1",
+					State: &container.State{
+						Running: true,
+						Status:  container.StateRunning,
 					},
 				})
 			default:
@@ -261,10 +255,10 @@ func TestEngine_RestorePreviousLifecycle_Regression(t *testing.T) {
 		}))
 		defer mockServer.Close()
 
-		cli, err := client.NewClientWithOpts(
+		cli, err := client.New(
 			client.WithHost(mockServer.URL),
 			client.WithHTTPClient(mockServer.Client()),
-			client.WithVersion("1.41"),
+			client.WithAPIVersion("1.41"),
 		)
 		require.NoError(t, err)
 		defer cli.Close()
@@ -317,10 +311,10 @@ func TestEngine_RestorePreviousLifecycle_Regression(t *testing.T) {
 		}))
 		defer mockServer.Close()
 
-		cli, err := client.NewClientWithOpts(
+		cli, err := client.New(
 			client.WithHost(mockServer.URL),
 			client.WithHTTPClient(mockServer.Client()),
-			client.WithVersion("1.41"),
+			client.WithAPIVersion("1.41"),
 		)
 		require.NoError(t, err)
 		defer cli.Close()
@@ -370,13 +364,11 @@ func TestEngine_RestorePreviousLifecycle_Regression(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			case strings.HasSuffix(r.URL.Path, "/json"):
 				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(types.ContainerJSON{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID: "prev-redis-healthy",
-						State: &types.ContainerState{
-							Running: true,
-							Status:  "running",
-						},
+				_ = json.NewEncoder(w).Encode(container.InspectResponse{
+					ID: "prev-redis-healthy",
+					State: &container.State{
+						Running: true,
+						Status:  container.StateRunning,
 					},
 				})
 			default:
@@ -385,10 +377,10 @@ func TestEngine_RestorePreviousLifecycle_Regression(t *testing.T) {
 		}))
 		defer mockServer.Close()
 
-		cli, err := client.NewClientWithOpts(
+		cli, err := client.New(
 			client.WithHost(mockServer.URL),
 			client.WithHTTPClient(mockServer.Client()),
-			client.WithVersion("1.41"),
+			client.WithAPIVersion("1.41"),
 		)
 		require.NoError(t, err)
 		defer cli.Close()

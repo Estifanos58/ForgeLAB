@@ -1628,3 +1628,100 @@ func TestDeploymentQueue_RemoveDuplicateIfLeaseHeld(t *testing.T) {
 		t.Fatalf("expected state to be pending, got %s", state)
 	}
 }
+
+func TestDeploymentQueue_GetQueueDiagnostics_LeasesRetriesAndDLQ(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.SetMaxRetries(4)
+	q.SetLeaseTTL(45 * time.Second)
+	ctx := context.Background()
+
+	// 1. Enqueue one pending job
+	pendingID := uuid.New()
+	if err := q.EnqueueServiceDeployment(ctx, pendingID); err != nil {
+		t.Fatalf("failed to enqueue pending job: %v", err)
+	}
+
+	// 2. Simulate an active leased processing job with 2 prior attempts
+	activeID := uuid.New()
+	activeJob := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  activeID,
+		ServiceDeploymentID: activeID,
+	}
+	if err := client.LPush(ctx, ProcessingQueueKey, activeJob.Encode()).Err(); err != nil {
+		t.Fatalf("failed to push processing job: %v", err)
+	}
+	if _, acquired, err := q.acquireLease(ctx, activeID, "worker-2-host:alpha"); err != nil || !acquired {
+		t.Fatalf("failed to acquire test lease: acquired=%v err=%v", acquired, err)
+	}
+	client.Set(ctx, JobAttemptsPrefix+activeID.String(), 2, time.Hour)
+
+	// 3. Simulate one valid job and one corrupt payload in Dead Letter Queue
+	dlqID := uuid.New()
+	dlqJob := Job{
+		Type:         JobTypeDeployment,
+		ID:           dlqID,
+		DeploymentID: &dlqID,
+	}
+	client.LPush(ctx, DeadLetterQueueKey, dlqJob.Encode())
+	client.Set(ctx, JobAttemptsPrefix+dlqID.String(), 4, time.Hour)
+	client.LPush(ctx, DeadLetterQueueKey, "{corrupt-dlq-payload")
+
+	diag, err := q.GetQueueDiagnostics(ctx)
+	if err != nil {
+		t.Fatalf("GetQueueDiagnostics failed: %v", err)
+	}
+
+	if diag.PendingJobs != 1 {
+		t.Errorf("expected pending_jobs=1, got %d", diag.PendingJobs)
+	}
+	if diag.ProcessingJobs != 1 {
+		t.Errorf("expected processing_jobs=1, got %d", diag.ProcessingJobs)
+	}
+	if diag.DeadLetterJobs != 2 {
+		t.Errorf("expected dead_letter_jobs=2, got %d", diag.DeadLetterJobs)
+	}
+	if diag.MaxRetries != 4 {
+		t.Errorf("expected max_retries=4, got %d", diag.MaxRetries)
+	}
+	if diag.LeaseTTLSeconds != 45 {
+		t.Errorf("expected lease_ttl_seconds=45, got %d", diag.LeaseTTLSeconds)
+	}
+	if diag.RetryingJobs != 2 {
+		t.Errorf("expected retrying_jobs=2, got %d", diag.RetryingJobs)
+	}
+
+	if len(diag.ActiveLeases) != 1 {
+		t.Fatalf("expected 1 active lease, got %+v", diag.ActiveLeases)
+	}
+	lease := diag.ActiveLeases[0]
+	if lease.JobID != activeID.String() {
+		t.Errorf("expected active lease job_id=%s, got %s", activeID.String(), lease.JobID)
+	}
+	if lease.JobType != string(JobTypeServiceDeployment) {
+		t.Errorf("expected job_type=service_deployment, got %q", lease.JobType)
+	}
+	if lease.WorkerID != "worker-2-host:alpha" {
+		t.Errorf("expected extracted worker_id='worker-2-host:alpha', got %q", lease.WorkerID)
+	}
+	if lease.LeaseTTLRemainingMs <= 0 {
+		t.Errorf("expected positive lease_ttl_remaining_ms, got %d", lease.LeaseTTLRemainingMs)
+	}
+	if lease.Attempts != 2 {
+		t.Errorf("expected attempts=2 on active lease, got %d", lease.Attempts)
+	}
+
+	if len(diag.DeadLetterEntries) != 2 {
+		t.Fatalf("expected 2 dead-letter entries, got %+v", diag.DeadLetterEntries)
+	}
+	if diag.DeadLetterEntries[0].JobType != "corrupt" || diag.DeadLetterEntries[0].RawPayload != "{corrupt-dlq-payload" {
+		t.Errorf("unexpected first DLQ entry: %+v", diag.DeadLetterEntries[0])
+	}
+	if diag.DeadLetterEntries[1].JobID != dlqID.String() || diag.DeadLetterEntries[1].Attempts != 4 {
+		t.Errorf("unexpected second DLQ entry: %+v", diag.DeadLetterEntries[1])
+	}
+}

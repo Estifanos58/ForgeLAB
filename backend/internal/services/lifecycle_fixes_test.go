@@ -81,6 +81,24 @@ func TestLifecycle_CalculateProjectStatus(t *testing.T) {
 		status := services.CalculateProjectStatus(svcs)
 		assert.Equal(t, models.ProjectStatusRunning, status)
 	})
+
+	t.Run("any degraded active service returns degraded", func(t *testing.T) {
+		svcs := []*models.Service{
+			{Status: models.ServiceStatusRunning, Classification: models.ClassificationApplication},
+			{Status: models.ServiceStatusDegraded, Classification: models.ClassificationApplication},
+		}
+		status := services.CalculateProjectStatus(svcs)
+		assert.Equal(t, models.ProjectStatusDegraded, status)
+	})
+
+	t.Run("degraded and stopped services returns partially_running", func(t *testing.T) {
+		svcs := []*models.Service{
+			{Status: models.ServiceStatusDegraded, Classification: models.ClassificationApplication},
+			{Status: models.ServiceStatusStopped, Classification: models.ClassificationApplication},
+		}
+		status := services.CalculateProjectStatus(svcs)
+		assert.Equal(t, models.ProjectStatusPartiallyRunning, status)
+	})
 }
 
 // TestLifecycle_PopulatePreviewURLRules verifies that preview URLs are strictly suppressed
@@ -173,6 +191,22 @@ func TestLifecycle_PopulatePreviewURLRules(t *testing.T) {
 		}
 		projectSvc.PopulateProjectPreviewURL(proj)
 		assert.NotEmpty(t, proj.PreviewURL, "partially_running project with running frontend must have preview URL")
+	})
+
+	t.Run("degraded public service preserves preview URL while running", func(t *testing.T) {
+		svc := &models.Service{
+			Status:        models.ServiceStatusDegraded,
+			Role:          models.RoleFrontend,
+			PublicExposed: true,
+			HostPort:      &hostPort,
+		}
+		proj := &models.Project{
+			Status:   models.ProjectStatusDegraded,
+			Services: []*models.Service{svc},
+		}
+		projectSvc.PopulateProjectPreviewURL(proj)
+		assert.NotEmpty(t, svc.PreviewURL, "degraded running service should preserve preview URL")
+		assert.NotEmpty(t, proj.PreviewURL, "degraded project should preserve preview URL")
 	})
 }
 

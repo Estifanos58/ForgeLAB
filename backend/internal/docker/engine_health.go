@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/forgelab/backend/internal/agent"
 	"github.com/forgelab/backend/internal/models"
@@ -24,7 +24,7 @@ func (e *Engine) fetchRecentContainerLogs(ctx context.Context, containerID strin
 	}
 	logCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	reader, err := e.dockerClient.ContainerLogs(logCtx, containerID, container.LogsOptions{
+	reader, err := e.dockerClient.ContainerLogs(logCtx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       fmt.Sprintf("%d", tailLines),
@@ -51,7 +51,7 @@ func (e *Engine) fetchRecentContainerLogs(ctx context.Context, containerID strin
 }
 
 // buildContainerExitDiagnostics collects rich diagnostic state from an exited container.
-func (e *Engine) buildContainerExitDiagnostics(ctx context.Context, containerID string, state *types.ContainerState) string {
+func (e *Engine) buildContainerExitDiagnostics(ctx context.Context, containerID string, state *container.State) string {
 	if state == nil {
 		return "state=unknown"
 	}
@@ -94,7 +94,7 @@ func isContainerNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if client.IsErrNotFound(err) {
+	if cerrdefs.IsNotFound(err) {
 		return true
 	}
 	type notFound interface {
@@ -120,21 +120,20 @@ func (e *Engine) isInternalPortListening(ctx context.Context, containerID string
 		return false, false
 	}
 	hexPort := fmt.Sprintf("%04X", internalPort)
-	execCfg := container.ExecOptions{
+	execCfg := client.ExecCreateOptions{
 		Cmd:          []string{"sh", "-c", fmt.Sprintf("grep -qiE ':[0-9A-Fa-f]*%s .* 0A' /proc/net/tcp /proc/net/tcp6 2>/dev/null", hexPort)},
 		AttachStdout: false,
 		AttachStderr: false,
 	}
-	execID, err := e.dockerClient.ContainerExecCreate(ctx, containerID, execCfg)
+	execID, err := e.dockerClient.ExecCreate(ctx, containerID, execCfg)
 	if err != nil {
 		return false, false
 	}
-	startCfg := container.ExecStartOptions{}
-	err = e.dockerClient.ContainerExecStart(ctx, execID.ID, startCfg)
+	_, err = e.dockerClient.ExecStart(ctx, execID.ID, client.ExecStartOptions{})
 	if err != nil {
 		return false, false
 	}
-	inspect, err := e.dockerClient.ContainerExecInspect(ctx, execID.ID)
+	inspect, err := e.dockerClient.ExecInspect(ctx, execID.ID, client.ExecInspectOptions{})
 	if err != nil {
 		return false, false
 	}
@@ -161,8 +160,8 @@ func (e *Engine) verifyServiceHealth(
 	hcConfigs ...*models.HealthCheckConfig,
 ) (bool, string) {
 	if healthStrategy == models.HealthStrategyNone {
-		cJSON, err := e.dockerClient.ContainerInspect(ctx, containerID)
-		if err == nil && cJSON.State != nil && cJSON.State.Running {
+		cRes, err := e.dockerClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+		if err == nil && cRes.Container.State != nil && cRes.Container.State.Running {
 			return true, "container verified running"
 		}
 		if errors.Is(ctx.Err(), context.Canceled) {
@@ -224,8 +223,9 @@ func (e *Engine) verifyServiceHealth(
 
 		// 2. Inspect container with bounded timeout
 		inspectCtx, inspectCancel := context.WithTimeout(ctx, 5*time.Second)
-		cJSON, err := e.dockerClient.ContainerInspect(inspectCtx, containerID)
+		cRes, err := e.dockerClient.ContainerInspect(inspectCtx, containerID, client.ContainerInspectOptions{})
 		inspectCancel()
+		cJSON := cRes.Container
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 				errLogFn("Health check cancelled: deployment context cancelled")
@@ -291,11 +291,11 @@ func (e *Engine) verifyServiceHealth(
 		if hasNativeHealth {
 			if cJSON.State.Health != nil {
 				status := cJSON.State.Health.Status
-				if status == "healthy" {
+				if status == container.Healthy {
 					logFn(fmt.Sprintf("Docker native health check reported healthy on attempt %d.", attempt))
 					return true, "healthy"
 				}
-				if status == "unhealthy" {
+				if status == container.Unhealthy {
 					diag := ""
 					if len(cJSON.State.Health.Log) > 0 {
 						lastEntry := cJSON.State.Health.Log[len(cJSON.State.Health.Log)-1]
@@ -344,12 +344,9 @@ func (e *Engine) verifyServiceHealth(
 		var targets []string
 		if cJSON.NetworkSettings != nil {
 			for _, netSettings := range cJSON.NetworkSettings.Networks {
-				if netSettings != nil && netSettings.IPAddress != "" && internalPort > 0 {
-					targets = append(targets, fmt.Sprintf("%s:%d", netSettings.IPAddress, internalPort))
+				if netSettings != nil && netSettings.IPAddress.IsValid() && !netSettings.IPAddress.IsUnspecified() && internalPort > 0 {
+					targets = append(targets, fmt.Sprintf("%s:%d", netSettings.IPAddress.String(), internalPort))
 				}
-			}
-			if cJSON.NetworkSettings.IPAddress != "" && internalPort > 0 {
-				targets = append(targets, fmt.Sprintf("%s:%d", cJSON.NetworkSettings.IPAddress, internalPort))
 			}
 		}
 
@@ -366,8 +363,12 @@ func (e *Engine) verifyServiceHealth(
 			targets = append(targets, fmt.Sprintf("localhost:%d", *hostPort))
 			if isContainer {
 				targets = append(targets, fmt.Sprintf("host.docker.internal:%d", *hostPort))
-				if cJSON.NetworkSettings != nil && cJSON.NetworkSettings.Gateway != "" {
-					targets = append(targets, fmt.Sprintf("%s:%d", cJSON.NetworkSettings.Gateway, *hostPort))
+				if cJSON.NetworkSettings != nil {
+					for _, netSettings := range cJSON.NetworkSettings.Networks {
+						if netSettings != nil && netSettings.Gateway.IsValid() && !netSettings.Gateway.IsUnspecified() {
+							targets = append(targets, fmt.Sprintf("%s:%d", netSettings.Gateway.String(), *hostPort))
+						}
+					}
 				}
 				if gw := agent.GetDefaultGateway(); gw != "" {
 					targets = append(targets, fmt.Sprintf("%s:%d", gw, *hostPort))

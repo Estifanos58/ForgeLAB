@@ -7,8 +7,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/container"
+	dockernetwork "github.com/moby/moby/api/types/network"
 )
 
 const (
@@ -55,7 +55,7 @@ var restrictedHostMounts = []string{
 
 // ContainerSecurityOptions parameters for creating a strictly sandboxed container.
 type ContainerSecurityOptions struct {
-	PortBindings             nat.PortMap
+	PortBindings             dockernetwork.PortMap
 	TargetCpuMillicores      int
 	TargetMemoryMB           int
 	TargetPidsLimit          int
