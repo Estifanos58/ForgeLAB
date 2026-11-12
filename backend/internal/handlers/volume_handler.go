@@ -117,7 +117,29 @@ func (h *VolumeHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.volumeManager.ListProjectVolumes(r.Context(), project.ID)
+	listCtx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+
+	forceRefresh := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("refresh")), "true") ||
+		strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("force")), "true")
+
+	type volumeRefreshManager interface {
+		ListProjectVolumesWithOptions(ctx context.Context, projectID uuid.UUID, forceRefresh bool) (*docker.ProjectVolumesResponse, error)
+	}
+
+	var (
+		res *docker.ProjectVolumesResponse
+		err error
+	)
+	if forceRefresh {
+		if rm, ok := h.volumeManager.(volumeRefreshManager); ok {
+			res, err = rm.ListProjectVolumesWithOptions(listCtx, project.ID, true)
+		} else {
+			res, err = h.volumeManager.ListProjectVolumes(listCtx, project.ID)
+		}
+	} else {
+		res, err = h.volumeManager.ListProjectVolumes(listCtx, project.ID)
+	}
 	if err != nil {
 		writeVolumeError(w, err)
 		return

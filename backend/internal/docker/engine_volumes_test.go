@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/moby/moby/api/pkg/stdcopy"
@@ -733,4 +734,107 @@ func TestListProjectVolumes_DockerAPIV152VerboseDiskUsage(t *testing.T) {
 	assert.Equal(t, int64(4096), res.DiskUsage.ProjectVolumesBytes)
 	assert.Equal(t, int64(7396), res.DiskUsage.TotalBytes)
 	assert.Equal(t, int64(900), res.DiskUsage.TotalReclaimable)
+}
+
+func TestListProjectVolumes_DiskUsageTimeoutFallbackAndCache(t *testing.T) {
+	ctx := context.Background()
+	projectID := uuid.New()
+	prefix := projectVolumePrefix(projectID)
+	pgDockerVol := prefix + "pgdata"
+	var verboseCalls atomic.Int32
+	var lightweightCalls atomic.Int32
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("API-Version", "1.52")
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/_ping"):
+			_, _ = w.Write([]byte("OK"))
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			_ = json.NewEncoder(w).Encode([]container.Summary{})
+		case strings.HasSuffix(r.URL.Path, "/system/df"):
+			if r.URL.Query().Get("verbose") == "1" {
+				verboseCalls.Add(1)
+				// Simulate a stalled verbose /system/df exceeding the 5s timeout.
+				select {
+				case <-r.Context().Done():
+				case <-time.After(8 * time.Second):
+				}
+				return
+			}
+			lightweightCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(system.DiskUsage{
+				ImageUsage: &image.DiskUsage{
+					ActiveCount: 1,
+					TotalCount:  1,
+					Reclaimable: 0,
+					TotalSize:   2048,
+				},
+				VolumeUsage: &volume.DiskUsage{
+					ActiveCount: 1,
+					TotalCount:  1,
+					Reclaimable: 0,
+					TotalSize:   4096,
+				},
+			})
+		case strings.HasSuffix(r.URL.Path, "/volumes"):
+			_ = json.NewEncoder(w).Encode(volume.ListResponse{
+				Volumes: []volume.Volume{
+					{
+						Name:   pgDockerVol,
+						Driver: "local",
+						Labels: map[string]string{
+							"forgelab.project_id":  projectID.String(),
+							"forgelab.volume_name": "pgdata",
+						},
+					},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	cli, err := client.New(
+		client.WithHost(server.URL),
+		client.WithHTTPClient(server.Client()),
+		client.WithAPIVersion("1.52"),
+	)
+	require.NoError(t, err)
+	defer cli.Close()
+
+	projSvc := services.NewProjectService(nil, nil, nil, nil)
+	projSvc.SetProjectByIDForTest(func(_ context.Context, pid uuid.UUID) (*models.Project, error) {
+		return &models.Project{ID: pid, Name: "stalled-df-proj"}, nil
+	})
+	svcSvc := services.NewServiceService(nil)
+	svcSvc.SetListServicesForTest(func(_ context.Context, _ uuid.UUID) ([]*models.Service, error) {
+		return nil, nil
+	})
+
+	engine := NewEngine(cli, projSvc, nil, nil, nil, nil, nil, nil, nil, t.TempDir())
+	engine.serviceService = svcSvc
+
+	start := time.Now()
+	res, err := engine.ListProjectVolumes(ctx, projectID)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	assert.Less(t, elapsed, 8*time.Second, "volume listing must complete promptly even when verbose system/df stalls")
+	assert.True(t, res.DockerAvailable)
+	require.Len(t, res.Volumes, 1)
+	assert.Equal(t, "pgdata", res.Volumes[0].Name)
+	assert.Equal(t, int64(6144), res.DiskUsage.TotalBytes)
+	assert.Contains(t, res.DiskUsage.Warning, "fast Docker disk summary")
+	assert.Equal(t, int32(1), verboseCalls.Load())
+	assert.Equal(t, int32(1), lightweightCalls.Load())
+
+	// Second call within TTL must hit the cache instead of stalling /system/df again.
+	startCached := time.Now()
+	res2, err := engine.ListProjectVolumes(ctx, projectID)
+	require.NoError(t, err)
+	assert.Less(t, time.Since(startCached), 500*time.Millisecond)
+	assert.Equal(t, int64(6144), res2.DiskUsage.TotalBytes)
+	assert.Equal(t, int32(1), verboseCalls.Load())
 }

@@ -27,6 +27,7 @@ export class ApiClientError extends Error {
 
 export interface ApiFetchOptions extends RequestInit {
   _retry?: boolean;
+  timeoutMs?: number;
 }
 
 export interface UploadProgress {
@@ -39,9 +40,10 @@ export interface UploadProgress {
 
 export async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {}): Promise<T> {
   const url = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  const { _retry, timeoutMs, signal: callerSignal, headers: rawHeaders, ...restOptions } = options;
 
   const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string>),
+    ...normalizeHeaders(rawHeaders),
   };
 
   if (typeof localStorage !== 'undefined') {
@@ -53,15 +55,67 @@ export async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {
     } catch {}
   }
 
-  if (options.body && !(options.body instanceof FormData)) {
+  if (restOptions.body && !(restOptions.body instanceof FormData)) {
     headers['Content-Type'] = 'application/json';
   }
 
-  const response = await fetch(url, {
-    ...options,
-    headers,
-    credentials: 'include',
-  });
+  const useAbort = Boolean(callerSignal || (typeof timeoutMs === 'number' && timeoutMs > 0));
+  const controller = useAbort ? new AbortController() : null;
+  let timedOut = false;
+  let callerAborted = false;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  const onCallerAbort = () => {
+    callerAborted = true;
+    controller?.abort();
+  };
+
+  if (controller) {
+    if (callerSignal?.aborted) {
+      throw createAbortError();
+    }
+    if (callerSignal) {
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+    if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+    }
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...restOptions,
+      headers,
+      credentials: 'include',
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } catch (err: any) {
+    if (timedOut && typeof timeoutMs === 'number') {
+      throw new ApiClientError(
+        `Request timed out after ${Math.max(1, Math.round(timeoutMs / 1000))}s. Please try again.`,
+        408,
+        { timeout: true, reason: 'timeout' }
+      );
+    }
+    if (callerAborted || callerSignal?.aborted) {
+      if (err?.name === 'AbortError') {
+        throw err;
+      }
+      throw createAbortError();
+    }
+    throw err;
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+    if (callerSignal && controller) {
+      callerSignal.removeEventListener('abort', onCallerAbort);
+    }
+  }
 
   const guestHeader = response.headers.get('x-guest-session');
   if (guestHeader && typeof localStorage !== 'undefined') {
@@ -77,7 +131,7 @@ export async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {
     url.includes('/api/auth/refresh') ||
     url.includes('/api/auth/logout');
 
-  if (response.status === 401 && !options._retry && !isAuthEndpoint) {
+  if (response.status === 401 && !_retry && !isAuthEndpoint) {
     try {
       await sessionManager.refreshSession();
       // Retry original request exactly once

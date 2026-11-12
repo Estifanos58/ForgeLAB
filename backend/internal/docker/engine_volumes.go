@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -139,6 +140,12 @@ func projectVolumePrefix(projectID uuid.UUID) string {
 // ListProjectVolumes enumerates persistent Docker volumes owned by a project along with mount references
 // and Docker Engine disk usage telemetry.
 func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*ProjectVolumesResponse, error) {
+	return e.ListProjectVolumesWithOptions(ctx, projectID, false)
+}
+
+// ListProjectVolumesWithOptions enumerates persistent Docker volumes owned by a project along with mount references
+// and Docker Engine disk usage telemetry, optionally bypassing the short-lived disk usage cache.
+func (e *Engine) ListProjectVolumesWithOptions(ctx context.Context, projectID uuid.UUID, forceRefresh bool) (*ProjectVolumesResponse, error) {
 	if e.projectService == nil {
 		return nil, errors.New("project service unavailable")
 	}
@@ -165,6 +172,7 @@ func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*
 	volMap := make(map[string]*ProjectVolumeInfo)
 	serviceByID := make(map[uuid.UUID]*models.Service)
 	serviceByName := make(map[string]*models.Service)
+	declaredVolNames := make(map[string]bool)
 
 	if e.serviceService != nil {
 		svcs, svcErr := e.serviceService.ListServices(ctx, projectID)
@@ -186,6 +194,7 @@ func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*
 					} else {
 						logicalName = strings.TrimPrefix(logicalName, prefix)
 					}
+					declaredVolNames[dockerName] = true
 
 					entry, exists := volMap[dockerName]
 					if !exists {
@@ -221,10 +230,45 @@ func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*
 		return resp, nil
 	}
 
+	// Query containers, volumes, and daemon disk usage concurrently with bounded timeouts
+	// so a slow/stalled `system/df` never hangs the entire Storage response.
+	var (
+		wg                     sync.WaitGroup
+		containerList          client.ContainerListResult
+		listContErr            error
+		dfSummary              DiskUsageSummary
+		usageByDockerName      map[string]volumeDiskUsage
+		dfErr                  error
+		volListRes             client.VolumeListResult
+		volListErr             error
+	)
+
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		cCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		containerList, listContErr = e.dockerClient.ContainerList(cCtx, client.ContainerListOptions{All: true})
+	}()
+
+	go func() {
+		defer wg.Done()
+		dfSummary, usageByDockerName, dfErr = e.getDockerDiskUsageCached(ctx, forceRefresh)
+	}()
+
+	go func() {
+		defer wg.Done()
+		vCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		volListRes, volListErr = e.dockerClient.VolumeList(vCtx, client.VolumeListOptions{})
+	}()
+
+	wg.Wait()
+
 	// Inspect Docker containers to find active/running mounts on project volumes.
 	runningByContainerID := make(map[string]bool)
 	liveMountsByDockerName := make(map[string][]VolumeMountRef)
-	containerList, listContErr := e.dockerClient.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if listContErr != nil {
 		slog.Warn("failed to list containers during volume inspection", "project_id", projectID, "error", listContErr)
 	} else {
@@ -239,7 +283,7 @@ func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*
 			belongs := c.Labels != nil && c.Labels["forgelab.project_id"] == projIDStr
 			if !belongs {
 				for _, m := range c.Mounts {
-					if m.Name != "" && (strings.HasPrefix(m.Name, prefix) || volMap[m.Name] != nil) {
+					if m.Name != "" && (strings.HasPrefix(m.Name, prefix) || declaredVolNames[m.Name]) {
 						belongs = true
 						break
 					}
@@ -284,7 +328,7 @@ func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*
 		}
 	}
 
-	// Mark running state on configured mounts from container inventory or fallback inspect
+	// Mark running state on configured mounts from container inventory or bounded fallback inspect
 	for _, entry := range volMap {
 		for i := range entry.Mounts {
 			cid := entry.Mounts[i].ContainerID
@@ -298,7 +342,10 @@ func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*
 				}
 				continue
 			}
-			if insp, iErr := e.dockerClient.ContainerInspect(ctx, cid, client.ContainerInspectOptions{}); iErr == nil && insp.Container.State != nil {
+			inspCtx, cancelInsp := context.WithTimeout(ctx, 2*time.Second)
+			insp, iErr := e.dockerClient.ContainerInspect(inspCtx, cid, client.ContainerInspectOptions{})
+			cancelInsp()
+			if iErr == nil && insp.Container.State != nil {
 				entry.Mounts[i].Running = insp.Container.State.Running
 				if insp.Container.State.Running {
 					entry.InUse = true
@@ -307,12 +354,13 @@ func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*
 		}
 	}
 
-	// Query DiskUsage (system/df) for daemon-wide storage breakdown and per-volume UsageData
-	dfSummary, usageByDockerName, dfErr := e.collectDockerDiskUsage(ctx)
+	// Apply DiskUsage (system/df) telemetry without letting a slow/timed-out system/df block volume management
 	if dfErr != nil {
-		resp.DockerAvailable = false
 		resp.DiskUsage.DockerAvailable = false
 		resp.DiskUsage.Warning = dfSummary.Warning
+		if listContErr != nil && volListErr != nil {
+			resp.DockerAvailable = false
+		}
 	} else {
 		dfSummary.ProjectVolumesBytes = resp.DiskUsage.ProjectVolumesBytes
 		dfSummary.ProjectVolumesCount = resp.DiskUsage.ProjectVolumesCount
@@ -320,13 +368,14 @@ func (e *Engine) ListProjectVolumes(ctx context.Context, projectID uuid.UUID) (*
 	}
 
 	// List Docker volumes and merge with project volumes
-	volListRes, volListErr := e.dockerClient.VolumeList(ctx, client.VolumeListOptions{})
 	if volListErr != nil {
-		if dfErr == nil {
+		if resp.DiskUsage.Warning == "" {
 			resp.DiskUsage.Warning = fmt.Sprintf("Failed to list Docker volumes: %v", volListErr)
 		}
-		resp.DockerAvailable = false
-		resp.DiskUsage.DockerAvailable = false
+		if listContErr != nil {
+			resp.DockerAvailable = false
+			resp.DiskUsage.DockerAvailable = false
+		}
 	} else {
 		projIDStr := projectID.String()
 		for _, dv := range volListRes.Items {
@@ -451,8 +500,94 @@ type volumeDiskUsage struct {
 	refCount int64
 }
 
-// collectDockerDiskUsage queries Docker daemon system disk usage (containers, images, volumes, build cache).
+type diskUsageCacheEntry struct {
+	summary           DiskUsageSummary
+	usageByDockerName map[string]volumeDiskUsage
+	expiresAt         time.Time
+}
+
+type diskUsageInFlightCall struct {
+	done              chan struct{}
+	summary           DiskUsageSummary
+	usageByDockerName map[string]volumeDiskUsage
+	err               error
+}
+
+func cloneVolumeDiskUsageMap(src map[string]volumeDiskUsage) map[string]volumeDiskUsage {
+	if len(src) == 0 {
+		return make(map[string]volumeDiskUsage)
+	}
+	dst := make(map[string]volumeDiskUsage, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// collectDockerDiskUsage queries Docker daemon system disk usage using short-lived caching,
+// singleflight deduplication, and bounded timeouts so slow Docker daemons never hang callers.
 func (e *Engine) collectDockerDiskUsage(ctx context.Context) (DiskUsageSummary, map[string]volumeDiskUsage, error) {
+	return e.getDockerDiskUsageCached(ctx, false)
+}
+
+func (e *Engine) getDockerDiskUsageCached(ctx context.Context, forceRefresh bool) (DiskUsageSummary, map[string]volumeDiskUsage, error) {
+	if e.dockerClient == nil {
+		return DiskUsageSummary{
+			DockerAvailable: false,
+			CollectedAt:     time.Now().UTC(),
+			Warning:         "Docker daemon connection is unavailable.",
+		}, make(map[string]volumeDiskUsage), ErrDockerUnavailable
+	}
+
+	now := time.Now().UTC()
+	e.diskUsageCacheMu.Lock()
+	ttl := e.diskUsageCacheTTL
+	if !forceRefresh && ttl > 0 && e.diskUsageCache != nil && now.Before(e.diskUsageCache.expiresAt) {
+		cachedSummary := e.diskUsageCache.summary
+		cachedMap := cloneVolumeDiskUsageMap(e.diskUsageCache.usageByDockerName)
+		e.diskUsageCacheMu.Unlock()
+		return cachedSummary, cachedMap, nil
+	}
+	if e.diskUsageInFlight != nil {
+		existing := e.diskUsageInFlight
+		e.diskUsageCacheMu.Unlock()
+		select {
+		case <-existing.done:
+			return existing.summary, cloneVolumeDiskUsageMap(existing.usageByDockerName), existing.err
+		case <-ctx.Done():
+			return DiskUsageSummary{
+				DockerAvailable: true,
+				CollectedAt:     time.Now().UTC(),
+				Warning:         fmt.Sprintf("Disk usage query cancelled: %v", ctx.Err()),
+			}, make(map[string]volumeDiskUsage), ctx.Err()
+		}
+	}
+
+	call := &diskUsageInFlightCall{done: make(chan struct{})}
+	e.diskUsageInFlight = call
+	e.diskUsageCacheMu.Unlock()
+
+	summary, usageByDockerName, err := e.collectDockerDiskUsageFresh(context.WithoutCancel(ctx))
+
+	e.diskUsageCacheMu.Lock()
+	e.diskUsageInFlight = nil
+	if err == nil && ttl > 0 {
+		e.diskUsageCache = &diskUsageCacheEntry{
+			summary:           summary,
+			usageByDockerName: cloneVolumeDiskUsageMap(usageByDockerName),
+			expiresAt:         time.Now().UTC().Add(ttl),
+		}
+	}
+	call.summary = summary
+	call.usageByDockerName = cloneVolumeDiskUsageMap(usageByDockerName)
+	call.err = err
+	close(call.done)
+	e.diskUsageCacheMu.Unlock()
+
+	return summary, usageByDockerName, err
+}
+
+func (e *Engine) collectDockerDiskUsageFresh(ctx context.Context) (DiskUsageSummary, map[string]volumeDiskUsage, error) {
 	now := time.Now().UTC()
 	summary := DiskUsageSummary{
 		DockerAvailable: e.dockerClient != nil,
@@ -464,17 +599,48 @@ func (e *Engine) collectDockerDiskUsage(ctx context.Context) (DiskUsageSummary, 
 		return summary, usageByDockerName, ErrDockerUnavailable
 	}
 
-	dfRes, dfErr := e.dockerClient.DiskUsage(ctx, client.DiskUsageOptions{
+	// Bound verbose DiskUsage (system/df?verbose=1) which can hang on Docker Desktop / BuildKit.
+	dfCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	dfRes, dfErr := e.dockerClient.DiskUsage(dfCtx, client.DiskUsageOptions{
 		Containers: true,
 		Images:     true,
 		Volumes:    true,
 		BuildCache: true,
 		Verbose:    true,
 	})
+	cancel()
+
+	usedLightweightFallback := false
+	if dfErr != nil && (errors.Is(dfErr, context.DeadlineExceeded) || errors.Is(dfCtx.Err(), context.DeadlineExceeded)) {
+		slog.Warn("verbose Docker DiskUsage timed out; retrying lightweight summary without build cache/verbose scan", "error", dfErr)
+		fbCtx, fbCancel := context.WithTimeout(ctx, 3*time.Second)
+		fbRes, fbErr := e.dockerClient.DiskUsage(fbCtx, client.DiskUsageOptions{
+			Containers: true,
+			Images:     true,
+			Volumes:    true,
+			BuildCache: false,
+			Verbose:    false,
+		})
+		fbCancel()
+		if fbErr == nil {
+			dfRes = fbRes
+			dfErr = nil
+			usedLightweightFallback = true
+		}
+	}
+
 	if dfErr != nil {
 		summary.DockerAvailable = false
-		summary.Warning = fmt.Sprintf("Failed to collect Docker disk usage: %v", dfErr)
+		if errors.Is(dfErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			summary.Warning = "Docker daemon disk usage inspection timed out; project volumes are listed below."
+		} else {
+			summary.Warning = fmt.Sprintf("Failed to collect Docker disk usage: %v", dfErr)
+		}
 		return summary, usageByDockerName, dfErr
+	}
+
+	if usedLightweightFallback {
+		summary.Warning = "Verbose disk usage and build cache scan timed out; showing fast Docker disk summary."
 	}
 
 	summary.Containers = DiskUsageCategory{

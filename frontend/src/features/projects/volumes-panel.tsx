@@ -6,6 +6,11 @@ import { ProjectVolumeInfo, ProjectVolumesResponse } from '@/lib/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Alert } from '@/components/ui/alert';
+import {
+  DonutChart,
+  HorizontalBarChart,
+  StackedDistributionBar,
+} from '@/components/ui/charts';
 import { formatBytes } from '@/lib/utils/format';
 import {
   AlertTriangle,
@@ -31,22 +36,37 @@ export function VolumesPanel({ projectId }: VolumesPanelProps) {
   const [backingUpVolume, setBackingUpVolume] = useState<string | null>(null);
   const [restoringVolume, setRestoringVolume] = useState<string | null>(null);
   const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const requestGenRef = useRef(0);
 
-  const loadVolumes = useCallback(async () => {
-    try {
-      setError(null);
-      const res = await api.projects.getVolumes(projectId);
-      setData(res);
-    } catch (err: any) {
-      setError(err?.message || 'Failed to load persistent volumes and disk usage');
-    } finally {
-      setLoading(false);
-    }
-  }, [projectId]);
+  const loadVolumes = useCallback(
+    async (forceRefresh = false) => {
+      const gen = ++requestGenRef.current;
+      try {
+        setLoading(true);
+        setError(null);
+        const res = await api.projects.getVolumes(
+          projectId,
+          forceRefresh ? { refresh: true } : undefined
+        );
+        if (gen !== requestGenRef.current) return;
+        setData(res);
+      } catch (err: any) {
+        if (gen !== requestGenRef.current) return;
+        setError(err?.message || 'Failed to load persistent volumes and disk usage');
+      } finally {
+        if (gen === requestGenRef.current) {
+          setLoading(false);
+        }
+      }
+    },
+    [projectId]
+  );
 
   useEffect(() => {
-    setLoading(true);
-    loadVolumes();
+    loadVolumes(false);
+    return () => {
+      requestGenRef.current++;
+    };
   }, [loadVolumes]);
 
   const handleBackup = async (vol: ProjectVolumeInfo) => {
@@ -101,7 +121,7 @@ export function VolumesPanel({ projectId }: VolumesPanelProps) {
       setStatusMessage(
         `${result.message} (${result.files_restored} files, ${formatBytes(result.bytes_restored)} restored).`
       );
-      await loadVolumes();
+      await loadVolumes(true);
     } catch (err: any) {
       setError(err?.message || `Failed to restore volume "${vol.name}"`);
     } finally {
@@ -111,15 +131,46 @@ export function VolumesPanel({ projectId }: VolumesPanelProps) {
 
   if (loading && !data) {
     return (
-      <div className="flex items-center justify-center p-8 text-xs text-neutral-400 gap-2">
-        <RefreshCw className="w-4 h-4 animate-spin" />
+      <div className="flex flex-col items-center justify-center p-10 text-xs text-neutral-400 gap-2.5 rounded-md border border-surface-border bg-surface">
+        <RefreshCw className="w-5 h-5 animate-spin text-emerald-400" />
         <span>Inspecting persistent volumes and Docker Engine disk usage...</span>
+      </div>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <div className="rounded-md border border-rose-500/30 bg-surface p-6 space-y-4">
+        <Alert variant="error" className="text-xs">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+        </Alert>
+        <div className="flex justify-end">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => loadVolumes(true)}
+            disabled={loading}
+            icon={<RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />}
+          >
+            Retry Storage Inspection
+          </Button>
+        </div>
       </div>
     );
   }
 
   const volumes = data?.volumes || [];
   const disk = data?.disk_usage;
+  const maxVolumeBytes = Math.max(1, ...volumes.map((v) => Math.max(0, v.size_bytes)));
+  const activeEngineBytes = disk
+    ? Math.max(0, disk.total_bytes - disk.total_reclaimable_bytes)
+    : 0;
+  const otherVolumeBytes = disk
+    ? Math.max(0, disk.volumes.total_bytes - disk.project_volumes_bytes)
+    : 0;
 
   return (
     <div className="space-y-4">
@@ -130,14 +181,14 @@ export function VolumesPanel({ projectId }: VolumesPanelProps) {
             <div>
               <h3 className="text-sm font-semibold text-white">Persistent Volumes &amp; Disk Usage</h3>
               <p className="text-[11px] text-neutral-400">
-                Inspect project storage, download offline .tar.gz backups, and restore stopped volumes safely.
+                Visual storage breakdown, offline .tar.gz backups, and safe restore for project volumes.
               </p>
             </div>
           </div>
           <Button
             variant="secondary"
             size="sm"
-            onClick={loadVolumes}
+            onClick={() => loadVolumes(true)}
             disabled={loading}
             className="h-7 text-xs px-2.5"
             icon={<RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />}
@@ -173,66 +224,118 @@ export function VolumesPanel({ projectId }: VolumesPanelProps) {
           </Alert>
         )}
 
+        {/* Storage Breakdown Graphs */}
         {disk && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 text-xs font-mono">
-            <div className="p-3 rounded bg-surface-elevated/40 border border-surface-border space-y-1">
-              <span className="text-[10px] text-neutral-400 uppercase block">Project Volumes</span>
-              <span className="text-base font-bold text-white block">
-                {formatBytes(disk.project_volumes_bytes)}
-              </span>
-              <span className="text-[10px] text-neutral-500 block">
-                {disk.project_volumes_count} volume{disk.project_volumes_count === 1 ? '' : 's'}
-              </span>
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-1">
+            <div className="lg:col-span-7 p-3.5 rounded-lg bg-surface-elevated/35 border border-surface-border space-y-2.5">
+              <div className="flex items-center justify-between text-[11px] font-mono text-neutral-400">
+                <span className="uppercase tracking-wider font-semibold text-neutral-300">
+                  Docker Engine Storage Composition
+                </span>
+                <span>{formatBytes(disk.total_bytes)} total</span>
+              </div>
+              <DonutChart
+                size={136}
+                thickness={16}
+                centerValue={formatBytes(disk.total_bytes)}
+                centerLabel="Engine Disk"
+                formatValue={(v) => formatBytes(v)}
+                emptyLabel="No disk telemetry"
+                segments={[
+                  {
+                    id: 'project-vol',
+                    label: 'Project Volumes',
+                    value: disk.project_volumes_bytes,
+                    color: '#10b981',
+                    detail: `${disk.project_volumes_count} vol`,
+                  },
+                  {
+                    id: 'other-vol',
+                    label: 'Other Volumes',
+                    value: otherVolumeBytes,
+                    color: '#14b8a6',
+                  },
+                  {
+                    id: 'images',
+                    label: 'Images',
+                    value: disk.images.total_bytes,
+                    color: '#3b82f6',
+                    detail: `${disk.images.active_count}/${disk.images.count}`,
+                  },
+                  {
+                    id: 'containers',
+                    label: 'Containers',
+                    value: disk.containers.total_bytes,
+                    color: '#6366f1',
+                    detail: `${disk.containers.active_count}/${disk.containers.count}`,
+                  },
+                  {
+                    id: 'build-cache',
+                    label: 'Build Cache',
+                    value: disk.build_cache.total_bytes,
+                    color: '#f59e0b',
+                    detail: `${disk.build_cache.count}`,
+                  },
+                ]}
+              />
             </div>
 
-            <div className="p-3 rounded bg-surface-elevated/40 border border-surface-border space-y-1">
-              <span className="text-[10px] text-neutral-400 uppercase block">All Containers</span>
-              <span className="text-base font-bold text-white block">
-                {formatBytes(disk.containers.total_bytes)}
-              </span>
-              <span className="text-[10px] text-neutral-500 block">
-                {disk.containers.active_count}/{disk.containers.count} active ·{' '}
-                {formatBytes(disk.containers.reclaimable_bytes)} reclaimable
-              </span>
-            </div>
+            <div className="lg:col-span-5 flex flex-col justify-between gap-3">
+              <div className="p-3.5 rounded-lg bg-surface-elevated/35 border border-surface-border space-y-2.5">
+                <div className="flex items-center justify-between text-[11px] font-mono text-neutral-400">
+                  <span className="uppercase tracking-wider font-semibold text-neutral-300">
+                    Active vs Reclaimable Space
+                  </span>
+                  <span className="text-amber-300">{formatBytes(disk.total_reclaimable_bytes)} reclaimable</span>
+                </div>
+                <StackedDistributionBar
+                  height={12}
+                  formatValue={(v) => formatBytes(v)}
+                  segments={[
+                    {
+                      id: 'active',
+                      label: 'In Use',
+                      value: activeEngineBytes,
+                      color: '#10b981',
+                    },
+                    {
+                      id: 'reclaimable',
+                      label: 'Reclaimable',
+                      value: disk.total_reclaimable_bytes,
+                      color: '#f59e0b',
+                    },
+                  ]}
+                />
+              </div>
 
-            <div className="p-3 rounded bg-surface-elevated/40 border border-surface-border space-y-1">
-              <span className="text-[10px] text-neutral-400 uppercase block">Images</span>
-              <span className="text-base font-bold text-white block">
-                {formatBytes(disk.images.total_bytes)}
-              </span>
-              <span className="text-[10px] text-neutral-500 block">
-                {disk.images.active_count}/{disk.images.count} in use ·{' '}
-                {formatBytes(disk.images.reclaimable_bytes)} reclaimable
-              </span>
-            </div>
-
-            <div className="p-3 rounded bg-surface-elevated/40 border border-surface-border space-y-1">
-              <span className="text-[10px] text-neutral-400 uppercase block">Build Cache</span>
-              <span className="text-base font-bold text-white block">
-                {formatBytes(disk.build_cache.total_bytes)}
-              </span>
-              <span className="text-[10px] text-neutral-500 block">
-                {disk.build_cache.count} entries ·{' '}
-                {formatBytes(disk.build_cache.reclaimable_bytes)} reclaimable
-              </span>
-            </div>
-
-            <div className="p-3 rounded bg-surface-elevated/40 border border-surface-border space-y-1">
-              <span className="text-[10px] text-neutral-400 uppercase block">Engine Total</span>
-              <span className="text-base font-bold text-white block">
-                {formatBytes(disk.total_bytes)}
-              </span>
-              <span className="text-[10px] text-neutral-500 block">
-                {formatBytes(disk.total_reclaimable_bytes)} reclaimable
-              </span>
+              <div className="p-3.5 rounded-lg bg-surface-elevated/35 border border-surface-border space-y-2.5 flex-1">
+                <div className="flex items-center justify-between text-[11px] font-mono text-neutral-400">
+                  <span className="uppercase tracking-wider font-semibold text-neutral-300">
+                    Project Volumes Footprint
+                  </span>
+                  <span>{formatBytes(disk.project_volumes_bytes)}</span>
+                </div>
+                <HorizontalBarChart
+                  emptyMessage="No provisioned volumes yet"
+                  formatValue={(v) => formatBytes(v)}
+                  items={volumes.map((v) => ({
+                    id: v.docker_name,
+                    label: v.name,
+                    sublabel: v.in_use ? 'active' : 'idle',
+                    value: Math.max(0, v.size_bytes),
+                    maxValue: maxVolumeBytes,
+                    valueLabel: v.size_bytes >= 0 ? formatBytes(v.size_bytes) : 'Pending',
+                    color: v.in_use ? '#10b981' : '#38bdf8',
+                  }))}
+                />
+              </div>
             </div>
           </div>
         )}
       </div>
 
       <div className="rounded-md border border-surface-border bg-surface p-4 sm:p-5 space-y-3">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2 text-xs font-semibold text-white">
             <Database className="w-3.5 h-3.5 text-sky-400" />
             <span>Project Persistent Volumes ({volumes.length})</span>
@@ -254,6 +357,8 @@ export function VolumesPanel({ projectId }: VolumesPanelProps) {
               const isRestoring = restoringVolume === vol.name;
               const restoreDisabled =
                 !data?.docker_available || vol.in_use || isBackingUp || isRestoring;
+              const sizeSharePct =
+                vol.size_bytes > 0 ? Math.max(3, (vol.size_bytes / maxVolumeBytes) * 100) : 0;
 
               return (
                 <div
@@ -320,18 +425,49 @@ export function VolumesPanel({ projectId }: VolumesPanelProps) {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
-                    <div className="p-2 rounded bg-surface/60 border border-surface-border/60">
-                      <span className="text-[10px] text-neutral-500 block uppercase">Size</span>
-                      <span className="text-white">
-                        {vol.size_bytes >= 0 ? formatBytes(vol.size_bytes) : 'Pending'}
-                      </span>
+                  {/* Volume Capacity & Mount Visual Bars */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs font-mono">
+                    <div className="p-2.5 rounded bg-surface/60 border border-surface-border/60 space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className="text-neutral-500 uppercase">Relative Volume Size</span>
+                        <span className="text-white">
+                          {vol.size_bytes >= 0 ? formatBytes(vol.size_bytes) : 'Pending'}
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full rounded-full bg-surface-border/60 overflow-hidden">
+                        <div
+                          className="h-full rounded-full bg-sky-400 transition-all duration-300"
+                          style={{ width: `${sizeSharePct}%` }}
+                        />
+                      </div>
                     </div>
-                    <div className="p-2 rounded bg-surface/60 border border-surface-border/60">
-                      <span className="text-[10px] text-neutral-500 block uppercase">Container Refs</span>
-                      <span className="text-white">{vol.ref_count >= 0 ? vol.ref_count : vol.mounts.length}</span>
+
+                    <div className="p-2.5 rounded bg-surface/60 border border-surface-border/60 space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className="text-neutral-500 uppercase">Mount Activity</span>
+                        <span className="text-white">
+                          {vol.mounts.filter((m) => m.running).length}/{Math.max(vol.mounts.length, vol.ref_count >= 0 ? vol.ref_count : 0)} active
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full rounded-full bg-surface-border/60 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all duration-300 ${
+                            vol.in_use ? 'bg-emerald-400' : 'bg-neutral-500'
+                          }`}
+                          style={{
+                            width: `${
+                              vol.mounts.length > 0
+                                ? Math.max(12, (vol.mounts.filter((m) => m.running).length / vol.mounts.length) * 100)
+                                : vol.ref_count > 0
+                                ? 50
+                                : 0
+                            }%`,
+                          }}
+                        />
+                      </div>
                     </div>
-                    <div className="p-2 rounded bg-surface/60 border border-surface-border/60 sm:col-span-2">
+
+                    <div className="p-2.5 rounded bg-surface/60 border border-surface-border/60 flex flex-col justify-center">
                       <span className="text-[10px] text-neutral-500 block uppercase">Restore Guard</span>
                       <span className={vol.in_use ? 'text-amber-300' : 'text-emerald-400'}>
                         {vol.in_use

@@ -251,4 +251,64 @@ func TestVolumeHandler_AuthOwnershipAndOperations(t *testing.T) {
 	})
 }
 
+type fakeRefreshVolumeManager struct {
+	fakeVolumeManager
+	listWithOptsFn func(ctx context.Context, projectID uuid.UUID, forceRefresh bool) (*docker.ProjectVolumesResponse, error)
+}
+
+func (f *fakeRefreshVolumeManager) ListProjectVolumesWithOptions(ctx context.Context, projectID uuid.UUID, forceRefresh bool) (*docker.ProjectVolumesResponse, error) {
+	return f.listWithOptsFn(ctx, projectID, forceRefresh)
+}
+
+func TestVolumeHandler_ForceRefreshQueryBypass(t *testing.T) {
+	ownerID := uuid.New()
+	projectID := uuid.New()
+
+	projSvc := services.NewProjectService(nil, nil, nil, nil)
+	projSvc.SetProjectGetterForTest(func(_ context.Context, pID, uID uuid.UUID) (*models.Project, error) {
+		if pID == projectID && uID == ownerID {
+			return &models.Project{ID: projectID, OwnerID: ownerID, Name: "RefreshDB"}, nil
+		}
+		return nil, services.ErrProjectNotFound
+	})
+
+	var sawDefaultCall bool
+	var sawRefreshCall bool
+	mgr := &fakeRefreshVolumeManager{
+		fakeVolumeManager: fakeVolumeManager{
+			listFn: func(_ context.Context, pid uuid.UUID) (*docker.ProjectVolumesResponse, error) {
+				sawDefaultCall = true
+				return &docker.ProjectVolumesResponse{ProjectID: pid, DockerAvailable: true}, nil
+			},
+		},
+		listWithOptsFn: func(_ context.Context, pid uuid.UUID, forceRefresh bool) (*docker.ProjectVolumesResponse, error) {
+			sawRefreshCall = forceRefresh
+			return &docker.ProjectVolumesResponse{ProjectID: pid, DockerAvailable: true}, nil
+		},
+	}
+
+	h := handlers.NewVolumeHandler(projSvc, mgr)
+	r := chi.NewRouter()
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			req = req.WithContext(withTestUser(req.Context(), ownerID))
+			next.ServeHTTP(w, req)
+		})
+	})
+	r.Get("/api/projects/{id}/volumes", h.List)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID.String()+"/volumes", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.True(t, sawDefaultCall)
+	assert.False(t, sawRefreshCall)
+
+	req = httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID.String()+"/volumes?refresh=true", nil)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.True(t, sawRefreshCall)
+}
+
 var _ = errors.New

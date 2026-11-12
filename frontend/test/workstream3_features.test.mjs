@@ -344,3 +344,32 @@ test('projectsClient.getMetrics supports refresh=true cache bypass and observabi
     restore();
   }
 });
+
+test('projectsClient.getVolumes supports refresh=true and aborts slow requests on timeoutMs', async () => {
+  const calls = [];
+  const restore = mockFetchOnce((url, init) => {
+    calls.push(String(url));
+    if (String(url).includes('refresh=true')) {
+      return jsonResponse({ project_id: 'p1', docker_available: true, volumes: [], disk_usage: {} });
+    }
+    return new Promise((_, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const err = new Error('Aborted');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    });
+  });
+
+  try {
+    await projectsClient.getVolumes('p1', { refresh: true });
+    assert.deepEqual(calls, ['/api/projects/p1/volumes?refresh=true']);
+
+    await assert.rejects(
+      () => projectsClient.getVolumes('p1', { timeoutMs: 25 }),
+      (err) => err?.status === 408 && /timed out/i.test(err?.message || '')
+    );
+  } finally {
+    restore();
+  }
+});

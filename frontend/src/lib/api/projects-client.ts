@@ -100,13 +100,24 @@ export const projectsClient = {
     return apiFetch<ProjectTopology>(`/api/projects/${id}/topology`);
   },
 
-  async getMetrics(id: string, options?: { refresh?: boolean }): Promise<ProjectRuntimeMetrics> {
+  async getMetrics(
+    id: string,
+    options?: { refresh?: boolean; timeoutMs?: number }
+  ): Promise<ProjectRuntimeMetrics> {
     const query = options?.refresh ? '?refresh=true' : '';
-    return apiFetch<ProjectRuntimeMetrics>(`/api/projects/${id}/metrics${query}`);
+    return apiFetch<ProjectRuntimeMetrics>(`/api/projects/${id}/metrics${query}`, {
+      timeoutMs: options?.timeoutMs ?? 15000,
+    });
   },
 
-  async getVolumes(id: string): Promise<ProjectVolumesResponse> {
-    return apiFetch<ProjectVolumesResponse>(`/api/projects/${id}/volumes`);
+  async getVolumes(
+    id: string,
+    options?: { refresh?: boolean; timeoutMs?: number }
+  ): Promise<ProjectVolumesResponse> {
+    const query = options?.refresh ? '?refresh=true' : '';
+    return apiFetch<ProjectVolumesResponse>(`/api/projects/${id}/volumes${query}`, {
+      timeoutMs: options?.timeoutMs ?? 15000,
+    });
   },
 
   async backupVolume(id: string, volumeName: string): Promise<{ blob: Blob; filename: string }> {

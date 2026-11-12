@@ -10,6 +10,11 @@ import {
 import { cn } from '@/lib/utils/cn';
 import { formatBytes } from '@/lib/utils/format';
 import {
+  HorizontalBarChart,
+  RadialGauge,
+  StackedDistributionBar,
+} from '@/components/ui/charts';
+import {
   Network,
   RefreshCw,
   AlertTriangle,
@@ -226,7 +231,18 @@ export function TopologySection({ projectId }: TopologySectionProps) {
             </span>
           </div>
         ) : (
-          <div className="space-y-2.5">
+          <div className="space-y-3">
+            <div className="p-2.5 rounded-md bg-surface-elevated/40 border border-surface-border/70">
+              <StackedDistributionBar
+                height={9}
+                segments={[
+                  { id: 'errors', label: 'Errors', value: errorCount, color: '#f43f5e' },
+                  { id: 'warnings', label: 'Warnings', value: warningCount, color: '#f59e0b' },
+                  { id: 'info', label: 'Info', value: infoCount, color: '#3b82f6' },
+                ]}
+              />
+            </div>
+            <div className="space-y-2.5">
             {filteredDiagnostics.map((diag, idx) => (
               <div
                 key={idx}
@@ -260,6 +276,7 @@ export function TopologySection({ projectId }: TopologySectionProps) {
                 </div>
               </div>
             ))}
+            </div>
           </div>
         )}
       </div>
@@ -441,49 +458,99 @@ export function TopologySection({ projectId }: TopologySectionProps) {
 
         {diagnosticsReport && (
           <>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
-              <div className="p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-1">
-                <span className="text-[10px] text-neutral-500 block uppercase">Docker Daemon</span>
-                <span className={diagnosticsReport.docker.available ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold'}>
-                  {diagnosticsReport.docker.available ? `Connected (${diagnosticsReport.docker.ping_latency_ms}ms)` : 'Unreachable'}
-                </span>
-                <span className="text-[10px] text-neutral-400 block truncate">
-                  {diagnosticsReport.docker.server_version
-                    ? `v${diagnosticsReport.docker.server_version} · API ${diagnosticsReport.docker.api_version || '—'}`
-                    : diagnosticsReport.docker.error || '—'}
-                </span>
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 text-xs font-mono">
+              {/* Docker Ping Latency Gauge */}
+              <div className="lg:col-span-3 p-3 rounded-lg bg-surface/60 border border-surface-border/60 flex flex-col items-center justify-center space-y-1.5">
+                <span className="text-[10px] text-neutral-500 uppercase self-start">Docker Daemon</span>
+                <RadialGauge
+                  value={diagnosticsReport.docker.available ? Math.min(100, (diagnosticsReport.docker.ping_latency_ms / 250) * 100) : 100}
+                  max={100}
+                  size={84}
+                  label="Ping"
+                  valueLabel={diagnosticsReport.docker.available ? `${diagnosticsReport.docker.ping_latency_ms}ms` : 'Down'}
+                  color={
+                    !diagnosticsReport.docker.available
+                      ? '#f43f5e'
+                      : diagnosticsReport.docker.ping_latency_ms > 150
+                      ? '#f59e0b'
+                      : '#10b981'
+                  }
+                  sublabel={
+                    diagnosticsReport.docker.server_version
+                      ? `v${diagnosticsReport.docker.server_version}`
+                      : diagnosticsReport.docker.error || 'Unreachable'
+                  }
+                />
               </div>
 
-              <div className="p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-1">
-                <span className="text-[10px] text-neutral-500 block uppercase">Host &amp; Reclaimable</span>
-                <span className="text-white font-semibold flex items-center gap-1">
-                  <HardDrive className="w-3 h-3 text-neutral-400" />
-                  {formatBytes(diagnosticsReport.resources.disk_usage?.total_reclaimable_bytes || 0)} reclaimable
-                </span>
-                <span className="text-[10px] text-neutral-400 block">
-                  {diagnosticsReport.resources.host_cpus || 0} CPUs &middot;{' '}
-                  {formatBytes(diagnosticsReport.resources.host_memory_total_bytes || 0)} RAM
-                </span>
-              </div>
-
-              <div className="p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-1">
-                <span className="text-[10px] text-neutral-500 block uppercase">Resource Warnings</span>
-                <span className={diagnosticsReport.resources.exhausted_services.length > 0 ? 'text-amber-400 font-semibold' : 'text-white font-semibold'}>
-                  {diagnosticsReport.resources.exhausted_services.length} service(s)
-                </span>
-                <span className="text-[10px] text-neutral-400 block">
-                  {diagnosticsReport.deployment_failures.length} failed deployment(s)
-                </span>
-              </div>
-
-              <div className="p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-1">
-                <span className="text-[10px] text-neutral-500 block uppercase">Repo Imports</span>
-                <span className="text-white font-semibold">
-                  {diagnosticsReport.imports.length} tracked
-                </span>
-                <span className="text-[10px] text-neutral-400 block">
+              {/* Host Storage Active vs Reclaimable Bar */}
+              <div className="lg:col-span-5 p-3 rounded-lg bg-surface/60 border border-surface-border/60 flex flex-col justify-between space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] text-neutral-500 uppercase flex items-center gap-1">
+                    <HardDrive className="w-3 h-3 text-neutral-400" />
+                    Host Disk Allocation
+                  </span>
+                  <span className="text-[10px] text-neutral-400">
+                    {diagnosticsReport.resources.host_cpus || 0} CPUs &middot;{' '}
+                    {formatBytes(diagnosticsReport.resources.host_memory_total_bytes || 0)} RAM
+                  </span>
+                </div>
+                <StackedDistributionBar
+                  height={11}
+                  formatValue={(v) => formatBytes(v)}
+                  segments={[
+                    {
+                      id: 'in-use',
+                      label: 'Active',
+                      value: Math.max(
+                        0,
+                        (diagnosticsReport.resources.disk_usage?.total_bytes || 0) -
+                          (diagnosticsReport.resources.disk_usage?.total_reclaimable_bytes || 0)
+                      ),
+                      color: '#10b981',
+                    },
+                    {
+                      id: 'reclaimable',
+                      label: 'Reclaimable',
+                      value: diagnosticsReport.resources.disk_usage?.total_reclaimable_bytes || 0,
+                      color: '#f59e0b',
+                    },
+                  ]}
+                />
+                <div className="text-[10px] text-neutral-500">
                   Reconciliation: {diagnosticsReport.docker.reconciliation?.status || 'idle'}
-                </span>
+                </div>
+              </div>
+
+              {/* Operational Events Bar Graph */}
+              <div className="lg:col-span-4 p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-2">
+                <span className="text-[10px] text-neutral-500 block uppercase">Operational Signal Breakdown</span>
+                <HorizontalBarChart
+                  formatValue={(v) => String(Math.round(v))}
+                  items={[
+                    {
+                      id: 'exhausted',
+                      label: 'Resource Warnings',
+                      value: diagnosticsReport.resources.exhausted_services.length,
+                      maxValue: Math.max(4, services.length),
+                      color: diagnosticsReport.resources.exhausted_services.length > 0 ? '#f59e0b' : '#10b981',
+                    },
+                    {
+                      id: 'failures',
+                      label: 'Failed Deploys',
+                      value: diagnosticsReport.deployment_failures.length,
+                      maxValue: Math.max(4, diagnosticsReport.deployment_failures.length),
+                      color: diagnosticsReport.deployment_failures.length > 0 ? '#f43f5e' : '#10b981',
+                    },
+                    {
+                      id: 'imports',
+                      label: 'Tracked Imports',
+                      value: diagnosticsReport.imports.length,
+                      maxValue: Math.max(4, diagnosticsReport.imports.length),
+                      color: '#38bdf8',
+                    },
+                  ]}
+                />
               </div>
             </div>
 

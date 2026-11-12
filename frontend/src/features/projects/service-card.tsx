@@ -234,38 +234,83 @@ export function ServiceCard({
         </div>
       </div>
 
-      {/* Resource Limits Row with Edit Button */}
-      <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded bg-surface/50 border border-surface-border/50 text-xs font-mono">
-        <div className="flex items-center gap-3 text-neutral-300 flex-wrap">
-          <div className="flex items-center gap-1 text-[11px]" title="Configured CPU allocation">
-            <Cpu className="w-3 h-3 text-blue-400" />
-            <span>{service.cpu_millicores ? `${(service.cpu_millicores / 1000).toFixed(1)} Core (${service.cpu_millicores}m)` : '1.0 Core (1000m)'}</span>
-          </div>
-          <div className="flex items-center gap-1 text-[11px]" title="Configured Memory allocation">
-            <Sliders className="w-3 h-3 text-emerald-400" />
-            <span>{service.memory_mb ? `${service.memory_mb} MB` : '1024 MB'}</span>
-          </div>
-          <div className="flex items-center gap-1 text-[11px]" title="Process limit">
-            <span className="text-amber-400 font-bold text-[10px]">#</span>
-            <span>{service.pids_limit || 256} PIDs</span>
-          </div>
-          {service.ephemeral_storage_mb && (
-            <div className="flex items-center gap-1 text-[11px] text-neutral-400" title="Informational ephemeral storage quota">
-              <HardDrive className="w-3 h-3 text-purple-400" />
-              <span>{service.ephemeral_storage_mb} MB (info)</span>
-            </div>
-          )}
+      {/* Resource Limits Row with Visual Allocation Bars & Edit Button */}
+      <div className="space-y-2 px-2.5 py-2 rounded bg-surface/50 border border-surface-border/50 text-xs font-mono">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[10px] text-neutral-500 uppercase tracking-wider">
+            Allocated Container Quotas
+          </span>
+          <button
+            type="button"
+            onClick={() => setShowResourceModal(true)}
+            className="text-[11px] text-neutral-400 hover:text-white flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-surface-elevated transition-colors border border-transparent hover:border-surface-border font-mono"
+            title="Configure CPU, Memory, PID, and ephemeral storage limits"
+          >
+            <Sliders className="w-3 h-3 text-neutral-400" />
+            <span>Edit Limits</span>
+          </button>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setShowResourceModal(true)}
-          className="text-[11px] text-neutral-400 hover:text-white flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-surface-elevated transition-colors border border-transparent hover:border-surface-border font-mono"
-          title="Configure CPU, Memory, PID, and ephemeral storage limits"
-        >
-          <Sliders className="w-3 h-3 text-neutral-400" />
-          <span>Edit Limits</span>
-        </button>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <div className="space-y-1" title="Configured CPU allocation">
+            <div className="flex items-center justify-between text-[10px] text-neutral-300">
+              <span className="inline-flex items-center gap-1">
+                <Cpu className="w-3 h-3 text-blue-400" />
+                CPU
+              </span>
+              <span className="text-neutral-400">
+                {service.cpu_millicores ? `${(service.cpu_millicores / 1000).toFixed(1)}c` : '1.0c'}
+              </span>
+            </div>
+            <div className="h-1.5 w-full rounded-full bg-surface-border/60 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-blue-400"
+                style={{ width: `${Math.min(100, Math.max(8, ((service.cpu_millicores || 1000) / 4000) * 100))}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-1" title="Configured Memory allocation">
+            <div className="flex items-center justify-between text-[10px] text-neutral-300">
+              <span className="inline-flex items-center gap-1">
+                <Sliders className="w-3 h-3 text-emerald-400" />
+                Memory
+              </span>
+              <span className="text-neutral-400">
+                {service.memory_mb ? `${service.memory_mb} MB` : '1024 MB'}
+              </span>
+            </div>
+            <div className="h-1.5 w-full rounded-full bg-surface-border/60 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-emerald-400"
+                style={{ width: `${Math.min(100, Math.max(8, ((service.memory_mb || 1024) / 4096) * 100))}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-1" title="Process limit">
+            <div className="flex items-center justify-between text-[10px] text-neutral-300">
+              <span className="inline-flex items-center gap-1">
+                <span className="text-amber-400 font-bold text-[10px]">#</span>
+                PIDs
+              </span>
+              <span className="text-neutral-400">{service.pids_limit || 256}</span>
+            </div>
+            <div className="h-1.5 w-full rounded-full bg-surface-border/60 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-amber-400"
+                style={{ width: `${Math.min(100, Math.max(8, ((service.pids_limit || 256) / 1024) * 100))}%` }}
+              />
+            </div>
+          </div>
+        </div>
+
+        {service.ephemeral_storage_mb && (
+          <div className="flex items-center gap-1.5 text-[10px] text-neutral-400 pt-0.5" title="Informational ephemeral storage quota">
+            <HardDrive className="w-3 h-3 text-purple-400" />
+            <span>Ephemeral quota (info): {service.ephemeral_storage_mb} MB</span>
+          </div>
+        )}
       </div>
 
       {/* Deployment Mode Selector */}

@@ -103,6 +103,10 @@ type Engine struct {
 	metricsCacheMu           sync.Mutex
 	metricsCache             map[uuid.UUID]*metricsCacheEntry
 	metricsInFlight          map[uuid.UUID]*metricsInFlightCall
+	diskUsageCacheTTL        time.Duration
+	diskUsageCacheMu         sync.Mutex
+	diskUsageCache           *diskUsageCacheEntry
+	diskUsageInFlight        *diskUsageInFlightCall
 }
 
 func (e *Engine) trackActiveContainer(id string) {
@@ -192,6 +196,7 @@ func NewEngine(
 		metricsCacheTTL:          10 * time.Second,
 		metricsCache:             make(map[uuid.UUID]*metricsCacheEntry),
 		metricsInFlight:          make(map[uuid.UUID]*metricsInFlightCall),
+		diskUsageCacheTTL:        30 * time.Second,
 		reconcileState: ReconciliationState{
 			Status:        "pending",
 			Authoritative: false,

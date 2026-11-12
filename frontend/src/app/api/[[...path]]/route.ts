@@ -76,6 +76,7 @@ async function handleProxy(request: NextRequest) {
     headers: forwardedHeaders,
     body,
     redirect: 'manual', // Preserve 3xx redirects without internally following
+    signal: request.signal,
   };
 
   if (body) {
@@ -86,6 +87,12 @@ async function handleProxy(request: NextRequest) {
   try {
     backendResponse = await fetch(targetUrl, fetchOptions);
   } catch (err: any) {
+    if (err?.name === 'AbortError' || request.signal?.aborted) {
+      return NextResponse.json(
+        { error: 'Request cancelled or timed out before backend responded' },
+        { status: 504 }
+      );
+    }
     return NextResponse.json(
       { error: `Backend service unavailable: ${err?.message || 'connection failed'}` },
       { status: 502 }
