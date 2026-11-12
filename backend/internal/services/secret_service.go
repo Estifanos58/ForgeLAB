@@ -47,6 +47,7 @@ type SecretService struct {
 	db             *pgxpool.Pool
 	encryptor      *crypto.Encryptor
 	projectService *ProjectService
+	setEnvForTest  func(ctx context.Context, projectID, ownerID uuid.UUID, input SetEnvVarInput) (*EnvVarResponse, error)
 }
 
 func NewSecretService(db *pgxpool.Pool, encryptor *crypto.Encryptor, projectService *ProjectService) *SecretService {
@@ -57,8 +58,16 @@ func NewSecretService(db *pgxpool.Pool, encryptor *crypto.Encryptor, projectServ
 	}
 }
 
+// SetEnvVarForTest configures a test hook for SetEnvVar when running without Postgres.
+func (s *SecretService) SetEnvVarForTest(fn func(ctx context.Context, projectID, ownerID uuid.UUID, input SetEnvVarInput) (*EnvVarResponse, error)) {
+	s.setEnvForTest = fn
+}
+
 // SetEnvVar creates or updates an environment variable for a project or specific service.
 func (s *SecretService) SetEnvVar(ctx context.Context, projectID, ownerID uuid.UUID, input SetEnvVarInput) (*EnvVarResponse, error) {
+	if s.setEnvForTest != nil {
+		return s.setEnvForTest(ctx, projectID, ownerID, input)
+	}
 	// Verify project ownership
 	if _, err := s.projectService.GetProject(ctx, projectID, ownerID); err != nil {
 		return nil, err

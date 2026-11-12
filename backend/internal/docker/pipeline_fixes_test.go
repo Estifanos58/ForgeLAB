@@ -433,7 +433,7 @@ func TestForgeLAB_OwnComposePipeline(t *testing.T) {
 		servicesMap[s.Name] = s
 	}
 
-	assert.Len(t, res.Services, 5, "ForgeLAB compose must discover exactly 5 services: postgres, redis, migrate, backend, frontend")
+	assert.Len(t, res.Services, 6, "ForgeLAB compose must discover exactly 6 services: postgres, redis, migrate, backend, frontend, caddy")
 	assert.NotContains(t, servicesMap, "project", "must not invent a bogus 'project' service")
 
 	// 1. Postgres
@@ -477,6 +477,13 @@ func TestForgeLAB_OwnComposePipeline(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, fe.DependsOn, "backend")
 	assert.Equal(t, "service_healthy", fe.DependsOnConditions["backend"])
+
+	// 6. Caddy (reverse proxy ingress)
+	cad, ok := servicesMap["caddy"]
+	require.True(t, ok)
+	assert.Equal(t, "image", cad.BuildStrategy)
+	assert.Equal(t, "caddy:2-alpine", cad.Image)
+	assert.Empty(t, cad.DockerfilePath)
 
 	// Convert to ServiceDeployment models and run preflight validation
 	var svcDeploys []*models.ServiceDeployment
@@ -538,7 +545,7 @@ func TestForgeLAB_OwnComposePipeline(t *testing.T) {
 	require.NoError(t, err, "Sanitized ForgeLAB deployment plan must pass preflight validation")
 
 	// Verify DAG execution tiers:
-	// Tier 1: postgres, redis (infrastructure image)
+	// Tier 1: postgres, redis, caddy (infrastructure & proxy images)
 	// Tier 2: migrate (depends on postgres)
 	// Tier 3: backend (depends on migrate, postgres, redis)
 	// Tier 4: frontend (depends on backend)
@@ -552,6 +559,7 @@ func TestForgeLAB_OwnComposePipeline(t *testing.T) {
 	}
 	assert.True(t, tier1Names["postgres"])
 	assert.True(t, tier1Names["redis"])
+	assert.True(t, tier1Names["caddy"])
 
 	assert.Equal(t, "migrate", tiers[1][0].ServiceName)
 	assert.Equal(t, "backend", tiers[2][0].ServiceName)

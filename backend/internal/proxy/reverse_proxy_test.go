@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -150,5 +152,35 @@ func TestBuildCaddyConfigJSON_AndSyncer(t *testing.T) {
 	errSyncer := NewCaddySyncer(errSrv.URL, "", errSrv.Client())
 	if err := errSyncer.SyncRoutes(context.Background(), routes); err == nil {
 		t.Fatalf("expected error on HTTP 400 from Caddy Admin API")
+	}
+
+	// Remote admin URL (like http://caddy:2019 inside Docker Compose) must preserve "admin": {"listen": ":2019"}
+	composeSyncer := NewCaddySyncer("http://caddy:2019", "ops@example.com", srv.Client())
+	if listen := composeSyncer.deriveAdminListen(); listen != ":2019" {
+		t.Fatalf("expected compose admin listen ':2019', got %q", listen)
+	}
+	adminPayload, err := BuildCaddyConfigJSONWithAdmin(routes, "ops@example.com", ":2019")
+	if err != nil {
+		t.Fatalf("BuildCaddyConfigJSONWithAdmin failed: %v", err)
+	}
+	var adminParsed map[string]any
+	if err := json.Unmarshal(adminPayload, &adminParsed); err != nil {
+		t.Fatalf("invalid admin JSON: %v", err)
+	}
+	adminBlock, ok := adminParsed["admin"].(map[string]any)
+	if !ok || adminBlock["listen"] != ":2019" {
+		t.Fatalf("expected preserved admin listen ':2019', got %#v", adminParsed["admin"])
+	}
+}
+
+func TestComposeCaddyfileBaselineConfiguration(t *testing.T) {
+	caddyfilePath := filepath.Join("..", "..", "..", "infra", "caddy", "Caddyfile")
+	data, err := os.ReadFile(caddyfilePath)
+	if err != nil {
+		t.Fatalf("failed to read infra/caddy/Caddyfile: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "admin :2019") {
+		t.Errorf("infra/caddy/Caddyfile must configure 'admin :2019' for backend container communication")
 	}
 }

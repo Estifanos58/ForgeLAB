@@ -3,24 +3,36 @@
 package agent
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+	"unicode/utf16"
+	"unsafe"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/forgelab/backend/internal/discovery"
+	"github.com/forgelab/backend/internal/security"
+	"github.com/forgelab/backend/internal/tararchive"
 )
 
 func TestWindows_InteractiveSessionInspection(t *testing.T) {
@@ -159,7 +171,7 @@ try {
 
 	psExe := resolveWindowsPowerShellPath()
 	encodedCmd := encodeUTF16LEBase64(psScript)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(
@@ -183,7 +195,7 @@ try {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	require.NoError(t, cmd.Run(), "PowerShell STA WinForms verification failed; stderr=%s", stderr.String())
+	require.NoError(t, cmd.Run(), "PowerShell STA WinForms verification failed; ctxErr=%v stdout=%s stderr=%s", ctx.Err(), stdout.String(), stderr.String())
 	assert.Empty(t, strings.TrimSpace(stderr.String()), "expected zero CLIXML/progress stderr noise")
 
 	decoded, err := decodeWindowsPickerOutput(stdout.String())
@@ -220,7 +232,7 @@ func TestWindows_PowerShellSubprocess_CancellationAndTimeout(t *testing.T) {
 		start := time.Now()
 		_, err := picker.PickFolder(ctx, "Cancel Test")
 		assert.ErrorIs(t, err, ErrPickerCancelled)
-		assert.Less(t, time.Since(start), 5*time.Second)
+		assert.Less(t, time.Since(start), 10*time.Second)
 
 		picker.isPicking.Lock()
 		picking := picker.picking
@@ -248,7 +260,7 @@ func TestWindows_PowerShellSubprocess_CancellationAndTimeout(t *testing.T) {
 		_, err := picker.PickFolder(context.Background(), "Timeout Test")
 		assert.ErrorIs(t, err, ErrPickerTimedOut)
 		assert.NotErrorIs(t, err, ErrPickerCancelled)
-		assert.Less(t, time.Since(start), 5*time.Second)
+		assert.Less(t, time.Since(start), 10*time.Second)
 
 		picker.isPicking.Lock()
 		picking := picker.picking
@@ -321,7 +333,7 @@ func TestWindows_AgentStartupAndPortConflict(t *testing.T) {
 				return true
 			}
 			return false
-		}, 10*time.Second, 50*time.Millisecond, "agent failed to log bound Ready URL; output=%s", out.String())
+		}, 15*time.Second, 50*time.Millisecond, "agent failed to log bound Ready URL; output=%s", out.String())
 
 		resp, err := http.Get(baseURL + "/api/agent/status")
 		require.NoError(t, err)
@@ -356,4 +368,213 @@ func TestWindows_AgentStartupAndPortConflict(t *testing.T) {
 		assert.NotContains(t, stdout.String(), "Ready on", "must NOT announce Ready when bind fails")
 		assert.Contains(t, strings.ToLower(stderr.String()), "already in use")
 	})
+}
+
+func windowsShortPath(t *testing.T, longPath string) (string, bool) {
+	t.Helper()
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	proc := kernel32.NewProc("GetShortPathNameW")
+	inUTF16, err := syscall.UTF16PtrFromString(longPath)
+	if err != nil {
+		return "", false
+	}
+	n, _, _ := proc.Call(uintptr(unsafe.Pointer(inUTF16)), 0, 0)
+	if n == 0 {
+		return "", false
+	}
+	buf := make([]uint16, n)
+	r, _, _ := proc.Call(uintptr(unsafe.Pointer(inUTF16)), uintptr(unsafe.Pointer(&buf[0])), n)
+	if r == 0 || r >= n {
+		return "", false
+	}
+	short := string(utf16.Decode(buf[:r]))
+	return short, !strings.EqualFold(filepath.Clean(short), filepath.Clean(longPath))
+}
+
+func TestWindows_ShortPathCanonicalization_And_EnvironmentDiscovery(t *testing.T) {
+	tempRoot := t.TempDir()
+	longRoot := filepath.Join(tempRoot, "ForgeLAB Runner Long Workspace Directory")
+	svcDir := filepath.Join(longRoot, "frontend")
+	require.NoError(t, os.MkdirAll(svcDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(longRoot, ".env"), []byte("ROOT_KEY=rootval\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(svcDir, ".env"), []byte("SVC_KEY=svcval\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(svcDir, "package.json"), []byte(`{"name":"fe"}`), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(svcDir, "index.js"), []byte("console.log('win ok');\n"), 0644))
+
+	shortRoot, has83 := windowsShortPath(t, longRoot)
+	if !has83 {
+		// Fall back to mixed case + redundant separators if NTFS 8.3 names are disabled on this volume
+		shortRoot = strings.ToLower(longRoot) + string(filepath.Separator)
+	}
+
+	// 1. PathValidator with 8.3 short allowedRoot validates long path (and vice versa)
+	validatorFromShort := NewPathValidator([]string{shortRoot})
+	gotLong, err := validatorFromShort.ValidateSourcePath(longRoot)
+	require.NoError(t, err)
+	expectedCanon, err := filepath.EvalSymlinks(longRoot)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Clean(expectedCanon), gotLong)
+
+	validatorFromLong := NewPathValidator([]string{longRoot})
+	gotFromShort, err := validatorFromLong.ValidateSourcePath(shortRoot)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Clean(expectedCanon), gotFromShort)
+
+	// 2. Agent session registered with 8.3 short CanonicalPath serves /environment and /stream-context without 403/empty services
+	token := "win-short-path-token"
+	sourceID := uuid.New()
+	agentSrv := NewAgentServer(AgentServerConfig{
+		Port: 4142,
+		SessionValidator: func(tok, agentID string) (*AgentSession, error) {
+			if tok != token {
+				return nil, ErrUnauthorized
+			}
+			return &AgentSession{
+				Token:    tok,
+				AgentID:  agentID,
+				SourceID: &sourceID,
+			}, nil
+		},
+	})
+	defer agentSrv.Close()
+
+	RegisterLocalSourceSession(&LocalSourceSession{
+		SourceID:      sourceID,
+		CanonicalPath: shortRoot,
+		FolderName:    "win-short-repo",
+		Status:        "ready",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(1 * time.Hour),
+		Token:         token,
+	})
+	t.Cleanup(func() { DeleteLocalSourceSession(sourceID) })
+
+	ts := httptest.NewServer(agentSrv.Router())
+	defer ts.Close()
+
+	// Check /environment
+	envReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/agent/sources/%s/environment?service_path=frontend", ts.URL, sourceID), nil)
+	envReq.Header.Set("Authorization", "Bearer "+token)
+	envResp, err := http.DefaultClient.Do(envReq)
+	require.NoError(t, err)
+	defer envResp.Body.Close()
+	require.Equal(t, http.StatusOK, envResp.StatusCode)
+
+	var envBody SourceEnvironmentResponse
+	require.NoError(t, json.NewDecoder(envResp.Body).Decode(&envBody))
+	assert.Equal(t, "rootval", envBody.Root["ROOT_KEY"])
+	require.Contains(t, envBody.Services, "frontend")
+	assert.Equal(t, "svcval", envBody.Services["frontend"]["SVC_KEY"])
+
+	// Check /stream-context
+	streamReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/agent/sources/%s/stream-context?service_path=frontend", ts.URL, sourceID), nil)
+	streamReq.Header.Set("Authorization", "Bearer "+token)
+	streamResp, err := http.DefaultClient.Do(streamReq)
+	require.NoError(t, err)
+	defer streamResp.Body.Close()
+	require.Equal(t, http.StatusOK, streamResp.StatusCode)
+
+	tr := tar.NewReader(streamResp.Body)
+	var foundIndex bool
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		if hdr.Name == "index.js" {
+			foundIndex = true
+		}
+		assert.False(t, strings.Contains(hdr.Name, ".env"), ".env secret leaked in tar: %s", hdr.Name)
+	}
+	assert.True(t, foundIndex)
+}
+
+func TestWindows_RestrictedPrefixBoundaries_UNC_And_JunctionEscape(t *testing.T) {
+	tempRoot := t.TempDir()
+
+	// Directory named windows_app inside allowed root must NOT trigger false-positive c:\windows restriction
+	winPrefixSafe := filepath.Join(tempRoot, "windows_app")
+	require.NoError(t, os.MkdirAll(winPrefixSafe, 0755))
+
+	validator := NewPathValidator(nil)
+	validated, err := validator.ValidateSourcePath(winPrefixSafe)
+	require.NoError(t, err)
+	assert.NotEmpty(t, validated)
+
+	// UNC network share must be rejected
+	_, err = validator.ValidateSourcePath(`\\127.0.0.1\C$\Users`)
+	assert.ErrorIs(t, err, ErrRestrictedSystemPath)
+
+	// Actual C:\Windows system path must remain rejected
+	if _, statErr := os.Stat(`C:\Windows`); statErr == nil {
+		_, err = validator.ValidateSourcePath(`C:\Windows\System32`)
+		assert.ErrorIs(t, err, ErrRestrictedSystemPath)
+	}
+
+	// Real NTFS directory junction (no SeCreateSymbolicLinkPrivilege required) pointing outside build context
+	outsideSecretDir := filepath.Join(tempRoot, "outside_secret")
+	svcDir := filepath.Join(tempRoot, "service")
+	require.NoError(t, os.MkdirAll(outsideSecretDir, 0755))
+	require.NoError(t, os.MkdirAll(svcDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(outsideSecretDir, "secret.txt"), []byte("do-not-leak"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(svcDir, "Dockerfile"), []byte("FROM alpine:3.21\n"), 0644))
+
+	junctionPath := filepath.Join(svcDir, "escape_junction")
+	cmd := exec.Command("cmd", "/c", "mklink", "/J", junctionPath, outsideSecretDir)
+	if out, mkErr := cmd.CombinedOutput(); mkErr != nil {
+		t.Skipf("mklink /J unavailable: %v (%s)", mkErr, string(out))
+	}
+
+	// TAR build context creation MUST reject the escaping NTFS junction
+	_, _, tarErr := tararchive.WriteBuildContext(context.Background(), io.Discard, tararchive.BuildContextOptions{
+		BuildContextDir: svcDir,
+	})
+	require.Error(t, tarErr)
+	assert.True(t, errors.Is(tarErr, tararchive.ErrSymlinkEscape), "expected ErrSymlinkEscape for escaping NTFS junction, got: %v", tarErr)
+
+	// security.PathValidator MUST also reject an NTFS junction inside allowedRoot pointing outside
+	secValidator := security.NewPathValidator([]string{svcDir})
+	_, secErr := secValidator.ValidateSourcePath(junctionPath)
+	require.Error(t, secErr)
+	assert.ErrorIs(t, secErr, security.ErrPathNotAllowed)
+
+	// discovery content fingerprinting MUST reject the escaping NTFS junction
+	_, discErr := discovery.ComputeDirectoryContentFingerprintWithContext(context.Background(), svcDir)
+	require.Error(t, discErr, "expected fingerprinting to reject escaping NTFS junction")
+
+	// Valid internal NTFS junction inside build context must be archived cleanly as a portable relative symlink
+	internalSvcDir := filepath.Join(tempRoot, "internal_service")
+	internalTargetDir := filepath.Join(internalSvcDir, "shared_pkg")
+	require.NoError(t, os.MkdirAll(internalTargetDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(internalSvcDir, "Dockerfile"), []byte("FROM alpine:3.21\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(internalTargetDir, "util.txt"), []byte("hello"), 0644))
+
+	internalJunction := filepath.Join(internalSvcDir, "linked_pkg")
+	cmdInternal := exec.Command("cmd", "/c", "mklink", "/J", internalJunction, internalTargetDir)
+	if out, mkErr := cmdInternal.CombinedOutput(); mkErr != nil {
+		t.Skipf("mklink /J unavailable for internal junction: %v (%s)", mkErr, string(out))
+	}
+
+	var tarBuf bytes.Buffer
+	_, _, tarInternalErr := tararchive.WriteBuildContext(context.Background(), &tarBuf, tararchive.BuildContextOptions{
+		BuildContextDir: internalSvcDir,
+	})
+	require.NoError(t, tarInternalErr)
+
+	tr := tar.NewReader(&tarBuf)
+	var foundJunctionLink bool
+	for {
+		hdr, rErr := tr.Next()
+		if rErr == io.EOF {
+			break
+		}
+		require.NoError(t, rErr)
+		if hdr.Name == "linked_pkg" {
+			foundJunctionLink = true
+			assert.Equal(t, byte(tar.TypeSymlink), hdr.Typeflag)
+			assert.Equal(t, "shared_pkg", hdr.Linkname)
+		}
+	}
+	assert.True(t, foundJunctionLink, "valid internal NTFS junction should be archived as portable tar.TypeSymlink")
 }

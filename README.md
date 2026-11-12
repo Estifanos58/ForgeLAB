@@ -7,22 +7,24 @@ ForgeLAB is a single control-plane application deployment platform built in Go. 
 ## Architecture Overview
 
 - **Backend Control Plane**: Go (REST API via `chi` + WebSockets via `gorilla/websocket` with Redis Pub/Sub)
-- **Database**: PostgreSQL 16 (Durable records for users, identities, projects, services, service deployments, secrets, github integrations, and logs)
-- **Service-First Architecture**: Projects compose multiple autonomous services with independent deployment pipelines (`POST /api/projects/{id}/services/{serviceId}/deploy`), rollbacks, and log streams
+- **Database**: PostgreSQL 16 (Durable records for users, identities, projects, services, service deployments, secrets, github integrations, repository imports, custom domains, metrics history, audit logs, and logs)
+- **Service-First Architecture**: Projects compose multiple autonomous services with independent deployment pipelines (`POST /api/projects/{id}/services/{serviceId}/deploy`), per-service deployment modes (`standard` or opt-in `blue_green` zero-downtime cutover via `TrafficRouter` at `/proxy/services/{serviceId}`), rollbacks, and log streams
 - **Work Queue & Lease Ownership**: Redis 7 (`LPUSH` / `BRPOP` queue with cryptographically unique execution lease tokens, Lua atomic renewal/recovery, heartbeat cancellation check, automatic orphaned release reconciler, and O(1) state indexing)
-- **Runtime Engine & Sandboxing**: Docker Engine SDK with strict trust boundary enforcement (no-new-privileges, capability drop `ALL`, minimal default safe capabilities `["CHOWN", "SETGID", "SETUID"]` omitting `DAC_OVERRIDE`/`FOWNER`, non-root execution profiles, rejection of `/var/run/docker.sock` and sensitive mounts, rejection of `host` and `container:` network namespace sharing, enforced per-service CPU/RAM/PID resource limits, per-owner cumulative resource/storage quotas, and truthful rejection of unsupported `ephemeral_storage_mb` disk quotas)
-- **Control-Plane Network Isolation**: The privileged ForgeLAB backend container is never connected to tenant Docker networks; preview routing resolves strictly via published container host ports (`HostPort`) with management port shielding (:8080, :4142, :5432, :6379)
-- **Guest Mode Security**: Disabled by default in production and `.env.example`, but fully available via explicit configuration (`FORGELAB_ALLOW_GUEST_MODE=true`) without breaking isolated guest sessions
+- **Runtime Engine & Sandboxing**: Docker Engine SDK with strict trust boundary enforcement (no-new-privileges, `CapDrop: ["ALL"]`, strict security allowlist `allowedContainerCapabilities` permitting only `CHOWN`, `SETGID`, `SETUID` while normalizing `CAP_` prefixes and rejecting disallowed capabilities fail-closed with `ErrCapabilityNotAllowed`, non-root execution profiles, rejection of `/var/run/docker.sock` and sensitive mounts, rejection of `host` and `container:` network namespace sharing, enforced per-service CPU/RAM/PID resource limits, per-owner cumulative resource/storage quotas, and truthful rejection of unsupported `ephemeral_storage_mb` disk quotas)
+- **Control-Plane Network Isolation**: The privileged ForgeLAB backend container is never connected to tenant Docker networks; preview routing resolves strictly via published container host ports (`HostPort`) with management port shielding (:8080, :4142, :3000, :5432, :6379)
+- **Custom Domains & Caddy HTTPS Ingress**: Integrated `caddy:2-alpine` reverse proxy in Compose (`infra/caddy/Caddyfile`, persistent `forgelab_caddy_data` and `forgelab_caddy_config` volumes, `CADDY_ADMIN_URL=http://caddy:2019`). Domains require DNS TXT verification (`_forgelab-verify.<domain>`) and are reported `https_active: true` (`tls_status: "active"`) only after confirmed Caddy Admin API route provisioning—truthfully reporting `proxy_unconfigured` otherwise
+- **Guest Mode Security**: Disabled by default in `.env.example` and production, while available via explicit configuration (`FORGELAB_ALLOW_GUEST_MODE=true`) or local dev defaults with isolated guest browser sessions
 - **Proxy Trust & Dynamic CORS**: Untrusted clients have spoofed forwarding headers stripped at the boundary; dynamic preview host registry validates active tunnel hosts without broad wildcard origins
 - **Gateway & Tunnel Reliability**: Production gateway requires verified TLS (`GATEWAY_TLS_SKIP_VERIFY=true` rejected; automatic plaintext fallback eliminated). Cloudflare Quick Tunnels feature graceful termination (`cmd.Cancel` with SIGINT & bounded WaitDelay), startup-state race elimination, and startup stale share reconciliation
 - **Authentication, Token Lifespans & WebSockets**: Extended active token (default 48h, > 1 day) and refresh token (default 14d, > 1 week) defaults supporting duration strings and minutes/days, prolonged 24h session inactivity limits, bidirectional session updates during active WebSocket communication, cross-tab refresh mutex, and transaction commit grace cache
-- **Health, Readiness & Diagnostics**: Lightweight `/health` liveness probe, deep dependency `/ready` check (probing PostgreSQL, Redis, and Docker Engine concurrently with 0 secret leakage), and `/health/queue` queue & abandoned-job recovery diagnostics
+- **Health, Self-Healing, Auto-Rollback & Diagnostics**: Lightweight `/health` liveness probe, deep dependency `/ready` probe, `/health/queue`, `/health/logs`, configurable background self-heal container restarts (`FORGELAB_SELF_HEAL_*`), crash-loop detection (`FORGELAB_CRASH_LOOP_*`), automatic rollback after sustained health-check failures or crash loops (`FORGELAB_AUTO_ROLLBACK_*`) preserving and verifying the prior healthy container (`VerifyPreviousHealthyContainer` / `RestorePreviousHealthyContainer`), and actionable system/project diagnostics (`GET /api/diagnostics`, `GET /api/projects/{id}/diagnostics`)
+- **Monitoring, Metrics History & Operational Audit Trail**: Backend-sampled and TTL-cached live metrics (`FORGELAB_METRICS_CACHE_TTL`), periodic background metrics history persisted to PostgreSQL with configurable retention (`FORGELAB_METRICS_SAMPLE_INTERVAL`, `FORGELAB_METRICS_RETENTION_DAYS`), and secret-redacted `audit_logs` covering deployments, rollbacks, secrets, domains, volumes, and imports
 - **Rate Limiting**: Configurable sliding-window throttling (`ratelimit`) backed by Redis/in-memory for authentication, uploads, deployments, and WebSockets returning HTTP 429
-- **Deployment Lifecycle**: Immediate cancellation abort during heartbeats, atomic superseding of obsolete queued builds, and strict non-regression invariant for healthy containers
-- **Source Ingestion**: Local Agent CLI (`cmd/agent`) with loopback `127.0.0.1` default binding and unauthenticated status protection, optional archive upload fallback (`/api/sources/upload`) with restricted `0700`/`0600` permissions and 1GB per-owner storage quota, & authorized GitHub repository import (`/api/integrations/github`) with hardened decompression quotas (100MB compressed/uncompressed, 10k files, 50MB/file, 3m timeout) and atomic cache creation
-- **Build Strategy**: Direct build context streaming (`io.Pipe()`) without in-memory archive buffering, bounded 64KB log lines, automatic heuristic multi-stage container build generation & custom Dockerfile build strategy
+- **Deployment Lifecycle & Persistent Volumes**: Immediate cancellation abort during heartbeats, atomic superseding of obsolete queued builds, strict non-regression invariant for healthy containers, and project-scoped persistent volume inspection, Docker disk usage visibility, and `.tar.gz` backup/safe restore (`409 ErrVolumeInUse` if mounted)
+- **Source Ingestion & Push-to-Deploy**: Local Agent CLI (`cmd/agent`) with loopback `127.0.0.1:4142` binding, Windows NTFS junction/8.3 short-path canonicalization, and interactive Session 0 guard; archive upload fallback (`/api/sources/upload`) with restricted permissions and 1GB per-owner quota; restart-recoverable GitHub repository imports (`RecoverInterruptedImports`, durable state, cancel/retry); and HMAC-SHA256 verified push-to-deploy webhooks (`POST /api/webhooks/github`)
+- **Build Strategy**: Direct build context streaming with `.dockerignore` pruning, TAR symlink-escape enforcement (`ErrSymlinkEscape`), bounded 64KB log lines, automatic heuristic multi-stage container build generation & custom Dockerfile build strategy
 - **Host Port Range**: Dynamic port allocation in the range **`10000–60000`** with dynamic container internal port mapping
-- **Frontend**: Next.js 16.3.6 LTS + React 19 + TypeScript + Tailwind CSS (Operational developer console)
+- **Frontend**: Next.js 16.4.6 + React 19 + TypeScript + Tailwind CSS with hardened Content Security Policy (`next.config.ts`)
 - **Secure Public Sharing**: Authenticated outbound Yamux multiplexed tunnel connecting to a standalone public gateway (`cmd/gateway`) for public HTTPS links without inbound port forwarding
 - **Deployment Safety Invariant**: Failed releases never terminate or replace the previous running deployment.
 
@@ -93,7 +95,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser:
 
 ### Workflow B: Container Infrastructure Setup (Docker Compose)
 
-You can also launch all services using Docker Compose:
+You can also launch all 6 services (`postgres`, `redis`, `migrate`, `backend`, `frontend`, and `caddy`) using Docker Compose:
 ```bash
 docker compose up --build
 ```
@@ -107,12 +109,13 @@ Or execute directly inside a running backend container:
 docker compose exec backend /app/forgelab-migrate up
 ```
 
-#### Containerized Local-Source Support:
+#### Containerized Stack Highlights:
 1. **Configured Host Source Root:** In `docker-compose.yml`, the backend container mounts `${FORGELAB_HOST_SOURCE_ROOT:-./}:/host-projects:ro` as a read-only volume. When running ForgeLAB in Docker, configure `FORGELAB_HOST_SOURCE_ROOT` to your host projects directory (e.g. `C:\Users\username\Projects` or `/home/user/projects`). The backend automatically translates host paths to the container mount safely.
-2. **Path Security:** ForgeLAB enforces `FORGELAB_ALLOWED_SOURCE_ROOTS` so that only directories within permitted roots can be validated or deployed.
-3. **No File Uploads Needed:** Direct local-directory deployment streams the Docker build context directly from the filesystem with `.dockerignore` pruning, eliminating browser uploads and disk duplication.
+2. **Host Local Agent Option:** Start `.\start-agent.ps1` (Windows) or `./start-agent.sh` (Linux/macOS) on `http://127.0.0.1:4142`; Compose configures `FORGELAB_AGENT_URL=http://host.docker.internal:4142` automatically.
+3. **Integrated Caddy Reverse Proxy (`caddy:2-alpine`):** Binds `${CADDY_HTTP_PORT_BINDING:-80}:80` and `${CADDY_HTTPS_PORT_BINDING:-443}:443` with baseline config at [infra/caddy/Caddyfile](infra/caddy/Caddyfile), persistent volumes `forgelab_caddy_data` (`/data`) and `forgelab_caddy_config` (`/config`), and dynamic route provisioning via `CADDY_ADMIN_URL=http://caddy:2019`.
+4. **Path Security & Streaming:** ForgeLAB enforces `FORGELAB_ALLOWED_SOURCE_ROOTS` and streams Docker build contexts from the filesystem with `.dockerignore` pruning and TAR symlink-escape enforcement, eliminating browser uploads and disk duplication.
 
-For active development with local-source deployments, use **Workflow A**.
+For active development with host-native source trees, use **Workflow A**.
 
 ---
 
@@ -260,7 +263,8 @@ ForgeLAB/
 │   ├── 13-decisions.md
 │   ├── 14-known-limitations.md
 │   └── 15-github-integration.md
-├── .github/workflows/       # GitHub Actions CI (gofmt, vet, test, npm build/lint, smoke, migration)
+├── .github/workflows/       # GitHub Actions CI & CodeQL workflows
+├── infra/caddy/             # Baseline Caddyfile for reverse proxy & automatic TLS
 ├── backend/                 # Go control-plane application
 │   ├── cmd/server/          # API server & embedded deployment worker entrypoint
 │   ├── cmd/agent/           # Local agent CLI for streaming local host source trees
@@ -268,29 +272,43 @@ ForgeLAB/
 │   ├── cmd/migrate/         # SQL migration CLI tool
 │   ├── Dockerfile           # Multi-stage Go backend Dockerfile
 │   ├── internal/            # Core business logic & services
+│   │   ├── agent/           # Local agent HTTP server, folder picker, session manager
+│   │   ├── analyzer/        # Build & configuration analyzer
 │   │   ├── auth/            # JWT authentication & claims
-│   │   ├── config/          # Environment configuration loader
-│   │   ├── crypto/          # AES-256-GCM encryption for secrets
+│   │   ├── config/          # Environment configuration loader & validation
+│   │   ├── crypto/          # AES-256-GCM encryption for secrets & tokens
 │   │   ├── database/        # PostgreSQL connection pool (pgx)
-│   │   ├── docker/          # Docker Engine build, container runner & trust boundary
+│   │   ├── detector/        # Heuristic framework & runtime detector
+│   │   ├── discovery/       # Multi-service topology, compose & fingerprint engine
+│   │   ├── docker/          # Docker SDK engine, capability allowlist, recovery, volumes, metrics & diagnostics
+│   │   ├── dockerignore/    # .dockerignore parser and rule matcher
+│   │   ├── envparser/       # Repository .env file parser
 │   │   ├── gateway/         # Public gateway proxy, TLS ingress & stream multiplexing
-│   │   ├── handlers/        # REST HTTP request handlers (including /health & /ready)
+│   │   ├── handlers/        # REST HTTP request handlers
 │   │   ├── logging/         # Log persistence & secret redactor
-│   │   ├── middleware/      # Auth, CORS, logger, & JSON middleware
+│   │   ├── middleware/      # Auth, guest isolation, CORS, trusted proxy & security headers
 │   │   ├── models/          # Data models & state machine transitions
 │   │   ├── network/         # Dynamic host port allocator (10000-60000)
+│   │   ├── proxy/           # Blue-green TrafficRouter & Caddy Admin API syncer
 │   │   ├── queue/           # Redis worker queue with lease ownership safety
 │   │   ├── ratelimit/       # Sliding-window rate limiting with in-memory fallback
-│   │   ├── security/        # Host path validator & boundary defense
-│   │   ├── services/        # User, Project, Service, Deployment, Share & Secret services
-│   │   ├── tunnel/          # Outbound Yamux tunnel client, local router & upstream resolver
-│   │   └── websocket/       # WebSocket Hub, rate limiter, & Redis PubSub
-│   └── migrations/          # PostgreSQL schema migrations
-├── frontend/                # Next.js 16.3.6 LTS + React 19 + TypeScript web application
-│   ├── src/app/             # Pages (Login, Register, Dashboard, Project & Service views)
-│   ├── src/lib/             # Typed API client & WebSocket hook
+│   │   ├── security/        # Windows/Unix path canonicalization, junction/reparse & root boundary validator
+│   │   ├── services/        # User, Project, Service, Deployment, Domain, Webhook, Import, Metrics, Audit & Secret services
+│   │   ├── tararchive/      # Streaming TAR build context & symlink escape enforcement
+│   │   ├── tunnel/          # Cloudflare & gateway outbound tunnels + share router
+│   │   └── websocket/       # WebSocket Hub, single-use tickets & Redis PubSub
+│   └── migrations/          # PostgreSQL schema migrations (000001 to 000027)
+├── frontend/                # Next.js 16.4.6 + React 19 + TypeScript web application
+│   ├── src/app/             # Pages & internal Next API proxy (App Router)
+│   ├── src/components/      # UI, auth, dashboard & marketing components
+│   ├── src/features/        # Domain modules (deployments, services, domains, volumes, metrics, topology, webhooks)
+│   ├── src/lib/             # Typed API clients, session manager & WebSocket hooks
+│   ├── test/                # Frontend Node/tsx unit & security header tests
+│   ├── next.config.ts       # Tightened CSP & HTTP security headers configuration
 │   └── Dockerfile           # Next.js container Dockerfile
-├── docker-compose.yml       # Local dev container stack
+├── docker-compose.yml       # Local stack (postgres, redis, migrate, backend, frontend, caddy)
+├── start-agent.ps1          # Windows interactive desktop Local Agent launcher
+├── start-agent.sh           # Linux/macOS Local Agent launcher
 ├── INSTRUCTION.md           # Persistent agent operational memory & workflow
 └── .env.example             # Environment variable template
 ```
@@ -299,22 +317,27 @@ ForgeLAB/
 
 ## Unit Testing Artifacts
 
-Automated unit tests validate isolated algorithmic logic across the backend:
+Automated unit and regression tests validate isolated algorithmic and integration logic across the backend and frontend:
 
 ```bash
 cd backend
-go test -v ./internal/...
+SKIP_DOCKER_LIVE_TEST=1 go test -timeout 300s ./...
+
+cd frontend
+npm test
 ```
 
-The unit test suite covers:
-- **JWT & Claims:** Expiration, claims validation, and token generation (`internal/auth`).
-- **Path Security:** Traversal defense, symlink evaluation, and restricted system directory rejection (`internal/security`).
-- **Secret Encryption:** AES-256-GCM encryption with unique nonces (`internal/crypto`).
-- **Log Redaction:** Plaintext secret masking in log streams (`internal/logging`).
-- **State Machine:** Valid and invalid deployment state transitions (`internal/models`).
-- **WebSocket Isolation:** Channel authorization and isolation (`internal/websocket`).
+The test suites cover:
+- **Path Canonicalization & TAR Security:** Traversal defense, Windows NTFS junctions / 8.3 short paths (`CanonicalizeExistingPath`, `\??\` normalization), UNC rejection (`internal/security`), and TAR symlink-escape enforcement (`ErrSymlinkEscape` in `internal/tararchive`).
+- **Container Trust Boundaries:** Capability drop `ALL` and strict allowlist enforcement (`CHOWN`, `SETGID`, `SETUID`, `ErrCapabilityNotAllowed`), socket/sensitive mount rejection, and resource caps (`internal/docker`).
+- **Custom Domains & Caddy Sync:** DNS TXT verification, dynamic Caddy route generation, and truthful `proxy_unconfigured` status handling (`internal/services`, `internal/proxy`, `internal/handlers`).
+- **Recovery, Self-Healing & Blue-Green Cutover:** Sustained health failure auto-rollback, crash-loop detection, verified preserved-container restoration, and `/proxy/services/{serviceId}` slot routing (`internal/docker`, `internal/proxy`).
+- **GitHub Import Recovery & Webhooks:** Startup `RecoverInterruptedImports`, durable cancel/retry state, HMAC-SHA256 webhook verification, and `X-GitHub-Delivery` deduplication (`internal/services`, `internal/handlers`).
+- **Volumes, Metrics, Audit Logs & Diagnostics:** Volume validation & archive safety bounds, TTL-cached runtime metrics & historical retention, secret-redacted `audit_logs`, and diagnostic aggregation (`internal/docker`, `internal/services`, `internal/handlers`).
+- **JWT, Crypto, Logs & WebSockets:** Claims & token rotation (`internal/auth`), AES-256-GCM encryption (`internal/crypto`), log redaction (`internal/logging`), state transitions (`internal/models`), and channel/ticket isolation (`internal/websocket`).
+- **Frontend Regression & CSP Tests:** Trusted-proxy header stripping, hardened CSP & HSTS headers, WebSocket tickets, log filters, session sync, and local agent checks (`frontend/test/`).
 
-*Note: These tests are supportive engineering artifacts. End-to-end platform validation requires manual execution per [docs/12-manual-verification.md](docs/12-manual-verification.md).*
+*Note: Automated tests are supportive engineering artifacts. Live host-environment validation remains governed by [docs/12-manual-verification.md](docs/12-manual-verification.md), where physical test records remain `NOT RECORDED` until executed.*
 
 ---
 
@@ -324,17 +347,17 @@ The `docs/` directory represents ForgeLAB's persistent engineering memory:
 
 - [docs/00-current-state.md](docs/00-current-state.md) — **Start here:** Implementation audit baseline, documentation status, and implementation matrix
 - [docs/01-product-vision.md](docs/01-product-vision.md) — Product scope, principles, and non-goals
-- [docs/02-functional-requirements.md](docs/02-functional-requirements.md) — MVP vs. future functional requirements
+- [docs/02-functional-requirements.md](docs/02-functional-requirements.md) — Implemented vs. future functional requirements
 - [docs/03-technology-decisions.md](docs/03-technology-decisions.md) — Tech stack rationale and rejected alternatives
 - [docs/04-architecture-decisions.md](docs/04-architecture-decisions.md) — Architecture, state machine, and data models
-- [docs/05-security-trust-boundaries.md](docs/05-security-trust-boundaries.md) — Security model, Docker socket trust, and secrets
-- [docs/06-websocket-contract.md](docs/06-websocket-contract.md) — Realtime WebSocket specifications & duplicate delivery note
+- [docs/05-security-trust-boundaries.md](docs/05-security-trust-boundaries.md) — Security model, Docker socket trust, CSP, and secrets
+- [docs/06-websocket-contract.md](docs/06-websocket-contract.md) — Realtime WebSocket specifications & single-use ticket auth
 - [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md) — Implementation roadmap & verification tracking
-- [docs/08-open-questions-future.md](docs/08-open-questions-future.md) — Resolved MVP architecture & deferred scope
+- [docs/08-open-questions-future.md](docs/08-open-questions-future.md) — Resolved platform architecture & deferred scope
 - [docs/09-api-contract.md](docs/09-api-contract.md) — Complete REST & WebSocket API contract
 - [docs/10-frontend-architecture.md](docs/10-frontend-architecture.md) — Next.js UI structure and state architecture
-- [docs/11-development-environment.md](docs/11-development-environment.md) — Development setup, ports, and troubleshooting
+- [docs/11-development-environment.md](docs/11-development-environment.md) — Development setup, ports, environment variables, and troubleshooting
 - [docs/12-manual-verification.md](docs/12-manual-verification.md) — Authoritative physical test procedures
-- [docs/13-decisions.md](docs/13-decisions.md) — Architecture Decision Records (DEC-001 to DEC-009)
+- [docs/13-decisions.md](docs/13-decisions.md) — Architecture Decision Records (DEC-001 to DEC-017)
 - [docs/14-known-limitations.md](docs/14-known-limitations.md) — Identified limitations, investigation items, and backlog
-- [docs/15-github-integration.md](docs/15-github-integration.md) — Future GitHub OAuth & repository selection design
+- [docs/15-github-integration.md](docs/15-github-integration.md) — GitHub App, OAuth, recoverable imports & push-to-deploy design

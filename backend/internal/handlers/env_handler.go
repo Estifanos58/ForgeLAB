@@ -10,12 +10,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/forgelab/backend/internal/models"
 	"github.com/forgelab/backend/internal/services"
 )
 
 type EnvHandler struct {
 	secretService  *services.SecretService
 	projectService *services.ProjectService
+	auditService   *services.AuditService
 }
 
 func NewEnvHandler(secretService *services.SecretService, projectService ...*services.ProjectService) *EnvHandler {
@@ -24,6 +26,43 @@ func NewEnvHandler(secretService *services.SecretService, projectService ...*ser
 		h.projectService = projectService[0]
 	}
 	return h
+}
+
+// SetAuditService configures operational audit logging for EnvHandler.
+func (h *EnvHandler) SetAuditService(auditSvc *services.AuditService) {
+	h.auditService = auditSvc
+}
+
+func (h *EnvHandler) recordAudit(r *http.Request, userID uuid.UUID, projectID uuid.UUID, projectName, action, resourceID, status, message string, metadata map[string]any) {
+	if h.auditService == nil {
+		return
+	}
+	pid := projectID
+	h.auditService.RecordBestEffort(r.Context(), services.AuditRecordInput{
+		ActorID:      userID,
+		ActorLabel:   getUserEmailFromContext(r),
+		IsGuest:      models.IsGuest(userID),
+		ProjectID:    &pid,
+		ProjectName:  projectName,
+		Action:       action,
+		ResourceType: "env_var",
+		ResourceID:   resourceID,
+		Status:       status,
+		Message:      message,
+		Metadata:     metadata,
+		IPAddress:    getClientIP(r),
+	})
+}
+
+func (h *EnvHandler) resolveProjectName(r *http.Request, projectID, userID uuid.UUID) string {
+	if h.projectService == nil {
+		return ""
+	}
+	proj, err := h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil || proj == nil {
+		return ""
+	}
+	return proj.Name
 }
 
 // Set handles POST /api/projects/{id}/env
@@ -64,6 +103,21 @@ func (h *EnvHandler) Set(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to set environment variable")
 		return
 	}
+
+	scope := "project"
+	if input.ServiceID != nil {
+		scope = "service"
+	}
+	resID := input.Key
+	if envVar != nil && envVar.ID != uuid.Nil {
+		resID = envVar.ID.String()
+	}
+	h.recordAudit(r, userID, projectID, h.resolveProjectName(r, projectID, userID), "env.set", resID, models.AuditStatusSuccess, fmt.Sprintf("Set environment variable %s (%s scope)", input.Key, scope), map[string]any{
+		"key":        input.Key,
+		"is_secret":  input.IsSecret,
+		"scope":      scope,
+		"service_id": input.ServiceID,
+	})
 
 	writeJSON(w, http.StatusOK, envVar)
 }
@@ -144,6 +198,11 @@ func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.recordAudit(r, userID, projectID, h.resolveProjectName(r, projectID, userID), "env.delete", key, models.AuditStatusSuccess, fmt.Sprintf("Deleted environment variable %s", key), map[string]any{
+		"key":        key,
+		"service_id": serviceID,
+	})
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "environment variable deleted"})
 }
 
@@ -186,6 +245,10 @@ func (h *EnvHandler) ImportLocalEnv(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to import environment variables")
 		return
 	}
+
+	h.recordAudit(r, userID, projectID, project.Name, "env.import", projectID.String(), models.AuditStatusSuccess, fmt.Sprintf("Imported %d environment variable(s) from source", count), map[string]any{
+		"imported_count": count,
+	})
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"imported_count": count,

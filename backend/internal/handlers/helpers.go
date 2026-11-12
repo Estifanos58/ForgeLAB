@@ -28,6 +28,17 @@ func getUserIDFromContext(r *http.Request) (uuid.UUID, bool) {
 	return middleware.GetUserID(r.Context())
 }
 
+// getUserEmailFromContext extracts the authenticated user's email or guest label from the request context.
+func getUserEmailFromContext(r *http.Request) string {
+	email, _ := middleware.GetUserEmail(r.Context())
+	return email
+}
+
+// getClientIP returns the request's client IP (already normalized by TrustedProxyRealIP when applicable).
+func getClientIP(r *http.Request) string {
+	return middleware.ExtractClientIP(r)
+}
+
 // ClearAuthCookies removes authenticated access and refresh cookies from the response.
 func ClearAuthCookies(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{

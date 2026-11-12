@@ -209,6 +209,7 @@ func TestAgentEnvironmentEndpoint_SecurityAndAuthorization(t *testing.T) {
 	streamResp, err := http.DefaultClient.Do(streamReq)
 	require.NoError(t, err)
 	defer streamResp.Body.Close()
+	require.Equal(t, http.StatusOK, streamResp.StatusCode)
 
 	tarReader := tar.NewReader(streamResp.Body)
 	for {

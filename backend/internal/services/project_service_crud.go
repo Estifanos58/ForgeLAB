@@ -57,6 +57,8 @@ func (s *ProjectService) ListProjects(ctx context.Context, ownerID uuid.UUID, pa
 		for _, p := range projects {
 			projectIDs = append(projectIDs, p.ID)
 		}
+	} else if s.db == nil {
+		return []*models.Project{}, nil
 	} else {
 		rows, err := s.db.Query(ctx,
 			`SELECT id, owner_id, source_id, name, slug, source_type, source_reference, repository_path, branch,

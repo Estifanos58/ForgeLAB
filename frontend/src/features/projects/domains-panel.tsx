@@ -196,12 +196,21 @@ export function DomainsPanel({ projectId, services }: DomainsPanelProps) {
         <div className="space-y-3">
           {domains.map((d) => {
             const targetServiceName = getServiceName(d.service_id);
+            const httpsActive = Boolean(
+              d.verified && d.tls_status === 'active' && d.https_active !== false
+            );
+            const isProxyUnconfigured = d.tls_status === 'proxy_unconfigured';
             const tlsVariant =
-              d.tls_status === 'active'
+              httpsActive
                 ? 'success'
                 : d.tls_status === 'error'
                 ? 'danger'
                 : 'warning';
+            const tlsBadgeLabel = isProxyUnconfigured
+              ? 'HTTPS: Caddy unconfigured'
+              : httpsActive
+              ? 'HTTPS: active'
+              : `TLS: ${d.tls_status}`;
 
             return (
               <div
@@ -210,12 +219,12 @@ export function DomainsPanel({ projectId, services }: DomainsPanelProps) {
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2 min-w-0">
-                    {d.verified ? (
+                    {httpsActive ? (
                       <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
                     ) : (
                       <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
                     )}
-                    {d.verified ? (
+                    {httpsActive ? (
                       <a
                         href={`https://${d.domain}`}
                         target="_blank"
@@ -242,7 +251,7 @@ export function DomainsPanel({ projectId, services }: DomainsPanelProps) {
                       {d.verified ? 'DNS Verified' : 'DNS Pending'}
                     </Badge>
                     <Badge status={d.tls_status} variant={tlsVariant}>
-                      TLS: {d.tls_status}
+                      {tlsBadgeLabel}
                     </Badge>
                   </div>
                 </div>
@@ -279,7 +288,13 @@ export function DomainsPanel({ projectId, services }: DomainsPanelProps) {
                 </div>
 
                 {d.last_error && (
-                  <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded px-2.5 py-1.5 font-mono">
+                  <div
+                    className={
+                      isProxyUnconfigured
+                        ? 'text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded px-2.5 py-1.5 font-mono'
+                        : 'text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded px-2.5 py-1.5 font-mono'
+                    }
+                  >
                     {d.last_error}
                   </div>
                 )}

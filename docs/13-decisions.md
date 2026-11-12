@@ -36,6 +36,7 @@
 | **DEC-014** | Direct Local-Directory Deployment, Streaming Docker Build Context, and Early `.dockerignore` Pruning | **ACTIVE** | 2026-09-27 |
 | **DEC-015** | Authoritative DeploymentPlan, Secret-Safe Discovery, and Complete Compose Semantics | **ACTIVE** | 2026-10-05 |
 | **DEC-016** | Secure Public Project Sharing via Authenticated Outbound Yamux Tunnel & Public Gateway | **ACTIVE** | 2026-10-20 |
+| **DEC-017** | Stabilization, Automated Operations, Caddy HTTPS Ingress & Windows Path Hardening | **ACTIVE** | 2026-11-12 |
 
 ---
 
@@ -143,7 +144,7 @@
   1. Prevents SSRF attacks and internal network reconnaissance.
   2. Enables access to private repositories.
   3. Provides an authorized identity token necessary for registering automated push webhooks.
-- **Current Implementation:** Fully documented in [docs/15-github-integration.md](15-github-integration.md). (Implementation deferred to post-MVP).
+- **Current Implementation:** `backend/internal/services/github_service.go`, `backend/internal/services/repository_import_service.go`, `backend/internal/services/webhook_service.go`, `backend/internal/handlers/integration_handler.go`, `backend/internal/handlers/webhook_handler.go`, and [docs/15-github-integration.md](15-github-integration.md).
 - **Rule for Future Agents:** Do not weaken this decision into "clone any arbitrary URL entered in a text box."
 
 ---
@@ -161,18 +162,18 @@
 
 ---
 
-## DEC-010: Multi-Provider OAuth Authentication with Deferred Repository Integration
+## DEC-010: Multi-Provider OAuth Authentication with Separated Repository Authorization
 
 - **Date:** 2026-09-26
 - **Status:** **ACTIVE**
-- **Decision:** Introduce Google OAuth 2.0 and GitHub OAuth as first-class authentication providers for ForgeLAB accounts, while strictly keeping GitHub repository importing, repository browsing, webhooks, and automated deployments deferred.
+- **Decision:** Introduce Google OAuth 2.0 and GitHub OAuth as first-class authentication providers for ForgeLAB accounts, while strictly isolating identity sign-in (`read:user user:email`) from repository authorization, importing, and webhooks (which use GitHub App installations, explicit `repo` OAuth/PAT grants, and HMAC-SHA256 webhooks).
 - **Reason:**
   1. **Developer Experience:** Modern developer tools require frictionless sign-in with existing identity providers (Google and GitHub) without forcing password management.
   2. **Security & Boundary Separation:** Decouples user authentication (verifying identity via standard OpenID Connect / OAuth user profile and verified email) from repository access (which requires high-privilege `repo` scopes, token persistence, webhook management, and clone isolation).
   3. **Backend-Owned Session Authority:** Sessions are issued and maintained by the Go backend via secure HttpOnly cookies (`forgelab_access_token`, `forgelab_refresh_token`). No JWT persistence in client-side `localStorage`.
   4. **Dedicated Identity Model:** Introduces the `auth_identities` table with nullable `users.password_hash` to support deterministic account linking by verified email and provider subject without fragile email-only matching.
 - **Current Implementation:** `backend/internal/services/oauth_service.go`, `backend/internal/services/user_service.go`, `backend/internal/handlers/auth_handler.go`, `backend/migrations/000003_add_auth_identities.up.sql`, `frontend/src/components/auth/oauth-buttons.tsx`.
-- **Rule for Future Agents:** Do not conflate GitHub sign-in with GitHub repository import. Keep repository importing and webhook synchronization behind explicit future design milestones as specified in DEC-008.
+- **Rule for Future Agents:** Do not conflate GitHub sign-in with GitHub repository import. Keep repository importing and webhook synchronization isolated from sign-in OAuth scopes per DEC-008 and DEC-011.
 
 ---
 
@@ -283,4 +284,19 @@
   6. **Reversible Migration & Cryptographic Share Tokens:** Public shares are stored in `public_shares` (migration `000020_add_public_shares`), keyed by 128-bit cryptographically secure random hexadecimal tokens (`crypto/rand`). Immediate revocation immediately deregisters routes at both local and gateway layers.
 - **Current Implementation:** `backend/cmd/gateway/`, `backend/internal/gateway/`, `backend/internal/tunnel/`, `backend/internal/services/share_service.go`, `backend/internal/handlers/share_handler.go`, `backend/internal/models/share.go`, `frontend/src/features/projects/share-modal.tsx`.
 - **Rule for Future Agents:** Never expose container host ports on `0.0.0.0` by default. Never allow public tunnel requests to target internal management planes or arbitrary ports. Always fail closed when gateway configuration is absent.
+
+---
+
+## DEC-017: Stabilization, Automated Operations, Caddy HTTPS Ingress & Windows Path Hardening
+
+- **Date:** 2026-11-12
+- **Status:** **ACTIVE**
+- **Decision:** Executed a focused stabilization and reliability pass across the single-node Go + Next.js platform without altering the single control-plane architecture or removing Guest Mode:
+  1. **Windows Local Agent Path & TAR Hardening:** `internal/security/path_validator.go` and `internal/tararchive/tararchive.go` canonicalize Windows volume/short-8.3 names and junctions via `filepath.EvalSymlinks`, reject UNC/device prefixes (`\\?\`, `\\.\`, `\\server\`), and enforce symlink boundary escape checks during build-context TAR streaming and source fingerprinting.
+  2. **Integrated Caddy Reverse Proxy & Truthful Custom Domains:** Added `caddy:2-alpine` (`infra/caddy/Caddyfile`, HTTP `:80`, HTTPS `:443`, `forgelab_caddy_data`, `forgelab_caddy_config`) to `docker-compose.yml` controlled via `CADDY_ADMIN_URL` (`http://caddy:2019` in Compose, empty by default for host-native runs). `DomainService` enforces DNS TXT ownership verification and syncs Caddy routes, reporting `tls_status: "proxy_unconfigured"` and `https_active: false` when Caddy Admin API is unconfigured.
+  3. **Strict Capability Allowlist & Tightened Frontend CSP:** Replaced Docker capability blacklist handling in `internal/docker/trust_boundary.go` with a strict allowlist permitting only `["CAP_CHOWN", "CHOWN", "SETGID", "SETUID"]` (rejecting all other capabilities with `ErrCapabilityNotAllowed`). Tightened `frontend/next.config.ts` Content Security Policy (`script-src 'self' 'unsafe-inline'` in production omitting `'unsafe-eval'`, `X-Frame-Options: DENY`, dynamic preview/agent `connect-src` allowlists).
+  4. **Recoverable Imports, Webhooks, Self-Healing & Blue-Green Switching:** `RepositoryImportService.RecoverInterruptedImports` resumes interrupted GitHub imports across restarts alongside cancel/retry controls. `WebhookService` processes HMAC-SHA256 verified GitHub push webhooks with delivery replay deduplication. `CheckContinuousRuntimeHealth` enforces configurable self-healing restart caps and automatic rollback preserving and inspect-verifying the previous healthy container before promoting recovery. `TrafficRouter` enables opt-in per-service `blue_green` zero-downtime switching (`/proxy/services/{serviceId}`).
+  5. **Volumes, Cached Metrics, Historical Telemetry, Audit Trail & Diagnostics:** Added project volume inspection, disk usage reporting, `.tar.gz` backup streaming, and bounded restore (`engine_volumes.go`), backend-sampled/TTL-cached runtime metrics (`engine_metrics.go`) plus PostgreSQL `metrics_history` retention (`000026_metrics_history`), redacted operational audit logging (`000027_audit_logs`), and aggregated system/project diagnostics (`engine_diagnostics.go`).
+- **Current Implementation:** `docker-compose.yml`, `infra/caddy/Caddyfile`, `frontend/next.config.ts`, `backend/internal/security/path_validator.go`, `backend/internal/tararchive/tararchive.go`, `backend/internal/docker/{trust_boundary,engine_recovery,engine_runtime_health,engine_metrics,engine_volumes,engine_diagnostics}.go`, `backend/internal/proxy/reverse_proxy.go`, `backend/internal/services/{domain_service,repository_import_service,webhook_service,metrics_service,audit_service}.go`, `backend/migrations/{000026_metrics_history,000027_audit_logs}.up.sql`.
+- **Rule for Future Agents:** Never report custom domains `https_active: true` without verified Caddy route synchronization. Never replace the Docker capability allowlist with a blacklist. Always inspect-verify restored containers before reporting rollback success.
 

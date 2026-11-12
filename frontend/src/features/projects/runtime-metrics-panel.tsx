@@ -2,7 +2,12 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api/client';
-import { ProjectRuntimeMetrics, ServiceRuntimeMetrics } from '@/lib/api/types';
+import {
+  ProjectMetricsHistoryResponse,
+  ProjectRuntimeMetrics,
+  ServiceMetricsSample,
+  ServiceRuntimeMetrics,
+} from '@/lib/api/types';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils/cn';
 import { formatBytes, formatUptime } from '@/lib/utils/format';
@@ -17,6 +22,7 @@ import {
   AlertTriangle,
   Clock,
   RotateCcw,
+  TrendingUp,
 } from 'lucide-react';
 
 interface RuntimeMetricsPanelProps {
@@ -37,36 +43,124 @@ function getHealthBadgeVariant(health: string, running: boolean): 'success' | 'w
   }
 }
 
+function MetricSparkline({
+  values,
+  colorClass,
+  maxScale = 100,
+  label,
+}: {
+  values: number[];
+  colorClass: string;
+  maxScale?: number;
+  label: string;
+}) {
+  const width = 180;
+  const height = 40;
+  if (values.length === 0) {
+    return (
+      <div className="h-10 flex items-center justify-center text-[10px] font-mono text-neutral-500 border border-surface-border/40 rounded bg-black/20">
+        No {label} samples yet
+      </div>
+    );
+  }
+
+  const peak = Math.max(maxScale, ...values, 1);
+  const points =
+    values.length === 1
+      ? `0,${height - Math.min(1, Math.max(0, values[0] / peak)) * (height - 6) - 3} ${width},${height - Math.min(1, Math.max(0, values[0] / peak)) * (height - 6) - 3}`
+      : values
+          .map((val, idx) => {
+            const x = (idx / (values.length - 1)) * width;
+            const norm = Math.min(1, Math.max(0, val / peak));
+            const y = height - norm * (height - 6) - 3;
+            return `${x.toFixed(1)},${y.toFixed(1)}`;
+          })
+          .join(' ');
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className={cn('w-full h-10 rounded border border-surface-border/40 bg-black/20 overflow-visible', colorClass)}
+      role="img"
+      aria-label={`${label} history sparkline`}
+    >
+      <polyline
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        points={points}
+      />
+    </svg>
+  );
+}
+
 export function RuntimeMetricsPanel({ projectId }: RuntimeMetricsPanelProps) {
   const [metrics, setMetrics] = useState<ProjectRuntimeMetrics | null>(null);
+  const [history, setHistory] = useState<ProjectMetricsHistoryResponse | null>(null);
+  const [historyHours, setHistoryHours] = useState<1 | 6 | 24>(1);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
 
-  const loadMetrics = useCallback(async () => {
-    try {
-      setError(null);
-      const data = await api.projects.getMetrics(projectId);
-      setMetrics(data);
-    } catch (err: any) {
-      setError(err?.message || 'Failed to load runtime metrics');
-    } finally {
-      setLoading(false);
-    }
-  }, [projectId]);
+  const loadMetrics = useCallback(
+    async (forceRefresh = false) => {
+      try {
+        setError(null);
+        const data = await api.projects.getMetrics(
+          projectId,
+          forceRefresh ? { refresh: true } : undefined
+        );
+        setMetrics(data);
+      } catch (err: any) {
+        setError(err?.message || 'Failed to load runtime metrics');
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    },
+    [projectId]
+  );
+
+  const loadHistory = useCallback(
+    async (hours: number) => {
+      try {
+        setHistoryError(null);
+        const hist = await api.observability.getMetricsHistory(projectId, {
+          hours,
+          limit: 240,
+        });
+        setHistory(hist);
+      } catch (err: any) {
+        setHistoryError(err?.message || 'Historical metrics unavailable');
+      }
+    },
+    [projectId]
+  );
 
   useEffect(() => {
     setLoading(true);
-    loadMetrics();
-  }, [loadMetrics]);
+    loadMetrics(false);
+    loadHistory(historyHours);
+  }, [loadMetrics, loadHistory, historyHours]);
 
   useEffect(() => {
     if (!autoRefresh) return;
     const id = setInterval(() => {
-      loadMetrics();
+      loadMetrics(false);
+      loadHistory(historyHours);
     }, 5000);
     return () => clearInterval(id);
-  }, [autoRefresh, loadMetrics]);
+  }, [autoRefresh, loadMetrics, loadHistory, historyHours]);
+
+  const handleManualRefresh = () => {
+    setRefreshing(true);
+    loadMetrics(true);
+    loadHistory(historyHours);
+  };
 
   if (loading && !metrics) {
     return (
@@ -78,6 +172,15 @@ export function RuntimeMetricsPanel({ projectId }: RuntimeMetricsPanelProps) {
   }
 
   const services: ServiceRuntimeMetrics[] = metrics?.services || [];
+  const samplesByService = new Map<string, ServiceMetricsSample[]>();
+  for (const sample of history?.samples || []) {
+    const existing = samplesByService.get(sample.service_id);
+    if (existing) {
+      existing.push(sample);
+    } else {
+      samplesByService.set(sample.service_id, [sample]);
+    }
+  }
 
   return (
     <div className="flex-1 flex flex-col min-h-0 space-y-5 overflow-y-auto pr-1">
@@ -88,7 +191,16 @@ export function RuntimeMetricsPanel({ projectId }: RuntimeMetricsPanelProps) {
             <Activity className="w-5 h-5 text-emerald-400" />
           </div>
           <div>
-            <h3 className="text-sm font-semibold text-white">Runtime Telemetry & Health</h3>
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-white">Runtime Telemetry & Health</h3>
+              {metrics && (
+                <Badge variant={metrics.cached ? 'neutral' : 'success'}>
+                  {metrics.cached
+                    ? `Cached (${Math.max(0, Math.round(metrics.cache_age_seconds ?? 0))}s)`
+                    : 'Live'}
+                </Badge>
+              )}
+            </div>
             <p className="text-xs text-neutral-400">
               {metrics?.docker_available
                 ? `Last sampled ${metrics?.collected_at ? new Date(metrics.collected_at).toLocaleTimeString() : 'just now'}`
@@ -112,11 +224,11 @@ export function RuntimeMetricsPanel({ projectId }: RuntimeMetricsPanelProps) {
           </button>
           <button
             type="button"
-            onClick={loadMetrics}
-            disabled={loading}
+            onClick={handleManualRefresh}
+            disabled={loading || refreshing}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-surface-elevated hover:bg-surface-border text-xs text-neutral-300 hover:text-white transition-colors border border-surface-border"
           >
-            <RefreshCw className={cn('w-3.5 h-3.5', loading && 'animate-spin')} />
+            <RefreshCw className={cn('w-3.5 h-3.5', (loading || refreshing) && 'animate-spin')} />
             <span>Refresh</span>
           </button>
         </div>
@@ -273,6 +385,112 @@ export function RuntimeMetricsPanel({ projectId }: RuntimeMetricsPanelProps) {
               )}
             </div>
           ))
+        )}
+      </div>
+
+      {/* Historical Telemetry Section */}
+      <div className="rounded-lg border border-surface-border bg-surface-card p-4 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <TrendingUp className="w-4 h-4 text-blue-400" />
+            <h4 className="text-xs font-semibold text-white uppercase tracking-wider">
+              Historical Telemetry &amp; Restarts
+            </h4>
+            {history && (
+              <span className="text-[11px] font-mono text-neutral-400">
+                ({history.retention_days}d retention &middot; {history.sample_interval_seconds}s cadence &middot; {history.total_samples} samples)
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1 text-xs font-mono">
+            {([1, 6, 24] as const).map((h) => (
+              <button
+                key={h}
+                type="button"
+                onClick={() => setHistoryHours(h)}
+                className={cn(
+                  'px-2.5 py-1 rounded border transition-colors',
+                  historyHours === h
+                    ? 'bg-white text-black border-white font-semibold'
+                    : 'bg-surface-elevated text-neutral-400 border-surface-border hover:text-white'
+                )}
+              >
+                {h}h
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {historyError && (
+          <div className="p-2.5 rounded bg-amber-500/10 border border-amber-500/20 text-[11px] font-mono text-amber-300">
+            {historyError}
+          </div>
+        )}
+
+        {(!history || history.summaries.length === 0) ? (
+          <div className="p-4 rounded border border-surface-border/60 bg-surface/40 text-center text-xs text-neutral-400">
+            Background metrics sampler records periodic CPU, memory, network, and restart snapshots here once services are running.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {history.summaries.map((summary) => {
+              const svcSamples = samplesByService.get(summary.service_id) || [];
+              const cpuSeries = svcSamples.map((s) => s.cpu_percent);
+              const memSeries = svcSamples.map((s) => s.memory_percent);
+
+              return (
+                <div
+                  key={summary.service_id}
+                  className="p-3.5 rounded-lg border border-surface-border bg-surface-elevated/40 space-y-3"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-white truncate">
+                      {summary.service_name}
+                    </span>
+                    <div className="flex items-center gap-1.5 text-[10px] font-mono">
+                      <span className="px-1.5 py-0.5 rounded bg-surface border border-surface-border text-neutral-300">
+                        {summary.sample_count} samples
+                      </span>
+                      {summary.oom_count > 0 && (
+                        <Badge variant="danger">{summary.oom_count} OOM</Badge>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-2 text-[11px] font-mono">
+                    <div className="p-2 rounded bg-surface/60 border border-surface-border/40">
+                      <span className="text-[10px] text-neutral-500 block">Peak CPU</span>
+                      <span className="text-white font-semibold">{summary.peak_cpu_percent.toFixed(1)}%</span>
+                    </div>
+                    <div className="p-2 rounded bg-surface/60 border border-surface-border/40">
+                      <span className="text-[10px] text-neutral-500 block">Avg CPU</span>
+                      <span className="text-white font-semibold">{summary.avg_cpu_percent.toFixed(1)}%</span>
+                    </div>
+                    <div className="p-2 rounded bg-surface/60 border border-surface-border/40">
+                      <span className="text-[10px] text-neutral-500 block">Peak Mem</span>
+                      <span className="text-white font-semibold">{formatBytes(summary.peak_memory_bytes)}</span>
+                    </div>
+                    <div className="p-2 rounded bg-surface/60 border border-surface-border/40">
+                      <span className="text-[10px] text-neutral-500 block">Restarts</span>
+                      <span className="text-white font-semibold">{summary.max_restart_count}</span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-mono text-neutral-400 block">CPU %</span>
+                      <MetricSparkline values={cpuSeries} colorClass="text-blue-400" maxScale={100} label="CPU" />
+                    </div>
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-mono text-neutral-400 block">Memory %</span>
+                      <MetricSparkline values={memSeries} colorClass="text-emerald-400" maxScale={100} label="memory" />
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         )}
       </div>
     </div>

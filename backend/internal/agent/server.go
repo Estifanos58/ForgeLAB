@@ -49,6 +49,11 @@ func RegisterLocalSourceSession(session *LocalSourceSession) {
 	if session == nil {
 		return
 	}
+	if session.CanonicalPath != "" {
+		if canon, err := canonicalizeWithAncestor(session.CanonicalPath); err == nil {
+			session.CanonicalPath = canon
+		}
+	}
 	globalSourceSessionsMu.Lock()
 	defer globalSourceSessionsMu.Unlock()
 	globalSourceSessions[session.SourceID] = session

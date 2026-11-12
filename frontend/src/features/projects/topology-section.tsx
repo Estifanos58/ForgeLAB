@@ -2,8 +2,13 @@
 
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api/client';
-import { ProjectTopology, TopologyServiceNode, TopologyDiagnostic } from '@/lib/api/types';
+import {
+  AuditLogEntry,
+  DiagnosticsReport,
+  ProjectTopology,
+} from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
+import { formatBytes } from '@/lib/utils/format';
 import {
   Network,
   RefreshCw,
@@ -15,16 +20,34 @@ import {
   ArrowRight,
   ExternalLink,
   ShieldCheck,
-  Cpu,
   Layers,
+  Activity,
+  History,
+  HardDrive,
 } from 'lucide-react';
 
 interface TopologySectionProps {
   projectId: string;
 }
 
+const AUDIT_RESOURCE_FILTERS: { id: string; label: string }[] = [
+  { id: 'all', label: 'All' },
+  { id: 'deployment', label: 'Releases' },
+  { id: 'service_deployment', label: 'Deploys' },
+  { id: 'service', label: 'Services' },
+  { id: 'env_var', label: 'Secrets' },
+  { id: 'domain', label: 'Domains' },
+  { id: 'volume', label: 'Volumes' },
+  { id: 'project', label: 'Project' },
+];
+
 export function TopologySection({ projectId }: TopologySectionProps) {
   const [topology, setTopology] = useState<ProjectTopology | null>(null);
+  const [diagnosticsReport, setDiagnosticsReport] = useState<DiagnosticsReport | null>(null);
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
+  const [auditFilter, setAuditFilter] = useState<string>('all');
+  const [auditError, setAuditError] = useState<string | null>(null);
+  const [diagError, setDiagError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filterCategory, setFilterCategory] = useState<string>('all');
@@ -33,14 +56,39 @@ export function TopologySection({ projectId }: TopologySectionProps) {
     try {
       setLoading(true);
       setError(null);
-      const data = await api.projects.getTopology(projectId);
-      setTopology(data);
-    } catch (err: any) {
-      setError(err?.message || 'Failed to load project service topology');
+      setDiagError(null);
+      setAuditError(null);
+
+      const [topoRes, diagRes, auditRes] = await Promise.allSettled([
+        api.projects.getTopology(projectId),
+        api.observability.getProjectDiagnostics(projectId),
+        api.observability.getProjectAuditLogs(projectId, {
+          resource_type: auditFilter === 'all' ? undefined : auditFilter,
+          limit: 30,
+        }),
+      ]);
+
+      if (topoRes.status === 'fulfilled') {
+        setTopology(topoRes.value);
+      } else {
+        setError(topoRes.reason?.message || 'Failed to load project service topology');
+      }
+
+      if (diagRes.status === 'fulfilled') {
+        setDiagnosticsReport(diagRes.value);
+      } else {
+        setDiagError(diagRes.reason?.message || 'Operational diagnostics unavailable');
+      }
+
+      if (auditRes.status === 'fulfilled') {
+        setAuditLogs(auditRes.value.logs || []);
+      } else {
+        setAuditError(auditRes.reason?.message || 'Operational audit logs unavailable');
+      }
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, auditFilter]);
 
   useEffect(() => {
     fetchTopology();
@@ -347,6 +395,222 @@ export function TopologySection({ projectId }: TopologySectionProps) {
                       </div>
                     );
                   })}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Operational Diagnostics Card */}
+      <div className="bg-surface-card border border-surface-border rounded-lg p-4 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Activity className="w-4 h-4 text-sky-400" />
+            <h4 className="text-xs font-semibold text-white uppercase tracking-wider">
+              Operational Diagnostics
+            </h4>
+            {diagnosticsReport && (
+              <span
+                className={cn(
+                  'px-2 py-0.5 rounded-full text-[11px] font-mono border uppercase',
+                  diagnosticsReport.overall_status === 'healthy' &&
+                    'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+                  diagnosticsReport.overall_status === 'degraded' &&
+                    'bg-amber-500/20 text-amber-400 border-amber-500/30',
+                  diagnosticsReport.overall_status === 'critical' &&
+                    'bg-rose-500/20 text-rose-400 border-rose-500/30'
+                )}
+              >
+                {diagnosticsReport.overall_status}
+              </span>
+            )}
+          </div>
+          {diagnosticsReport && (
+            <span className="text-[11px] font-mono text-neutral-400">
+              Collected {new Date(diagnosticsReport.collected_at).toLocaleTimeString()}
+            </span>
+          )}
+        </div>
+
+        {diagError && (
+          <div className="p-2.5 rounded bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300">
+            {diagError}
+          </div>
+        )}
+
+        {diagnosticsReport && (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+              <div className="p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-1">
+                <span className="text-[10px] text-neutral-500 block uppercase">Docker Daemon</span>
+                <span className={diagnosticsReport.docker.available ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold'}>
+                  {diagnosticsReport.docker.available ? `Connected (${diagnosticsReport.docker.ping_latency_ms}ms)` : 'Unreachable'}
+                </span>
+                <span className="text-[10px] text-neutral-400 block truncate">
+                  {diagnosticsReport.docker.server_version
+                    ? `v${diagnosticsReport.docker.server_version} · API ${diagnosticsReport.docker.api_version || '—'}`
+                    : diagnosticsReport.docker.error || '—'}
+                </span>
+              </div>
+
+              <div className="p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-1">
+                <span className="text-[10px] text-neutral-500 block uppercase">Host &amp; Reclaimable</span>
+                <span className="text-white font-semibold flex items-center gap-1">
+                  <HardDrive className="w-3 h-3 text-neutral-400" />
+                  {formatBytes(diagnosticsReport.resources.disk_usage?.total_reclaimable_bytes || 0)} reclaimable
+                </span>
+                <span className="text-[10px] text-neutral-400 block">
+                  {diagnosticsReport.resources.host_cpus || 0} CPUs &middot;{' '}
+                  {formatBytes(diagnosticsReport.resources.host_memory_total_bytes || 0)} RAM
+                </span>
+              </div>
+
+              <div className="p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-1">
+                <span className="text-[10px] text-neutral-500 block uppercase">Resource Warnings</span>
+                <span className={diagnosticsReport.resources.exhausted_services.length > 0 ? 'text-amber-400 font-semibold' : 'text-white font-semibold'}>
+                  {diagnosticsReport.resources.exhausted_services.length} service(s)
+                </span>
+                <span className="text-[10px] text-neutral-400 block">
+                  {diagnosticsReport.deployment_failures.length} failed deployment(s)
+                </span>
+              </div>
+
+              <div className="p-3 rounded-lg bg-surface/60 border border-surface-border/60 space-y-1">
+                <span className="text-[10px] text-neutral-500 block uppercase">Repo Imports</span>
+                <span className="text-white font-semibold">
+                  {diagnosticsReport.imports.length} tracked
+                </span>
+                <span className="text-[10px] text-neutral-400 block">
+                  Reconciliation: {diagnosticsReport.docker.reconciliation?.status || 'idle'}
+                </span>
+              </div>
+            </div>
+
+            {diagnosticsReport.issues.length === 0 ? (
+              <div className="flex items-center gap-2.5 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>No Docker connectivity, resource exhaustion, deployment failure, or stalled import issues detected.</span>
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {diagnosticsReport.issues.map((issue, idx) => (
+                  <div
+                    key={`${issue.category}-${idx}`}
+                    className={cn(
+                      'p-3 rounded-lg border text-xs space-y-1.5',
+                      issue.severity === 'critical' && 'bg-rose-500/10 border-rose-500/30 text-rose-200',
+                      issue.severity === 'warning' && 'bg-amber-500/10 border-amber-500/30 text-amber-200',
+                      issue.severity !== 'critical' &&
+                        issue.severity !== 'warning' &&
+                        'bg-blue-500/10 border-blue-500/30 text-blue-200'
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold">{issue.title}</span>
+                      <span className="uppercase text-[10px] font-mono opacity-80">
+                        {issue.severity} &middot; {issue.category}
+                      </span>
+                    </div>
+                    <p className="text-neutral-300 leading-relaxed">{issue.message}</p>
+                    <div className="p-2 rounded bg-black/30 border border-white/10 text-neutral-100">
+                      <span className="font-semibold text-emerald-400 mr-1.5">Remediation:</span>
+                      <span>{issue.remediation}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Operational Audit Trail Card */}
+      <div className="bg-surface-card border border-surface-border rounded-lg p-4 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <History className="w-4 h-4 text-purple-400" />
+            <h4 className="text-xs font-semibold text-white uppercase tracking-wider">
+              Operational Audit Trail
+            </h4>
+            <span className="text-[11px] font-mono text-neutral-400">
+              ({auditLogs.length} events)
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1 text-xs">
+            {AUDIT_RESOURCE_FILTERS.map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => setAuditFilter(f.id)}
+                className={cn(
+                  'px-2 py-1 rounded transition-colors text-[11px] uppercase tracking-wider',
+                  auditFilter === f.id
+                    ? 'bg-white text-black font-semibold'
+                    : 'text-neutral-400 hover:text-neutral-200 bg-surface-elevated'
+                )}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {auditError && (
+          <div className="p-2.5 rounded bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300">
+            {auditError}
+          </div>
+        )}
+
+        {auditLogs.length === 0 ? (
+          <div className="p-4 rounded border border-surface-border/60 bg-surface/40 text-center text-xs text-neutral-400">
+            No operational audit events recorded for this filter yet. Deployments, rollbacks, secret updates, custom domains, volume backups, and lifecycle actions appear here.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {auditLogs.map((entry) => (
+              <div
+                key={entry.id}
+                className="p-3 rounded-lg border border-surface-border bg-surface-elevated/40 text-xs space-y-1"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className={cn(
+                        'px-1.5 py-0.5 rounded font-mono text-[10px] uppercase border',
+                        entry.status === 'success' && 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
+                        entry.status === 'warning' && 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+                        entry.status === 'failure' && 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                      )}
+                    >
+                      {entry.status}
+                    </span>
+                    <span className="font-mono font-semibold text-white">{entry.action}</span>
+                    <span className="px-1.5 py-0.5 rounded bg-surface border border-surface-border text-[10px] font-mono text-neutral-400">
+                      {entry.resource_type}
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-mono text-neutral-400">
+                    {new Date(entry.created_at).toLocaleString()}
+                  </span>
+                </div>
+
+                <p className="text-neutral-300">{entry.message}</p>
+
+                <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono text-neutral-500">
+                  <span>Actor: {entry.is_guest ? 'Guest Workspace' : entry.actor_label || entry.actor_id}</span>
+                  {entry.metadata &&
+                    Object.entries(entry.metadata)
+                      .slice(0, 4)
+                      .map(([k, v]) => (
+                        <span
+                          key={k}
+                          className="px-1.5 py-0.5 rounded bg-black/30 border border-surface-border/50 text-neutral-300"
+                        >
+                          {k}={String(v)}
+                        </span>
+                      ))}
                 </div>
               </div>
             ))}

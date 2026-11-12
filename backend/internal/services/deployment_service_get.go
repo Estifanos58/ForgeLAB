@@ -68,6 +68,13 @@ func (s *DeploymentService) ListDeployments(ctx context.Context, projectID uuid.
 		offset = pagination[1]
 	}
 
+	if s.listDeploymentsForTest != nil {
+		return s.listDeploymentsForTest(ctx, projectID, limit, offset)
+	}
+	if s.db == nil {
+		return []*models.Deployment{}, nil
+	}
+
 	rows, err := s.db.Query(ctx,
 		`SELECT id, project_id, deploy_number, status, commit_sha, branch,
 		 image_tag, container_id, source_revision, build_strategy, build_command,
@@ -329,6 +336,13 @@ func (s *DeploymentService) GetServiceDeployment(ctx context.Context, serviceDep
 
 // ListServiceDeploymentsByService retrieves all service deployments for a specific service ordered by deploy number.
 func (s *DeploymentService) ListServiceDeploymentsByService(ctx context.Context, serviceID uuid.UUID) ([]*models.ServiceDeployment, error) {
+	if s.listServiceDeploymentsByServiceForTest != nil {
+		return s.listServiceDeploymentsByServiceForTest(ctx, serviceID)
+	}
+	if s.db == nil {
+		return []*models.ServiceDeployment{}, nil
+	}
+
 	rows, err := s.db.Query(ctx,
 		`SELECT sd.id, sd.deployment_id, sd.service_id, s.name, s.public_exposed, sd.deploy_number,
 		        sd.status, sd.image_tag, sd.container_id, sd.host_port, sd.internal_port,

@@ -1,0 +1,18 @@
+# ForgeLAB Reverse Proxy Baseline Configuration
+# Dynamic custom-domain HTTPS routes are synchronized at runtime via the Caddy Admin API (/load)
+# by the ForgeLAB backend when domains pass DNS ownership verification.
+
+{
+	admin :2019
+}
+
+:80 {
+	@health path /caddy-health
+	handle @health {
+		respond "ok" 200
+	}
+
+	handle {
+		respond "ForgeLAB reverse proxy ready (no custom domain matched)" 404
+	}
+}

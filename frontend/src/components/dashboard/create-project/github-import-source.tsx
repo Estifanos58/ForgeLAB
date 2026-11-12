@@ -258,6 +258,42 @@ export function GitHubImportSource({
             </div>
           )}
 
+          {/* Cancelled State with Retry Option */}
+          {activeImport.status === 'cancelled' && (
+            <div className="p-3 rounded bg-neutral-900/70 border border-surface-border text-xs text-neutral-300 space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-neutral-400 flex-shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-semibold text-neutral-200">
+                    Repository Import Cancelled
+                  </div>
+                  <p className="mt-0.5 text-neutral-400">
+                    {activeImport.error_message || 'This import was cancelled before completion.'}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setGhSubStep('configure')}
+                >
+                  Back to Settings
+                </Button>
+                <Button
+                  type="button"
+                  variant="primary"
+                  size="sm"
+                  onClick={handleRetryImport}
+                  icon={<RefreshCw className="w-3.5 h-3.5" />}
+                >
+                  Retry Import
+                </Button>
+              </div>
+            </div>
+          )}
+
           {/* Ready State */}
           {activeImport.status === 'ready' && (
             <div className="p-3 rounded bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-300 space-y-2">

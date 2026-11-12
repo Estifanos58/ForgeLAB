@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/forgelab/backend/internal/security"
 	"github.com/forgelab/backend/internal/tararchive"
 )
 
@@ -111,7 +112,7 @@ func StreamBuildContext(ctx context.Context, opts TarStreamerOptions) io.ReadClo
 		maxFileSize = getEnvInt64("BUILD_CONTEXT_MAX_FILE_BYTES", 100*1024*1024) // 100 MB default
 	}
 
-	canonicalContextDir, err := filepath.EvalSymlinks(opts.BuildContextDir)
+	canonicalContextDir, err := security.CanonicalizeExistingPath(opts.BuildContextDir)
 	if err != nil {
 		canonicalContextDir = filepath.Clean(opts.BuildContextDir)
 	}

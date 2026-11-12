@@ -558,3 +558,108 @@ func TestGitHubImport_PruneExpiredImports_CleansDiskAndDatabase(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, count, "expired import record must be pruned from database")
 }
+
+// 7. Regression Test: Durable restart recovery, cancellation, and retry persistence in PostgreSQL
+func TestGitHubImport_DatabaseRestartRecovery_CancelAndRetry(t *testing.T) {
+	importService, ghService, _, _, _, tempDir := setupImportTestServices(t)
+	ctx := context.Background()
+	ownerID := uuid.New()
+	pool, _ := connectTestDB(t)
+
+	_, err := pool.Exec(ctx, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`,
+		ownerID, fmt.Sprintf("test-%s@example.com", ownerID.String()[:8]), "hash")
+	require.NoError(t, err)
+
+	pinnedSHA := strings.ReplaceAll(uuid.New().String()+uuid.New().String(), "-", "")[:40]
+	t.Cleanup(func() {
+		_ = os.RemoveAll(filepath.Join(os.TempDir(), "forgelab_gh_cache", "public", "recover-org", "recover-repo", pinnedSHA))
+	})
+	tarballBytes := createTestTarGz(map[string]string{
+		"package.json": `{"name": "db-recovered-app", "scripts": {"start": "node server.js"}}`,
+		"server.js":    `console.log("ok");`,
+	})
+
+	mockGitHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/recover-org/recover-repo":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":             99905,
+				"name":           "recover-repo",
+				"full_name":      "recover-org/recover-repo",
+				"private":        false,
+				"default_branch": "main",
+			})
+		case strings.HasPrefix(r.URL.Path, "/repos/recover-org/recover-repo/commits/"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"sha": pinnedSHA})
+		case strings.HasPrefix(r.URL.Path, "/repos/recover-org/recover-repo/tarball/"):
+			w.Header().Set("Content-Type", "application/gzip")
+			_, _ = w.Write(tarballBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockGitHub.Close()
+
+	ghService.SetHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			u, _ := url.Parse(mockGitHub.URL + req.URL.RequestURI())
+			req.URL = u
+			return http.DefaultTransport.RoundTrip(req)
+		}),
+	})
+
+	// Simulate an interrupted DB record left over after backend crash
+	interruptedID := uuid.New()
+	staleDir := filepath.Join(tempDir, "imports", interruptedID.String())
+	require.NoError(t, os.MkdirAll(staleDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(staleDir, "partial.tmp"), []byte("incomplete"), 0644))
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO repository_imports (
+			id, owner_id, source_type, repository_full_name, branch, commit_sha,
+			root_dir, snapshot_path, status, progress, stage, expires_at
+		) VALUES ($1, $2, 'github_public', 'recover-org/recover-repo', 'main', $3, '', $4, 'downloading', 50, 'Downloading', NOW() + INTERVAL '6 hours')
+	`, interruptedID, ownerID, pinnedSHA, staleDir)
+	require.NoError(t, err)
+
+	// Freshly initialized RepositoryImportService recovers interrupted row on startup
+	restartedSvc := services.NewRepositoryImportService(pool, tempDir, ghService)
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = restartedSvc.Stop(stopCtx)
+		_ = importService.Stop(stopCtx)
+	})
+
+	recovered, err := restartedSvc.RecoverInterruptedImports(ctx)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, recovered, 1)
+
+	require.Eventually(t, func() bool {
+		rec, getErr := restartedSvc.GetImport(ctx, ownerID, interruptedID)
+		return getErr == nil && rec.Status == models.ImportStatusReady
+	}, 5*time.Second, 100*time.Millisecond)
+
+	readyRec, err := restartedSvc.GetImport(ctx, ownerID, interruptedID)
+	require.NoError(t, err)
+	assert.Equal(t, pinnedSHA, readyRec.CommitSHA)
+	assert.NoFileExists(t, filepath.Join(readyRec.SnapshotPath, "partial.tmp"))
+	assert.FileExists(t, filepath.Join(readyRec.SnapshotPath, "package.json"))
+
+	// Cancel and retry against PostgreSQL
+	cancelledRec, err := restartedSvc.CancelImport(ctx, ownerID, interruptedID)
+	require.NoError(t, err)
+	assert.Equal(t, models.ImportStatusCancelled, cancelledRec.Status)
+	assert.NoDirExists(t, staleDir)
+
+	retriedRec, err := restartedSvc.RetryImport(ctx, ownerID, interruptedID)
+	require.NoError(t, err)
+	assert.Equal(t, models.ImportStatusPending, retriedRec.Status)
+
+	require.Eventually(t, func() bool {
+		rec, getErr := restartedSvc.GetImport(ctx, ownerID, interruptedID)
+		return getErr == nil && rec.Status == models.ImportStatusReady
+	}, 5*time.Second, 100*time.Millisecond)
+}

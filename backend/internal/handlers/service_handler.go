@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ type ServiceHandler struct {
 	deploymentService *services.DeploymentService
 	dockerEngine      *docker.Engine
 	deployQueue       *queue.DeploymentQueue
+	auditService      *services.AuditService
 }
 
 func NewServiceHandler(
@@ -39,6 +41,32 @@ func NewServiceHandler(
 		dockerEngine:      dockerEngine,
 		deployQueue:       deployQueue,
 	}
+}
+
+// SetAuditService configures operational audit logging on ServiceHandler.
+func (h *ServiceHandler) SetAuditService(auditSvc *services.AuditService) {
+	h.auditService = auditSvc
+}
+
+func (h *ServiceHandler) recordAudit(r *http.Request, userID uuid.UUID, projectID uuid.UUID, projectName, action, resourceType, resourceID, status, message string, metadata map[string]any) {
+	if h.auditService == nil {
+		return
+	}
+	pid := projectID
+	h.auditService.RecordBestEffort(r.Context(), services.AuditRecordInput{
+		ActorID:      userID,
+		ActorLabel:   getUserEmailFromContext(r),
+		IsGuest:      models.IsGuest(userID),
+		ProjectID:    &pid,
+		ProjectName:  projectName,
+		Action:       action,
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		Status:       status,
+		Message:      message,
+		Metadata:     metadata,
+		IPAddress:    getClientIP(r),
+	})
 }
 
 // List handles GET /api/projects/{id}/services
@@ -100,7 +128,7 @@ func (h *ServiceHandler) Stop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify project ownership
-	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -142,6 +170,10 @@ func (h *ServiceHandler) Stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.recordAudit(r, userID, projectID, project.Name, "service.stop", "service", serviceID.String(), models.AuditStatusSuccess, "Stopped service "+svc.Name, map[string]any{
+		"service_name": svc.Name,
+	})
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
 }
 
@@ -166,7 +198,7 @@ func (h *ServiceHandler) Start(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify project ownership
-	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -208,6 +240,10 @@ func (h *ServiceHandler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.recordAudit(r, userID, projectID, project.Name, "service.start", "service", serviceID.String(), models.AuditStatusSuccess, "Started service "+svc.Name, map[string]any{
+		"service_name": svc.Name,
+	})
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
 }
 
@@ -232,7 +268,7 @@ func (h *ServiceHandler) Restart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify project ownership
-	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -273,6 +309,10 @@ func (h *ServiceHandler) Restart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to restart service: "+err.Error())
 		return
 	}
+
+	h.recordAudit(r, userID, projectID, project.Name, "service.restart", "service", serviceID.String(), models.AuditStatusSuccess, "Restarted service "+svc.Name, map[string]any{
+		"service_name": svc.Name,
+	})
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
 }
@@ -356,6 +396,12 @@ func (h *ServiceHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, reason)
 		return
 	}
+
+	h.recordAudit(r, userID, projectID, project.Name, "service.deploy", "service_deployment", deployment.ID.String(), models.AuditStatusSuccess, fmt.Sprintf("Queued deployment #%d for service %s", deployment.DeployNumber, svc.Name), map[string]any{
+		"service_id":    svc.ID,
+		"service_name":  svc.Name,
+		"deploy_number": deployment.DeployNumber,
+	})
 
 	writeJSON(w, http.StatusCreated, deployment)
 }
@@ -443,6 +489,12 @@ func (h *ServiceHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, reason)
 		return
 	}
+
+	h.recordAudit(r, userID, projectID, project.Name, "service.rollback", "service_deployment", rollbackDeploy.ID.String(), models.AuditStatusSuccess, fmt.Sprintf("Queued rollback deployment #%d for service %s", rollbackDeploy.DeployNumber, svc.Name), map[string]any{
+		"service_id":    svc.ID,
+		"service_name":  svc.Name,
+		"deploy_number": rollbackDeploy.DeployNumber,
+	})
 
 	writeJSON(w, http.StatusCreated, rollbackDeploy)
 }
@@ -713,7 +765,7 @@ func (h *ServiceHandler) UpdateResources(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -792,6 +844,12 @@ func (h *ServiceHandler) UpdateResources(w http.ResponseWriter, r *http.Request)
 	}
 
 	svc.ResourceConfig = cfg
+	h.recordAudit(r, userID, projectID, project.Name, "service.resources.update", "service", serviceID.String(), models.AuditStatusSuccess, "Updated resource limits for service "+svc.Name, map[string]any{
+		"service_name":   svc.Name,
+		"cpu_millicores": cfg.CpuMillicores,
+		"memory_mb":      cfg.MemoryMB,
+		"pids_limit":     cfg.PidsLimit,
+	})
 	writeJSON(w, http.StatusOK, svc)
 }
 
@@ -825,7 +883,7 @@ func (h *ServiceHandler) UpdateDeploymentMode(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -872,6 +930,10 @@ func (h *ServiceHandler) UpdateDeploymentMode(w http.ResponseWriter, r *http.Req
 	}
 
 	svc.DeploymentMode = normalized
+	h.recordAudit(r, userID, projectID, project.Name, "service.deployment_mode.update", "service", serviceID.String(), models.AuditStatusSuccess, "Updated deployment mode for service "+svc.Name+" to "+normalized, map[string]any{
+		"service_name":    svc.Name,
+		"deployment_mode": normalized,
+	})
 	writeJSON(w, http.StatusOK, svc)
 }
 
@@ -902,7 +964,7 @@ func (h *ServiceHandler) CancelDeployment(w http.ResponseWriter, r *http.Request
 	}
 
 	// Verify project ownership
-	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -950,6 +1012,11 @@ func (h *ServiceHandler) CancelDeployment(w http.ResponseWriter, r *http.Request
 	if h.dockerEngine != nil {
 		h.dockerEngine.CancelActiveDeployment(deploymentID)
 	}
+
+	h.recordAudit(r, userID, projectID, project.Name, "service_deployment.cancel", "service_deployment", deploymentID.String(), models.AuditStatusSuccess, "Cancelled service deployment for "+svc.Name, map[string]any{
+		"service_id":   svc.ID,
+		"service_name": svc.Name,
+	})
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "service deployment cancelled successfully",

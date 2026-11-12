@@ -35,13 +35,14 @@ These are deliberate scoping decisions for the current platform release. They ar
 4. **Single-Owner Tenant Model:**
    - Projects and deployments belong strictly to the creating user (`owner_id`).
    - There are no teams, organizations, or Role-Based Access Control (RBAC) permissions.
-5. **Deployment-Time Health Gating & Runtime Monitoring (Docker Restart Policy vs ForgeLAB Self-Healing):**
+5. **Deployment-Time Health Gating, Self-Healing & Auto-Rollback:**
    - Health checks occur during deployment promotion (`HEALTH_CHECKING`) supporting `auto`, `http`, `tcp`, and `none`.
    - **Docker runtime restart behavior (`IMPLEMENTED`):** Deployed application containers are configured with `RestartPolicy: { Name: "unless-stopped" }` in [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go). The Docker daemon automatically restarts stopped or crashed containers at the container-engine layer.
-   - **ForgeLAB continuous runtime health monitoring (`IMPLEMENTED`):** The background deployment reconciler periodically inspects running containers via `CheckContinuousRuntimeHealth` in [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go), detecting unexpected container exits and kernel OOM kills (`insp.State.OOMKilled`) and transitioning service records to `FAILED` with diagnostics.
-   - **ForgeLAB continuous self-healing / auto-rollback (`NOT IMPLEMENTED`):** ForgeLAB does not implement automatic rollback, automated crash-loop recovery, or automated re-promotion upon runtime failure. If an application enters a broken state or fails long after reaching `RUNNING`, ForgeLAB flags the service as failed and logs diagnostics, but takes no automated remedial rollback action.
-6. **No Zero-Downtime Rolling Traffic Shift:**
-   - Promotion stops the old container and starts traffic on the new port. Because there is no proxy layer to gracefully drain connections or shift HTTP traffic, a brief connection gap can occur.
+   - **ForgeLAB continuous runtime health monitoring (`IMPLEMENTED`):** The background deployment reconciler periodically inspects running containers via `CheckContinuousRuntimeHealth` in [`backend/internal/docker/engine_runtime_health.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_runtime_health.go), detecting unexpected container exits, kernel OOM kills (`insp.State.OOMKilled`), restart loops, and Docker health-check degradation (`healthy` / `unhealthy`).
+   - **ForgeLAB configurable self-healing & auto-rollback (`IMPLEMENTED`):** Bounded container restart self-healing (`FORGELAB_SELF_HEAL_ENABLED`, `FORGELAB_SELF_HEAL_MAX_RESTARTS`), sliding-window crash-loop detection (`FORGELAB_CRASH_LOOP_THRESHOLD`, `FORGELAB_CRASH_LOOP_WINDOW`), and automatic rollback to the prior known-good image (`FORGELAB_AUTO_ROLLBACK_ENABLED`, `FORGELAB_AUTO_ROLLBACK_THRESHOLD`, `FORGELAB_AUTO_ROLLBACK_COOLDOWN`) run continuously when enabled, recording audit trail entries and never silently overwriting healthy releases. Multi-node external orchestration remains out of scope.
+6. **Zero-Downtime Rolling Traffic Shift (Opt-In Blue-Green Implemented; Standard Mode Direct Cutover):**
+   - By default (`deployment_mode: "standard"`), service promotions bind dynamically allocated host ports (`10000–60000`) and replace the prior container once health checks pass; a brief connection gap can occur for direct host-port callers.
+   - Services configured with `deployment_mode: "blue_green"` (`PATCH /api/projects/{id}/services/{serviceId}/deployment-mode`) start and health-verify the replacement container before atomically cutting over routes in `TrafficRouter` (`/proxy/services/{serviceId}/*`) and syncing Caddy routes (`SetOnRouteChange`) prior to retiring the old container.
 7. **REST Pre-Fetch & WebSocket Sequence Replay (`RESOLVED IN ARCHITECTURE`):**
    - Historical logs are fetched via REST endpoints (`GET /api/projects/:id/logs` or `GET /api/projects/:id/deployments/:did/logs`) with subquery-based recent log ordering (`ORDER BY id DESC LIMIT N` wrapped in `ORDER BY id ASC`).
    - On WebSocket reconnection, clients transmit `last_sequence` with their subscription frame, triggering the backend WebSocket Hub to stream missing historical logs from PostgreSQL before live events, preventing gaps or duplicates.
@@ -71,9 +72,9 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Location:** [`frontend/src/lib/api/client.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/lib/api/client.ts), [`frontend/src/proxy.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/proxy.ts)
 - **Resolution:** Authentication is backend-owned via HttpOnly cookies (`forgelab_access_token` and `forgelab_refresh_token`). The frontend client (`apiClient`) intercepts 401 responses, executes an atomic token refresh via `/api/auth/refresh`, and seamlessly retries the original request with circuit-breaker protection against infinite loops.
 
-### 4. Docker Compose Networking & Rewrite Alignment (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`frontend/next.config.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.ts), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml)
-- **Resolution:** `next.config.ts` dynamically configures rewrite destinations using `${process.env.BACKEND_INTERNAL_URL || 'http://backend:8080'}/api/:path*`, allowing transparent proxying between containers on the internal Docker Compose bridge network.
+### 4. Docker Compose Networking, Next.js Proxy & CSP Alignment (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`frontend/src/app/api/[[...path]]/route.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/app/api/%5B%5B...path%5D%5D/route.ts), [`frontend/next.config.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.ts), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml)
+- **Resolution:** Frontend API requests proxy transparently via the App Router catch-all handler (`route.ts`) to `${BACKEND_INTERNAL_URL || 'http://backend:8080'}` while stripping untrusted client forwarding headers, paired with a hardened Content-Security-Policy (`'unsafe-eval'` omitted outside development) and security headers in `next.config.ts`.
 
 ### 5. Platform-Dependent Ephemeral Storage Quotas (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/docker/trust_boundary.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/trust_boundary.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/models/models.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/models/models.go)
@@ -177,7 +178,7 @@ These are identified codebase behaviors that require investigation and resolutio
   - *Operational Observability:* Exposed operational health diagnostics via `GET /health/logs` and `GET /ready` (`active_collectors`, `lines_collected`, `last_activity`, `collection_errors`, `persistence_errors`) with sanitized secret masking.
   - *Configurable Log Retention:* Implemented `DeploymentService.PruneLogs` with age-based (`FORGELAB_LOG_RETENTION_DAYS`, default 30) and per-deployment count-based (`FORGELAB_LOG_MAX_PER_DEPLOYMENT`, default 10,000) cleanup, scheduled via a background ticker (`FORGELAB_LOG_CLEANUP_INTERVAL`, default 1h).
 
-### 18. GitHub Repository Importing & Authorization Architecture (`RESOLVED IN ARCHITECTURE`)
+### 29. GitHub Repository Importing & Authorization Architecture (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/services/repository_import_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/repository_import_service.go), [`backend/internal/services/github_app.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/github_app.go), [`backend/internal/services/github_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/github_service.go), [`frontend/src/components/dashboard/create-project-modal.tsx`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/components/dashboard/create-project-modal.tsx)
 - **Defects Fixed:**
   - Removed all fake repository metadata (`id: Date.now()`) and synthetic default-branch fallbacks (`main`). Network and authorization failures strictly return actionable errors instead of masking missing permissions.
@@ -197,24 +198,24 @@ These are identified codebase behaviors that require investigation and resolutio
   - Enforces archive security bounds: 100MB compressed, 100MB uncompressed, 10,000 files, 50MB single file, traversal and symlink guards.
   - Periodic background ticker prunes expired or abandoned import snapshots and database records after 24 hours.
 
-### 19. Authoritative Dependency Graph Validation & Silent Fallback Elimination (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/discovery/graph.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/graph.go), [`backend/internal/discovery/compose.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/compose.go), [`backend/internal/discovery/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/engine.go), [`backend/internal/docker/preflight.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/preflight.go), [`backend/internal/docker/engine_build.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go)
+### 30. Authoritative Dependency Graph Validation & Silent Fallback Elimination (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/discovery/graph.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/graph.go), [`backend/internal/discovery/compose.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/compose.go), [`backend/internal/discovery/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/engine.go), [`backend/internal/docker/preflight.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/preflight.go), [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
 - **Resolution:**
   - Replaced disparate cycle checking and heuristic graph parsing with a single authoritative dependency-graph implementation (`ValidateAndBuildDAG`).
   - Strict validation rejects cyclic service dependencies with explicit directed cycle paths (e.g. `svc-a -> svc-b -> svc-c -> svc-a`), self-dependencies, unknown service references, and unsupported dependency conditions before building images or creating containers.
   - Plan generation (`GeneratePlan`) and release execution (`buildServiceDeploymentTiers`) fail closed immediately on graph errors without falling back to flawed tiers containing cyclic services.
   - Generates deterministic tiers using Kahn's algorithm with alphabetical sorting within each tier, and deterministically honors `service_started`, `service_healthy`, and `service_completed_successfully` dependency conditions.
 
-### 20. Compose Network Isolation, Alias Preservation & Fatal Attachment Handling (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_lifecycle.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_lifecycle.go)
+### 31. Compose Network Isolation, Alias Preservation & Fatal Attachment Handling (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go)
 - **Resolution:**
   - Preserves declared Compose network configuration, including user-defined network membership, driver, `internal`, and supported `external` settings.
   - When services declare explicit networks, they are isolated to those declared networks and are not attached to the common project bridge network (`forgelab-net-<projectID>`).
   - Preserves default service-name DNS aliases and custom aliases across all networks to which the service belongs.
   - Treats network creation failures or secondary network attachment failures as fatal deployment failures (fails closed, cleans up the container, restores the previous running container, and records failure diagnostics), never demoting network failures to non-fatal warnings.
 
-### 21. Target Database Credential Resolution, URL Encoding & Secret Redaction (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/logging/redactor.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/logging/redactor.go)
+### 32. Target Database Credential Resolution, URL Encoding & Secret Redaction (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/logging/redactor.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/logging/redactor.go)
 - **Resolution:**
   - Standardized connection string resolver derives target database credentials directly from the target database service's configuration and decrypted secrets (`secretService.GetDecryptedEnvMap`), not from the consuming service's environment.
   - Encodes connection credentials using standard library `url.UserPassword` to safely percent-encode special characters.
@@ -222,21 +223,22 @@ These are identified codebase behaviors that require investigation and resolutio
   - Dynamically registers generated connection URLs and database passwords with the log redactor, guaranteeing zero plaintext secret exposure in plans, logs, API responses, or diagnostics.
   - Resolves client-facing frontend variables (`NEXT_PUBLIC_API_URL`, `VITE_API_URL`, `API_URL`) to public URLs, custom domains, or host port bindings, never private Docker DNS names (`backend:8080`).
 
-### 22. Strict Health Check Status Gating & Readiness Diagnostics (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/docker/engine_health.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_health.go)
+### 33. Strict Health Check Status Gating & Readiness Diagnostics (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_health.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_health.go)
 - **Resolution:**
   - Explicit HTTP health checks require HTTP 2xx or 3xx responses (status 200–399) and reject HTTP 404 and 5xx responses.
   - HTTP health checks never silently fall back to TCP socket inspection upon HTTP failure.
   - Keeps HTTP, TCP, Docker-native, Auto, and None health check strategies behaviorally distinct.
   - Deployment status and diagnostics clearly distinguish process startup, listening ports, application readiness, and dependency connectivity.
 
-### 23. Release Promotion Container Preservation & Rollback Truthfulness (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go)
+### 34. Release Promotion Container Preservation & Rollback Truthfulness (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
 - **Resolution:**
   - In release deployments, previous healthy service containers are preserved throughout execution across all tiers and are only superseded/cleaned up after the full release meets promotion criteria.
   - When partial failures occur (some services succeed while others fail), ForgeLAB accurately logs that individual services were updated and explicitly disclaims full release rollback, preventing misleading rollback claims.
-### 24. Unified Volume Mount Resolution Across Remote and Local Source Types (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/docker/volume_resolver.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/volume_resolver.go), [`backend/internal/services/source_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/source_service.go), [`backend/internal/services/project_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/project_service.go)
+
+### 35. Unified Volume Mount Resolution Across Remote and Local Source Types (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/volume_resolver.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/volume_resolver.go), [`backend/internal/services/source_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/source_service.go), [`backend/internal/services/project_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/project_service.go)
 - **Defects Fixed:**
   - Resolved preflight validation failure (`bind mount source directory '.' (resolved to '') does not exist or is not accessible from backend environment`) when deploying imported GitHub repositories and archive uploads.
   - Unified `ResolveProjectSourcePaths` and `ResolveAndValidateVolumeMount` across all source origins (`local_directory`, `local_agent`, `local_upload`, `github`, and `github_public`).
@@ -244,63 +246,63 @@ These are identified codebase behaviors that require investigation and resolutio
   - Implemented dynamic daemon host path translation (`translateBackendPathToDaemon` and `DetectAllBackendContainerMounts`) to translate container storage volume paths to host paths visible to the Docker daemon (`/var/lib/docker/volumes/...`).
   - Permitted boundary-safe automatic directory creation for relative project subpaths (e.g. `./data`) during preflight while strictly maintaining path-escape rejections, restricted directory checks, and Docker socket mount bans.
 
-### 25. WebSocket Query String Token Removal & Single-Use Ticket Protocol (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/websocket/hub.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/websocket/hub.go), [`backend/cmd/server/main.go`](file:///home/estif/Projects/ForgeLAB/backend/cmd/server/main.go)
+### 36. WebSocket Query String Token Removal & Single-Use Ticket Protocol (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/websocket/hub.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/websocket/hub.go), [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go)
 - **Resolution:** Removed token authentication via URL query parameters (`?token=...`), which leaked JWT credentials into server/proxy access logs and browser histories. Connection requests containing `?token=` are strictly rejected with `401 Unauthorized`. Implemented short-lived (60s TTL), single-use tickets minted via `POST /api/ws/ticket` and consumed via `GET /api/ws?ticket=<uuid>`. Replayed or expired tickets are rejected with `401 Unauthorized`. Also supported authentication via secure HttpOnly `forgelab_access_token` cookies and `Authorization: Bearer <token>` headers.
 
-### 26. Enforced WebSocket Origin Policies (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/websocket/hub.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/websocket/hub.go)
+### 37. Enforced WebSocket Origin Policies (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/websocket/hub.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/websocket/hub.go)
 - **Resolution:** Replaced unconditional `CheckOrigin: func(...) { return true }` with strict origin verification. All WebSocket upgrade requests validate the incoming `Origin` header against configured frontend URLs (`CORS_ALLOWED_ORIGINS` and `FRONTEND_URL`) and same-origin host matching, eliminating cross-site WebSocket hijacking (CSWSH) vulnerabilities.
 
-### 27. Restricted Internal Diagnostics Access (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/handlers/health_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/health_handler.go), [`backend/cmd/server/main.go`](file:///home/estif/Projects/ForgeLAB/backend/cmd/server/main.go)
+### 38. Restricted Internal Diagnostics Access (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/handlers/health_handler.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/handlers/health_handler.go), [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go)
 - **Resolution:** Public `/ready` health probe no longer leaks internal operational details (`queue`, `build_queue`, `log_collectors`) to unauthenticated external clients; external callers receive a sanitized readiness status checking core dependencies. Detailed queue metrics and container log collector diagnostics via `/ready`, `/health/queue`, and `/health/logs` are restricted strictly to trusted loopback/internal callers or authenticated administrators, returning `401 Unauthorized` for external unauthenticated requests.
 
-### 28. Docker Host Port Conflict Retries & In-Transition Reconciliation (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_port.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_port.go), [`backend/internal/docker/engine_lifecycle.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_lifecycle.go)
+### 39. Docker Host Port Conflict Retries & In-Transition Reconciliation (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_port.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_port.go), [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go)
 - **Resolution:** Implemented automatic conflict detection and retry logic (up to 3 retries) during container creation and startup. When Docker Engine reports that an allocated port is already bound on the host (`isPortConflictError`), ForgeLAB registers the conflicted port as used in `PortManager`, allocates a fresh port, updates port bindings, and reattempts creation/start. In addition, `ReconcileDaemonContainers` collects host ports from containers across `running`, `restarting`, `created`, and `paused` states, preventing collisions during service transitions.
 
-### 29. Build Reproducibility & Source Revision Fingerprint Verification (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_build.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_build.go)
+### 40. Build Reproducibility & Source Revision Fingerprint Verification (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go)
 - **Resolution:** Pinned immutable source revisions across both release and independent service deployments. For local directory deployments, when a source revision fingerprint is pinned (`fp_...`), `resolveSourceDirectory` computes a fresh content-based fingerprint (`ComputeDirectoryContentFingerprintWithContext`) and fails closed with an informative error (`source content changed since deployment was created`) if disk files drift from the reviewed deployment revision before build execution.
 
-### 30. Remote Public Host URL Resolution (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/config/config.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/config/config.go), [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go), [`backend/cmd/server/main.go`](file:///home/estif/Projects/ForgeLAB/backend/cmd/server/main.go)
+### 41. Remote Public Host URL Resolution (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/config/config.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/config/config.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go)
 - **Resolution:** Configured `PublicHost` via `FORGELAB_PUBLIC_HOST` or `PUBLIC_HOST` (falling back to host from `FRONTEND_URL`), preventing remote deployments from erroneously generating `localhost` browser URLs.
 
-### 31. Local Agent Endpoint Identity Verification & Token Revocability (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/agent/server.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/agent/server.go), [`backend/internal/agent/client.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/agent/client.go), [`backend/internal/agent/session.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/agent/session.go), [`backend/internal/handlers/source_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/source_handler.go)
+### 42. Local Agent Endpoint Identity Verification & Token Revocability (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/agent/server.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/server.go), [`backend/internal/agent/client.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/client.go), [`backend/internal/agent/session.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/session.go), [`backend/internal/handlers/source_handler.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/handlers/source_handler.go)
 - **Resolution:** Added preflight unauthenticated identity verification probes (`POST /api/agent/verify-identity` and `GET /api/agent/status` with `X-Expected-Agent-ID`). The control plane verifies endpoint identity BEFORE transmitting bearer credentials, preventing session tokens from ever being sent to unverified fallback endpoints. Tokens default to a short 15-minute TTL (`FORGELAB_AGENT_SESSION_TTL`), support explicit revocation via `POST /api/sources/agent/session/revoke`, and are automatically revoked upon source workspace deletion.
 
-### 32. Isolated Anonymous Browser Sessions & Safe Local Fallback (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/middleware/middleware.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/middleware/middleware.go), [`backend/internal/services/user_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/user_service.go), [`backend/internal/websocket/hub.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/websocket/hub.go)
+### 43. Isolated Anonymous Browser Sessions & Safe Local Fallback (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/middleware/middleware.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/middleware/middleware.go), [`backend/internal/services/user_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/user_service.go), [`backend/internal/websocket/hub.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/websocket/hub.go)
 - **Resolution:** Anonymous browser users are assigned an isolated guest UUID and cookie (`forgelab_guest_session`) / header (`X-Guest-Session`) with provisioned database records (`guest-<uuid>@forgelab.local`), preventing anonymous users from accessing one another's projects, logs, or secrets. Local non-browser loopback requests (`curl`, scripts, test harnesses) resolve safely to `models.GuestUserID`, preserving registration-free local CLI workflows.
 
-### 33. Deployment Reliability & Non-Destructive Failure Invariant (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/handlers/project_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/project_handler.go), [`backend/internal/docker/engine_lifecycle.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_lifecycle.go), [`backend/internal/handlers/health_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/health_handler.go)
+### 44. Deployment Reliability & Non-Destructive Failure Invariant (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/handlers/project_handler.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/handlers/project_handler.go), [`backend/internal/docker/engine_lifecycle.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_lifecycle.go), [`backend/internal/handlers/health_handler.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/handlers/health_handler.go)
 - **Resolution:** Enqueue failures never claim successful queueing (properly failing deployment record with HTTP 500 error). If an active release is running, enqueue or deployment failures derive project status via `CalculateProjectStatus` rather than destroying the healthy release. Startup daemon container reconciliation authoritativeness is tracked and exposed via `/ready` (returning 503 if reconciliation is unavailable or failed).
 
-### 34. Bounded Discovery & Leak-Free Build Context Tar Cleanup (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/discovery/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/engine.go), [`backend/internal/tararchive/tararchive.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/tararchive/tararchive.go), [`backend/internal/docker/engine.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine.go)
+### 45. Bounded Discovery & Leak-Free Build Context Tar Cleanup (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/discovery/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/engine.go), [`backend/internal/tararchive/tararchive.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/tararchive/tararchive.go), [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go)
 - **Resolution:** `DiscoverWithContext` enforces context cancellation, 50,000 file and 500 MB bounds, and verifies that directory traversal and symlinks do not escape the canonical project root. Archive creation logs progress every 1,000 files, and build context `.tar` files are cleaned up reliably via `defer os.Remove` in all build code paths.
 
-### 35. Live-Preview URL Suppression for Non-Running Containers (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/services/service_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/service_service.go), [`backend/internal/services/deployment_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/deployment_service.go)
+### 46. Live-Preview URL Suppression for Non-Running Containers (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/service_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/service_service.go), [`backend/internal/services/deployment_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/deployment_service.go)
 - **Resolution:** Stopped, failed, or unreachable services strictly set `preview_url = nil` across ServiceService, DeploymentService, and ProjectService, preventing misleading preview links from displaying in the UI for non-running containers.
 
-### 36. Authoritative Service Connection Diagnostics & DAG Topology View (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/docker/engine_topology.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/engine_topology.go), [`backend/internal/handlers/project_handler.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/handlers/project_handler.go), [`frontend/src/features/projects/topology-section.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/features/projects/topology-section.tsx), [`frontend/src/app/(app)/projects/[id]/page.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/app/(app)/projects/[id]/page.tsx)
+### 47. Authoritative Service Connection Diagnostics & DAG Topology View (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_topology.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_topology.go), [`backend/internal/handlers/project_handler.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/handlers/project_handler.go), [`frontend/src/features/projects/topology-section.tsx`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/features/projects/topology-section.tsx), [`frontend/src/app/(app)/projects/[id]/page.tsx`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/app/(app)/projects/%5Bid%5D/page.tsx)
 - **Resolution:** Implemented `GET /api/projects/{id}/topology` reusing existing DAG discovery and plan architecture. Exposes DAG execution tiers, service nodes (internal DNS, ports, host ports, networks, readiness), and actionable connection diagnostics (port collisions, missing dependencies, failed upstreams, database connection strings). Added interactive `Topology & Diagnostics` tab in the frontend project view.
 
-### 37. Node.js/Next.js Lifecycle Build Staging & Prisma Generation (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/discovery/detector.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/discovery/detector.go), [`backend/internal/detector/detector.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/detector/detector.go), [`backend/internal/docker/preflight.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/docker/preflight.go)
+### 48. Node.js/Next.js Lifecycle Build Staging & Prisma Generation (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/discovery/detector.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/detector.go), [`backend/internal/detector/detector.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/detector/detector.go), [`backend/internal/docker/preflight.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/preflight.go)
 - **Resolution:** When Next.js or Node.js services declare lifecycle scripts requiring Prisma (e.g. `postinstall: prisma generate`), the automatic Dockerfile generator selectively stages `prisma/` and config files (`prisma.config.ts`, or custom paths from `package.json`) before dependency installation (`RUN npm ci`). Ephemeral placeholder `DATABASE_URL` is scoped to build commands without baking credentials into images. Unrelated projects emit zero extra COPY steps. In addition, preflight checks validate manifest integrity and schema presence, surfacing actionable diagnostics before Docker build starts. Container start commands use JSON-serialized `CMD ["sh", "-c", ...]` escaping quotes and shell metacharacters.
 
-### 38. Safe Multi-Service Exposure Controls & Volume Sanitization (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`backend/internal/services/project_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/project_service.go), [`backend/internal/security/volume_security.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/security/volume_security.go), [`frontend/src/components/dashboard/create-project-modal.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/components/dashboard/create-project-modal.tsx)
+### 49. Safe Multi-Service Exposure Controls & Volume Sanitization (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/project_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/project_service.go), [`backend/internal/security/volume_security.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/security/volume_security.go), [`frontend/src/components/dashboard/create-project-modal.tsx`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/src/components/dashboard/create-project-modal.tsx)
 - **Resolution:** Added explicit `public_exposed` selection per service in the project creation modal and API (`*bool`). Legacy and older API requests that omit the flag preserve backward-compatible heuristic defaults while ensuring database/infrastructure services never default to public exposure. Volume sanitization strictly validates volume targets and parent escapes (`..`), propagating errors rather than silently continuing, while safely removing forbidden Docker socket mounts.
 
-### 40. Domainless Public Sharing via Cloudflare Quick Tunnels & Gateway Hardening (`RESOLVED IN ARCHITECTURE`)
+### 50. Domainless Public Sharing via Cloudflare Quick Tunnels & Gateway Hardening (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/tunnel/`](file:///home/estif/Projects/ForgeLAB/backend/internal/tunnel/), [`backend/internal/gateway/`](file:///home/estif/Projects/ForgeLAB/backend/internal/gateway/), [`backend/internal/services/share_service.go`](file:///home/estif/Projects/ForgeLAB/backend/internal/services/share_service.go), [`frontend/src/features/projects/share-modal.tsx`](file:///home/estif/Projects/ForgeLAB/frontend/src/features/projects/share-modal.tsx)
 - **Resolution:**
   1. *Provider Abstraction:* Created `ShareProvider` interface implemented by `CloudflareProvider` (default domainless) and `GatewayProvider` (advanced self-hosted).
@@ -331,8 +333,8 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Location:** [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go), [`backend/internal/middleware/middleware.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/middleware/middleware.go), [`frontend/next.config.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.ts), [`frontend/test/security-headers.test.mjs`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/test/security-headers.test.mjs)
 - **Resolution:**
   - Registered `SecurityHeadersWithTrustedProxies` on the backend Chi router, injecting `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`, `Referrer-Policy: strict-origin-when-cross-origin`, and `Permissions-Policy`.
-  - Configured Next.js frontend headers in `next.config.ts`: Content-Security-Policy (CSP) compatible with Next.js inline hydration and styles, `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, and `Referrer-Policy: strict-origin-when-cross-origin`.
-  - HSTS (`Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`) is applied exclusively when requests arrive over verified HTTPS or when a trusted reverse proxy signals `X-Forwarded-Proto: https`, preventing breakage during local HTTP development.
+  - Configured tightened Next.js frontend headers in `next.config.ts`: Content-Security-Policy (`'unsafe-eval'` omitted outside development builds, explicit `connect-src` allowlist covering `'self'`, `ws:`/`wss:`, Local Agent `127.0.0.1:4142`, and configured backend origins rather than wildcard `http:`/`https:`, `frame-ancestors 'none'`, `form-action 'self'`, `object-src 'none'`, `base-uri 'self'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`.
+  - HSTS (`Strict-Transport-Security`) is applied on HTTPS (`COOKIE_SECURE=true` / `ENABLE_HSTS=true` on frontend; direct TLS or trusted `X-Forwarded-Proto: https` on backend), preventing breakage during local HTTP development.
 
 ### 44. Deployment Recovery Reliability & Degraded State Reporting (`RESOLVED IN ARCHITECTURE`)
 - **Location:** [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go), [`backend/internal/docker/engine_recovery.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_recovery.go), [`backend/internal/docker/engine_recovery_test.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_recovery_test.go)
@@ -404,7 +406,7 @@ These are identified codebase behaviors that require investigation and resolutio
   - Introduced cumulative per-owner resource quota validation (`ValidateOwnerResourceQuota`) and practical per-owner storage quota check (`MaxOwnerStorageQuotaBytes = 1GB`) on source archive ingest.
 
 ### 54. Independent CI Security Scanners & Govulncheck Audit (`RESOLVED IN ARCHITECTURE`)
-- **Location:** [`.github/workflows/ci.yml`](file:///.github/workflows/ci.yml), [`docs/00-current-state.md`](file:///docs/00-current-state.md)
+- **Location:** [`.github/workflows/ci.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/.github/workflows/ci.yml), [`docs/00-current-state.md`](file:///c:/Users/estif/Desktop/ForgeLAB/docs/00-current-state.md)
 - **Resolution:**
   - Split unified `security-scan` job into three independent CI jobs: `security-govulncheck`, `security-npm-audit`, and `security-trivy`. If one scanner reports findings, the others still execute to completion.
   - Documented govulncheck findings: 2 findings in `github.com/docker/docker@v28.5.2+incompatible` (`GO-2026-4887`, `GO-2026-4883`, Fixed in: N/A) reside in the Docker daemon (`daemon.Daemon.ContainerCreate`) not run by ForgeLAB; standard library findings on local dev (`go1.27.0`) are resolved in production CI via Go 1.26.10 (`golang:1.26-alpine`).
@@ -418,6 +420,30 @@ These are identified codebase behaviors that require investigation and resolutio
   - Fixed `agentFetch` to omit `Content-Type: application/json` on bodyless GET requests (avoiding unnecessary CORS preflight), increased default status timeout to 5s, cleanly separated timeouts (HTTP 408) from caller aborts (`AbortError`) and unreachable agent errors, and guarded `CreateProjectModal` against leaving `agentStage` stuck in `selecting`.
   - Enforced interactive logged-in user session checks (`SessionId != 0` and visible window station) in both PowerShell startup scripts and Win32 preflight (`InspectInteractiveSession`), hardened PowerShell `-STA` `-EncodedCommand` `FolderBrowserDialog` invocation with a disposed invisible active-screen owner `Form`, UTF-8 Base64 path transport (`FORGELAB_PATH_B64:`), and distinct cancellation (`ErrPickerCancelled`) vs timeout (`ErrPickerTimedOut`).
 
+### 56. Windows Path Canonicalization, NTFS Junction Resolution & TAR Context Hardening (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/security/path_validator.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/security/path_validator.go), [`backend/internal/tararchive/tararchive.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/tararchive/tararchive.go), [`backend/internal/discovery/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/discovery/engine.go), [`backend/internal/agent/session.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/agent/session.go)
+- **Resolution:** Added unified `CanonicalizeExistingPath` and `CanonicalizeWithAncestor` normalizing Windows object-manager prefixes (`\??\C:\...`, `\??\UNC\...`), resolving NTFS junctions/reparse points step-by-step, canonicalizing Windows 8.3 short paths (e.g. `RUNNER~1`), and rejecting UNC/network paths (`ErrRestrictedSystemPath`). Discovery and TAR context creation reject symlinks/reparse targets escaping the canonical root boundary (`ErrSymlinkEscape`).
+
+### 57. Custom-Domain Lifecycle Truthfulness & Standard Compose Caddy Integration (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/domain_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/domain_service.go), [`backend/internal/proxy/caddy_syncer.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/proxy/caddy_syncer.go), [`docker-compose.yml`](file:///c:/Users/estif/Desktop/ForgeLAB/docker-compose.yml), [`infra/caddy/Caddyfile`](file:///c:/Users/estif/Desktop/ForgeLAB/infra/caddy/Caddyfile)
+- **Resolution:** Integrated `caddy:2-alpine` into `docker-compose.yml` with persistent `forgelab_caddy_data` and `forgelab_caddy_config` volumes, baseline `infra/caddy/Caddyfile`, and Admin API route synchronization (`CADDY_ADMIN_URL`). When `CADDY_ADMIN_URL` is unconfigured or Caddy sync fails, DNS-verified custom domains truthfully report `tls_status: "proxy_unconfigured"` or `"error"` with `https_active: false` instead of falsely reporting active HTTPS.
+
+### 58. Strict Docker Capability Security Allowlist (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/trust_boundary.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/trust_boundary.go)
+- **Resolution:** Replaced legacy blacklist filtering with `allowedContainerCapabilities` (`CHOWN`, `SETGID`, `SETUID` with `CAP_` prefix normalization) after `CapDrop: ["ALL"]`; any capability outside the allowlist is rejected fail-closed with `ErrCapabilityNotAllowed`.
+
+### 59. Restart-Recoverable GitHub Imports & Push-to-Deploy Webhooks (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/services/repository_import_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/repository_import_service.go), [`backend/internal/services/webhook_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/webhook_service.go), [`backend/internal/handlers/webhook_handler.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/handlers/webhook_handler.go), [`backend/cmd/server/main.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/cmd/server/main.go)
+- **Resolution:** Durable `repository_imports` recovery (`RecoverInterruptedImports`) automatically resumes interrupted imports across backend restarts alongside `GET /api/integrations/github/imports`, cancel, and retry controls. Implemented push-to-deploy webhooks (`POST /api/webhooks/github`, `GET`/`PATCH /api/projects/{id}/webhook`) with AES-256-GCM encrypted secrets, 1 MiB body caps, HMAC-SHA256 verification, and `X-GitHub-Delivery` replay deduplication.
+
+### 60. Configurable Self-Healing, Automatic Rollback, Blue-Green Cutover & Persistent Volume Backups (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_runtime_health.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_runtime_health.go), [`backend/internal/docker/engine_recovery.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_recovery.go), [`backend/internal/proxy/traffic_router.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/proxy/traffic_router.go), [`backend/internal/docker/engine_volumes.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_volumes.go)
+- **Resolution:** Added configurable runtime self-healing restarts, crash-loop detection, automatic rollback with verified previous healthy container inspection (`VerifyPreviousHealthyContainer` / `RestorePreviousHealthyContainer`), opt-in `blue_green` traffic shifting via `TrafficRouter` (`/proxy/services/{serviceId}/*`), and project volume disk usage visibility plus gzip tar backup/restore (`POST .../backup`, `POST .../restore`).
+
+### 61. Cached & Historical Runtime Metrics, Redacted Audit Logs & Diagnostics (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/internal/docker/engine_metrics.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_metrics.go), [`backend/internal/services/metrics_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/metrics_service.go), [`backend/internal/services/audit_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/audit_service.go), [`backend/internal/docker/engine_diagnostics.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_diagnostics.go)
+- **Resolution:** Added backend-sampled/cached live metrics (`FORGELAB_METRICS_CACHE_TTL`, single-flight deduplication), configurable historical metrics persistence and retention (`FORGELAB_METRICS_SAMPLE_INTERVAL`, `FORGELAB_METRICS_RETENTION_DAYS`), secret-redacted operational audit trail (`audit_logs`), and aggregated diagnostics (`GET /api/diagnostics`, `GET /api/projects/{id}/diagnostics`).
+
 
 ---
 
@@ -425,13 +451,13 @@ These are identified codebase behaviors that require investigation and resolutio
 
 1. **`localStorage` Token Storage (`RESOLVED IN ARCHITECTURE`):**
    - Authentication is backend-owned using `HttpOnly`, `Secure`, `SameSite=Lax` cookies (`forgelab_access_token` and `forgelab_refresh_token`). Client-side token storage in `localStorage` has been completely eliminated.
-2. **WebSocket Query String Token (`MIGRATION IN PROGRESS / RESOLVED IN ARCHITECTURE`):**
-   - Single-use ticket authentication (`POST /api/ws/ticket`) and HttpOnly cookies are standard in the web UI. Query token authentication (`?token=...`) is deprecated and logs scrubbed warnings; full rejection can be scheduled once all external clients are migrated.
+2. **WebSocket Query String Token (`RESOLVED IN ARCHITECTURE`):**
+   - Single-use ticket authentication (`POST /api/ws/ticket` -> `?ticket=<uuid>`), HttpOnly cookies, and `Authorization: Bearer` headers are enforced; `?token=...` query string authentication is strictly rejected with `401 Unauthorized`.
 3. **Permissive WebSocket CORS / Origin Check (`RESOLVED IN ARCHITECTURE`):**
    - Strict origin validation is enforced across all WebSocket upgrades, matching against configured frontend URLs (`CORS_ALLOWED_ORIGINS` and `FRONTEND_URL`) or same-origin host headers.
 4. **Backend Docker Socket Trust (Inherent Architectural Boundary):**
    - The Go backend mounts `/var/run/docker.sock` with root-equivalent Docker Engine control.
-   - Architectural Hardening Required for Complete Elimination: Because the Docker daemon does not offer granular per-tenant Unix socket ACLs, root-equivalent control over the host cannot be eliminated purely in software on a shared single-node daemon. Complete architectural mitigation requires Docker-in-Docker (DinD), Rootless Docker, or isolated microVM hypervisors (Firecracker/gVisor). Active defense-in-depth mitigations (rejection of socket mounts into tenant containers, `CapDrop: ALL`, `no-new-privileges`, strict path validation) are currently enforced.
+   - Architectural Hardening Required for Complete Elimination: Because the Docker daemon does not offer granular per-tenant Unix socket ACLs, root-equivalent control over the host cannot be eliminated purely in software on a shared single-node daemon. Complete architectural mitigation requires Docker-in-Docker (DinD), Rootless Docker, or isolated microVM hypervisors (Firecracker/gVisor). Active defense-in-depth mitigations (rejection of socket mounts into tenant containers, `CapDrop: ALL`, strict capability allowlist, `no-new-privileges`, strict path validation) are currently enforced.
 5. **Container Resource Limits (`RESOLVED IN ARCHITECTURE`):**
    - `ValidateAndBuildSecureHostConfig` enforces CPU (`NanoCPUs`), Memory (`Memory`), and PIDs (`PidsLimit`) quotas per service within `container.HostConfig.Resources`. Ephemeral storage quotas are explicitly rejected.
 
@@ -439,20 +465,16 @@ These are identified codebase behaviors that require investigation and resolutio
 
 ## 4. Prioritized Future Platform Capabilities (Explicitly Post-MVP Roadmap)
 
-Do not implement these capabilities during current MVP verification; they are prioritized roadmap items for future passes:
+Do not implement these capabilities during current stabilization verification; they are prioritized roadmap items for future passes:
 
-1. **Caddy Reverse Proxy & Automatic HTTPS:**
-   - Automatic subdomain routing (`<slug>.forgelab.local`) and Let's Encrypt / local ACME TLS certificate automation. Currently, dynamic host port allocation (`10000–60000`) and loopback bindings provide direct service access.
-2. **GitHub Push-to-Deploy & Webhook Automation:**
-   - Automated deployment triggers on `git push` to tracked branches with HMAC-SHA256 signature verification. Currently, manual immutable commit-pinned deployments (`source_type: "github"`) are active.
-3. **Pull-Request Preview Environments:**
-   - Ephemeral preview environments automatically created and torn down on GitHub pull requests. Currently, project and service deployments are managed per-project.
-4. **Distributed Multi-Node Orchestration:**
+1. **Pull-Request Preview Environments:**
+   - Ephemeral preview environments automatically created and torn down on GitHub pull requests. Currently, project, branch push-to-deploy, and service deployments are managed per-project.
+2. **Distributed Multi-Node Orchestration:**
    - Offloading Docker builds and container scheduling to external runner nodes or worker clusters. Currently, a single-node Docker daemon with an embedded background worker queue is active.
-5. **Full Observability Infrastructure (APM & OpenTelemetry):**
-   - Distributed request tracing, metrics scraping, Prometheus exporters, and external APM integrations. Currently, container log streaming, bounded log retention, and `/health/*` deep diagnostics are active.
-6. **Continuous Self-Healing / Auto-Rollback:**
-   - Automated crash-loop recovery and automatic rollback upon runtime failure (continuous health inspection is implemented).
-7. **Role-Based Access Control (RBAC):**
+3. **Full External Observability Exporters (APM & OpenTelemetry):**
+   - Distributed request tracing (`OTLP`), Prometheus `/metrics` scraping endpoints, and external APM integrations. Currently, backend-cached/historical runtime metrics, container log streaming, redacted audit logs, and `/health/*` + `/api/diagnostics` are active.
+4. **Role-Based Access Control (RBAC):**
    - Organization-level user permissions and team workspaces (single-owner per-project model active).
+5. **Packaged / Signed Local Agent Installers:**
+   - Code-signed OS installers / installers via Homebrew/winget for `forgelab-agent` rather than script-based host startup (`start-agent.ps1` / `start-agent.sh`).
 

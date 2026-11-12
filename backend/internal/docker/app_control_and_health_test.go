@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/forgelab/backend/internal/models"
+	"github.com/forgelab/backend/internal/proxy"
 	"github.com/forgelab/backend/internal/services"
 )
 
@@ -449,4 +450,236 @@ func extractContainerID(path, suffix string) string {
 		return ""
 	}
 	return parts[len(parts)-1]
+}
+
+func TestRuntimeHealth_SelfHealAndCrashLoopEscalation(t *testing.T) {
+	ctx := context.Background()
+	ownerID := uuid.New()
+	projectID := uuid.New()
+	apiSvcID := uuid.New()
+	currentSDID := uuid.New()
+	rollbackSDID := uuid.New()
+	hostPort := 18940
+
+	var mu sync.Mutex
+	inspectState := container.State{
+		Running:  false,
+		Status:   container.StateExited,
+		ExitCode: 1,
+	}
+	restartCountMetric := 0
+	restartCalls := 0
+	var postRestartState container.State
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/restart"):
+			mu.Lock()
+			restartCalls++
+			inspectState = postRestartState
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/start"):
+			mu.Lock()
+			inspectState = container.State{
+				Running: true,
+				Status:  container.StateRunning,
+				Health:  &container.Health{Status: container.Healthy},
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			mu.Lock()
+			st := inspectState
+			rc := restartCountMetric
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				ID:           "c-selfheal-1",
+				RestartCount: rc,
+				State:        &st,
+			})
+		case strings.HasSuffix(r.URL.Path, "/logs"):
+			w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	cli, cleanup := newTestDockerClient(t, handler)
+	defer cleanup()
+
+	svcRecord := &models.Service{
+		ID:                         apiSvcID,
+		ProjectID:                  projectID,
+		Name:                       "api",
+		Role:                       models.RoleBackend,
+		Classification:             models.ClassificationApplication,
+		Status:                     models.ServiceStatusRunning,
+		ContainerID:                strPtr("c-selfheal-1"),
+		HostPort:                   &hostPort,
+		PublicExposed:              true,
+		CurrentServiceDeploymentID: &currentSDID,
+	}
+	project := &models.Project{
+		ID:      projectID,
+		OwnerID: ownerID,
+		Name:    "selfheal-app",
+		Status:  models.ProjectStatusRunning,
+	}
+
+	var sdStatus string = models.DeployStatusRunning
+	svcSvc := services.NewServiceService(nil)
+	svcSvc.SetGetServiceForTest(func(ctx context.Context, sID uuid.UUID) (*models.Service, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := *svcRecord
+		return &cp, nil
+	})
+	svcSvc.SetListActiveServicesForTest(func(ctx context.Context) ([]*models.Service, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := *svcRecord
+		return []*models.Service{&cp}, nil
+	})
+	svcSvc.SetListServicesForTest(func(ctx context.Context, pID uuid.UUID) ([]*models.Service, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := *svcRecord
+		return []*models.Service{&cp}, nil
+	})
+	svcSvc.SetUpdateServiceStatusForTest(func(ctx context.Context, serviceID uuid.UUID, status string, containerID, imageTag *string, hp *int) error {
+		mu.Lock()
+		defer mu.Unlock()
+		svcRecord.Status = status
+		return nil
+	})
+
+	projSvc := services.NewProjectService(nil, nil, nil, nil)
+	projSvc.SetServiceService(svcSvc)
+	projSvc.SetProjectGetterForTest(func(ctx context.Context, pID, oID uuid.UUID) (*models.Project, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := *project
+		return &cp, nil
+	})
+	projSvc.SetProjectByIDForTest(func(ctx context.Context, pID uuid.UUID) (*models.Project, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := *project
+		return &cp, nil
+	})
+	projSvc.SetUpdateProjectStatusForTest(func(ctx context.Context, pID uuid.UUID, status string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		project.Status = status
+		return nil
+	})
+
+	rollbackCalls := 0
+	depSvc := services.NewDeploymentService(nil)
+	depSvc.SetUpdateServiceDeploymentStatusForTest(func(ctx context.Context, sdID uuid.UUID, newStatus string, reason *string) error {
+		mu.Lock()
+		sdStatus = newStatus
+		mu.Unlock()
+		return nil
+	})
+	depSvc.SetRollbackServiceDeploymentForTest(func(ctx context.Context, p *models.Project, s *models.Service) (*models.ServiceDeployment, error) {
+		mu.Lock()
+		rollbackCalls++
+		svcRecord.Status = models.ServiceStatusDeploying
+		mu.Unlock()
+		return &models.ServiceDeployment{
+			ID:            rollbackSDID,
+			ServiceID:     s.ID,
+			Status:        models.DeployStatusQueued,
+			ExecutionMode: models.ExecutionModeReuseImage,
+		}, nil
+	})
+
+	router := proxy.NewTrafficRouter()
+	enqueuer := &mockRollbackEnqueuer{}
+	eng := NewEngine(cli, projSvc, depSvc, nil, nil, nil, nil, nil, nil, t.TempDir())
+	eng.SetServiceService(svcSvc)
+	eng.SetTrafficRouter(router)
+	eng.SetQueueEnqueuer(enqueuer)
+	eng.SetSelfHealConfig(true, 3)
+	eng.SetCrashLoopConfig(3, 10*time.Minute)
+	eng.SetAutoRollbackConfig(true, 3, 0)
+	defer eng.StopAllLogCollectors()
+
+	// 1. Transient crash (exit 1) -> self-heal restarts and verifies healthy -> Running & route restored
+	mu.Lock()
+	inspectState = container.State{Running: false, Status: container.StateExited, ExitCode: 1}
+	postRestartState = container.State{Running: true, Status: container.StateRunning, Health: &container.Health{Status: container.Healthy}}
+	mu.Unlock()
+
+	require.NoError(t, eng.CheckContinuousRuntimeHealth(ctx))
+	assert.Equal(t, 1, restartCalls)
+	assert.Equal(t, 1, eng.GetSelfHealRestartCount(apiSvcID))
+	assert.Equal(t, 1, eng.GetCrashLoopCount(apiSvcID))
+	assert.Equal(t, models.ServiceStatusRunning, svcRecord.Status)
+	assert.Empty(t, enqueuer.EnqueuedIDs())
+	rt, hasRoute := router.GetRoute(apiSvcID)
+	require.True(t, hasRoute)
+	assert.Equal(t, "c-selfheal-1", rt.ContainerID)
+
+	// 2. Repeated crashes inside CrashLoopWindow -> tick 2 restarts, tick 3 hits CrashLoopThreshold=3 -> escalates to Failed + AutoRollback
+	mu.Lock()
+	inspectState = container.State{OOMKilled: true, Running: false, Status: container.StateExited, ExitCode: 137}
+	postRestartState = container.State{Running: true, Status: container.StateRunning}
+	mu.Unlock()
+	require.NoError(t, eng.CheckContinuousRuntimeHealth(ctx))
+	assert.Equal(t, 2, restartCalls)
+	assert.Equal(t, 2, eng.GetCrashLoopCount(apiSvcID))
+	assert.Equal(t, models.ServiceStatusRunning, svcRecord.Status)
+
+	mu.Lock()
+	inspectState = container.State{OOMKilled: true, Running: false, Status: container.StateExited, ExitCode: 137}
+	mu.Unlock()
+	require.NoError(t, eng.CheckContinuousRuntimeHealth(ctx))
+	assert.Equal(t, 2, restartCalls, "must NOT restart once crash-loop threshold is reached")
+	assert.Equal(t, models.DeployStatusCrashed, sdStatus)
+	assert.Equal(t, models.ServiceStatusDeploying, svcRecord.Status)
+	assert.Equal(t, 1, rollbackCalls)
+	assert.Len(t, enqueuer.EnqueuedIDs(), 1)
+	_, hasRoute = router.GetRoute(apiSvcID)
+	assert.False(t, hasRoute, "route must be removed on crash-loop failure")
+
+	// 3. Manual StartService resets crash-loop & self-heal budgets
+	require.NoError(t, eng.StartService(ctx, projectID, apiSvcID, ownerID))
+	assert.Equal(t, 0, eng.GetSelfHealRestartCount(apiSvcID))
+	assert.Equal(t, 0, eng.GetCrashLoopCount(apiSvcID))
+	assert.Equal(t, models.ServiceStatusRunning, svcRecord.Status)
+
+	// 4. Daemon Restarting loop -> degraded before threshold, escalates + rollbacks on threshold
+	mu.Lock()
+	restartCountMetric = 1
+	inspectState = container.State{Running: false, Restarting: true, Status: container.StateRestarting}
+	mu.Unlock()
+	require.NoError(t, eng.CheckContinuousRuntimeHealth(ctx))
+	assert.Equal(t, models.ServiceStatusDegraded, svcRecord.Status)
+	assert.Equal(t, 1, eng.GetCrashLoopCount(apiSvcID))
+
+	mu.Lock()
+	restartCountMetric = 3
+	inspectState = container.State{Running: false, Restarting: true, Status: container.StateRestarting}
+	mu.Unlock()
+	require.NoError(t, eng.CheckContinuousRuntimeHealth(ctx))
+	assert.Equal(t, 2, rollbackCalls)
+	assert.Len(t, enqueuer.EnqueuedIDs(), 2)
+
+	// 5. SelfHealEnabled=false disables restart and immediately fails + auto-rollbacks (or stays Failed if no prior deploy)
+	require.NoError(t, eng.StartService(ctx, projectID, apiSvcID, ownerID))
+	eng.SetSelfHealConfig(false, 3)
+	eng.SetAutoRollbackConfig(false, 3, 0)
+	prevRestarts := restartCalls
+	mu.Lock()
+	inspectState = container.State{Running: false, Status: container.StateExited, ExitCode: 1}
+	mu.Unlock()
+	require.NoError(t, eng.CheckContinuousRuntimeHealth(ctx))
+	assert.Equal(t, prevRestarts, restartCalls)
+	assert.Equal(t, models.ServiceStatusFailed, svcRecord.Status)
+	assert.Len(t, enqueuer.EnqueuedIDs(), 2)
 }

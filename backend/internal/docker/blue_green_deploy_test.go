@@ -366,7 +366,19 @@ func TestExecuteServiceDeployment_BlueGreen_FailedHealthKeepsBlueServing(t *test
 			mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			id := extractContainerID(r.URL.Path, "/json")
 			w.Header().Set("Content-Type", "application/json")
+			if id == blueCID {
+				_ = json.NewEncoder(w).Encode(container.InspectResponse{
+					ID: blueCID,
+					State: &container.State{
+						Running: true,
+						Status:  container.StateRunning,
+						Health:  &container.Health{Status: container.Healthy},
+					},
+				})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(container.InspectResponse{
 				ID: greenCID,
 				State: &container.State{

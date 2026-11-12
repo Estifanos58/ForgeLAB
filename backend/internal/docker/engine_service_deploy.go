@@ -103,6 +103,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	e.registerActiveExec(serviceDeploymentID, project.ID, execCancel)
 	defer e.unregisterActiveExec(serviceDeploymentID)
+	defer e.InvalidateProjectMetricsCache(project.ID)
 
 	if project.Status == models.ProjectStatusDeleting {
 		return errors.New("deployment aborted: project deletion is in progress")
@@ -113,7 +114,18 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	previousContainerID := service.ContainerID
 	previousDeploymentID := service.CurrentServiceDeploymentID
 	previousHostPort := service.HostPort
-	hasPreviousHealthy := ((previousServiceStatus == models.ServiceStatusRunning || previousServiceStatus == models.ServiceStatusDegraded) && previousContainerID != nil && *previousContainerID != "")
+	previousContainerRunning := ((previousServiceStatus == models.ServiceStatusRunning || previousServiceStatus == models.ServiceStatusDegraded) && previousContainerID != nil && *previousContainerID != "")
+	hasPreviousHealthy := previousContainerRunning
+	if !previousContainerRunning && previousServiceStatus == models.ServiceStatusDeploying && previousContainerID != nil && *previousContainerID != "" && e.dockerClient != nil {
+		inspCtx, inspCancel := context.WithTimeout(execCtx, 5*time.Second)
+		if inspRes, inspErr := e.dockerClient.ContainerInspect(inspCtx, *previousContainerID, client.ContainerInspectOptions{}); inspErr == nil && inspRes.Container.State != nil && inspRes.Container.State.Running {
+			previousContainerRunning = true
+			if !inspRes.Container.State.OOMKilled && (inspRes.Container.State.Health == nil || inspRes.Container.State.Health.Status != container.Unhealthy) {
+				hasPreviousHealthy = true
+			}
+		}
+		inspCancel()
+	}
 
 	deployMode := strings.ToLower(strings.TrimSpace(service.DeploymentMode))
 	if deployMode == "" && project != nil {
@@ -1489,7 +1501,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	var stoppedPreviousForStateful bool
-	if isStateful && hasPreviousHealthy && previousContainerID != nil && *previousContainerID != "" {
+	if isStateful && (hasPreviousHealthy || previousContainerRunning) && previousContainerID != nil && *previousContainerID != "" {
 		if isBlueGreen {
 			emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("BLUE-GREEN: Service '%s' has writable storage/infrastructure state; using safe stop-before-start fallback with automatic restore-on-failure.", service.Name))
 		}
@@ -1501,7 +1513,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		_, _ = e.dockerClient.ContainerStop(stopCtx, *previousContainerID, client.ContainerStopOptions{Timeout: &stopTimeoutSec})
 		stopCancel()
-		stoppedPreviousForStateful = true
+		stoppedPreviousForStateful = hasPreviousHealthy
 	} else if isBlueGreen && hasPreviousHealthy && !isStateful && previousContainerID != nil && *previousContainerID != "" {
 		emitLog(models.LogPhaseStartup, models.LogStreamSystem, fmt.Sprintf("BLUE-GREEN: Keeping previous Blue container %s for service '%s' live while provisioning Green replacement (%s)...", (*previousContainerID)[:min(12, len(*previousContainerID))], service.Name, containerName))
 	}
@@ -1511,7 +1523,19 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 			res := e.RestorePreviousHealthyContainer(ctx, service, previousContainerID, previousDeploymentID, emitLog)
 			if !res.Restored {
 				hasPreviousHealthy = false
+				if e.trafficRouter != nil {
+					e.trafficRouter.RemoveRoute(service.ID)
+				}
 				return fmt.Sprintf("%s; RESTORATION FAILED: previous container could not be restored (%v)", failureReason, res.Error)
+			}
+		} else if hasPreviousHealthy && previousContainerID != nil && *previousContainerID != "" {
+			res := e.VerifyPreviousHealthyContainer(ctx, service, previousContainerID, previousDeploymentID, emitLog)
+			if !res.Restored {
+				hasPreviousHealthy = false
+				if e.trafficRouter != nil {
+					e.trafficRouter.RemoveRoute(service.ID)
+				}
+				return fmt.Sprintf("%s; PREVIOUS RELEASE VERIFICATION FAILED: previous container is not healthy (%v)", failureReason, res.Error)
 			}
 		} else if hasPreviousHealthy {
 			emitLog(phase, models.LogStreamSystem, fmt.Sprintf("SAFETY INVARIANT ENFORCED: New deployment for '%s' failed, but previous healthy container remains active!", service.Name))
@@ -1696,6 +1720,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		if err := e.deploymentService.UpdateServiceDeploymentContainer(ctx, serviceDeploy.ID, containerID, nil); err != nil {
 			slog.Warn("failed to record job service deployment container", "service_deployment_id", serviceDeploy.ID, "error", err)
 		}
+		e.resetServiceHealthState(service.ID)
 		emitStatus(models.DeployStatusStopped, nil, nil)
 		emitLog(models.LogPhaseRuntime, models.LogStreamSystem, fmt.Sprintf("Job service '%s' deployment #%d completed successfully!", service.Name, serviceDeploy.DeployNumber))
 		return nil
@@ -1808,6 +1833,7 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		return fmt.Errorf("failed to promote service deployment: %w", err)
 	}
 
+	e.resetServiceHealthState(service.ID)
 	if err := e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort); err != nil {
 		slog.Warn("failed to update service deployment container on promotion", "service_deployment_id", serviceDeploy.ID, "error", err)
 	}

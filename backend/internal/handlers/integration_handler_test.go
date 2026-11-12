@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -267,4 +268,113 @@ func TestIntegrationHandler_GitHubAppCallback_ValidationAndSecurity(t *testing.T
 		assert.Equal(t, http.StatusFound, recReplay.Code)
 		assert.Contains(t, recReplay.Header().Get("Location"), "error=invalid_or_expired_installation_state")
 	})
+}
+
+func TestIntegrationHandler_ImportsLifecycle_CancelRetryAndConflicts(t *testing.T) {
+	tempDir := t.TempDir()
+	testUser := uuid.New()
+	inFlightEntered := make(chan struct{})
+	releaseRequest := make(chan struct{})
+
+	ghSvc := services.NewGitHubService(nil, nil, config.OAuthConfig{}, nil)
+	ghSvc.SetHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(req.URL.Path, "/repos/acme/demo") {
+				select {
+				case <-inFlightEntered:
+				default:
+					close(inFlightEntered)
+				}
+				select {
+				case <-releaseRequest:
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       io.NopCloser(strings.NewReader(`{"message":"Not Found"}`)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader(`{}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	})
+
+	impSvc := services.NewRepositoryImportService(nil, tempDir, ghSvc)
+	t.Cleanup(func() {
+		close(releaseRequest)
+		_ = impSvc.Stop(context.Background())
+	})
+	handler := handlers.NewIntegrationHandler(ghSvc, nil, impSvc, "http://localhost:3000")
+
+	r := chi.NewRouter()
+	r.Get("/api/integrations/github/imports", handler.ListImports)
+	r.Post("/api/integrations/github/imports", handler.StartImport)
+	r.Get("/api/integrations/github/imports/{id}", handler.GetImport)
+	r.Post("/api/integrations/github/imports/{id}/cancel", handler.CancelImport)
+	r.Post("/api/integrations/github/imports/{id}/retry", handler.RetryImport)
+
+	// Start import
+	startReq := httptest.NewRequest(http.MethodPost, "/api/integrations/github/imports", strings.NewReader(`{"repository":"acme/demo","branch":"main"}`))
+	startReq = startReq.WithContext(withTestUser(startReq.Context(), testUser))
+	startRec := httptest.NewRecorder()
+	r.ServeHTTP(startRec, startReq)
+	require.Equal(t, http.StatusCreated, startRec.Code)
+
+	var started models.RepositoryImport
+	require.NoError(t, json.NewDecoder(startRec.Body).Decode(&started))
+
+	select {
+	case <-inFlightEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for background import call")
+	}
+
+	// Retry while active -> 409 Conflict
+	retryActiveReq := httptest.NewRequest(http.MethodPost, "/api/integrations/github/imports/"+started.ID.String()+"/retry", nil)
+	retryActiveReq = retryActiveReq.WithContext(withTestUser(retryActiveReq.Context(), testUser))
+	retryActiveRec := httptest.NewRecorder()
+	r.ServeHTTP(retryActiveRec, retryActiveReq)
+	assert.Equal(t, http.StatusConflict, retryActiveRec.Code)
+
+	// List imports -> includes started import
+	listReq := httptest.NewRequest(http.MethodGet, "/api/integrations/github/imports", nil)
+	listReq = listReq.WithContext(withTestUser(listReq.Context(), testUser))
+	listRec := httptest.NewRecorder()
+	r.ServeHTTP(listRec, listReq)
+	require.Equal(t, http.StatusOK, listRec.Code)
+	var listResp struct {
+		Imports []models.RepositoryImport `json:"imports"`
+	}
+	require.NoError(t, json.NewDecoder(listRec.Body).Decode(&listResp))
+	assert.Len(t, listResp.Imports, 1)
+
+	// Cancel active import -> 200 OK
+	cancelReq := httptest.NewRequest(http.MethodPost, "/api/integrations/github/imports/"+started.ID.String()+"/cancel", nil)
+	cancelReq = cancelReq.WithContext(withTestUser(cancelReq.Context(), testUser))
+	cancelRec := httptest.NewRecorder()
+	r.ServeHTTP(cancelRec, cancelReq)
+	require.Equal(t, http.StatusOK, cancelRec.Code)
+	var cancelled models.RepositoryImport
+	require.NoError(t, json.NewDecoder(cancelRec.Body).Decode(&cancelled))
+	assert.Equal(t, models.ImportStatusCancelled, cancelled.Status)
+
+	// Mark completed -> Cancel & Retry both return 409 Conflict
+	require.NoError(t, impSvc.MarkCompleted(context.Background(), testUser, started.ID, uuid.New()))
+
+	cancelCompReq := httptest.NewRequest(http.MethodPost, "/api/integrations/github/imports/"+started.ID.String()+"/cancel", nil)
+	cancelCompReq = cancelCompReq.WithContext(withTestUser(cancelCompReq.Context(), testUser))
+	cancelCompRec := httptest.NewRecorder()
+	r.ServeHTTP(cancelCompRec, cancelCompReq)
+	assert.Equal(t, http.StatusConflict, cancelCompRec.Code)
+
+	retryCompReq := httptest.NewRequest(http.MethodPost, "/api/integrations/github/imports/"+started.ID.String()+"/retry", nil)
+	retryCompReq = retryCompReq.WithContext(withTestUser(retryCompReq.Context(), testUser))
+	retryCompRec := httptest.NewRecorder()
+	r.ServeHTTP(retryCompRec, retryCompReq)
+	assert.Equal(t, http.StatusConflict, retryCompRec.Code)
 }

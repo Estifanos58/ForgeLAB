@@ -30,6 +30,27 @@ type Config struct {
 	RateLimit  RateLimitConfig
 	Share      ShareConfig
 	Proxy      ProxyConfig
+	Health     HealthConfig
+	Metrics    MetricsConfig
+}
+
+// MetricsConfig holds runtime metrics sampling, backend caching, and history retention settings.
+type MetricsConfig struct {
+	CacheTTL       time.Duration
+	SampleInterval time.Duration
+	RetentionDays  int
+}
+
+// HealthConfig holds runtime health monitoring, self-healing, and auto-rollback settings.
+type HealthConfig struct {
+	RuntimeCheckInterval  time.Duration
+	AutoRollbackEnabled   bool
+	AutoRollbackThreshold int
+	AutoRollbackCooldown  time.Duration
+	SelfHealEnabled       bool
+	SelfHealMaxRestarts   int
+	CrashLoopThreshold    int
+	CrashLoopWindow       time.Duration
 }
 
 // ProxyConfig holds settings for custom domain ingress and automatic Caddy TLS configuration.
@@ -37,6 +58,7 @@ type ProxyConfig struct {
 	CaddyAdminURL string
 	IngressHost   string
 	ACMEEmail     string
+	TargetHost    string
 }
 
 // ShareConfig holds settings for outbound public tunnel and sharing.
@@ -462,6 +484,30 @@ func Load() (*Config, error) {
 			CaddyAdminURL: strings.TrimRight(strings.TrimSpace(getEnv("CADDY_ADMIN_URL", "")), "/"),
 			IngressHost:   strings.TrimSpace(getEnv("FORGELAB_INGRESS_HOST", getEnv("FORGELAB_PUBLIC_HOST", getEnv("PUBLIC_HOST", "")))),
 			ACMEEmail:     strings.TrimSpace(getEnv("ACME_EMAIL", "")),
+			TargetHost: func() string {
+				if v := strings.TrimSpace(getEnv("FORGELAB_CADDY_TARGET_HOST", "")); v != "" {
+					return v
+				}
+				if strings.EqualFold(strings.TrimSpace(getEnv("FORGELAB_IN_DOCKER", "")), "true") {
+					return "host.docker.internal"
+				}
+				return getEnv("FORGELAB_APP_HOST_IP", "127.0.0.1")
+			}(),
+		},
+		Health: HealthConfig{
+			RuntimeCheckInterval:  parseDurationEnv("FORGELAB_RUNTIME_HEALTH_CHECK_INTERVAL", 30*time.Second),
+			AutoRollbackEnabled:   parseBoolEnv("FORGELAB_AUTO_ROLLBACK_ENABLED", true),
+			AutoRollbackThreshold: parseIntEnv("FORGELAB_AUTO_ROLLBACK_THRESHOLD", 3),
+			AutoRollbackCooldown:  parseNonNegativeDurationEnv("FORGELAB_AUTO_ROLLBACK_COOLDOWN", 5*time.Minute),
+			SelfHealEnabled:       parseBoolEnv("FORGELAB_SELF_HEAL_ENABLED", true),
+			SelfHealMaxRestarts:   parseNonNegativeIntEnv("FORGELAB_SELF_HEAL_MAX_RESTARTS", 3),
+			CrashLoopThreshold:    parseIntEnv("FORGELAB_CRASH_LOOP_THRESHOLD", 3),
+			CrashLoopWindow:       parseDurationEnv("FORGELAB_CRASH_LOOP_WINDOW", 10*time.Minute),
+		},
+		Metrics: MetricsConfig{
+			CacheTTL:       parseNonNegativeDurationEnv("FORGELAB_METRICS_CACHE_TTL", 10*time.Second),
+			SampleInterval: parseNonNegativeDurationEnv("FORGELAB_METRICS_SAMPLE_INTERVAL", 15*time.Second),
+			RetentionDays:  parseNonNegativeIntEnv("FORGELAB_METRICS_RETENTION_DAYS", 7),
 		},
 	}
 
@@ -482,7 +528,16 @@ func getEnv(key, fallback string) string {
 
 func parseIntEnv(key string, fallback int) int {
 	if value, ok := os.LookupEnv(key); ok {
-		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func parseNonNegativeIntEnv(key string, fallback int) int {
+	if value, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && n >= 0 {
 			return n
 		}
 	}
@@ -491,8 +546,29 @@ func parseIntEnv(key string, fallback int) int {
 
 func parseDurationEnv(key string, fallback time.Duration) time.Duration {
 	if value, ok := os.LookupEnv(key); ok {
-		if d, err := time.ParseDuration(value); err == nil && d > 0 {
+		if d, err := time.ParseDuration(strings.TrimSpace(value)); err == nil && d > 0 {
 			return d
+		}
+	}
+	return fallback
+}
+
+func parseNonNegativeDurationEnv(key string, fallback time.Duration) time.Duration {
+	if value, ok := os.LookupEnv(key); ok {
+		if d, err := time.ParseDuration(strings.TrimSpace(value)); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return fallback
+}
+
+func parseBoolEnv(key string, fallback bool) bool {
+	if value, ok := os.LookupEnv(key); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "true", "1", "yes", "on":
+			return true
+		case "false", "0", "no", "off":
+			return false
 		}
 	}
 	return fallback

@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -24,6 +26,8 @@ type ProjectHandler struct {
 	deploymentService *services.DeploymentService
 	dockerEngine      *docker.Engine
 	deployQueue       *queue.DeploymentQueue
+	auditService      *services.AuditService
+	metricsService    *services.MetricsService
 }
 
 // NewProjectHandler creates a new ProjectHandler.
@@ -39,6 +43,36 @@ func NewProjectHandler(
 		dockerEngine:      dockerEngine,
 		deployQueue:       deployQueue,
 	}
+}
+
+// SetAuditService configures operational audit logging on ProjectHandler.
+func (h *ProjectHandler) SetAuditService(auditSvc *services.AuditService) {
+	h.auditService = auditSvc
+}
+
+// SetMetricsService configures historical runtime metrics querying on ProjectHandler.
+func (h *ProjectHandler) SetMetricsService(metricsSvc *services.MetricsService) {
+	h.metricsService = metricsSvc
+}
+
+func (h *ProjectHandler) recordAudit(r *http.Request, userID uuid.UUID, projectID *uuid.UUID, projectName, action, resourceType, resourceID, status, message string, metadata map[string]any) {
+	if h.auditService == nil {
+		return
+	}
+	h.auditService.RecordBestEffort(r.Context(), services.AuditRecordInput{
+		ActorID:      userID,
+		ActorLabel:   getUserEmailFromContext(r),
+		IsGuest:      models.IsGuest(userID),
+		ProjectID:    projectID,
+		ProjectName:  projectName,
+		Action:       action,
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		Status:       status,
+		Message:      message,
+		Metadata:     metadata,
+		IPAddress:    getClientIP(r),
+	})
 }
 
 // Create handles POST /api/projects
@@ -89,6 +123,11 @@ func (h *ProjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create project")
 		return
 	}
+
+	h.recordAudit(r, userID, &project.ID, project.Name, "project.create", "project", project.ID.String(), models.AuditStatusSuccess, "Created project "+project.Name, map[string]any{
+		"source_type": project.SourceType,
+		"branch":      project.Branch,
+	})
 
 	writeJSON(w, http.StatusCreated, project)
 }
@@ -223,13 +262,137 @@ func (h *ProjectHandler) GetRuntimeMetrics(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	metrics, err := h.dockerEngine.GetProjectRuntimeMetrics(r.Context(), projectID)
+	forceRefresh := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("refresh")), "true") ||
+		strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("force")), "true")
+
+	metrics, err := h.dockerEngine.GetProjectRuntimeMetricsWithOptions(r.Context(), projectID, forceRefresh)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to collect runtime metrics: "+err.Error())
 		return
 	}
 
 	writeJSON(w, http.StatusOK, metrics)
+}
+
+// GetRuntimeMetricsHistory handles GET /api/projects/{id}/metrics/history
+func (h *ProjectHandler) GetRuntimeMetricsHistory(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserIDFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	projectID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	if h.projectService == nil {
+		writeError(w, http.StatusServiceUnavailable, "project service unavailable")
+		return
+	}
+
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, services.ErrProjectNotOwned) {
+			writeError(w, http.StatusForbidden, "access denied")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project")
+		return
+	}
+
+	if h.metricsService == nil {
+		writeError(w, http.StatusServiceUnavailable, "metrics history service unavailable")
+		return
+	}
+
+	var serviceUUIDPtr *uuid.UUID
+	if serviceIDStr := strings.TrimSpace(r.URL.Query().Get("service_id")); serviceIDStr != "" {
+		serviceUUID, parseErr := uuid.Parse(serviceIDStr)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid service_id")
+			return
+		}
+		belongs := false
+		for _, svc := range project.Services {
+			if svc != nil && svc.ID == serviceUUID {
+				belongs = true
+				break
+			}
+		}
+		if !belongs && h.deploymentService != nil {
+			var vErr error
+			belongs, vErr = h.deploymentService.VerifyServiceBelongsToProject(r.Context(), serviceUUID, projectID)
+			if vErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to verify service access")
+				return
+			}
+		}
+		if !belongs {
+			writeError(w, http.StatusBadRequest, "service does not belong to project")
+			return
+		}
+		serviceUUIDPtr = &serviceUUID
+	}
+
+	now := time.Now().UTC()
+	to := now
+	hours := 1
+	if hoursStr := strings.TrimSpace(r.URL.Query().Get("hours")); hoursStr != "" {
+		parsedHours, parseErr := strconv.Atoi(hoursStr)
+		if parseErr != nil || parsedHours < 1 || parsedHours > 720 {
+			writeError(w, http.StatusBadRequest, "hours must be an integer between 1 and 720")
+			return
+		}
+		hours = parsedHours
+	}
+	from := to.Add(-time.Duration(hours) * time.Hour)
+
+	if fromStr := strings.TrimSpace(r.URL.Query().Get("from")); fromStr != "" {
+		parsedFrom, parseErr := time.Parse(time.RFC3339, fromStr)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid from timestamp (expected RFC3339)")
+			return
+		}
+		from = parsedFrom.UTC()
+	}
+	if toStr := strings.TrimSpace(r.URL.Query().Get("to")); toStr != "" {
+		parsedTo, parseErr := time.Parse(time.RFC3339, toStr)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid to timestamp (expected RFC3339)")
+			return
+		}
+		to = parsedTo.UTC()
+	}
+
+	limit := 240
+	if limitStr := strings.TrimSpace(r.URL.Query().Get("limit")); limitStr != "" {
+		parsedLimit, parseErr := strconv.Atoi(limitStr)
+		if parseErr != nil || parsedLimit < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = parsedLimit
+	}
+
+	history, err := h.metricsService.QueryProjectHistory(r.Context(), projectID, services.MetricsHistoryQueryOptions{
+		From:      from,
+		To:        to,
+		ServiceID: serviceUUIDPtr,
+		Limit:     limit,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to query runtime metrics history")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, history)
 }
 
 // Update handles PATCH /api/projects/{id}
@@ -274,6 +437,12 @@ func (h *ProjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.recordAudit(r, userID, &project.ID, project.Name, "project.update", "project", project.ID.String(), models.AuditStatusSuccess, "Updated project "+project.Name, map[string]any{
+		"name":        project.Name,
+		"branch":      project.Branch,
+		"auto_deploy": project.AutoDeploy,
+	})
+
 	writeJSON(w, http.StatusOK, project)
 }
 
@@ -289,6 +458,13 @@ func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid project ID")
 		return
+	}
+
+	projName := ""
+	if h.projectService != nil {
+		if existing, gErr := h.projectService.GetProject(r.Context(), projectID, userID); gErr == nil && existing != nil {
+			projName = existing.Name
+		}
 	}
 
 	var cleanup func(ctx context.Context, id uuid.UUID) error
@@ -309,6 +485,12 @@ func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	msg := "Deleted project"
+	if projName != "" {
+		msg = "Deleted project " + projName
+	}
+	h.recordAudit(r, userID, &projectID, projName, "project.delete", "project", projectID.String(), models.AuditStatusSuccess, msg, nil)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "project deleted"})
 }
@@ -374,6 +556,11 @@ func (h *ProjectHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.recordAudit(r, userID, &project.ID, project.Name, "deployment.create", "deployment", deployment.ID.String(), models.AuditStatusSuccess, fmt.Sprintf("Queued release deployment #%d", deployment.DeployNumber), map[string]any{
+		"deploy_number": deployment.DeployNumber,
+		"strategy":      deployment.DeploymentStrategy,
+	})
+
 	writeJSON(w, http.StatusCreated, deployment)
 }
 
@@ -420,6 +607,14 @@ func (h *ProjectHandler) Stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	projName := ""
+	if h.projectService != nil {
+		if existing, gErr := h.projectService.GetProject(r.Context(), projectID, userID); gErr == nil && existing != nil {
+			projName = existing.Name
+		}
+	}
+	h.recordAudit(r, userID, &projectID, projName, "project.stop", "project", projectID.String(), models.AuditStatusSuccess, "Stopped project containers", nil)
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "application stopped"})
 }
 
@@ -455,6 +650,14 @@ func (h *ProjectHandler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	projName := ""
+	if h.projectService != nil {
+		if existing, gErr := h.projectService.GetProject(r.Context(), projectID, userID); gErr == nil && existing != nil {
+			projName = existing.Name
+		}
+	}
+	h.recordAudit(r, userID, &projectID, projName, "project.start", "project", projectID.String(), models.AuditStatusSuccess, "Started project containers", nil)
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "application started"})
 }
 
@@ -489,6 +692,14 @@ func (h *ProjectHandler) Restart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	projName := ""
+	if h.projectService != nil {
+		if existing, gErr := h.projectService.GetProject(r.Context(), projectID, userID); gErr == nil && existing != nil {
+			projName = existing.Name
+		}
+	}
+	h.recordAudit(r, userID, &projectID, projName, "project.restart", "project", projectID.String(), models.AuditStatusSuccess, "Restarted project containers", nil)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "application restarted"})
 }
@@ -561,6 +772,10 @@ func (h *ProjectHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, reason)
 		return
 	}
+
+	h.recordAudit(r, userID, &project.ID, project.Name, "deployment.rollback", "deployment", newDeploy.ID.String(), models.AuditStatusSuccess, fmt.Sprintf("Queued rollback release deployment #%d", newDeploy.DeployNumber), map[string]any{
+		"deploy_number": newDeploy.DeployNumber,
+	})
 
 	writeJSON(w, http.StatusCreated, newDeploy)
 }
@@ -952,7 +1167,7 @@ func (h *ProjectHandler) CancelDeployment(w http.ResponseWriter, r *http.Request
 	}
 
 	// Verify ownership
-	_, err = h.projectService.GetProject(r.Context(), projectID, userID)
+	project, err := h.projectService.GetProject(r.Context(), projectID, userID)
 	if err != nil {
 		if errors.Is(err, services.ErrProjectNotFound) {
 			writeError(w, http.StatusNotFound, "project not found")
@@ -989,6 +1204,8 @@ func (h *ProjectHandler) CancelDeployment(w http.ResponseWriter, r *http.Request
 	if h.dockerEngine != nil {
 		h.dockerEngine.CancelActiveDeployment(deploymentID)
 	}
+
+	h.recordAudit(r, userID, &projectID, project.Name, "deployment.cancel", "deployment", deploymentID.String(), models.AuditStatusSuccess, "Cancelled queued release deployment", nil)
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "deployment cancelled successfully",

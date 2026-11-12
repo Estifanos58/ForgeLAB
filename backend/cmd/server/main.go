@@ -192,6 +192,8 @@ func main() {
 	deploymentService.SetGitHubService(githubService)
 	projectService.SetSecretService(secretService)
 	projectService.SetDeploymentService(deploymentService)
+	metricsService := services.NewMetricsService(pool, cfg.Metrics.RetentionDays, cfg.Metrics.SampleInterval)
+	auditService := services.NewAuditService(pool)
 
 	// Public Project Sharing Service
 	shareService := services.NewShareService(
@@ -227,6 +229,12 @@ func main() {
 	dockerEngine.SetLocalBuildMode(cfg.Docker.LocalBuildMode)
 	dockerEngine.SetMaxConcurrentBuilds(cfg.Docker.MaxConcurrentBuilds)
 	dockerEngine.SetPublicHost(cfg.App.PublicHostName())
+	dockerEngine.SetAutoRollbackConfig(cfg.Health.AutoRollbackEnabled, cfg.Health.AutoRollbackThreshold, cfg.Health.AutoRollbackCooldown)
+	dockerEngine.SetSelfHealConfig(cfg.Health.SelfHealEnabled, cfg.Health.SelfHealMaxRestarts)
+	dockerEngine.SetCrashLoopConfig(cfg.Health.CrashLoopThreshold, cfg.Health.CrashLoopWindow)
+	dockerEngine.SetMetricsService(metricsService)
+	dockerEngine.SetAuditService(auditService)
+	dockerEngine.SetMetricsCacheTTL(cfg.Metrics.CacheTTL)
 	if cfg.Share.AppHostIP != "" {
 		dockerEngine.SetAppHostIP(cfg.Share.AppHostIP)
 	}
@@ -236,8 +244,11 @@ func main() {
 	trafficRouter := proxy.NewTrafficRouter()
 	dockerEngine.SetTrafficRouter(trafficRouter)
 	caddySyncer := proxy.NewCaddySyncer(cfg.Proxy.CaddyAdminURL, cfg.Proxy.ACMEEmail, nil)
-	domainService := services.NewDomainService(pool, serviceService, trafficRouter, caddySyncer, cfg.Proxy.IngressHost, cfg.Share.AppHostIP)
+	domainService := services.NewDomainService(pool, serviceService, trafficRouter, caddySyncer, cfg.Proxy.IngressHost, cfg.Proxy.TargetHost)
 	dockerEngine.SetOnRouteChange(func(syncCtx context.Context) {
+		if !domainService.IsCaddyConfigured() {
+			return
+		}
 		if err := domainService.SyncAllVerifiedRoutes(syncCtx); err != nil {
 			slog.Warn("failed to sync custom domain routes after service cutover", "error", err)
 		}
@@ -324,11 +335,6 @@ func main() {
 			slog.Warn("failed to reconcile daemon containers", "error", err)
 		}
 
-		// Perform continuous runtime health inspection to detect OOM kills and crash loops
-		if err := dockerEngine.CheckContinuousRuntimeHealth(ctx); err != nil {
-			slog.Warn("failed to inspect continuous runtime container health", "error", err)
-		}
-
 		if deployQueue != nil {
 			// Periodic recovery of abandoned/expired Redis queue jobs
 			if recCount, err := deployQueue.RecoverAbandonedJobs(ctx); err != nil {
@@ -361,8 +367,18 @@ func main() {
 	if err := dockerEngine.CheckContinuousRuntimeHealth(startupReconcileCtx); err != nil {
 		slog.Warn("initial runtime container health check failed", "error", err)
 	}
-	if err := domainService.SyncAllVerifiedRoutes(startupReconcileCtx); err != nil {
-		slog.Warn("initial custom domain Caddy route sync failed", "error", err)
+	if domainService.IsCaddyConfigured() {
+		if err := domainService.SyncAllVerifiedRoutes(startupReconcileCtx); err != nil {
+			slog.Warn("initial custom domain Caddy route sync failed", "error", err)
+		}
+	}
+	if _, err := repositoryImportService.PruneExpiredImports(startupReconcileCtx); err != nil {
+		slog.Warn("initial expired repository imports prune failed", "error", err)
+	}
+	if recovered, err := repositoryImportService.RecoverInterruptedImports(startupReconcileCtx); err != nil {
+		slog.Warn("initial repository import recovery failed", "error", err)
+	} else if recovered > 0 {
+		slog.Info("resumed interrupted repository imports on startup", "count", recovered)
 	}
 	startupCancel()
 	slog.Info("initial container and runtime status reconciliation complete")
@@ -377,7 +393,7 @@ func main() {
 		})
 	}
 
-	// Launch periodic background reconciliation for continuous health inspection
+	// Launch periodic background reconciliation for container/deployment state
 	go func() {
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
@@ -390,6 +406,24 @@ func main() {
 			}
 		}
 	}()
+
+	// Launch dedicated runtime health, self-healing, and auto-rollback monitor loop
+	if cfg.Health.RuntimeCheckInterval > 0 {
+		go func() {
+			healthTicker := time.NewTicker(cfg.Health.RuntimeCheckInterval)
+			defer healthTicker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-healthTicker.C:
+					if err := dockerEngine.CheckContinuousRuntimeHealth(ctx); err != nil {
+						slog.Warn("failed to inspect continuous runtime container health", "error", err)
+					}
+				}
+			}
+		}()
+	}
 
 	// Launch periodic garbage collection on a separate, less frequent schedule
 	// Protected by the exclusive build-maintenance lock inside dockerEngine to prevent overlap with builds
@@ -474,6 +508,49 @@ func main() {
 		}
 	}()
 
+	// Launch periodic background runtime metrics sampler (caches latest snapshots and records historical metrics)
+	if cfg.Metrics.SampleInterval > 0 {
+		go func() {
+			metricsTicker := time.NewTicker(cfg.Metrics.SampleInterval)
+			defer metricsTicker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-metricsTicker.C:
+					if err := dockerEngine.SampleActiveProjectsMetrics(ctx); err != nil && ctx.Err() == nil {
+						slog.Warn("failed to sample active project runtime metrics", "error", err)
+					}
+				}
+			}
+		}()
+	}
+
+	// Launch periodic retention cleanup for historical runtime metrics
+	if cfg.Metrics.RetentionDays > 0 {
+		go func() {
+			if pruned, err := metricsService.PruneOldSamples(ctx, cfg.Metrics.RetentionDays); err != nil && ctx.Err() == nil {
+				slog.Warn("initial runtime metrics retention cleanup failed", "error", err)
+			} else if pruned > 0 {
+				slog.Info("pruned expired runtime metrics samples", "count", pruned)
+			}
+			pruneTicker := time.NewTicker(1 * time.Hour)
+			defer pruneTicker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-pruneTicker.C:
+					if pruned, err := metricsService.PruneOldSamples(ctx, cfg.Metrics.RetentionDays); err != nil && ctx.Err() == nil {
+						slog.Warn("failed to prune expired runtime metrics samples", "error", err)
+					} else if pruned > 0 {
+						slog.Info("pruned expired runtime metrics samples", "count", pruned)
+					}
+				}
+			}
+		}()
+	}
+
 	// Rate Limiting (Fixed-Window Counter with Trusted Proxy validation)
 	rateLimiter := ratelimit.NewLimiter(redisClient, cfg.RateLimit.Enabled, cfg.RateLimit.TrustedProxies...)
 	wsHub.SetRateLimiter(rateLimiter, cfg.RateLimit.WSSubscriptionLimit)
@@ -489,11 +566,21 @@ func main() {
 	authHandler := handlers.NewAuthHandler(userService, oauthService, cfg.App.FrontendURL, cfg.App.CookieSecure)
 	authHandler.SetAllowGuestMode(cfg.App.AllowGuestMode)
 	projectHandler := handlers.NewProjectHandler(projectService, deploymentService, dockerEngine, deployQueue)
+	projectHandler.SetAuditService(auditService)
+	projectHandler.SetMetricsService(metricsService)
 	serviceHandler := handlers.NewServiceHandler(serviceService, projectService, deploymentService, dockerEngine, deployQueue)
+	serviceHandler.SetAuditService(auditService)
+	volumeHandler := handlers.NewVolumeHandler(projectService, dockerEngine)
+	volumeHandler.SetAuditService(auditService)
 	domainHandler := handlers.NewDomainHandler(domainService, projectService)
+	domainHandler.SetAuditService(auditService)
 	webhookHandler := handlers.NewWebhookHandler(webhookService, projectService)
 	envHandler := handlers.NewEnvHandler(secretService, projectService)
+	envHandler.SetAuditService(auditService)
 	integrationHandler := handlers.NewIntegrationHandler(githubService, githubAppManager, repositoryImportService, cfg.App.FrontendURL, cfg.App.CookieSecure)
+	integrationHandler.SetAuditService(auditService)
+	auditHandler := handlers.NewAuditHandler(auditService, projectService)
+	diagnosticsHandler := handlers.NewDiagnosticsHandler(projectService, repositoryImportService, dockerEngine)
 	sourceHandler := handlers.NewSourceHandler(sourceService, pathValidator)
 	discoveryHandler := handlers.NewDiscoveryHandler(githubService, sourceService, pathValidator, secretService)
 	shareHandler := handlers.NewShareHandler(shareService, projectService)
@@ -607,6 +694,7 @@ func main() {
 					r.Get("/repositories/{owner}/{repo}/branches", integrationHandler.ListBranches)
 					r.Get("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
 					r.Post("/repositories/{owner}/{repo}/detect", integrationHandler.DetectRepository)
+					r.Get("/imports", integrationHandler.ListImports)
 					r.Post("/imports", integrationHandler.StartImport)
 					r.Get("/imports/{id}", integrationHandler.GetImport)
 					r.Post("/imports/{id}/cancel", integrationHandler.CancelImport)
@@ -636,6 +724,10 @@ func main() {
 				r.With(sourceThrottle).Post("/plan", discoveryHandler.GeneratePlan)
 			})
 
+			// Operational Audit Trail & Diagnostics
+			r.Get("/audit-logs", auditHandler.ListUserLogs)
+			r.Get("/diagnostics", diagnosticsHandler.GetSystemDiagnostics)
+
 			// Projects
 			r.Route("/projects", func(r chi.Router) {
 				r.Post("/", projectHandler.Create)
@@ -643,6 +735,9 @@ func main() {
 				r.Get("/{id}", projectHandler.Get)
 				r.Get("/{id}/topology", projectHandler.GetTopology)
 				r.Get("/{id}/metrics", projectHandler.GetRuntimeMetrics)
+				r.Get("/{id}/metrics/history", projectHandler.GetRuntimeMetricsHistory)
+				r.Get("/{id}/audit-logs", auditHandler.ListProjectLogs)
+				r.Get("/{id}/diagnostics", diagnosticsHandler.GetProjectDiagnostics)
 				r.Patch("/{id}", projectHandler.Update)
 				r.Delete("/{id}", projectHandler.Delete)
 
@@ -686,6 +781,11 @@ func main() {
 				r.Delete("/{id}/domains/{domainId}", domainHandler.Remove)
 				r.Post("/{id}/domains/{domainId}/verify", domainHandler.Verify)
 
+				// Persistent Volumes & Disk Usage
+				r.Get("/{id}/volumes", volumeHandler.List)
+				r.Post("/{id}/volumes/{volumeName}/backup", volumeHandler.Backup)
+				r.Post("/{id}/volumes/{volumeName}/restore", volumeHandler.Restore)
+
 				// Push-to-Deploy Webhook Settings
 				r.Get("/{id}/webhook", webhookHandler.GetConfig)
 				r.Patch("/{id}/webhook", webhookHandler.UpdateConfig)
@@ -725,6 +825,9 @@ func main() {
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelShutdown()
 
+		if err := repositoryImportService.Stop(shutdownCtx); err != nil {
+			slog.Warn("repository import worker shutdown warning", "error", err)
+		}
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			slog.Error("server shutdown error", "error", err)
 		}

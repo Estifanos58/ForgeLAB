@@ -41,8 +41,8 @@
 - When `FORGELAB_ALLOW_GUEST_MODE=true` (or in local development `isDev`), unauthenticated requests to local deployment endpoints (`/api/sources/*`, `/api/discovery/plan`, `/api/projects/*`, and `/api/ws`) use `middleware.AuthOrGuestMiddleware`.
 - **Browser Isolation:** Anonymous browser visitors are issued an isolated guest UUID and given a secure HttpOnly cookie `forgelab_guest_session` and header `X-Guest-Session`. The corresponding user record (`guest-<uuid>@forgelab.local`) is automatically provisioned in PostgreSQL. This guarantees anonymous browser users cannot access one another's projects, sources, logs, or secrets.
 - **Local CLI Usage:** Local non-browser requests (e.g. `curl` or automated local scripts originating on loopback without browser session headers) resolve to the safe installation-level guest identity `00000000-0000-0000-0000-000000000001` (`guest@forgelab.local`), preserving frictionless local CLI workflows.
-- All GitHub integrations (`/api/integrations/github/*`) and `source_type: "github"` strictly require registered accounts and reject guest requests with `401 Unauthorized` or `403 Forbidden`.
-- `GET /api/auth/mode` returns installation guest mode configuration (`allow_guest_mode`, `guest_user_id`).
+- Account-linked GitHub integration endpoints (`/api/integrations/github`, `/connect`, `/token`, `/app/install`, `/orgs`, `/disconnect`, `/repositories`, `/detect`) and `source_type: "github"` require registered accounts and reject guest requests with `403 Forbidden`. Public repository lookup and import endpoints (`GET /api/integrations/github/repositories/{owner}/{repo}`, `/branches`, and `POST|GET /api/integrations/github/imports*` when targeting public repositories) and `source_type: "github_public"` are available to both registered and guest users.
+- `GET /api/auth/mode` returns installation guest mode configuration (`guest_mode_enabled`, `allow_guest_mode`, `guest_user_id`).
 
 ### Server-Side Ownership Enforcement
 - ForgeLAB enforces strict multi-tenant data isolation at the backend service layer:
@@ -172,15 +172,23 @@ Common status codes:
   }
   ```
 
-### `GET /health/queue`
-- **Authentication:** None (Public)
-- **Authorization:** None
-- **Purpose:** Deployment worker queue and shared image build diagnostics.
-- **Success Response:** `200 OK`
-
 ---
 
 ## 3. Authentication Endpoints (`/api/auth`)
+
+### `GET /api/auth/mode`
+- **Authentication:** None (Public)
+- **Purpose:** Reports whether registration-free Guest Mode is enabled for this installation and exposes the installation fallback `guest_user_id`.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "guest_mode_enabled": true,
+    "allow_guest_mode": true,
+    "guest_user_id": "00000000-0000-0000-0000-000000000001"
+  }
+  ```
+
+---
 
 ### `POST /api/auth/register`
 - **Authentication:** None (Public)
@@ -206,14 +214,11 @@ Common status codes:
       "display_name": "Developer",
       "created_at": "2026-09-26T10:00:00Z"
     },
-    "tokens": {
-      "access_token": "eyJhbGciOiJIUzI1NiIsIn...",
-      "refresh_token": "dGhpcy1pcy1hLXJlZnJlc2gtdG9rZW4..."
-    }
+    "expires_in": 172800
   }
   ```
 - **Side Effects:**
-  - Sets HttpOnly cookies: `forgelab_access_token` (15m) and `forgelab_refresh_token` (7d).
+  - Sets HttpOnly cookies: `forgelab_access_token` (default 48h via `JWT_ACCESS_TOKEN_EXPIRY`) and `forgelab_refresh_token` (default 14d via `JWT_REFRESH_TOKEN_EXPIRY`). Access/refresh tokens are not returned in the JSON body.
   - Inserts hashed refresh token record in `refresh_tokens` table.
 - **Error Responses:**
   - `400 Bad Request`: Validation failure.
@@ -240,10 +245,7 @@ Common status codes:
       "display_name": "Developer",
       "created_at": "2026-09-26T10:00:00Z"
     },
-    "tokens": {
-      "access_token": "eyJhbGciOiJIUzI1NiIsIn...",
-      "refresh_token": "dGhpcy1pcy1hLXJlZnJlc2gtdG9rZW4..."
-    }
+    "expires_in": 172800
   }
   ```
 - **Side Effects:**
@@ -265,18 +267,31 @@ Common status codes:
 - **Success Response:** `200 OK`
   ```json
   {
-    "tokens": {
-      "access_token": "eyJhbGciOiJIUzI1NiIsIn...",
-      "refresh_token": "bmV3LXJlZnJlc2gtdG9rZW4..."
-    }
+    "expires_in": 172800
   }
   ```
 - **Side Effects:**
-  - Atomically revokes existing refresh token (single-use replay prevention).
-  - Issues new access and refresh token pair.
-  - Updates auth cookies.
+  - Atomically revokes existing refresh token (single-use replay prevention with concurrency grace handling).
+  - Issues new access and refresh token pair via HttpOnly cookies.
 - **Error Responses:**
+  - `400 Bad Request`: Missing refresh token.
   - `401 Unauthorized`: Token expired, revoked, or non-existent.
+
+---
+
+### `POST /api/auth/touch`
+- **Authentication:** Optional (Access cookie/header, refresh cookie/body, or Guest fallback if enabled)
+- **Purpose:** Extends session activity without forcing refresh-token rotation while an access token remains valid; rotates tokens if expired and refresh token is present, or ensures an isolated guest session when `FORGELAB_ALLOW_GUEST_MODE=true`.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "status": "ok",
+    "authenticated": true,
+    "user_id": "c3d4e5f6-a7b8-4c1d-9e0f-1a2b3c4d5e6f"
+  }
+  ```
+- **Error Responses:**
+  - `401 Unauthorized`: No valid session and guest mode is disabled.
 
 ---
 
@@ -377,7 +392,7 @@ Common status codes:
 
 ---
 
-## 3.5 Discovery & Deployment Plan Endpoints (`/api/discovery`)
+## 4. Discovery & Deployment Plan Endpoints (`/api/discovery`)
 
 ### `POST /api/discovery/plan`
 Generates an authoritative repository discovery analysis and immutable `DeploymentPlan` blueprint from any supported source (GitHub, Local Directory, Local Agent, or Archive Upload).
@@ -509,7 +524,7 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ---
 
-## 4. Project Management Endpoints (`/api/projects`)
+## 5. Project Management Endpoints (`/api/projects`)
 
 ### `POST /api/projects`
 - **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
@@ -674,13 +689,13 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 - **Success Response:** `200 OK`
   ```json
   {
-    "message": "project deleted successfully"
+    "message": "project deleted"
   }
   ```
 
 ---
 
-## 5. Application Lifecycle Endpoints
+## 6. Application Lifecycle & Topology Endpoints
 
 ### `POST /api/projects/{id}/stop`
 - **Authentication:** Required (Bearer JWT)
@@ -810,7 +825,7 @@ Generates an authoritative repository discovery analysis and immutable `Deployme
 
 ---
 
-## 5. Public Project Sharing (`/api/projects/{id}/share`)
+## 7. Public Project Sharing (`/api/projects/{id}/share`)
 
 ### `GET /api/projects/{id}/share`
 Retrieves public sharing configuration, active provider health, and active share details for a project.
@@ -969,7 +984,7 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
-## 6. Environment Variables & Secrets (`/api/projects/{id}/env`)
+## 8. Environment Variables & Secrets (`/api/projects/{id}/env`)
 
 ### `GET /api/projects/{id}/env`
 - **Authentication:** Required (Bearer JWT)
@@ -1018,8 +1033,9 @@ Immediately revokes the active public share for the project, terminates any runn
 ---
 
 ### `DELETE /api/projects/{id}/env/{key}`
-- **Authentication:** Required (Bearer JWT)
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
 - **Parameters:** `id` (Project UUID), `key` (Variable name, URL-encoded).
+- **Query Parameters:** `service_id` (optional Service UUID to scope deletion to a single service).
 - **Success Response:** `200 OK`
   ```json
   {
@@ -1029,7 +1045,20 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
-## 7. Deployment Endpoints
+### `POST /api/projects/{id}/env/import`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Purpose:** Re-imports detected `.env` variables from the project's configured source workspace into encrypted PostgreSQL storage without duplicating manually overridden keys.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "imported_count": 4,
+    "message": "Successfully imported 4 environment variable(s)"
+  }
+  ```
+
+---
+
+## 9. Deployment Endpoints
 
 ### `POST /api/projects/{id}/deployments`
 - **Authentication:** Required (Bearer JWT)
@@ -1073,11 +1102,35 @@ Immediately revokes the active public share for the project, terminates any runn
 ---
 
 ### `GET /api/projects/{id}/deployments/{deploymentId}`
-- **Authentication:** Required (Bearer JWT)
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
 - **Authorization:** Checks user ownership of parent project.
 - **Success Response:** `200 OK` (Single Deployment object).
 - **Error Responses:**
   - `404 Not Found`: Deployment or project not found.
+
+---
+
+### `POST /api/projects/{id}/deployments/{deploymentId}/cancel`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Authorization:** Checks user ownership of parent project.
+- **Purpose:** Cancels a queued or in-flight pre-running release deployment and aborts any active Docker build context.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "message": "deployment cancelled successfully"
+  }
+  ```
+- **Error Responses:**
+  - `400 Bad Request`: Deployment is already in a terminal state (`running`/`failed`/`stopped`/etc.).
+  - `404 Not Found`: Deployment or project not found.
+  - `409 Conflict`: Cannot cancel a deployment that is already `running`.
+
+---
+
+### `GET /api/projects/{id}/deployments/{deploymentId}/services`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Authorization:** Checks user ownership of parent project.
+- **Success Response:** `200 OK` (Array of `ServiceDeployment` records belonging to the parent release deployment).
 
 ---
 
@@ -1151,7 +1204,7 @@ Immediately revokes the active public share for the project, terminates any runn
   ```
 ---
 
-## 8. Service Lifecycle & Independent Deployment Endpoints
+## 10. Service Lifecycle, Resource Limits & Blue-Green Proxy
 
 ### `GET /api/projects/{id}/services`
 - **Authentication:** Required (Bearer JWT)
@@ -1275,13 +1328,305 @@ Immediately revokes the active public share for the project, terminates any runn
 ---
 
 ### `POST /api/projects/{id}/services/{serviceId}/restart`
-- **Authentication:** Required (Bearer JWT)
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
 - **Side Effects:** Restarts container for this service.
 - **Success Response:** `200 OK` (`{"status": "running"}`).
 
 ---
 
-## 6. Source Management Endpoints (`/api/sources`)
+### `POST /api/projects/{id}/services/{serviceId}/deployments/{deploymentId}/cancel`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Authorization:** Checks project ownership and service association.
+- **Purpose:** Cancels a queued or pre-running independent service deployment and aborts any active Docker build context.
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "message": "service deployment cancelled successfully"
+  }
+  ```
+- **Error Responses:**
+  - `400 Bad Request`: Service deployment already in a terminal state, or service does not belong to project.
+  - `404 Not Found`: Project, service, or deployment not found.
+  - `409 Conflict`: Service deployment is already running.
+
+---
+
+### `PATCH /api/projects/{id}/services/{serviceId}/resources`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Authorization:** Checks project ownership and service association.
+- **Request Body:**
+  ```json
+  {
+    "cpu_millicores": 500,
+    "memory_mb": 512,
+    "pids_limit": 256
+  }
+  ```
+- **Validation Rules:**
+  - `cpu_millicores`: `100` to `16000` (Guests capped at `1000` millicores / 1 core).
+  - `memory_mb`: `64` to `32768` (Guests capped at `1024` MB / 1 GB).
+  - `pids_limit`: `16` to `4096`.
+  - `ephemeral_storage_mb`: Rejected with `400 Bad Request` on unsupported storage drivers when `> 0`.
+- **Success Response:** `200 OK` (Returns updated `Service` object).
+
+---
+
+### `PATCH /api/projects/{id}/services/{serviceId}/deployment-mode`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Authorization:** Checks project ownership and service association.
+- **Request Body:**
+  ```json
+  {
+    "deployment_mode": "blue_green"
+  }
+  ```
+- **Validation Rules:**
+  - `deployment_mode`: Required. Must be `"standard"` or `"blue_green"`.
+- **Success Response:** `200 OK` (Returns updated `Service` object).
+
+---
+
+### `ALL /proxy/services/{serviceId}` & `/proxy/services/{serviceId}/*`
+- **Authentication:** None (Service Traffic Proxy Ingress; mounted directly on root router)
+- **Purpose:** Routes live HTTP requests through `TrafficRouter` to the active healthy container slot (`blue` or `green`) when `blue_green` zero-downtime deployment mode is in use. Strips the `/proxy/services/{serviceId}` path prefix before forwarding upstream and emits `X-ForgeLAB-Slot: blue|green`.
+- **Error Responses:**
+  - `400 Bad Request`: Invalid `serviceId` UUID.
+  - `502 Bad Gateway` / `503 Service Unavailable`: No active healthy slot route registered for service.
+
+---
+
+## 11. Custom Domains & Caddy HTTPS Lifecycle (`/api/projects/{id}/domains`)
+
+### `GET /api/projects/{id}/domains`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Authorization:** Checks project ownership.
+- **Purpose:** Lists custom domains bound to a project with DNS verification instructions and effective HTTPS status.
+- **Success Response:** `200 OK` (`[]CustomDomain`; `https_active` is `true` only when `verified == true` and `tls_status == "active"`).
+  ```json
+  [
+    {
+      "id": "5c6d7e8f-1111-2222-3333-444455556666",
+      "project_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "service_id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e",
+      "domain": "app.example.com",
+      "verification_token": "fl-verify-...",
+      "verified": true,
+      "tls_status": "active",
+      "https_active": true,
+      "target_port": 10005,
+      "verification_record_name": "_forgelab-verify.app.example.com",
+      "verification_record_value": "fl-verify-...",
+      "cname_instruction": "CNAME app.example.com -> ingress.example.com",
+      "last_checked_at": "2026-11-12T10:00:00Z",
+      "created_at": "2026-11-12T09:50:00Z",
+      "updated_at": "2026-11-12T10:00:00Z"
+    }
+  ]
+  ```
+
+---
+
+### `POST /api/projects/{id}/domains`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Request Body:**
+  ```json
+  {
+    "domain": "app.example.com",
+    "service_id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e"
+  }
+  ```
+- **Success Response:** `201 Created` (Returns created `CustomDomain` with `verified: false`, `tls_status: "pending"`, `https_active: false`, and DNS TXT/CNAME instructions).
+- **Error Responses:**
+  - `400 Bad Request`: Invalid domain format or service mismatch.
+  - `404 Not Found`: Project or target service not found.
+  - `409 Conflict`: Domain is already registered.
+
+---
+
+### `POST /api/projects/{id}/domains/{domainId}/verify`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Purpose:** Performs live DNS TXT verification (`_forgelab-verify.<domain>`) and CNAME/A routing checks (for non-local `FORGELAB_INGRESS_HOST` setups), then pushes the domain route into Caddy via `CADDY_ADMIN_URL` when configured.
+- **Success Response (DNS Valid):** `200 OK`
+  - If Caddy Admin API is configured and route provisioning succeeds: returns `CustomDomain` with `verified: true`, `tls_status: "active"`, `https_active: true`.
+  - If DNS passes but `CADDY_ADMIN_URL` is unset: returns `CustomDomain` with `verified: true`, `tls_status: "proxy_unconfigured"`, `https_active: false` (never reports HTTPS as active without real Caddy provisioning).
+- **Error Responses:**
+  - `404 Not Found`: Project or custom domain not found.
+  - `422 Unprocessable Entity`: DNS verification failed (`{"error": "...", "domain": {...}}`).
+  - `502 Bad Gateway`: DNS passed, but Caddy Admin API route synchronization returned an error (`{"error": "...", "domain": {...}}`).
+
+---
+
+### `DELETE /api/projects/{id}/domains/{domainId}`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Side Effects:** Removes Caddy route configuration (if Caddy Admin API is configured) and deletes the domain binding.
+- **Success Response:** `200 OK` (`{"message": "custom domain removed"}`).
+
+---
+
+## 12. Persistent Volumes & Disk Usage (`/api/projects/{id}/volumes`)
+
+### `GET /api/projects/{id}/volumes`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Authorization:** Checks project ownership.
+- **Purpose:** Inspects project-scoped Docker named volumes, mount references (`service_id`, `service_name`, `container_id`, `running`, `target`, `read_only`), active `in_use` state, and Docker daemon disk usage summary (`containers`, `images`, `volumes`, `build_cache`, reclaimable bytes, storage warning).
+- **Success Response:** `200 OK` (`ProjectVolumesResponse`).
+- **Error Responses:**
+  - `503 Service Unavailable`: Docker Engine unavailable.
+
+---
+
+### `POST /api/projects/{id}/volumes/{volumeName}/backup`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Parameters:** `volumeName` (Validated 1–128 char alphanumeric/`._-` identifier; path traversal rejected).
+- **Purpose:** Archives the project volume contents from a read-only Alpine helper container (`CapDrop: ["ALL"]`, `NetworkMode: "none"`) into a `.tar.gz` download stream.
+- **Success Response:** `200 OK` (`Content-Type: application/gzip`, `Content-Disposition: attachment; filename="..."`).
+- **Error Responses:**
+  - `400 Bad Request`: Invalid volume name.
+  - `404 Not Found`: Project or volume not found.
+  - `503 Service Unavailable`: Docker Engine unavailable.
+
+---
+
+### `POST /api/projects/{id}/volumes/{volumeName}/restore`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Request Body:** Raw `.tar.gz` binary stream OR `multipart/form-data` with field `file` or `archive`.
+- **Security & Resource Limits:**
+  - Rejects restores while any container mounts the volume in a running state (`409 Conflict` / `ErrVolumeInUse`).
+  - Enforces strict archive bounds: 100 MB compressed max, 512 MB uncompressed max, and 50,000 files max (`413 Payload Too Large` / `ErrVolumeArchiveTooLarge`).
+  - Rejects path traversal (`..`), absolute paths, device nodes (`TypeChar`, `TypeBlock`, `TypeFifo`), and escaping symlinks/hardlinks, and strips `setuid`/`setgid` mode bits (`400 Bad Request` / `ErrInvalidVolumeArchive`).
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "volume_name": "db_data",
+    "docker_name": "forgelab-vol-a1b2c3d4-db_data",
+    "files_restored": 128,
+    "bytes_restored": 4194304,
+    "archive_bytes": 1048576,
+    "message": "Volume restored successfully"
+  }
+  ```
+
+---
+
+## 13. Push-to-Deploy Webhooks (`/api/projects/{id}/webhook` & `/api/webhooks/github`)
+
+### `GET /api/projects/{id}/webhook`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Authorization:** Checks project ownership.
+- **Success Response:** `200 OK` (`WebhookConfigView`):
+  ```json
+  {
+    "auto_deploy": true,
+    "auto_deploy_branch": "main",
+    "has_webhook_secret": true,
+    "webhook_url": "http://localhost:8080/api/webhooks/github?project_id=a1b2c3d4-..."
+  }
+  ```
+- **Security Rule:** `webhook_secret` is never returned on `GET`.
+
+---
+
+### `PATCH /api/projects/{id}/webhook`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Request Body:**
+  ```json
+  {
+    "auto_deploy": true,
+    "auto_deploy_branch": "main",
+    "regenerate_secret": true
+  }
+  ```
+- **Success Response:** `200 OK` (`WebhookConfigView`). When a secret is generated for the first time or rotated via `regenerate_secret: true`, `webhook_secret` is included **once** in this response and encrypted at rest via AES-256-GCM.
+
+---
+
+### `POST /api/webhooks/github`
+- **Authentication:** Public Receiver authenticated via GitHub `X-Hub-Signature-256` HMAC-SHA256 verification.
+- **Query Parameters:** `project_id` (optional UUID hint).
+- **Headers:** `X-GitHub-Event` (`push` or `ping`), `X-GitHub-Delivery` (replay-protection delivery UUID), `X-Hub-Signature-256` (`sha256=<hex>`).
+- **Body Cap:** `1 MiB` (`413 Payload Too Large` if exceeded).
+- **Success Responses:**
+  - `202 Accepted` (when `push` matches enabled project/branch and enqueues a new deployment):
+    ```json
+    {
+      "ok": true,
+      "triggered": true,
+      "event": "push",
+      "project_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "deployment_id": "d1e2f3a4-b5c6-7d8e-9f0a-1b2c3d4e5f6a",
+      "commit_sha": "7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b",
+      "branch": "main"
+    }
+    ```
+  - `200 OK`: `ping` event, non-matching branch/deleted ref/auto-deploy disabled (`"ignored": true`), or duplicate `X-GitHub-Delivery` (`"duplicate": true`).
+- **Error Responses:**
+  - `401 Unauthorized`: Invalid/missing HMAC signature or webhook secret unavailable.
+  - `409 Conflict`: Active deployment already running for target project.
+  - `503 Service Unavailable`: Deployment queue unavailable.
+
+---
+
+## 14. Runtime Metrics, History, Audit Logs & Diagnostics
+
+### `GET /api/projects/{id}/metrics`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Query Parameters:**
+  - `refresh` / `force` (`true` to bypass the backend TTL cache `FORGELAB_METRICS_CACHE_TTL` and force a fresh Docker stats sample; concurrent refreshes are deduplicated).
+- **Success Response:** `200 OK` (`ProjectRuntimeMetrics`, containing `cached`, `cache_age_seconds`, `docker_available`, aggregated `total_cpu_percent`, `total_memory_used_bytes`, `total_network_rx_bytes`, `total_network_tx_bytes`, and per-service live telemetry).
+
+---
+
+### `GET /api/projects/{id}/metrics/history`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Query Parameters:**
+  - `service_id` (optional UUID filter scoped to the project)
+  - `hours` (integer `1` to `720`, default `1`)
+  - `from` / `to` (optional RFC 3339 timestamps overriding `hours`)
+  - `limit` (positive integer, default `240`)
+- **Success Response:** `200 OK` (`ProjectMetricsHistoryResponse`, returning `retention_days`, `sample_interval_seconds`, per-service `summaries`, and historical `samples` recorded by the background sampler).
+
+---
+
+### `GET /api/audit-logs` & `GET /api/projects/{id}/audit-logs`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Query Parameters:**
+  - `project_id` (only on `/api/audit-logs`)
+  - `action` (e.g. `project.delete`, `deployment.rollback`, `domain.verify`, `volume.restore`)
+  - `resource_type` (e.g. `project`, `service`, `deployment`, `env_var`, `domain`, `volume`, `repository_import`)
+  - `limit` (default `50`, max `200`), `offset` (default `0`)
+- **Success Response:** `200 OK` (`{"logs": [...], "limit": 50, "offset": 0}`). Sensitive metadata keys (`value`, `secret`, `password`, `token`, `api_key`, etc.) are recursively scrubbed to `"[REDACTED]"`.
+
+---
+
+### `GET /api/diagnostics` & `GET /api/projects/{id}/diagnostics`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Purpose:** Aggregates actionable operational diagnostics across Docker connectivity & daemon reconciliation state, recent release/service deployment failures, host/container resource exhaustion & Docker disk usage, and stalled/failed repository imports.
+- **Success Response:** `200 OK` (`DiagnosticsReport`, returning `scope: "system"|"project"`, `overall_status: "healthy"|"degraded"|"critical"`, `docker`, `deployment_failures`, `resources`, `imports`, and remediable `issues`).
+
+---
+
+## 15. Source Management & Local Agent Endpoints (`/api/sources` & `/api/agent`)
+
+### `POST /api/sources/local/validate`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Purpose:** Validates an approved host directory beneath `FORGELAB_ALLOWED_SOURCE_ROOTS`, performs canonical symlink checking, and runs heuristic runtime detection. Supports synchronous (`<= 2s`) or asynchronous (`"async": true`, returning `202 Accepted` with `session_id`) scanning.
+- **Request Body:**
+  ```json
+  {
+    "repository_path": "C:\\Users\\username\\Projects\\my-app",
+    "async": false
+  }
+  ```
+- **Success Response:** `200 OK` (or `202 Accepted` when async/long scan) returning `session_id`, `status` (`ready` | `scanning` | `failed`), `valid`, `repository_path`, `project_name`, `files_count`, `total_bytes`, `runtime`, `framework`, `build_strategy`, `suggested_port`, `health_strategy`, `health_check_path`.
+
+---
+
+### `GET /api/sources/local/validate/{sessionId}`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session)
+- **Purpose:** Polls scan progress (`status`, `files_scanned`, `total_bytes`, `result`, `error`) for an asynchronous local validation session.
+- **Success Response:** `200 OK`.
+
+---
 
 ### `POST /api/sources/upload`
 - **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
@@ -1370,6 +1715,27 @@ Immediately revokes the active public share for the project, terminates any runn
   ```json
   {
     "message": "source workspace deleted successfully"
+  }
+  ```
+
+---
+
+### `POST /api/sources/agent/session`
+- **Authentication:** Required (Bearer JWT, cookie, or Guest session; requires existing user record)
+- **Purpose:** Issues a signed short-lived Local Agent session token (`24h` TTL) bound to the authenticated user and optional `agent_id`.
+- **Request Body:**
+  ```json
+  {
+    "agent_id": "laptop-macos"
+  }
+  ```
+- **Success Response:** `201 Created`
+  ```json
+  {
+    "session_id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+    "token": "sess_tok_991823ab",
+    "agent_id": "laptop-macos",
+    "expires_at": "2026-10-02T12:00:00Z"
   }
   ```
 
@@ -1521,8 +1887,22 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
+### Local Agent Daemon: `POST /api/agent/select-path`
+- **Daemon URL:** `http://127.0.0.1:4142`
+- **Authentication:** Required (`Authorization: Bearer <session_token>` or `X-Agent-Session-Token: <session_token>`)
+- **Purpose:** Validates an explicit local directory path via `PathValidator` without opening a GUI dialog (used by CLI/automation and tests) and registers the `AgentSourceSession`.
+- **Request Body:**
+  ```json
+  {
+    "path": "C:\\Users\\username\\Projects\\my-app"
+  }
+  ```
+- **Success Response:** `200 OK` returning `AgentSourceSession` metadata (never exposing raw `CanonicalPath`).
+
+---
+
 ### Local Agent Daemon: `POST /api/agent/verify-identity`
-- **Daemon URL:** `http://localhost:8081` (or `host.docker.internal:8081`)
+- **Daemon URL:** `http://127.0.0.1:4142` (or `host.docker.internal:4142`)
 - **Authentication:** None (Preflight identity verification probe)
 - **Purpose:** Allows the ForgeLAB control plane to verify candidate agent endpoint identity before transmitting any bearer credentials or session tokens.
 - **Request Body:**
@@ -1563,10 +1943,10 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
-## 7. GitHub Integration Endpoints (`/api/integrations/github`)
+## 16. GitHub Integration Endpoints (`/api/integrations/github`)
 
-### `GET /api/integrations/github/status` (also `GET /api/integrations/github`)
-- **Authentication:** Optional (Registered or Guest)
+### `GET /api/integrations/github`
+- **Authentication:** Required (Registered account only; Guest sessions rejected with `403 Forbidden`)
 - **Purpose:** Checks GitHub connection status, authentication type (`app`, `oauth`, `pat`), connected username, active installations, and reconnection guidance.
 - **Success Response:** `200 OK`
   ```json
@@ -1595,7 +1975,7 @@ Immediately revokes the active public share for the project, terminates any runn
 ---
 
 ### `GET /api/integrations/github/app/install`
-- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Authentication:** Required (Registered account only; Guest sessions rejected with `403 Forbidden`)
 - **Purpose:** Generates a secure installation URL for the configured GitHub App.
 - **Success Response:** `200 OK`
   ```json
@@ -1613,8 +1993,21 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
+### `GET /api/integrations/github/imports`
+- **Authentication:** Supported (Registered or Guest session; returns imports owned by caller)
+- **Query Parameters:** `limit` (integer, default `20`).
+- **Purpose:** Lists recent repository import jobs (including jobs recovered after backend restarts).
+- **Success Response:** `200 OK`
+  ```json
+  {
+    "imports": [ ... ]
+  }
+  ```
+
+---
+
 ### `POST /api/integrations/github/imports`
-- **Authentication:** Optional (Registered or Guest; public repos accessible to all)
+- **Authentication:** Supported (Registered or Guest; public repos accessible to all)
 - **Request Body:**
   ```json
   {
@@ -1623,7 +2016,7 @@ Immediately revokes the active public share for the project, terminates any runn
     "root_dir": "apps/web"
   }
   ```
-- **Purpose:** Initiates asynchronous, durable import pipeline: verifies access, resolves commit SHA, downloads tarball, safely extracts snapshot to `data/sources/imports/<id>`, executes discovery engine, and generates deployment plan.
+- **Purpose:** Initiates asynchronous, PostgreSQL-durable import pipeline (`RecoverInterruptedImports` resumes/reconciles in-flight jobs across backend restarts): verifies access, resolves commit SHA, downloads tarball, safely extracts snapshot to `data/sources/imports/<id>`, executes discovery engine, and generates deployment plan.
 - **Success Response:** `201 Created`
   ```json
   {
@@ -1645,7 +2038,7 @@ Immediately revokes the active public share for the project, terminates any runn
 ---
 
 ### `GET /api/integrations/github/imports/{id}`
-- **Authentication:** Optional (Registered or Guest)
+- **Authentication:** Supported (Registered or Guest)
 - **Purpose:** Polls the status, progress, stage, error, discovery result, and deployment plan of an active or completed import.
 - **Success Response:** `200 OK`
   ```json
@@ -1670,26 +2063,21 @@ Immediately revokes the active public share for the project, terminates any runn
 ---
 
 ### `POST /api/integrations/github/imports/{id}/cancel`
-- **Authentication:** Optional (Registered or Guest)
-- **Purpose:** Cancels an in-flight background import and cleans up the temporary snapshot workspace.
-- **Success Response:** `200 OK`
-  ```json
-  {
-    "message": "import cancelled"
-  }
-  ```
+- **Authentication:** Supported (Registered or Guest)
+- **Purpose:** Cancels an in-flight background import, updates durable DB state, and cleans up temporary snapshot workspace. Rejects completed imports with `409 Conflict`.
+- **Success Response:** `200 OK` (Returns updated `RepositoryImport` object with `status: "cancelled"`).
 
 ---
 
 ### `POST /api/integrations/github/imports/{id}/retry`
-- **Authentication:** Optional (Registered or Guest)
-- **Purpose:** Restarts a failed import with fresh status and progress tracking.
-- **Success Response:** `200 OK` returning updated import record.
+- **Authentication:** Supported (Registered or Guest)
+- **Purpose:** Restarts a failed or cancelled import with fresh durable status and progress tracking (`409 Conflict` if already active or non-retryable).
+- **Success Response:** `200 OK` returning updated `RepositoryImport` record.
 
 ---
 
-### `POST /api/integrations/github/pat`
-- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+### `POST /api/integrations/github/token`
+- **Authentication:** Required (Registered account only; Guest sessions rejected with `403 Forbidden`)
 - **Request Body:**
   ```json
   {
@@ -1709,10 +2097,10 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
-### `POST /api/integrations/github/connect`
-- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
-- **Purpose:** Generates a cryptographic state parameter and returns GitHub's OAuth authorize URL requesting `repo,read:user` permissions.
-- **Success Response:** `200 OK`
+### `GET|POST /api/integrations/github/connect`
+- **Authentication:** Required (Registered account only; Guest sessions rejected with `403 Forbidden`)
+- **Purpose:** Generates a cryptographic state parameter + nonce cookie and either redirects (`GET`) or returns GitHub's OAuth authorize URL (`POST`) requesting `repo,read:user` permissions.
+- **Success Response (`POST`):** `200 OK`
   ```json
   {
     "url": "https://github.com/login/oauth/authorize?client_id=...&redirect_uri=...&scope=repo%2Cread%3Auser&state=..."
@@ -1722,14 +2110,14 @@ Immediately revokes the active public share for the project, terminates any runn
 ---
 
 ### `GET /api/integrations/github/callback`
-- **Authentication:** Public callback with `code` and `state` parameters from GitHub.
-- **Purpose:** Validates state, exchanges code for access token, fetches GitHub username, encrypts token at rest via AES-256-GCM, and upserts into `github_integrations`.
+- **Authentication:** Public callback with `code` and `state` parameters from GitHub plus `forgelab_oauth_nonce_repo` cookie.
+- **Purpose:** Validates state and nonce, exchanges code for access token, fetches GitHub username, encrypts token at rest via AES-256-GCM, and upserts into `github_integrations`.
 - **Response:** `302 Found` redirecting to `${FRONTEND_URL}/dashboard?github_connected=true`.
 
 ---
 
 ### `POST /api/integrations/github/disconnect`
-- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Authentication:** Required (Registered account only; Guest sessions rejected with `403 Forbidden`)
 - **Purpose:** Disconnects repository access and deletes encrypted OAuth token or PAT from `github_integrations`.
 - **Success Response:** `200 OK`
   ```json
@@ -1740,11 +2128,18 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
+### `GET /api/integrations/github/orgs`
+- **Authentication:** Required (Registered account only; Guest sessions rejected with `403 Forbidden`)
+- **Purpose:** Lists GitHub organizations accessible to the user's connected GitHub account.
+- **Success Response:** `200 OK` (`{"organizations": [...]}`).
+
+---
+
 ### `GET /api/integrations/github/repositories`
-- **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie)
+- **Authentication:** Required (Registered account only; Guest sessions rejected with `403 Forbidden`)
 - **Query Parameters:**
-  - `page`: Page number (default: 1)
-  - `per_page`: Repositories per page (default: 30, max: 100)
+  - `page`: Page number (default: `1`)
+  - `per_page`: Repositories per page (default: `30`, max: `100`)
   - `org`: Optional organization login to list organization-specific repositories
 - **Purpose:** Returns repositories accessible under the user's active GitHub App installations or encrypted GitHub token.
 - **Success Response:** `200 OK`
@@ -1764,16 +2159,24 @@ Immediately revokes the active public share for the project, terminates any runn
       }
     ],
     "page": 1,
-    "per_page": 30
+    "per_page": 30,
+    "has_more": false
   }
   ```
 - **Error Responses:**
-  - `403 Forbidden`: GitHub repository access not authorized (`not_connected: true` or `needs_reauth: true`).
+  - `403 Forbidden`: GitHub repository access not authorized (`not_connected: true`, `needs_reauth: true`, or `sso_required: true`).
+
+---
+
+### `GET /api/integrations/github/repositories/{owner}/{repo}`
+- **Authentication:** Supported (Registered or Guest; public repositories accessible without linked GitHub credentials)
+- **Purpose:** Fetches metadata for a specific GitHub repository (`id`, `full_name`, `private`, `default_branch`, etc.).
+- **Success Response:** `200 OK` (`GitHubRepo` object).
 
 ---
 
 ### `GET /api/integrations/github/repositories/{owner}/{repo}/branches`
-- **Authentication:** Optional (Registered or Guest; public repos accessible unauthenticated)
+- **Authentication:** Supported (Registered or Guest; public repos accessible without linked GitHub credentials)
 - **Purpose:** Lists branches for an authorized or public repository.
 - **Success Response:** `200 OK`
   ```json
@@ -1789,138 +2192,42 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
-### `GET /api/integrations/github/repositories/{owner}/{repo}/detect`
-- **Authentication:** Optional (Registered or Guest; public repos accessible unauthenticated)
-- **Query Parameters:**
+### `GET|POST /api/integrations/github/repositories/{owner}/{repo}/detect`
+- **Authentication:** Required (Registered account only; Guest sessions rejected with `403 Forbidden`)
+- **Query / JSON Body Parameters:**
   - `branch`: Git branch to inspect (default: repository default branch)
-  - `root_dir`: Subdirectory root path (default: ".")
-- **Purpose:** Inspects files from the GitHub repository tree to detect runtime, framework, commands, and port before project creation.
+  - `root_dir`: Subdirectory root path (default: `"."`)
+- **Purpose:** Inspects files from the GitHub repository tree to detect runtimes, frameworks, services, commands, and ports before project creation.
 - **Success Response:** `200 OK`
   ```json
   {
+    "source": {
+      "source_type": "github",
+      "source_reference": "octocat/hello-world",
+      "branch": "main",
+      "folder_name": "hello-world",
+      "root_dir": "."
+    },
+    "services": [...],
+    "total_files": 24,
+    "total_bytes": 182400,
     "runtime": "python",
     "framework": "fastapi",
     "build_strategy": "auto",
     "suggested_port": 8000,
-    "build_command": "pip install -r requirements.txt",
-    "start_command": "uvicorn main:app --host 0.0.0.0 --port 8000",
     "health_check_path": "/health",
     "health_strategy": "auto",
-    "detected_files": ["requirements.txt", "main.py"]
+    "build_command": "pip install -r requirements.txt",
+    "start_command": "uvicorn main:app --host 0.0.0.0 --port 8000"
   }
   ```
 - **Error Responses:**
   - `404 Not Found`: Repository not found or access denied (`not_found: true`).
-  - `403 Forbidden`: Re-authorization required (`needs_reauth: true`).
+  - `403 Forbidden`: Re-authorization required (`needs_reauth: true` or guest session).
 
 ---
 
-## 8. WebSocket Endpoint (`/api/ws`)
-
-### Connection Handshake
-- **URL:** `ws://localhost:8080/api/ws?token=<access_token>`
-- **Handshake Authentication:**
-  1. Checks `token` query parameter.
-  2. Fallback to `Authorization: Bearer <token>` header.
-  3. Fallback to `forgelab_access_token` cookie.
-- **Protocol:** JSON message frames.
-
-### Client Messages:
-1. **Subscribe:**
-   ```json
-   { "type": "subscribe", "channel": "deployment:<uuid>" }
-   ```
-2. **Unsubscribe:**
-   ```json
-   { "type": "unsubscribe", "channel": "deployment:<uuid>" }
-   ```
-3. **Keepalive:**
-   ```json
-   { "type": "ping" }
-   ```
-
----
-
-## 8. Source Management Endpoints (`/api/sources`)
-
-### `POST /api/sources/local/validate`
-- **Authentication:** Required (Bearer JWT)
-- **Purpose:** Fast directory validation and heuristic runtime inspection for direct local-directory deployments. Does NOT transfer project files over HTTP.
-- **Request Body:**
-  ```json
-  {
-    "repository_path": "C:\\Users\\username\\Projects\\my-app"
-  }
-  ```
-- **Validation Rules:**
-  - `repository_path`: Required non-empty string.
-  - Path must exist and resolve to a directory (not a regular file).
-  - Must reside under configured `FORGELAB_ALLOWED_SOURCE_ROOTS`.
-  - Evaluates canonical symlinks and rejects restricted system directories (`/etc`, `C:\Windows`, etc.).
-  - In Docker Compose, translates host path beneath `FORGELAB_HOST_SOURCE_ROOT` to `/host-projects`.
-  - Prunes ignored directories (`node_modules`, `.git`, `.next`, cache dirs) during structure scanning.
-- **Success Response:** `200 OK`
-  ```json
-  {
-    "valid": true,
-    "repository_path": "C:\\Users\\username\\Projects\\my-app",
-    "project_name": "my-app",
-    "files_count": 42,
-    "total_bytes": 1048576,
-    "runtime": "node",
-    "framework": "nextjs",
-    "build_strategy": "dockerfile",
-    "dockerfile_path": "Dockerfile",
-    "build_context": ".",
-    "build_command": "npm run build",
-    "start_command": "npm start",
-    "suggested_port": 3000,
-    "health_strategy": "http",
-    "health_check_path": "/"
-  }
-  ```
-- **Error Responses:**
-  - `400 Bad Request`: Path is empty, not a directory, or system restricted directory.
-  - `403 Forbidden`: Path is outside configured `FORGELAB_ALLOWED_SOURCE_ROOTS`.
-  - `404 Not Found`: Path does not exist on the filesystem.
-
----
-
-### `POST /api/sources/upload`
-- **Authentication:** Required (Bearer JWT)
-- **Purpose:** Optional fallback archive ingestion (.zip, .tar.gz, .tgz) when direct filesystem access is unavailable.
-- **Request Format:** `multipart/form-data` with `archive` file field.
-- **Constraints:** Maximum 100 MB uncompressed size limit.
-- **Success Response:** `201 Created`
-  ```json
-  {
-    "source_id": "b2c3d4e5-f6a7-8b9c-0d1e-2f3a4b5c6d7e",
-    "status": "processing",
-    "phase": "finalizing",
-    "files_count": 120,
-    "total_bytes": 4500000
-  }
-  ```
-
----
-
-### `GET /api/sources/{id}`
-- **Authentication:** Required (Bearer JWT)
-- **Parameters:** `id` (Source workspace UUID).
-- **Purpose:** Check processing status and detection results for an uploaded archive source workspace.
-- **Success Response:** `200 OK`
-
----
-
-### `DELETE /api/sources/{id}`
-- **Authentication:** Required (Bearer JWT)
-- **Parameters:** `id` (Source workspace UUID).
-- **Purpose:** Delete an uploaded source workspace from disk and the `source_workspaces` database table.
-- **Success Response:** `200 OK`
-
----
-
-## 9. Realtime WebSocket Protocol (`/api/ws`)
+## 17. Realtime WebSocket Protocol (`/api/ws`)
 
 ### `POST /api/ws/ticket`
 - **Authentication:** Required (Bearer JWT or `forgelab_access_token` cookie; Guest mode allowed if configured)
@@ -2008,12 +2315,11 @@ Immediately revokes the active public share for the project, terminates any runn
 
 ---
 
-## 10. Future / Planned Endpoints (Not Implemented in MVP)
+## 18. Future / Planned Endpoints (Not Yet Implemented)
 
-The following endpoints were discussed in design architecture but are **not present** in the current codebase:
+The following endpoints were discussed in design architecture and remain **unimplemented** in the current codebase:
 
-- `POST /api/webhooks/github` — Automated push deployment receiver.
-- `GET /api/metrics` — OpenTelemetry / Prometheus platform metrics.
-- `GET /api/projects/{id}/deployments/{deploymentId}/events` — Event-replay log stream.
+- `GET /api/metrics` — OpenTelemetry / Prometheus control-plane export endpoint (per-project live and historical metrics are implemented at `GET /api/projects/{id}/metrics` and `GET /api/projects/{id}/metrics/history`).
+- `GET /api/projects/{id}/deployments/{deploymentId}/events` — Dedicated event-replay SSE/JSON stream outside the WebSocket/log endpoints.
 
 

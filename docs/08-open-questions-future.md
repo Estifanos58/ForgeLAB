@@ -13,7 +13,7 @@
 - [docs/11-development-environment.md](11-development-environment.md) — Development environment setup & ports
 - [docs/13-decisions.md](13-decisions.md) — Architecture Decision Records (ADRs)
 - [docs/14-known-limitations.md](14-known-limitations.md) — Known limitations and investigation items
-- [docs/15-github-integration.md](15-github-integration.md) — Future GitHub integration design
+- [docs/15-github-integration.md](15-github-integration.md) — Implemented GitHub App, OAuth, recoverable imports & webhooks design
 
 ---
 
@@ -91,33 +91,37 @@ These questions were evaluated and implemented in the MVP control-plane architec
 
 ---
 
-## Next Product Stage Roadmap (Post-MVP Scope)
+### OQ-11: Reverse-Proxy Integration, Custom Domains, & Blue-Green Switching [RESOLVED & IMPLEMENTED]
+- **Caddy Reverse-Proxy Integration:** `caddy:2-alpine` is integrated into `docker-compose.yml` (`infra/caddy/Caddyfile`, persistent `forgelab_caddy_data` & `forgelab_caddy_config` volumes) and dynamically configured via `CADDY_ADMIN_URL` (`http://caddy:2019` in Compose).
+- **Custom Domain Routing & Truthful HTTPS Status:** Users register custom hostnames (`/api/projects/{id}/domains`), verify DNS TXT ownership (`_forgelab-verify.<domain>`), and sync TLS routes into Caddy. When Caddy Admin API is unconfigured, `DomainService` reports `tls_status: "proxy_unconfigured"` and `https_active: false`.
+- **Opt-In Blue-Green Traffic Switching:** Per-service `deployment_mode: "blue_green"` shifts traffic via `TrafficRouter` (`/proxy/services/{serviceId}`) only after the replacement container passes health checks.
 
-Following completion of the core reliability and security hardening, subsequent platform capabilities are prioritized in order:
+### OQ-12: GitHub Push-to-Deploy Webhooks & Recoverable Imports [RESOLVED & IMPLEMENTED]
+- **Webhook Receiver Endpoint:** `POST /api/webhooks/github` verifies `X-Hub-Signature-256` with AES-GCM encrypted per-project webhook secrets and deduplicates `X-GitHub-Delivery` IDs (`webhook_deliveries`) against replays before enqueuing branch-matched deployments.
+- **Restart-Recoverable Imports:** `RepositoryImportService.RecoverInterruptedImports` resumes interrupted `repository_imports` across backend restarts with cancel and retry APIs.
 
-### Priority 1: Reverse-Proxy Integration, Stable URLs & HTTPS (Next Stage Focus)
-- **Caddy Reverse-Proxy Integration:** Embed or orchestrate a dedicated Caddy reverse-proxy service to manage dynamic domain routing and automatic Let's Encrypt / ZeroSSL TLS certificate issuance.
-- **Stable Application URLs & Virtual Hosts:** Replace raw dynamic host port access (`http://host:10423`) with predictable, stable hostnames (e.g. `https://<project-slug>.example.com` or `https://<service-name>.<project-slug>.example.com`).
-- **Custom Domain Routing:** Enable users to map custom top-level domains (e.g. `api.mycompany.com`) directly to target public services with automated TLS provisioning and DNS validation.
-- **Zero-Downtime Traffic Switching:** Shift incoming HTTP traffic via the reverse proxy to new service containers only after health checks pass, eliminating connection gaps during redeployments.
+### OQ-13: Self-Healing, Verified Auto-Rollback, Native Metrics & Audit Trail [RESOLVED & IMPLEMENTED]
+- **Configurable Self-Healing & Auto-Rollback:** `CheckContinuousRuntimeHealth` enforces bounded restarts (`FORGELAB_SELF_HEAL_*`), crash-loop detection (`FORGELAB_CRASH_LOOP_*`), and cooldown-guarded automatic rollback (`FORGELAB_AUTO_ROLLBACK_*`), preserving and inspect-verifying prior healthy containers.
+- **Runtime Metrics Cache, Historical Telemetry & Diagnostics:** `Engine.GetProjectRuntimeMetricsWithOptions` caches Docker stats (`FORGELAB_METRICS_CACHE_TTL`), a background sampler stores historical CPU/memory/network/restart telemetry (`metrics_history`, `FORGELAB_METRICS_RETENTION_DAYS`), and `/api/diagnostics` diagnoses Docker, deployment, resource, and import health.
+- **Redacted Operational Audit Trail & Volume Backups:** `AuditService` records redacted events in `audit_logs`, while `EngineVolumes` provides volume disk usage visibility, streaming `.tar.gz` backups, and size-bounded restores.
 
-### Priority 2: GitHub Push-to-Deploy & Webhook Receivers
-- **Webhook Receiver Endpoint:** Secure `POST /api/webhooks/github` verifying GitHub HMAC-SHA256 payload signatures (`X-Hub-Signature-256`).
-- **Branch-Filtered Auto-Deployments:** Automatically trigger release or service deployments when commits are pushed to configured production/tracking branches.
-- **Commit Status Check Reporting:** Post deployment lifecycle status and preview URLs directly back to GitHub commit status checks / deployment API.
+---
 
-### Priority 3: Preview Environments & Ephemeral Workspaces
-- **Ephemeral Pull Request Environments:** Automatically provision isolated multi-service environments for active pull requests.
-- **Auto-Teardown Lifecycle:** Synchronously decommission preview containers, networks, and ephemeral volumes when pull requests are closed or merged.
+## Remaining Future Product Stage Roadmap (Deferred Scope)
 
-### Priority 4: Runtime Observability & Container Metrics
-- **Prometheus & OpenTelemetry Exporters:** Expose continuous container CPU, memory, network I/O, and disk usage metrics via `/api/metrics` or OpenTelemetry OTLP collectors.
-- **Resource Usage Dashboards:** Render real-time and historical resource consumption graphs within the Next.js service dashboard.
+The following capabilities remain intentionally deferred beyond the single-node stabilization pass:
 
-### Priority 5: Audit Logging & Access Governance
-- **Persistent Structured Audit Trail:** Record security-relevant operational events (project creation/deletion, secret modifications, deployment triggers, rollbacks, OAuth connections) with actor identity, source IP, timestamp, and metadata.
-- **Role-Based Access Control (RBAC):** Organization-level user workspaces with granular permissions (Admin, Operator, Developer, Viewer).
+### Priority 1: Commit Status Reporting & Ephemeral Pull-Request Environments
+- **Commit Status Check Reporting:** Post deployment lifecycle status and preview URLs back to GitHub commit status / Deployments API.
+- **Ephemeral Pull Request Environments:** Automatically provision and tear down isolated multi-service preview environments for open pull requests.
 
-### Priority 6: Enhanced Local-Agent & Multi-Node Execution
-- **One-Command Agent Installer:** Simplified CLI setup and background daemon service management across Linux, macOS, and Windows.
-- **Distributed Worker Runners:** Decouple the deployment worker into standalone daemon agents pulling jobs from the Redis queue across multiple host nodes.
+### Priority 2: OpenTelemetry / Prometheus Exporter & Frontend Log Virtualization
+- **Prometheus & OTLP Exporter:** Expose platform-wide Prometheus scrape metrics (`/api/metrics`) and distributed traces alongside the existing native runtime metrics API.
+- **Virtualized Terminal Log Viewer:** Add DOM virtualization for large multi-thousand-line runtime log streams.
+
+### Priority 3: Team Governance & Role-Based Access Control (RBAC)
+- **Role-Based Access Control (RBAC):** Organization-level workspaces with granular permissions (Admin, Operator, Developer, Viewer).
+
+### Priority 4: Enhanced Local-Agent Packaging & Multi-Node Execution
+- **Packaged Desktop Service / Installer:** Native OS service installer wrappers alongside the current `cmd/agent` binary and PowerShell launcher.
+- **Distributed Worker Runners:** Decouple the embedded worker loop to run across remote worker nodes when multi-host scheduling is warranted.

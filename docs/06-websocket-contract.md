@@ -1,7 +1,7 @@
 # ForgeLAB — WebSocket Contract & Realtime Architecture
 
 **Status:** Current Implementation Specification  
-**Endpoint:** `GET /api/ws?token=<access_token>` (or authenticated via `forgelab_access_token` HttpOnly cookie)  
+**Endpoint:** `GET /api/ws` (authenticated via `forgelab_access_token` HttpOnly cookie, `Authorization: Bearer <token>`, or single-use ticket `?ticket=<uuid>` via `POST /api/ws/ticket`)  
 **Protocol:** WebSocket (RFC 6455)  
 
 ---
@@ -76,10 +76,10 @@ Docker Build / Container Logs
   - Next.js dev server on port 3000: `${wsProto}//${window.location.hostname}:8080/api/ws` (configurable via `NEXT_PUBLIC_BACKEND_PORT`).
   - Unified reverse-proxy / production: `${wsProto}//${window.location.host}/api/ws`.
 - **Authentication:**
-  1. Primary for browsers: `forgelab_access_token` HttpOnly cookie automatically forwarded by the browser during the WebSocket HTTP Upgrade handshake.
-  2. Fallback: `token` query parameter (`?token=<jwt_access_token>`).
-  3. Fallback: `Authorization: Bearer <token>` header.
-- If no valid token or session exists, the server responds with `HTTP 401 Unauthorized` and aborts the WebSocket upgrade.
+  1. Primary for browsers: Short-lived single-use ticket (`POST /api/ws/ticket` -> `GET /api/ws?ticket=<uuid>`, 60s TTL) or `forgelab_access_token` HttpOnly cookie automatically forwarded during the WebSocket HTTP Upgrade handshake.
+  2. Header fallback (CLI/non-browser): `Authorization: Bearer <token>` header.
+  3. **Strict URL Query Token Rejection:** Connecting with `?token=<jwt>` is strictly rejected with `HTTP 401 Unauthorized` to prevent token leakage into proxy/server logs, browser history, and `Referer` headers.
+- If no valid ticket, cookie, or Authorization header exists, the server responds with `HTTP 401 Unauthorized` and aborts the WebSocket upgrade.
 
 ---
 

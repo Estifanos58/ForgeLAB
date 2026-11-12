@@ -115,6 +115,75 @@ export async function apiFetch<T>(endpoint: string, options: ApiFetchOptions = {
   return data as T;
 }
 
+function parseContentDispositionFilename(header: string | null): string {
+  if (!header) return '';
+  const match = header.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+  return match?.[1]?.trim() || '';
+}
+
+export async function apiFetchBlob(
+  endpoint: string,
+  options: ApiFetchOptions = {}
+): Promise<{ blob: Blob; filename: string }> {
+  const url = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+
+  const headers: Record<string, string> = {
+    ...(options.headers as Record<string, string>),
+  };
+
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const guestId = localStorage.getItem('forgelab_guest_session_id');
+      if (guestId && !headers['X-Guest-Session']) {
+        headers['X-Guest-Session'] = guestId;
+      }
+    } catch {}
+  }
+
+  const response = await fetch(url, {
+    ...options,
+    headers,
+    credentials: 'include',
+  });
+
+  const guestHeader = response.headers.get('x-guest-session');
+  if (guestHeader && typeof localStorage !== 'undefined') {
+    try {
+      localStorage.setItem('forgelab_guest_session_id', guestHeader);
+    } catch {}
+  }
+
+  if (response.status === 401 && !options._retry) {
+    try {
+      await sessionManager.refreshSession();
+      return await apiFetchBlob(endpoint, {
+        ...options,
+        _retry: true,
+      });
+    } catch {
+      // Refresh failed; proceed with original error handling
+    }
+  }
+
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || '';
+    let data: any;
+    if (contentType.includes('application/json')) {
+      data = await response.json().catch(() => null);
+    } else {
+      data = await response.text().catch(() => '');
+    }
+    const errorMsg =
+      typeof data === 'object' && data?.error ? data.error : `Request failed with status ${response.status}`;
+    throw new ApiClientError(errorMsg, response.status, data);
+  }
+
+  sessionManager.recordActivity('user');
+  const blob = await response.blob();
+  const filename = parseContentDispositionFilename(response.headers.get('content-disposition'));
+  return { blob, filename };
+}
+
 const AGENT_URL = 'http://127.0.0.1:4142';
 let currentAgentToken: string | null = null;
 

@@ -32,7 +32,9 @@ type DeploymentService struct {
 	githubService                            *GitHubService
 	getDeploymentForTest                     func(ctx context.Context, deploymentID uuid.UUID) (*models.Deployment, error)
 	getServiceDeploymentForTest              func(ctx context.Context, serviceDeploymentID uuid.UUID) (*models.ServiceDeployment, error)
+	listDeploymentsForTest                   func(ctx context.Context, projectID uuid.UUID, limit, offset int) ([]*models.Deployment, error)
 	listServiceDeploymentsForTest            func(ctx context.Context, deploymentID uuid.UUID) ([]*models.ServiceDeployment, error)
+	listServiceDeploymentsByServiceForTest   func(ctx context.Context, serviceID uuid.UUID) ([]*models.ServiceDeployment, error)
 	updateDeploymentStatusForTest            func(ctx context.Context, deploymentID uuid.UUID, newStatus string, failureReason *string) error
 	updateServiceDeploymentStatusForTest     func(ctx context.Context, serviceDeploymentID uuid.UUID, newStatus string, failureReason *string) error
 	resetInterruptedServiceDeploymentForTest func(ctx context.Context, serviceDeploymentID uuid.UUID) error
@@ -59,9 +61,19 @@ func (s *DeploymentService) SetGetServiceDeploymentForTest(fn func(ctx context.C
 	s.getServiceDeploymentForTest = fn
 }
 
+// SetListDeploymentsForTest configures a test hook for ListDeployments.
+func (s *DeploymentService) SetListDeploymentsForTest(fn func(ctx context.Context, projectID uuid.UUID, limit, offset int) ([]*models.Deployment, error)) {
+	s.listDeploymentsForTest = fn
+}
+
 // SetListServiceDeploymentsForTest configures a test hook for ListServiceDeployments.
 func (s *DeploymentService) SetListServiceDeploymentsForTest(fn func(ctx context.Context, deploymentID uuid.UUID) ([]*models.ServiceDeployment, error)) {
 	s.listServiceDeploymentsForTest = fn
+}
+
+// SetListServiceDeploymentsByServiceForTest configures a test hook for ListServiceDeploymentsByService.
+func (s *DeploymentService) SetListServiceDeploymentsByServiceForTest(fn func(ctx context.Context, serviceID uuid.UUID) ([]*models.ServiceDeployment, error)) {
+	s.listServiceDeploymentsByServiceForTest = fn
 }
 
 // SetUpdateDeploymentStatusForTest configures a test hook for UpdateDeploymentStatus.

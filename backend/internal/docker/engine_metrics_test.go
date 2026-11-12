@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -316,4 +318,213 @@ func TestGetProjectRuntimeMetrics_ServiceQueryError_Propagates(t *testing.T) {
 	_, err := eng.GetProjectRuntimeMetrics(ctx, projectID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "db connection reset")
+}
+
+func TestGetProjectRuntimeMetrics_CacheAndSingleflight(t *testing.T) {
+	ctx := context.Background()
+	projectID := uuid.New()
+	svcID := uuid.New()
+	cid := "cid-cache-sf"
+
+	var statsCalls atomic.Int32
+	var slowStats atomic.Bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				ID:           cid,
+				RestartCount: 2,
+				State: &container.State{
+					Running:   true,
+					Status:    container.StateRunning,
+					StartedAt: time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano),
+					Health:    &container.Health{Status: container.Healthy},
+				},
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/stats") {
+			if slowStats.Load() {
+				time.Sleep(40 * time.Millisecond)
+			}
+			statsCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(container.StatsResponse{
+				ID:     cid,
+				OSType: "linux",
+				CPUStats: container.CPUStats{
+					CPUUsage:    container.CPUUsage{TotalUsage: 400_000_000},
+					SystemUsage: 10_000_000_000,
+					OnlineCPUs:  1,
+				},
+				PreCPUStats: container.CPUStats{
+					CPUUsage:    container.CPUUsage{TotalUsage: 100_000_000},
+					SystemUsage: 0,
+					OnlineCPUs:  1,
+				},
+				MemoryStats: container.MemoryStats{Usage: 128 * 1024 * 1024, Limit: 512 * 1024 * 1024},
+				Networks:    map[string]container.NetworkStats{"eth0": {RxBytes: 512, TxBytes: 1024}},
+				PidsStats:   container.PidsStats{Current: 7},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	cli, cleanup := newDirectTestDockerClient(t, handler)
+	defer cleanup()
+
+	projSvc := services.NewProjectService(nil, nil, nil, nil)
+	projSvc.SetProjectByIDForTest(func(ctx context.Context, pID uuid.UUID) (*models.Project, error) {
+		return &models.Project{ID: projectID, Name: "cache-proj", Status: models.ProjectStatusRunning}, nil
+	})
+	svcSvc := services.NewServiceService(nil)
+	svcSvc.SetListServicesForTest(func(ctx context.Context, pID uuid.UUID) ([]*models.Service, error) {
+		return []*models.Service{{ID: svcID, ProjectID: projectID, Name: "api", ContainerID: &cid, Status: models.ServiceStatusRunning}}, nil
+	})
+	projSvc.SetServiceService(svcSvc)
+
+	eng := NewEngine(cli, projSvc, nil, nil, nil, nil, nil, nil, nil, t.TempDir())
+	eng.SetServiceService(svcSvc)
+	eng.SetMetricsCacheTTL(30 * time.Second)
+
+	// 1. Cold fetch hits Docker /stats once
+	m1, err := eng.GetProjectRuntimeMetrics(ctx, projectID)
+	require.NoError(t, err)
+	assert.False(t, m1.Cached)
+	assert.Equal(t, int32(1), statsCalls.Load())
+
+	// 2. Subsequent poll within TTL hits backend cache without querying Docker
+	m2, err := eng.GetProjectRuntimeMetrics(ctx, projectID)
+	require.NoError(t, err)
+	assert.True(t, m2.Cached)
+	assert.Equal(t, int32(1), statsCalls.Load())
+
+	// 3. Forced refresh bypasses cache
+	m3, err := eng.GetProjectRuntimeMetricsWithOptions(ctx, projectID, true)
+	require.NoError(t, err)
+	assert.False(t, m3.Cached)
+	assert.Equal(t, int32(2), statsCalls.Load())
+
+	// 4. Invalidate cache + concurrent calls coalesce via singleflight
+	eng.InvalidateProjectMetricsCache(projectID)
+	slowStats.Store(true)
+	var wg sync.WaitGroup
+	errs := make(chan error, 6)
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			snap, callErr := eng.GetProjectRuntimeMetricsWithOptions(ctx, projectID, true)
+			if callErr != nil {
+				errs <- callErr
+				return
+			}
+			if snap == nil || len(snap.Services) != 1 {
+				errs <- errors.New("unexpected empty snapshot")
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for callErr := range errs {
+		require.NoError(t, callErr)
+	}
+	assert.Equal(t, int32(3), statsCalls.Load(), "concurrent callers must coalesce via singleflight")
+}
+
+func TestSampleActiveProjectsMetrics_PersistsAndUpdatesCache(t *testing.T) {
+	ctx := context.Background()
+	projectID := uuid.New()
+	svcID := uuid.New()
+	cid := "cid-sampled"
+
+	var statsCalls atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
+			_ = json.NewEncoder(w).Encode(container.InspectResponse{
+				ID:           cid,
+				RestartCount: 3,
+				State: &container.State{
+					Running: true,
+					Health:  &container.Health{Status: container.Healthy},
+				},
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/stats") {
+			statsCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(container.StatsResponse{
+				ID:     cid,
+				OSType: "linux",
+				CPUStats: container.CPUStats{
+					CPUUsage:    container.CPUUsage{TotalUsage: 500_000_000},
+					SystemUsage: 10_000_000_000,
+					OnlineCPUs:  1,
+				},
+				PreCPUStats: container.CPUStats{
+					CPUUsage:    container.CPUUsage{TotalUsage: 100_000_000},
+					SystemUsage: 0,
+					OnlineCPUs:  1,
+				},
+				MemoryStats: container.MemoryStats{Usage: 200 * 1024 * 1024, Limit: 1000 * 1024 * 1024},
+				Networks:    map[string]container.NetworkStats{"eth0": {RxBytes: 2048, TxBytes: 4096}},
+				PidsStats:   container.PidsStats{Current: 9},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	cli, cleanup := newDirectTestDockerClient(t, handler)
+	defer cleanup()
+
+	svcModel := &models.Service{
+		ID:             svcID,
+		ProjectID:      projectID,
+		Name:           "worker",
+		ContainerID:    &cid,
+		Status:         models.ServiceStatusRunning,
+		ResourceConfig: models.ResourceConfig{MemoryMB: 1000},
+	}
+	projSvc := services.NewProjectService(nil, nil, nil, nil)
+	projSvc.SetProjectByIDForTest(func(ctx context.Context, pID uuid.UUID) (*models.Project, error) {
+		return &models.Project{ID: projectID, Name: "sampled-proj", Status: models.ProjectStatusRunning}, nil
+	})
+	svcSvc := services.NewServiceService(nil)
+	svcSvc.SetListActiveServicesForTest(func(ctx context.Context) ([]*models.Service, error) {
+		return []*models.Service{svcModel}, nil
+	})
+	svcSvc.SetListServicesForTest(func(ctx context.Context, pID uuid.UUID) ([]*models.Service, error) {
+		return []*models.Service{svcModel}, nil
+	})
+	projSvc.SetServiceService(svcSvc)
+
+	metricsSvc := services.NewMetricsService(nil, 7, 15*time.Second)
+	eng := NewEngine(cli, projSvc, nil, nil, nil, nil, nil, nil, nil, t.TempDir())
+	eng.SetServiceService(svcSvc)
+	eng.SetMetricsService(metricsSvc)
+	eng.SetMetricsCacheTTL(30 * time.Second)
+
+	require.NoError(t, eng.SampleActiveProjectsMetrics(ctx))
+	assert.Equal(t, int32(1), statsCalls.Load())
+
+	// Subsequent request serves directly from cache primed by sampler
+	cached, err := eng.GetProjectRuntimeMetrics(ctx, projectID)
+	require.NoError(t, err)
+	assert.True(t, cached.Cached)
+	assert.Equal(t, int32(1), statsCalls.Load())
+
+	// Historical sample was persisted cleanly
+	hist, err := metricsSvc.QueryProjectHistory(ctx, projectID, services.MetricsHistoryQueryOptions{
+		From: time.Now().UTC().Add(-time.Hour),
+		To:   time.Now().UTC().Add(time.Minute),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, hist.TotalSamples)
+	require.Len(t, hist.Summaries, 1)
+	assert.Equal(t, "worker", hist.Summaries[0].ServiceName)
+	assert.InDelta(t, 4.0, hist.Summaries[0].PeakCPUPercent, 0.01)
+	assert.Equal(t, 3, hist.Summaries[0].MaxRestartCount)
+	assert.Equal(t, uint64(2048), hist.Samples[0].NetworkRxBytes)
 }

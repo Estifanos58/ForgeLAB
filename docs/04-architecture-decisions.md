@@ -227,8 +227,12 @@ A critical distinction in ForgeLAB's architecture:
   - If 10 attempts fail: the deployment transitions to `FAILED`, the broken container is removed, and the previous running deployment is kept intact.
 - **Docker Engine Restart Behavior (CURRENT IMPLEMENTATION — IMPLEMENTED):**
   Deployed containers are configured with `RestartPolicy: { Name: "unless-stopped" }` in [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go). The underlying Docker daemon automatically restarts stopped or crashed containers at the container-engine layer.
-- **ForgeLAB-Level Continuous Health Monitoring & Self-Healing (FUTURE ARCHITECTURE — NOT IMPLEMENTED):**
-  ForgeLAB does **not** implement continuous control-plane application health monitoring, crash diagnosis, automatic ForgeLAB-level rollback, health-based remediation, crash-loop analysis, or deployment re-promotion. Docker's container-level restart policy must not be confused with platform-level self-healing.
+- **ForgeLAB-Level Continuous Health Monitoring, Self-Healing & Auto-Rollback (IMPLEMENTED — CONFIGURABLE):**
+  A dedicated background runtime monitor (`CheckContinuousRuntimeHealth` in `engine_runtime_health.go`, running every `FORGELAB_RUNTIME_HEALTH_CHECK_INTERVAL`, default `30s`) inspects running containers via the Docker daemon:
+  - Tracks consecutive unhealthy health-check streaks, unexpected exits (distinguishing intentional stops from crashes/exit codes), kernel OOM kills (`insp.State.OOMKilled`), and crash loops (`FORGELAB_CRASH_LOOP_THRESHOLD` / `FORGELAB_CRASH_LOOP_WINDOW`).
+  - Attempts bounded container self-healing restarts (`FORGELAB_SELF_HEAL_ENABLED=true`, `FORGELAB_SELF_HEAL_MAX_RESTARTS=3`) when enabled.
+  - When sustained failures exceed `FORGELAB_AUTO_ROLLBACK_THRESHOLD` (outside `FORGELAB_AUTO_ROLLBACK_COOLDOWN`), triggers automatic rollback to the prior known-good release (`engine_recovery.go`), preserving and inspect-verifying the previous healthy container before declaring restoration successful.
+  - In addition, services can opt into `deployment_mode: "blue_green"` (`TrafficRouter` in `internal/proxy/reverse_proxy.go`), routing HTTP traffic only after the replacement container passes health checks.
 
 ---
 
@@ -442,17 +446,17 @@ Log Processor (secret redaction)
 
 The architecture is designed so these future capabilities can be added without rewriting the foundation:
 
-| Future Feature | Extension Point |
-|----------------|-----------------|
-| Worker separation | Redis queue already exists; workers can become separate processes |
-| Multi-node | Deploy queue is Redis-based, not in-process |
-| GitHub import | source_type field on projects; new source handler |
-| Webhooks | New endpoint + deployment trigger |
-| RBAC | user_id already on projects; add roles/permissions table |
-| Environments | Add environment_id to deployments and env vars |
-| Resource limits | Docker container config already has CPU/memory options |
-| Custom domains | Caddy API integration layer |
-| Audit logging | Insert audit records at service boundaries |
+| Capability / Extension Area | Status | Architecture / Extension Point |
+|-----------------------------|--------|--------------------------------|
+| Worker separation | Future Extension | Redis queue already exists; workers can become separate processes |
+| Multi-node scheduling | Future Extension | Deploy queue is Redis-based, not in-process |
+| RBAC | Future Extension | `user_id` already on projects; add roles/permissions table |
+| Multi-environment targets | Future Extension | Add `environment_id` to deployments and env vars |
+| GitHub import & push webhooks | Implemented | `github_service.go`, `repository_import_service.go`, `webhook_service.go` |
+| Resource limits | Implemented | `trust_boundary.go` CPU/memory/PIDs enforcement |
+| Custom domains & HTTPS | Implemented | `domain_service.go`, `CaddySyncer`, `caddy:2-alpine` via `CADDY_ADMIN_URL` |
+| Operational audit logging | Implemented | `AuditService` + PostgreSQL `audit_logs` (`000027_audit_logs`) with key redaction |
+| Native telemetry & diagnostics | Implemented | `engine_metrics.go`, `MetricsService` (`000026_metrics_history`), `engine_diagnostics.go` |
 
 ---
 
@@ -568,19 +572,26 @@ To maintain maintainability and clean boundaries, oversized files across the bac
   - `engine_cleanup.go`: Safe container, image, and network pruning.
   - `engine_reconcile.go`: Synchronous daemon container startup reconciliation.
   - `engine_networks.go`: Docker network creation, options, and cleanup.
-  - `engine_runtime_health.go`: Periodic container inspection, daemon checks, and crash detection.
+  - `engine_runtime_health.go`: Periodic container inspection, self-healing restarts, crash-loop detection, and cooldown-guarded auto-rollback triggers.
+  - `engine_recovery.go`: Previous container preservation and inspect-verified release/service restoration during recovery/rollback.
+  - `engine_metrics.go`: TTL-cached, single-flight live Docker container metrics (`GetProjectRuntimeMetricsWithOptions`) and background sampling (`SampleActiveProjectsMetrics`).
+  - `engine_volumes.go`: Persistent volume enumeration, disk usage reporting, `.tar.gz` backup streaming, and traversal-safe bounded restores.
+  - `engine_diagnostics.go`: System & project operational diagnostics across Docker connectivity, failed deployments, resource pressure, and imports.
   - `engine_status.go`: Project and service status recalculation and status mapping.
   - `engine_stream.go`: Docker multiplexed log stream demuxing and timestamp stripping.
-- **Services & Queues:**
+- **Services, Proxy & Queues:**
   - `deployment_service`: Modularized into `create`, `service_deploy`, `rollback`, `get`, `logs`, `reconcile`, and `status`.
   - `project_service`: Modularized into `crud`, `status`, and `env`.
   - `source_service`: Modularized into `credentials` and `ingest`.
-  - `github_service`: Modularized into `auth`, `repos`, and `tarball`.
-  - `agent/server`: Modularized into `auth`, `folders`, and `sources`.
+  - `github_service`: Modularized into `auth`, `repos`, and `tarball`, paired with `repository_import_service.go` (restart recovery) and `webhook_service.go`.
+  - `domain_service.go`, `metrics_service.go`, `audit_service.go`, `share_service.go`: Domain DNS/Caddy sync, historical telemetry retention, redacted audit logging, and tunnel shares.
+  - `proxy/reverse_proxy.go`: Internal `TrafficRouter` for `blue_green` services and `CaddySyncer` Admin API integration.
+  - `agent/server`: Modularized into `auth`, `folders`, and `sources` (paired with `tararchive` & `security` Windows canonicalization).
   - `queue/redis_queue`: Modularized into `leases`, `recovery`, `scripts`, and `worker`.
   - `websocket/hub`: Modularized into `tickets`, `subscriptions`, and `events`.
-- **Frontend API Architecture:**
-  - `lib/api/`: Domain clients (`auth-client`, `projects-client`, `services-client`, `env-client`, `integrations-client`, `sources-client`, `agent-client`, `discovery-client`) built on a common `base.ts` fetch engine, exported through a backward-compatible facade in `client.ts`.
+- **Frontend API & Console Architecture:**
+  - `lib/api/`: Domain clients (`auth-client`, `projects-client`, `services-client`, `env-client`, `integrations-client`, `sources-client`, `agent-client`, `discovery-client`, `observability-client`) built on `base.ts`, exported through `client.ts`.
+  - `features/projects/`: Dedicated panels for domains (`domains-panel.tsx`), volumes & disk usage (`volumes-panel.tsx`), cached/historical runtime metrics (`runtime-metrics-panel.tsx`), service topology (`topology-section.tsx`), and sharing (`share-modal.tsx`).
 
 ### 14. Control-Plane Isolation, Gateway Security & Container Hardening
 - **Control-Plane Network Isolation:**
@@ -595,8 +606,8 @@ To maintain maintainability and clean boundaries, oversized files across the bac
   - Verified TLS is mandatory for gateway connections in production (`!isDev`). `GATEWAY_TLS_SKIP_VERIFY=true` is rejected during configuration validation, and automatic TLS-to-plaintext fallback is eliminated.
   - Cloudflare Quick Tunnel child process lifecycles use `cmd.Cancel` with graceful `os.Interrupt`, 3-second wait delays, and synchronized `sync.WaitGroup` process reaping on `Close()`.
   - Ephemeral stale shares from previous runs are reconciled and marked revoked upon server startup.
-- **Container Capability Minimization & Quotas:**
-  - Default container capabilities are minimized to `CapAdd: ["CHOWN", "SETGID", "SETUID"]` with `CapDrop: ["ALL"]`, removing filesystem permission bypasses (`DAC_OVERRIDE`, `FOWNER`).
+- **Container Capability Allowlist & Quotas:**
+  - Capabilities use a strict **allowlist** (`ValidateCapabilities`) permitting only `["CAP_CHOWN", "CHOWN", "SETGID", "SETUID"]` alongside `CapDrop: ["ALL"]`; any requested capability outside the allowlist is rejected with `ErrCapabilityNotAllowed`.
   - Support for declared non-root `user` execution profiles in Compose manifests and service definitions is propagated to `containerConfig.User`.
   - Owner-level cumulative resource quotas (`ValidateOwnerResourceQuota`) and a 1GB cumulative source upload quota (`MaxOwnerStorageQuotaBytes`) prevent resource exhaustion across multi-project tenant workloads.
 - **Extended Token Lifespans & Concurrent Refresh Recovery:**

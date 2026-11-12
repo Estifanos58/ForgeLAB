@@ -11,7 +11,7 @@
 - [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
 - [docs/04-architecture-decisions.md](04-architecture-decisions.md) — System architecture & data models
 - [docs/11-development-environment.md](11-development-environment.md) — Host tool requirements & setup
-- [docs/13-decisions.md](13-decisions.md) — Architecture Decision Records (DEC-001 to DEC-003)
+- [docs/13-decisions.md](13-decisions.md) — Architecture Decision Records (DEC-001 to DEC-017)
 
 ---
 
@@ -26,9 +26,9 @@
 | Queue / Background Work | **Redis** | Deployment work coordination, pub/sub for realtime, single-use OAuth state storage |
 | Application Runtime | **Docker** | Container build and execution environment |
 | Authentication Providers | **Email/Password, Google OAuth, GitHub OAuth** | Multi-provider auth with backend-owned session issuing (HttpOnly cookies) |
-| Reverse Proxy | **Caddy** | Future routing/HTTPS automation (not MVP) |
-| Frontend | **Next.js 16.3.6 Active LTS + React 19 + TypeScript** | Modern App Router, proxy.ts conventions, Tailwind CSS, landing page and dashboard |
-| Observability | **OpenTelemetry** | Future metrics/tracing direction (not MVP) |
+| Reverse Proxy | **Caddy 2 (`caddy:2-alpine`)** | Integrated in `docker-compose.yml` (`infra/caddy/Caddyfile`) & controlled dynamically via Caddy Admin API (`CADDY_ADMIN_URL`) for custom domains & HTTPS; internal Go `TrafficRouter` handles opt-in `blue_green` switching |
+| Frontend | **Next.js 16.3.6 Active LTS + React 19 + TypeScript** | Modern App Router, `route.ts` same-origin API proxy, tightened CSP, Tailwind CSS, landing page and dashboard |
+| Observability | **Native Telemetry + Audit Trail (OpenTelemetry Future)** | Backend-sampled/cached live metrics, PostgreSQL `metrics_history` retention, redacted `audit_logs`, & `/api/diagnostics`; OpenTelemetry/Prometheus export (`/api/metrics`) remains future work |
 
 ## Important Technology Constraints
 

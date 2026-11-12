@@ -270,6 +270,9 @@ func (s *GitHubService) AcquireRepoTarball(ctx context.Context, userID uuid.UUID
 	for {
 		select {
 		case <-extractCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return ErrGitHubExtractionTimeout
 		default:
 		}

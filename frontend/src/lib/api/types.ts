@@ -818,12 +818,191 @@ export interface ProjectRuntimeMetrics {
   project_name: string;
   status: string;
   collected_at: string;
+  cached?: boolean;
+  cache_age_seconds?: number;
   docker_available: boolean;
   total_cpu_percent: number;
   total_memory_used_bytes: number;
   total_network_rx_bytes: number;
   total_network_tx_bytes: number;
   services: ServiceRuntimeMetrics[];
+}
+
+export interface ServiceMetricsSample {
+  id: string;
+  project_id: string;
+  service_id: string;
+  service_name: string;
+  container_id?: string;
+  running: boolean;
+  cpu_percent: number;
+  memory_used_bytes: number;
+  memory_limit_bytes: number;
+  memory_percent: number;
+  network_rx_bytes: number;
+  network_tx_bytes: number;
+  pids_current: number;
+  restart_count: number;
+  oom_killed: boolean;
+  health_status: string;
+  sampled_at: string;
+}
+
+export interface ServiceMetricsHistorySummary {
+  service_id: string;
+  service_name: string;
+  sample_count: number;
+  peak_cpu_percent: number;
+  avg_cpu_percent: number;
+  peak_memory_bytes: number;
+  max_restart_count: number;
+  oom_count: number;
+  latest_sampled_at?: string;
+}
+
+export interface ProjectMetricsHistoryResponse {
+  project_id: string;
+  from: string;
+  to: string;
+  retention_days: number;
+  sample_interval_seconds: number;
+  total_samples: number;
+  summaries: ServiceMetricsHistorySummary[];
+  samples: ServiceMetricsSample[];
+}
+
+export interface AuditLogEntry {
+  id: string;
+  actor_id: string;
+  actor_label?: string;
+  is_guest: boolean;
+  project_id?: string | null;
+  project_name?: string;
+  action: string;
+  resource_type: string;
+  resource_id?: string;
+  status: 'success' | 'failure' | 'warning' | string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  ip_address?: string;
+  created_at: string;
+}
+
+export interface AuditLogsResponse {
+  logs: AuditLogEntry[];
+  limit: number;
+  offset: number;
+}
+
+export interface ReconciliationState {
+  status: string;
+  authoritative: boolean;
+  last_error?: string;
+  started_at?: string;
+  completed_at?: string;
+  projects_checked?: number;
+  services_checked?: number;
+  drifted_containers?: number;
+}
+
+export interface DockerConnectivityDiagnostics {
+  available: boolean;
+  ping_latency_ms: number;
+  api_version?: string;
+  server_version?: string;
+  operating_system?: string;
+  os_type?: string;
+  architecture?: string;
+  storage_driver?: string;
+  builder_version?: string;
+  cpus?: number;
+  memory_total_bytes?: number;
+  daemon_warnings?: string[];
+  error?: string;
+  reconciliation: ReconciliationState;
+}
+
+export interface DeploymentFailureDiagnostic {
+  scope: 'release' | 'service' | string;
+  id: string;
+  project_id: string;
+  project_name: string;
+  service_id?: string;
+  service_name?: string;
+  deploy_number: number;
+  status: string;
+  failure_reason?: string;
+  created_at: string;
+  finished_at?: string | null;
+}
+
+export interface ServiceResourceWarning {
+  project_id: string;
+  project_name: string;
+  service_id: string;
+  service_name: string;
+  status: string;
+  cpu_percent: number;
+  memory_used_bytes: number;
+  memory_limit_bytes: number;
+  memory_percent: number;
+  oom_killed: boolean;
+  restart_count: number;
+  health_status: string;
+  health_failing_streak: number;
+  self_heal_restarts?: number;
+  crash_loop_events?: number;
+  reason: string;
+}
+
+export interface ResourceDiagnostic {
+  docker_available: boolean;
+  host_cpus?: number;
+  host_memory_total_bytes?: number;
+  disk_usage: DiskUsageSummary;
+  exhausted_services: ServiceResourceWarning[];
+}
+
+export interface ImportDiagnostic {
+  import_id: string;
+  repository: string;
+  branch: string;
+  status: string;
+  stage?: string;
+  progress: number;
+  error_code?: string;
+  error_message?: string;
+  stale: boolean;
+  project_id?: string | null;
+  updated_at: string;
+}
+
+export interface DiagnosticIssue {
+  severity: 'critical' | 'warning' | 'info' | string;
+  category:
+    | 'docker_connectivity'
+    | 'deployment_failure'
+    | 'resource_exhaustion'
+    | 'repository_import'
+    | 'runtime_health'
+    | string;
+  title: string;
+  message: string;
+  remediation: string;
+  resource_id?: string;
+}
+
+export interface DiagnosticsReport {
+  scope: 'system' | 'project' | string;
+  project_id?: string | null;
+  project_name?: string;
+  overall_status: 'healthy' | 'degraded' | 'critical' | string;
+  collected_at: string;
+  docker: DockerConnectivityDiagnostics;
+  deployment_failures: DeploymentFailureDiagnostic[];
+  resources: ResourceDiagnostic;
+  imports: ImportDiagnostic[];
+  issues: DiagnosticIssue[];
 }
 
 export interface CustomDomain {
@@ -833,7 +1012,8 @@ export interface CustomDomain {
   domain: string;
   verification_token: string;
   verified: boolean;
-  tls_status: 'pending' | 'active' | 'error' | string;
+  tls_status: 'pending' | 'active' | 'proxy_unconfigured' | 'error' | string;
+  https_active?: boolean;
   target_port: number;
   verification_record_name: string;
   verification_record_value: string;
@@ -861,6 +1041,69 @@ export interface UpdateWebhookConfigInput {
   auto_deploy?: boolean;
   auto_deploy_branch?: string;
   regenerate_secret?: boolean;
+}
+
+export interface VolumeMountRef {
+  service_id?: string;
+  service_name: string;
+  container_id?: string;
+  running: boolean;
+  target: string;
+  read_only: boolean;
+}
+
+export interface ProjectVolumeInfo {
+  name: string;
+  docker_name: string;
+  driver: string;
+  mountpoint?: string;
+  scope?: string;
+  created_at?: string;
+  size_bytes: number;
+  ref_count: number;
+  in_use: boolean;
+  labels?: Record<string, string>;
+  mounts: VolumeMountRef[];
+  backup_ready: boolean;
+}
+
+export interface DiskUsageCategory {
+  count: number;
+  active_count: number;
+  total_bytes: number;
+  reclaimable_bytes: number;
+}
+
+export interface DiskUsageSummary {
+  docker_available: boolean;
+  collected_at: string;
+  project_volumes_bytes: number;
+  project_volumes_count: number;
+  containers: DiskUsageCategory;
+  images: DiskUsageCategory;
+  volumes: DiskUsageCategory;
+  build_cache: DiskUsageCategory;
+  total_bytes: number;
+  total_reclaimable_bytes: number;
+  warning?: string;
+}
+
+export interface ProjectVolumesResponse {
+  project_id: string;
+  project_name: string;
+  docker_available: boolean;
+  collected_at: string;
+  volumes: ProjectVolumeInfo[];
+  disk_usage: DiskUsageSummary;
+}
+
+export interface VolumeRestoreResult {
+  volume_name: string;
+  docker_name: string;
+  files_restored: number;
+  bytes_restored: number;
+  archive_bytes: number;
+  message: string;
 }
 
 

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,17 @@ import (
 
 	"github.com/forgelab/backend/internal/models"
 )
+
+type metricsCacheEntry struct {
+	snapshot  *ProjectRuntimeMetrics
+	expiresAt time.Time
+}
+
+type metricsInFlightCall struct {
+	done chan struct{}
+	res  *ProjectRuntimeMetrics
+	err  error
+}
 
 // ServiceRuntimeMetrics holds live container telemetry and health details for a single service.
 type ServiceRuntimeMetrics struct {
@@ -52,6 +65,8 @@ type ProjectRuntimeMetrics struct {
 	ProjectName          string                  `json:"project_name"`
 	Status               string                  `json:"status"`
 	CollectedAt          time.Time               `json:"collected_at"`
+	Cached               bool                    `json:"cached"`
+	CacheAgeSeconds      float64                 `json:"cache_age_seconds,omitempty"`
 	DockerAvailable      bool                    `json:"docker_available"`
 	TotalCPUPercent      float64                 `json:"total_cpu_percent"`
 	TotalMemoryUsedBytes uint64                  `json:"total_memory_used_bytes"`
@@ -60,9 +75,189 @@ type ProjectRuntimeMetrics struct {
 	Services             []ServiceRuntimeMetrics `json:"services"`
 }
 
-// GetProjectRuntimeMetrics collects live CPU, memory, network, PID, uptime, and Docker health metrics
-// for all services in the specified project.
+func cloneProjectRuntimeMetrics(src *ProjectRuntimeMetrics) *ProjectRuntimeMetrics {
+	if src == nil {
+		return nil
+	}
+	cp := *src
+	if src.Services != nil {
+		cp.Services = make([]ServiceRuntimeMetrics, len(src.Services))
+		for i, svc := range src.Services {
+			cp.Services[i] = svc
+			if svc.ContainerID != nil {
+				cid := *svc.ContainerID
+				cp.Services[i].ContainerID = &cid
+			}
+			if svc.StartedAt != nil {
+				st := *svc.StartedAt
+				cp.Services[i].StartedAt = &st
+			}
+		}
+	}
+	return &cp
+}
+
+// InvalidateProjectMetricsCache clears any cached runtime metrics snapshot for projectID.
+func (e *Engine) InvalidateProjectMetricsCache(projectID uuid.UUID) {
+	if e == nil || projectID == uuid.Nil {
+		return
+	}
+	e.metricsCacheMu.Lock()
+	if e.metricsCache != nil {
+		delete(e.metricsCache, projectID)
+	}
+	e.metricsCacheMu.Unlock()
+}
+
+// GetProjectRuntimeMetrics returns runtime CPU, memory, network, PID, uptime, and Docker health metrics
+// for all services in the project, using backend TTL caching and in-flight request deduplication.
 func (e *Engine) GetProjectRuntimeMetrics(ctx context.Context, projectID uuid.UUID) (*ProjectRuntimeMetrics, error) {
+	return e.GetProjectRuntimeMetricsWithOptions(ctx, projectID, false)
+}
+
+// GetProjectRuntimeMetricsWithOptions collects or serves cached runtime telemetry for projectID.
+// When forceRefresh is true, any cached snapshot is bypassed and refreshed from Docker.
+func (e *Engine) GetProjectRuntimeMetricsWithOptions(ctx context.Context, projectID uuid.UUID, forceRefresh bool) (*ProjectRuntimeMetrics, error) {
+	if e.projectService == nil {
+		return nil, fmt.Errorf("project service is not initialized")
+	}
+
+	now := time.Now().UTC()
+	e.metricsCacheMu.Lock()
+	if e.metricsCache == nil {
+		e.metricsCache = make(map[uuid.UUID]*metricsCacheEntry)
+	}
+	if e.metricsInFlight == nil {
+		e.metricsInFlight = make(map[uuid.UUID]*metricsInFlightCall)
+	}
+	ttl := e.metricsCacheTTL
+	if !forceRefresh && ttl > 0 {
+		if entry, ok := e.metricsCache[projectID]; ok && entry != nil && entry.snapshot != nil && now.Before(entry.expiresAt) {
+			cached := cloneProjectRuntimeMetrics(entry.snapshot)
+			cached.Cached = true
+			age := now.Sub(cached.CollectedAt).Seconds()
+			if age < 0 {
+				age = 0
+			}
+			cached.CacheAgeSeconds = round2Decimals(age)
+			e.metricsCacheMu.Unlock()
+			return cached, nil
+		}
+	}
+
+	if existingCall, busy := e.metricsInFlight[projectID]; busy {
+		e.metricsCacheMu.Unlock()
+		select {
+		case <-existingCall.done:
+			if existingCall.err != nil {
+				return nil, existingCall.err
+			}
+			shared := cloneProjectRuntimeMetrics(existingCall.res)
+			return shared, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	call := &metricsInFlightCall{done: make(chan struct{})}
+	e.metricsInFlight[projectID] = call
+	e.metricsCacheMu.Unlock()
+
+	collectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	res, err := e.collectProjectRuntimeMetricsFresh(collectCtx, projectID)
+	cancel()
+
+	e.metricsCacheMu.Lock()
+	delete(e.metricsInFlight, projectID)
+	if err == nil && res != nil && ttl > 0 {
+		e.metricsCache[projectID] = &metricsCacheEntry{
+			snapshot:  cloneProjectRuntimeMetrics(res),
+			expiresAt: time.Now().UTC().Add(ttl),
+		}
+	}
+	call.res = res
+	call.err = err
+	close(call.done)
+	e.metricsCacheMu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	return cloneProjectRuntimeMetrics(res), nil
+}
+
+// SampleActiveProjectsMetrics collects fresh metrics for active projects, updates the backend cache,
+// and persists historical samples via MetricsService.
+func (e *Engine) SampleActiveProjectsMetrics(ctx context.Context) error {
+	if e == nil || e.serviceService == nil || e.projectService == nil {
+		return nil
+	}
+	activeSvcs, err := e.serviceService.ListActiveServices(ctx)
+	if err != nil {
+		return err
+	}
+	projectSet := make(map[uuid.UUID]struct{})
+	for _, svc := range activeSvcs {
+		if svc != nil && svc.ProjectID != uuid.Nil {
+			projectSet[svc.ProjectID] = struct{}{}
+		}
+	}
+	if len(projectSet) == 0 {
+		return nil
+	}
+
+	projectIDs := make([]uuid.UUID, 0, len(projectSet))
+	for pid := range projectSet {
+		projectIDs = append(projectIDs, pid)
+	}
+	sort.Slice(projectIDs, func(i, j int) bool {
+		return projectIDs[i].String() < projectIDs[j].String()
+	})
+
+	for _, pid := range projectIDs {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		snapshot, snapErr := e.GetProjectRuntimeMetricsWithOptions(ctx, pid, true)
+		if snapErr != nil {
+			slog.Warn("metrics sampler failed to collect project metrics", "project_id", pid, "error", snapErr)
+			continue
+		}
+		if e.metricsService != nil && snapshot != nil && len(snapshot.Services) > 0 {
+			samples := make([]models.ServiceMetricsSample, 0, len(snapshot.Services))
+			for _, sm := range snapshot.Services {
+				var cid string
+				if sm.ContainerID != nil {
+					cid = *sm.ContainerID
+				}
+				samples = append(samples, models.ServiceMetricsSample{
+					ProjectID:        snapshot.ProjectID,
+					ServiceID:        sm.ServiceID,
+					ServiceName:      sm.ServiceName,
+					ContainerID:      cid,
+					Running:          sm.Running,
+					CPUPercent:       sm.CPUPercent,
+					MemoryUsedBytes:  sm.MemoryUsedBytes,
+					MemoryLimitBytes: sm.MemoryLimitBytes,
+					MemoryPercent:    sm.MemoryPercent,
+					NetworkRxBytes:   sm.NetworkRxBytes,
+					NetworkTxBytes:   sm.NetworkTxBytes,
+					PidsCurrent:      sm.PidsCurrent,
+					RestartCount:     sm.RestartCount,
+					OOMKilled:        sm.OOMKilled,
+					HealthStatus:     sm.HealthStatus,
+					SampledAt:        sm.CollectedAt,
+				})
+			}
+			if recErr := e.metricsService.RecordSamples(ctx, samples); recErr != nil {
+				slog.Warn("metrics sampler failed to record historical samples", "project_id", pid, "error", recErr)
+			}
+		}
+	}
+	return nil
+}
+
+func (e *Engine) collectProjectRuntimeMetricsFresh(ctx context.Context, projectID uuid.UUID) (*ProjectRuntimeMetrics, error) {
 	if e.projectService == nil {
 		return nil, fmt.Errorf("project service is not initialized")
 	}

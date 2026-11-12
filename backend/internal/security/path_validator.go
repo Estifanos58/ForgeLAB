@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"unicode"
@@ -34,21 +35,215 @@ func NewPathValidator(allowedRoots []string) *PathValidator {
 	return NewPathValidatorWithMapping(allowedRoots, "", "")
 }
 
+// NormalizeReadlinkTarget normalizes Windows object-manager prefixes (e.g. \??\C:\... or \??\UNC\...)
+// returned by NTFS junctions and reparse points into standard Win32 paths.
+func NormalizeReadlinkTarget(target string) string {
+	if strings.HasPrefix(target, `\??\`) {
+		trimmed := strings.TrimPrefix(target, `\??\`)
+		if len(trimmed) >= 2 && trimmed[1] == ':' {
+			return trimmed
+		}
+		if strings.HasPrefix(trimmed, `UNC\`) {
+			return `\\` + strings.TrimPrefix(trimmed, `UNC\`)
+		}
+	}
+	return target
+}
+
+func isUNCPath(raw string) bool {
+	return strings.HasPrefix(raw, `\\`) || strings.HasPrefix(raw, `//`)
+}
+
+func stepResolveFirstReparse(cleanAbs string) (next string, changed bool, missingAt string, err error) {
+	vol := filepath.VolumeName(cleanAbs)
+	rest := strings.TrimPrefix(cleanAbs, vol)
+	rest = strings.TrimLeft(rest, `/\`)
+
+	prefix := vol
+	if vol != "" && strings.HasPrefix(strings.TrimPrefix(cleanAbs, vol), string(os.PathSeparator)) {
+		prefix += string(os.PathSeparator)
+	} else if vol == "" && strings.HasPrefix(cleanAbs, string(os.PathSeparator)) {
+		prefix = string(os.PathSeparator)
+	}
+	if rest == "" {
+		return cleanAbs, false, "", nil
+	}
+
+	parts := strings.Split(rest, string(os.PathSeparator))
+	cur := prefix
+	for i, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		lfi, lErr := os.Lstat(cur)
+		if lErr != nil {
+			return "", false, cur, lErr
+		}
+		if lfi.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			target, rErr := os.Readlink(cur)
+			if rErr == nil {
+				target = NormalizeReadlinkTarget(strings.TrimSpace(target))
+				if target == "" {
+					return "", false, "", fmt.Errorf("empty reparse target for %s", cur)
+				}
+				if runtime.GOOS == "windows" && isUNCPath(target) {
+					return "", false, "", ErrRestrictedSystemPath
+				}
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(cur), target)
+				}
+				rem := make([]string, 0, 1+len(parts)-i-1)
+				rem = append(rem, filepath.Clean(target))
+				rem = append(rem, parts[i+1:]...)
+				return filepath.Clean(filepath.Join(rem...)), true, "", nil
+			}
+		}
+	}
+	return cleanAbs, false, "", nil
+}
+
+// CanonicalizeExistingPath resolves symlinks, Windows NTFS junctions/reparse points,
+// and Windows 8.3 short paths (e.g. RUNNER~1) for an existing filesystem path.
+func CanonicalizeExistingPath(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("path is empty")
+	}
+	if runtime.GOOS == "windows" && isUNCPath(trimmed) {
+		return "", ErrRestrictedSystemPath
+	}
+
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid path format: %w", err)
+	}
+	cur := filepath.Clean(abs)
+	if runtime.GOOS == "windows" && isUNCPath(cur) {
+		return "", ErrRestrictedSystemPath
+	}
+
+	const maxLinkHops = 40
+	for hop := 0; hop < maxLinkHops; hop++ {
+		next, changed, _, sErr := stepResolveFirstReparse(cur)
+		if sErr != nil {
+			return "", sErr
+		}
+		if changed {
+			cur = next
+			if runtime.GOOS == "windows" && isUNCPath(cur) {
+				return "", ErrRestrictedSystemPath
+			}
+			continue
+		}
+
+		eval, eErr := filepath.EvalSymlinks(cur)
+		if eErr != nil {
+			return "", eErr
+		}
+		cleanEval := filepath.Clean(eval)
+		if cleanEval == cur {
+			return cleanEval, nil
+		}
+		cur = cleanEval
+	}
+	return "", errors.New("too many levels of symbolic links or junctions")
+}
+
+// CanonicalizeWithAncestor canonicalizes an existing path or, when the leaf does not yet exist
+// (such as a broken symlink target or pre-creation directory), resolves symlinks, NTFS junctions,
+// and 8.3 short segments through the deepest existing ancestor after following any reparse hops.
+func CanonicalizeWithAncestor(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("path is empty")
+	}
+	if runtime.GOOS == "windows" && isUNCPath(trimmed) {
+		return "", ErrRestrictedSystemPath
+	}
+
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		return "", err
+	}
+	cur := filepath.Clean(abs)
+	if runtime.GOOS == "windows" && isUNCPath(cur) {
+		return "", ErrRestrictedSystemPath
+	}
+
+	const maxLinkHops = 40
+	for hop := 0; hop < maxLinkHops; hop++ {
+		next, changed, _, sErr := stepResolveFirstReparse(cur)
+		if sErr == nil {
+			if changed {
+				cur = next
+				if runtime.GOOS == "windows" && isUNCPath(cur) {
+					return "", ErrRestrictedSystemPath
+				}
+				continue
+			}
+			if eval, eErr := filepath.EvalSymlinks(cur); eErr == nil {
+				cleanEval := filepath.Clean(eval)
+				if cleanEval == cur {
+					return cleanEval, nil
+				}
+				cur = cleanEval
+				continue
+			}
+			return cur, nil
+		}
+		if errors.Is(sErr, ErrRestrictedSystemPath) {
+			return "", sErr
+		}
+		// Leaf or intermediate segment after any already-resolved reparse hops does not exist:
+		// walk up ancestors of the current rewritten path cur to canonicalize the existing prefix.
+		break
+	}
+
+	var suffix []string
+	walk := cur
+	for {
+		parent := filepath.Dir(walk)
+		if parent == walk {
+			break
+		}
+		suffix = append(suffix, filepath.Base(walk))
+		walk = parent
+		if realCur, cErr := CanonicalizeExistingPath(walk); cErr == nil {
+			parts := make([]string, 0, 1+len(suffix))
+			parts = append(parts, realCur)
+			for i := len(suffix) - 1; i >= 0; i-- {
+				parts = append(parts, suffix[i])
+			}
+			return filepath.Clean(filepath.Join(parts...)), nil
+		}
+	}
+	return cur, nil
+}
+
+// IsWithinRoot checks whether canonical target resides at or inside canonical root using path component boundaries.
+func IsWithinRoot(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func isWithinRoot(root, target string) bool {
+	return IsWithinRoot(root, target)
+}
+
+func hasParentTraversal(cleanRel string) bool {
+	return cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) || filepath.IsAbs(cleanRel)
+}
+
 // NewPathValidatorWithMapping creates a PathValidator with allowed roots and optional host-to-container path translation.
 func NewPathValidatorWithMapping(allowedRoots []string, hostSourceRoot, containerSourceRoot string) *PathValidator {
 	var cleanRoots []string
 	for _, root := range allowedRoots {
-		if strings.TrimSpace(root) == "" {
-			continue
-		}
-		abs, err := filepath.Abs(strings.TrimSpace(root))
-		if err == nil {
-			eval, err := filepath.EvalSymlinks(abs)
-			if err == nil {
-				cleanRoots = append(cleanRoots, filepath.Clean(eval))
-			} else {
-				cleanRoots = append(cleanRoots, filepath.Clean(abs))
-			}
+		if canon, err := CanonicalizeWithAncestor(root); err == nil {
+			cleanRoots = append(cleanRoots, canon)
 		}
 	}
 
@@ -56,9 +251,8 @@ func NewPathValidatorWithMapping(allowedRoots []string, hostSourceRoot, containe
 	cleanContainer := strings.TrimSpace(containerSourceRoot)
 
 	if cleanContainer != "" {
-		absContainer, err := filepath.Abs(cleanContainer)
-		if err == nil {
-			cleanContainer = filepath.Clean(absContainer)
+		if canonContainer, err := CanonicalizeWithAncestor(cleanContainer); err == nil {
+			cleanContainer = canonContainer
 		}
 	}
 
@@ -115,7 +309,7 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 		if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
 			rel := normCandidate[len(prefixWithSep):]
 			cleanRel := filepath.Clean(filepath.FromSlash(rel))
-			if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+			if hasParentTraversal(cleanRel) {
 				return "", ErrPathNotAllowed
 			}
 			return filepath.Join(containerRoot, cleanRel), nil
@@ -137,7 +331,7 @@ func (v *PathValidator) TranslateHostToContainer(candidatePath string) (string, 
 		if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
 			rel := normCandidate[len(prefixWithSep):]
 			cleanRel := filepath.Clean(filepath.FromSlash(rel))
-			if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+			if hasParentTraversal(cleanRel) {
 				return "", ErrPathNotAllowed
 			}
 			return filepath.Join(containerRoot, cleanRel), nil
@@ -249,7 +443,7 @@ func (v *PathValidator) TranslateContainerToHost(candidatePath string) (string, 
 	if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
 		rel := normCandidate[len(prefixWithSep):]
 		cleanRel := filepath.Clean(filepath.FromSlash(rel))
-		if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+		if hasParentTraversal(cleanRel) {
 			return "", ErrPathNotAllowed
 		}
 		// Join with hostRoot preserving host format
@@ -299,7 +493,7 @@ func (v *PathValidator) TranslateContainerToDaemon(candidatePath string) (string
 	if strings.HasPrefix(strings.ToLower(normCandidate), strings.ToLower(prefixWithSep)) {
 		rel := normCandidate[len(prefixWithSep):]
 		cleanRel := filepath.Clean(filepath.FromSlash(rel))
-		if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+		if hasParentTraversal(cleanRel) {
 			return "", ErrPathNotAllowed
 		}
 		// Join with daemonRoot preserving host format
@@ -341,6 +535,9 @@ func (v *PathValidator) ValidateSourcePath(candidatePath string) (string, error)
 	if strings.TrimSpace(candidatePath) == "" {
 		return "", ErrPathNotExist
 	}
+	if runtime.GOOS == "windows" && isUNCPath(strings.TrimSpace(candidatePath)) {
+		return "", ErrRestrictedSystemPath
+	}
 
 	// 1. Translate host path to container path if configured
 	resolvedPath, err := v.TranslateHostToContainer(candidatePath)
@@ -348,24 +545,19 @@ func (v *PathValidator) ValidateSourcePath(candidatePath string) (string, error)
 		return "", err
 	}
 
-	// 2. Convert to absolute path
-	absPath, err := filepath.Abs(resolvedPath)
-	if err != nil {
-		return "", fmt.Errorf("invalid path format: %w", err)
-	}
-
-	// 3. Canonicalize by evaluating symlinks
-	canonicalPath, err := filepath.EvalSymlinks(absPath)
+	// 2. Canonicalize by evaluating symlinks, NTFS junctions/reparse points, and 8.3 short paths
+	canonicalPath, err := CanonicalizeExistingPath(resolvedPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", ErrPathNotExist
 		}
+		if errors.Is(err, ErrRestrictedSystemPath) {
+			return "", ErrRestrictedSystemPath
+		}
 		return "", fmt.Errorf("failed to evaluate symlinks: %w", err)
 	}
 
-	canonicalPath = filepath.Clean(canonicalPath)
-
-	// 4. Verify existence and directory stat
+	// 3. Verify existence and directory stat
 	info, err := os.Stat(canonicalPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -377,11 +569,19 @@ func (v *PathValidator) ValidateSourcePath(candidatePath string) (string, error)
 		return "", ErrPathNotDirectory
 	}
 
-	// 5. Block dangerous system directories
+	// 4. Block dangerous system directories and drive roots
+	if runtime.GOOS == "windows" {
+		lower := strings.ToLower(canonicalPath)
+		if isUNCPath(canonicalPath) || (len(lower) <= 3 && strings.HasSuffix(lower, `:\`)) {
+			return "", ErrRestrictedSystemPath
+		}
+	} else if canonicalPath == "/" {
+		return "", ErrRestrictedSystemPath
+	}
 	systemDirs := []string{
 		"/etc", "/var", "/usr", "/sys", "/proc", "/dev", "/boot", "/bin", "/sbin", "/root",
 		`C:\Windows`, `C:\Program Files`, `C:\Program Files (x86)`, `C:\System Volume Information`,
-		`C:\Recovery`,
+		`C:\Recovery`, `C:\$Recycle.Bin`,
 	}
 	for _, sysDir := range systemDirs {
 		cleanSysDir := filepath.Clean(sysDir)
@@ -390,20 +590,18 @@ func (v *PathValidator) ValidateSourcePath(candidatePath string) (string, error)
 		}
 	}
 
-	// 6. Check containerSourceRoot boundary if mapping is enabled
+	// 5. Check containerSourceRoot boundary if mapping is enabled
 	if v.containerSourceRoot != "" {
-		relContainer, err := filepath.Rel(v.containerSourceRoot, canonicalPath)
-		if err != nil || strings.HasPrefix(relContainer, "..") || relContainer == ".." {
+		if !isWithinRoot(v.containerSourceRoot, canonicalPath) {
 			return "", fmt.Errorf("%w: source path escapes container source root boundary %s", ErrPathNotAllowed, v.containerSourceRoot)
 		}
 	}
 
-	// 7. If allowedRoots are specified, check boundary
+	// 6. If allowedRoots are specified, check boundary
 	if len(v.allowedRoots) > 0 {
 		allowed := false
 		for _, root := range v.allowedRoots {
-			rel, err := filepath.Rel(root, canonicalPath)
-			if err == nil && !strings.HasPrefix(rel, "..") && rel != ".." {
+			if isWithinRoot(root, canonicalPath) {
 				allowed = true
 				break
 			}
@@ -429,20 +627,13 @@ func (v *PathValidator) ValidateBuildContextAndDockerfile(sourcePath, buildConte
 
 	// Resolve build context relative to canonicalSource
 	targetCtx := filepath.Join(canonicalSource, buildContext)
-	absCtx, err := filepath.Abs(targetCtx)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid build context path: %w", err)
-	}
-
-	canonicalCtx, err := filepath.EvalSymlinks(absCtx)
+	canonicalCtx, err := CanonicalizeExistingPath(targetCtx)
 	if err != nil {
 		return "", "", fmt.Errorf("build context does not exist: %w", err)
 	}
-	canonicalCtx = filepath.Clean(canonicalCtx)
 
 	// Ensure build context is within sourcePath
-	relCtx, err := filepath.Rel(canonicalSource, canonicalCtx)
-	if err != nil || strings.HasPrefix(relCtx, "..") {
+	if !isWithinRoot(canonicalSource, canonicalCtx) {
 		return "", "", errors.New("build context escapes repository path boundary")
 	}
 
@@ -452,23 +643,16 @@ func (v *PathValidator) ValidateBuildContextAndDockerfile(sourcePath, buildConte
 
 	// Resolve Dockerfile relative to canonicalCtx
 	targetDockerfile := filepath.Join(canonicalCtx, dockerfilePath)
-	absDockerfile, err := filepath.Abs(targetDockerfile)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid dockerfile path: %w", err)
-	}
-
-	canonicalDockerfile, err := filepath.EvalSymlinks(absDockerfile)
+	canonicalDockerfile, err := CanonicalizeExistingPath(targetDockerfile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", "", ErrDockerfileNotFound
 		}
 		return "", "", fmt.Errorf("dockerfile path error: %w", err)
 	}
-	canonicalDockerfile = filepath.Clean(canonicalDockerfile)
 
 	// Ensure Dockerfile is within canonicalCtx
-	relDocker, err := filepath.Rel(canonicalCtx, canonicalDockerfile)
-	if err != nil || strings.HasPrefix(relDocker, "..") {
+	if !isWithinRoot(canonicalCtx, canonicalDockerfile) {
 		return "", "", errors.New("dockerfile escapes build context boundary")
 	}
 
@@ -491,15 +675,10 @@ func (v *PathValidator) ValidateServiceBuildPaths(
 	isAutoBuild bool,
 ) (resolvedContextDir string, relDockerPath string, err error) {
 	// 1. Validate canonicalSourceRoot
-	cleanRoot, err := filepath.Abs(canonicalSourceRoot)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid source root path: %w", err)
-	}
-	cleanRoot, err = filepath.EvalSymlinks(cleanRoot)
+	cleanRoot, err := CanonicalizeExistingPath(canonicalSourceRoot)
 	if err != nil {
 		return "", "", fmt.Errorf("source root does not exist: %w", err)
 	}
-	cleanRoot = filepath.Clean(cleanRoot)
 
 	// 2. Validate serviceSourcePath within cleanRoot
 	cleanSourcePath := strings.TrimSpace(serviceSourcePath)
@@ -509,31 +688,28 @@ func (v *PathValidator) ValidateServiceBuildPaths(
 
 	// Reject absolute paths that attempt to reference outside cleanRoot
 	if filepath.IsAbs(cleanSourcePath) {
-		absSource, err := filepath.EvalSymlinks(filepath.Clean(cleanSourcePath))
+		absSource, err := CanonicalizeExistingPath(filepath.Clean(cleanSourcePath))
 		if err != nil {
 			return "", "", fmt.Errorf("service source path does not exist: %w", err)
 		}
+		if !isWithinRoot(cleanRoot, absSource) {
+			return "", "", errors.New("service source path is an absolute path outside repository boundary")
+		}
 		rel, err := filepath.Rel(cleanRoot, absSource)
-		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+		if err != nil {
 			return "", "", errors.New("service source path is an absolute path outside repository boundary")
 		}
 		cleanSourcePath = rel
 	}
 
 	targetServiceDir := filepath.Join(cleanRoot, cleanSourcePath)
-	absServiceDir, err := filepath.Abs(targetServiceDir)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid service source directory: %w", err)
-	}
-	canonicalServiceDir, err := filepath.EvalSymlinks(absServiceDir)
+	canonicalServiceDir, err := CanonicalizeExistingPath(targetServiceDir)
 	if err != nil {
 		return "", "", fmt.Errorf("service source path does not exist: %w", err)
 	}
-	canonicalServiceDir = filepath.Clean(canonicalServiceDir)
 
 	// Ensure canonicalServiceDir is within cleanRoot
-	relService, err := filepath.Rel(cleanRoot, canonicalServiceDir)
-	if err != nil || strings.HasPrefix(relService, "..") {
+	if !isWithinRoot(cleanRoot, canonicalServiceDir) {
 		return "", "", errors.New("service source path escapes repository boundary")
 	}
 
@@ -545,18 +721,17 @@ func (v *PathValidator) ValidateServiceBuildPaths(
 
 	var targetContextDir string
 	if filepath.IsAbs(cleanBuildContext) {
-		absCtx, err := filepath.EvalSymlinks(filepath.Clean(cleanBuildContext))
+		absCtx, err := CanonicalizeExistingPath(filepath.Clean(cleanBuildContext))
 		if err != nil {
 			return "", "", fmt.Errorf("build context path does not exist: %w", err)
 		}
-		rel, err := filepath.Rel(cleanRoot, absCtx)
-		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+		if !isWithinRoot(cleanRoot, absCtx) {
 			return "", "", errors.New("build context is an absolute path outside repository boundary")
 		}
 		targetContextDir = absCtx
 	} else {
 		cleanRel := filepath.Clean(filepath.FromSlash(cleanBuildContext))
-		if strings.HasPrefix(cleanRel, "..") {
+		if hasParentTraversal(cleanRel) {
 			return "", "", errors.New("build context escapes repository boundary")
 		}
 
@@ -576,19 +751,13 @@ func (v *PathValidator) ValidateServiceBuildPaths(
 		}
 	}
 
-	absContextDir, err := filepath.Abs(targetContextDir)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid build context path: %w", err)
-	}
-	canonicalContextDir, err := filepath.EvalSymlinks(absContextDir)
+	canonicalContextDir, err := CanonicalizeExistingPath(targetContextDir)
 	if err != nil {
 		return "", "", fmt.Errorf("build context directory does not exist: %w", err)
 	}
-	canonicalContextDir = filepath.Clean(canonicalContextDir)
 
 	// Ensure canonicalContextDir does not escape cleanRoot
-	relContext, err := filepath.Rel(cleanRoot, canonicalContextDir)
-	if err != nil || strings.HasPrefix(relContext, "..") {
+	if !isWithinRoot(cleanRoot, canonicalContextDir) {
 		return "", "", errors.New("build context escapes repository boundary")
 	}
 
@@ -603,34 +772,35 @@ func (v *PathValidator) ValidateServiceBuildPaths(
 	}
 
 	if filepath.IsAbs(cleanDockerfilePath) {
-		absDF, err := filepath.EvalSymlinks(filepath.Clean(cleanDockerfilePath))
+		absDF, err := CanonicalizeExistingPath(filepath.Clean(cleanDockerfilePath))
 		if err != nil {
 			return "", "", ErrDockerfileNotFound
 		}
+		if !isWithinRoot(canonicalContextDir, absDF) {
+			return "", "", errors.New("dockerfile escapes build context boundary")
+		}
 		rel, err := filepath.Rel(canonicalContextDir, absDF)
-		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+		if err != nil {
 			return "", "", errors.New("dockerfile escapes build context boundary")
 		}
 		cleanDockerfilePath = filepath.ToSlash(rel)
 	}
 
 	targetDF := filepath.Join(canonicalContextDir, cleanDockerfilePath)
-	absDF, err := filepath.Abs(targetDF)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid dockerfile path: %w", err)
-	}
-	canonicalDF, err := filepath.EvalSymlinks(absDF)
+	canonicalDF, err := CanonicalizeExistingPath(targetDF)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", "", ErrDockerfileNotFound
 		}
 		return "", "", fmt.Errorf("dockerfile path error: %w", err)
 	}
-	canonicalDF = filepath.Clean(canonicalDF)
 
 	// Ensure canonicalDF is inside canonicalContextDir
+	if !isWithinRoot(canonicalContextDir, canonicalDF) {
+		return "", "", errors.New("dockerfile escapes build context boundary")
+	}
 	relDF, err := filepath.Rel(canonicalContextDir, canonicalDF)
-	if err != nil || strings.HasPrefix(relDF, "..") {
+	if err != nil {
 		return "", "", errors.New("dockerfile escapes build context boundary")
 	}
 

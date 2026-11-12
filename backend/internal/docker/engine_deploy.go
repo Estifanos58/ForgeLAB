@@ -53,6 +53,7 @@ func (e *Engine) ExecuteDeployment(ctx context.Context, deploymentID uuid.UUID) 
 
 	e.registerActiveExec(deploymentID, project.ID, execCancel)
 	defer e.unregisterActiveExec(deploymentID)
+	defer e.InvalidateProjectMetricsCache(project.ID)
 
 	if project.Status == models.ProjectStatusDeleting {
 		return errors.New("deployment aborted: project deletion is in progress")

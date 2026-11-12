@@ -32,6 +32,7 @@ var (
 	ErrHostNetworkingRejected          = errors.New("security violation: host networking mode for deployed containers is forbidden")
 	ErrContainerNetworkSharingRejected = errors.New("security violation: container network namespace sharing is forbidden")
 	ErrHostMountNotAllowed             = errors.New("security violation: host mount path is not within the approved ForgeLAB mount allowlist")
+	ErrCapabilityNotAllowed            = errors.New("security violation: requested Linux capability is not in the approved ForgeLAB security allowlist")
 	ErrCpuOutOfRange                   = fmt.Errorf("cpu_millicores must be between %d and %d (0.1 to 16 cores)", MinCpuMillicores, MaxCpuMillicores)
 	ErrMemoryOutOfRange                = fmt.Errorf("memory_mb must be between %d and %d (64MB to 32GB)", MinMemoryMB, MaxMemoryMB)
 	ErrPidsOutOfRange                  = fmt.Errorf("pids_limit must be between %d and %d", MinPidsLimit, MaxPidsLimit)
@@ -51,6 +52,20 @@ var restrictedHostMounts = []string{
 	"/etc",
 	"/root",
 	"\\\\.\\pipe\\docker_engine", // Windows named pipe
+}
+
+// Strict security allowlist of Linux capabilities permitted inside tenant containers.
+// Only minimal privilege-dropping capabilities needed by entrypoint switch tools (gosu, su-exec, setpriv)
+// are permitted; all other capabilities (e.g. ALL, SYS_ADMIN, DAC_OVERRIDE, NET_ADMIN, FOWNER) are rejected.
+var allowedContainerCapabilities = map[string]bool{
+	"CHOWN":  true,
+	"SETGID": true,
+	"SETUID": true,
+}
+
+func normalizeCapabilityName(raw string) string {
+	upper := strings.ToUpper(strings.TrimSpace(raw))
+	return strings.TrimPrefix(upper, "CAP_")
 }
 
 // ContainerSecurityOptions parameters for creating a strictly sandboxed container.
@@ -216,27 +231,24 @@ func ValidateAndBuildSecureHostConfig(opts ContainerSecurityOptions) (*container
 	pidsLimit := int64(pidsLimitVal)
 
 	// 4. Construct secure HostConfig with defense-in-depth isolation
-	// Standard safe capabilities required by unprivileged container switch tools (e.g. gosu, su-exec, setpriv)
-	// to drop privileges safely without granting arbitrary filesystem bypass capabilities like DAC_OVERRIDE or FOWNER.
+	// Enforce strict capability allowlist: start from safe privilege-drop defaults and reject
+	// any requested capability not explicitly present in allowedContainerCapabilities.
 	safeCaps := []string{"CHOWN", "SETGID", "SETUID"}
 	if len(opts.CapAdd) > 0 {
-		dangerousCaps := map[string]bool{
-			"SYS_ADMIN": true, "NET_ADMIN": true, "SYS_PTRACE": true,
-			"SYS_RAWIO": true, "SYS_MODULE": true, "DAC_READ_SEARCH": true,
-		}
 		for _, c := range opts.CapAdd {
-			upper := strings.ToUpper(strings.TrimSpace(c))
-			if upper != "" && !dangerousCaps[upper] {
-				found := false
-				for _, sc := range safeCaps {
-					if sc == upper {
-						found = true
-						break
-					}
+			normalized := normalizeCapabilityName(c)
+			if normalized == "" || !allowedContainerCapabilities[normalized] {
+				return nil, fmt.Errorf("%w: %q", ErrCapabilityNotAllowed, strings.TrimSpace(c))
+			}
+			found := false
+			for _, sc := range safeCaps {
+				if sc == normalized {
+					found = true
+					break
 				}
-				if !found {
-					safeCaps = append(safeCaps, upper)
-				}
+			}
+			if !found {
+				safeCaps = append(safeCaps, normalized)
 			}
 		}
 	}

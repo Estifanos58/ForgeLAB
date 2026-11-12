@@ -44,50 +44,65 @@ type ReconciliationState struct {
 }
 
 type Engine struct {
-	clientMu              sync.Mutex // synchronizes streaming transport wrapping and client updates
-	dockerClient          *client.Client
-	projectService        *services.ProjectService
-	deploymentService     *services.DeploymentService
-	secretService         *services.SecretService
-	sourceService         *services.SourceService
-	githubService         *services.GitHubService
-	serviceService        *services.ServiceService
-	portManager           *network.PortManager
-	pathValidator         *security.PathValidator
-	wsHub                 *ws.Hub
-	workDir               string
-	localBuildMode        string
-	maxConcurrentBuilds   int
-	buildSem              *BuildSemaphore
-	semMu                 sync.Mutex
-	buildMaintenanceMu    sync.RWMutex          // synchronizes Docker image builds vs image pruning/maintenance
-	pruneFilterLabel      string                // optional label filter for scoped image pruning
-	activeLogCollectors   sync.Map              // map[string]context.CancelFunc — tracks running log collector goroutines
-	collectorRegistry     *LogCollectorRegistry // race-safe registry and operational diagnostics for runtime log collectors
-	activeCancels         sync.Map              // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
-	activeExecMu          sync.Mutex            // protects activeExecs map
-	activeExecs           map[uuid.UUID]*activeExecEntry
-	activeContainers      sync.Map                // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
-	sharedBuildArtifacts  sync.Map                // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
-	sharedCoordMu         sync.Mutex              // protects initialization and mutation of sharedCoordinator
-	sharedCoordinator     *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
-	cachedBuilderVer      atomic.Value            // stores build.BuilderVersion advertised by Docker daemon
-	streamingHookSet      atomic.Bool             // true when dockerClient is already configured with BuildStreamRequestHook
-	streamingCli          *client.Client          // cached streaming-hook Docker client built by ensureStreamingTransport
-	startTime             time.Time               // instance boot timestamp for tracking interrupted deployments
-	publicHost            string                  // host name or IP used for browser-facing URLs
-	appHostIP             string                  // host IP binding for application ports (defaults to 127.0.0.1)
-	reconcileMu           sync.RWMutex
-	reconcileState        ReconciliationState
-	queueEnqueuer         RollbackJobEnqueuer
-	healthStrikeMu        sync.Mutex
-	healthStrikes         map[uuid.UUID]int
-	lastAutoRollbackAt    map[uuid.UUID]time.Time
-	autoRollbackEnabled   bool
-	autoRollbackThreshold int
-	autoRollbackCooldown  time.Duration
-	trafficRouter         *proxy.TrafficRouter
-	onRouteChange         func(context.Context)
+	clientMu                 sync.Mutex // synchronizes streaming transport wrapping and client updates
+	dockerClient             *client.Client
+	projectService           *services.ProjectService
+	deploymentService        *services.DeploymentService
+	secretService            *services.SecretService
+	sourceService            *services.SourceService
+	githubService            *services.GitHubService
+	serviceService           *services.ServiceService
+	portManager              *network.PortManager
+	pathValidator            *security.PathValidator
+	wsHub                    *ws.Hub
+	workDir                  string
+	localBuildMode           string
+	maxConcurrentBuilds      int
+	buildSem                 *BuildSemaphore
+	semMu                    sync.Mutex
+	buildMaintenanceMu       sync.RWMutex          // synchronizes Docker image builds vs image pruning/maintenance
+	pruneFilterLabel         string                // optional label filter for scoped image pruning
+	activeLogCollectors      sync.Map              // map[string]context.CancelFunc — tracks running log collector goroutines
+	collectorRegistry        *LogCollectorRegistry // race-safe registry and operational diagnostics for runtime log collectors
+	activeCancels            sync.Map              // map[uuid.UUID]context.CancelFunc — tracks active deployment execution cancel funcs
+	activeExecMu             sync.Mutex            // protects activeExecs map
+	activeExecs              map[uuid.UUID]*activeExecEntry
+	activeContainers         sync.Map                // map[string]time.Time — containerID -> creation timestamp, tracks in-flight containers during deployment
+	sharedBuildArtifacts     sync.Map                // map[string]*sharedBuildPromise — deduplicates and coordinates builds for identical context+dockerfile
+	sharedCoordMu            sync.Mutex              // protects initialization and mutation of sharedCoordinator
+	sharedCoordinator        *SharedBuildCoordinator // Coordinates shared builds across services with completion guarantees
+	cachedBuilderVer         atomic.Value            // stores build.BuilderVersion advertised by Docker daemon
+	streamingHookSet         atomic.Bool             // true when dockerClient is already configured with BuildStreamRequestHook
+	streamingCli             *client.Client          // cached streaming-hook Docker client built by ensureStreamingTransport
+	startTime                time.Time               // instance boot timestamp for tracking interrupted deployments
+	publicHost               string                  // host name or IP used for browser-facing URLs
+	appHostIP                string                  // host IP binding for application ports (defaults to 127.0.0.1)
+	reconcileMu              sync.RWMutex
+	reconcileState           ReconciliationState
+	queueEnqueuer            RollbackJobEnqueuer
+	healthStrikeMu           sync.Mutex
+	healthStrikes            map[uuid.UUID]int
+	lastAutoRollbackAt       map[uuid.UUID]time.Time
+	crashEvents              map[uuid.UUID][]time.Time
+	selfHealRestarts         map[uuid.UUID]int
+	lastObservedRestartCount map[uuid.UUID]int
+	autoRollbackEnabled      bool
+	autoRollbackThreshold    int
+	autoRollbackCooldown     time.Duration
+	selfHealEnabled          bool
+	selfHealMaxRestarts      int
+	crashLoopThreshold       int
+	crashLoopWindow          time.Duration
+	runtimeHealthMu          sync.Mutex
+	trafficRouter            *proxy.TrafficRouter
+	onRouteChange            func(context.Context)
+	volumeHelperImage        string
+	metricsService           *services.MetricsService
+	auditService             *services.AuditService
+	metricsCacheTTL          time.Duration
+	metricsCacheMu           sync.Mutex
+	metricsCache             map[uuid.UUID]*metricsCacheEntry
+	metricsInFlight          map[uuid.UUID]*metricsInFlightCall
 }
 
 func (e *Engine) trackActiveContainer(id string) {
@@ -144,29 +159,39 @@ func NewEngine(
 	_ = os.MkdirAll(workDir, 0755)
 
 	return &Engine{
-		dockerClient:          dockerClient,
-		projectService:        projectService,
-		deploymentService:     deploymentService,
-		secretService:         secretService,
-		sourceService:         sourceService,
-		githubService:         githubService,
-		serviceService:        services.NewServiceService(nil),
-		portManager:           portManager,
-		pathValidator:         pathValidator,
-		wsHub:                 wsHub,
-		workDir:               workDir,
-		localBuildMode:        "snapshot",
-		maxConcurrentBuilds:   DefaultMaxConcurrentBuilds(),
-		buildSem:              NewBuildSemaphore(DefaultMaxConcurrentBuilds()),
-		sharedCoordinator:     NewSharedBuildCoordinator(),
-		activeExecs:           make(map[uuid.UUID]*activeExecEntry),
-		collectorRegistry:     NewLogCollectorRegistry(),
-		startTime:             time.Now(),
-		healthStrikes:         make(map[uuid.UUID]int),
-		lastAutoRollbackAt:    make(map[uuid.UUID]time.Time),
-		autoRollbackEnabled:   true,
-		autoRollbackThreshold: 3,
-		autoRollbackCooldown:  5 * time.Minute,
+		dockerClient:             dockerClient,
+		projectService:           projectService,
+		deploymentService:        deploymentService,
+		secretService:            secretService,
+		sourceService:            sourceService,
+		githubService:            githubService,
+		serviceService:           services.NewServiceService(nil),
+		portManager:              portManager,
+		pathValidator:            pathValidator,
+		wsHub:                    wsHub,
+		workDir:                  workDir,
+		localBuildMode:           "snapshot",
+		maxConcurrentBuilds:      DefaultMaxConcurrentBuilds(),
+		buildSem:                 NewBuildSemaphore(DefaultMaxConcurrentBuilds()),
+		sharedCoordinator:        NewSharedBuildCoordinator(),
+		activeExecs:              make(map[uuid.UUID]*activeExecEntry),
+		collectorRegistry:        NewLogCollectorRegistry(),
+		startTime:                time.Now(),
+		healthStrikes:            make(map[uuid.UUID]int),
+		lastAutoRollbackAt:       make(map[uuid.UUID]time.Time),
+		crashEvents:              make(map[uuid.UUID][]time.Time),
+		selfHealRestarts:         make(map[uuid.UUID]int),
+		lastObservedRestartCount: make(map[uuid.UUID]int),
+		autoRollbackEnabled:      true,
+		autoRollbackThreshold:    3,
+		autoRollbackCooldown:     5 * time.Minute,
+		selfHealEnabled:          true,
+		selfHealMaxRestarts:      3,
+		crashLoopThreshold:       3,
+		crashLoopWindow:          10 * time.Minute,
+		metricsCacheTTL:          10 * time.Second,
+		metricsCache:             make(map[uuid.UUID]*metricsCacheEntry),
+		metricsInFlight:          make(map[uuid.UUID]*metricsInFlightCall),
 		reconcileState: ReconciliationState{
 			Status:        "pending",
 			Authoritative: false,
@@ -189,7 +214,32 @@ func (e *Engine) GetTrafficRouter() *proxy.TrafficRouter {
 	return e.trafficRouter
 }
 
-// SetAutoRollbackConfig configures automatic rollback behavior on sustained unhealthy runtime checks.
+// SetVolumeHelperImage overrides the helper image used for Docker volume backup/restore tasks.
+func (e *Engine) SetVolumeHelperImage(img string) {
+	e.volumeHelperImage = strings.TrimSpace(img)
+}
+
+// SetMetricsService configures historical runtime metrics sample persistence.
+func (e *Engine) SetMetricsService(ms *services.MetricsService) {
+	e.metricsService = ms
+}
+
+// SetAuditService configures operational audit logging for automated runtime events (e.g. self-heal/auto-rollback).
+func (e *Engine) SetAuditService(as *services.AuditService) {
+	e.auditService = as
+}
+
+// SetMetricsCacheTTL sets the backend cache duration for live project runtime metrics queries (0 disables caching).
+func (e *Engine) SetMetricsCacheTTL(ttl time.Duration) {
+	e.metricsCacheMu.Lock()
+	defer e.metricsCacheMu.Unlock()
+	if ttl < 0 {
+		ttl = 0
+	}
+	e.metricsCacheTTL = ttl
+}
+
+// SetAutoRollbackConfig configures automatic rollback behavior on sustained unhealthy runtime checks or crash loops.
 func (e *Engine) SetAutoRollbackConfig(enabled bool, threshold int, cooldown time.Duration) {
 	e.healthStrikeMu.Lock()
 	defer e.healthStrikeMu.Unlock()
@@ -204,6 +254,32 @@ func (e *Engine) SetAutoRollbackConfig(enabled bool, threshold int, cooldown tim
 	}
 }
 
+// SetSelfHealConfig configures bounded automatic container restarts when a service crashes unexpectedly.
+func (e *Engine) SetSelfHealConfig(enabled bool, maxRestarts int) {
+	e.healthStrikeMu.Lock()
+	defer e.healthStrikeMu.Unlock()
+	e.selfHealEnabled = enabled
+	if maxRestarts >= 0 {
+		e.selfHealMaxRestarts = maxRestarts
+	}
+}
+
+// SetCrashLoopConfig configures the crash count and sliding window used for crash-loop detection.
+func (e *Engine) SetCrashLoopConfig(threshold int, window time.Duration) {
+	e.healthStrikeMu.Lock()
+	defer e.healthStrikeMu.Unlock()
+	if threshold > 0 {
+		e.crashLoopThreshold = threshold
+	} else if e.crashLoopThreshold <= 0 {
+		e.crashLoopThreshold = 3
+	}
+	if window > 0 {
+		e.crashLoopWindow = window
+	} else if e.crashLoopWindow <= 0 {
+		e.crashLoopWindow = 10 * time.Minute
+	}
+}
+
 // GetHealthStrikeCount returns the current consecutive unhealthy check count for a service.
 func (e *Engine) GetHealthStrikeCount(serviceID uuid.UUID) int {
 	e.healthStrikeMu.Lock()
@@ -214,11 +290,65 @@ func (e *Engine) GetHealthStrikeCount(serviceID uuid.UUID) int {
 	return e.healthStrikes[serviceID]
 }
 
+// GetSelfHealRestartCount returns the number of self-heal restarts attempted since the last manual start or deploy.
+func (e *Engine) GetSelfHealRestartCount(serviceID uuid.UUID) int {
+	e.healthStrikeMu.Lock()
+	defer e.healthStrikeMu.Unlock()
+	if e.selfHealRestarts == nil {
+		return 0
+	}
+	return e.selfHealRestarts[serviceID]
+}
+
+// GetCrashLoopCount returns the number of recorded crashes for a service within the configured crash-loop window.
+func (e *Engine) GetCrashLoopCount(serviceID uuid.UUID) int {
+	e.healthStrikeMu.Lock()
+	defer e.healthStrikeMu.Unlock()
+	if e.crashEvents == nil {
+		return 0
+	}
+	window := e.crashLoopWindow
+	if window <= 0 {
+		window = 10 * time.Minute
+	}
+	cutoff := time.Now().Add(-window)
+	events := e.crashEvents[serviceID]
+	valid := events[:0]
+	for _, ts := range events {
+		if ts.After(cutoff) || ts.Equal(cutoff) {
+			valid = append(valid, ts)
+		}
+	}
+	if len(valid) == 0 {
+		delete(e.crashEvents, serviceID)
+		return 0
+	}
+	e.crashEvents[serviceID] = valid
+	return len(valid)
+}
+
 func (e *Engine) resetHealthStrike(serviceID uuid.UUID) {
 	e.healthStrikeMu.Lock()
 	defer e.healthStrikeMu.Unlock()
 	if e.healthStrikes != nil {
 		delete(e.healthStrikes, serviceID)
+	}
+}
+
+func (e *Engine) resetServiceHealthState(serviceID uuid.UUID) {
+	e.healthStrikeMu.Lock()
+	defer e.healthStrikeMu.Unlock()
+	if e.healthStrikes != nil {
+		delete(e.healthStrikes, serviceID)
+	}
+	if e.crashEvents != nil {
+		delete(e.crashEvents, serviceID)
+	}
+	if e.selfHealRestarts != nil {
+		delete(e.selfHealRestarts, serviceID)
+	}
+	if e.lastObservedRestartCount != nil {
+		delete(e.lastObservedRestartCount, serviceID)
 	}
 }
 

@@ -127,12 +127,16 @@ func TestPathValidatorHostToContainerMapping(t *testing.T) {
 	)
 
 	// Valid host path mapped into container
+	expectedAppDir, evalErr := filepath.EvalSymlinks(appDir)
+	if evalErr != nil {
+		expectedAppDir = filepath.Clean(appDir)
+	}
 	canonical, err := validator.ValidateSourcePath(`C:\Projects\my-app`)
 	if err != nil {
 		t.Fatalf("expected valid mapped path, got error: %v", err)
 	}
-	if canonical != appDir {
-		t.Errorf("expected canonical %s, got %s", appDir, canonical)
+	if canonical != filepath.Clean(expectedAppDir) {
+		t.Errorf("expected canonical %s, got %s", expectedAppDir, canonical)
 	}
 
 	// Host path with traversal
@@ -158,12 +162,16 @@ func TestPathValidatorValidateServiceBuildPaths(t *testing.T) {
 	validator := security.NewPathValidator([]string{repoDir})
 
 	t.Run("ValidServicePaths", func(t *testing.T) {
+		expectedSvcDir, evalErr := filepath.EvalSymlinks(svcDir)
+		if evalErr != nil {
+			expectedSvcDir = filepath.Clean(svcDir)
+		}
 		ctxDir, relDF, err := validator.ValidateServiceBuildPaths(repoDir, "services/api", ".", "Dockerfile", false)
 		if err != nil {
 			t.Fatalf("expected valid paths, got: %v", err)
 		}
-		if ctxDir != svcDir {
-			t.Errorf("expected contextDir %s, got %s", svcDir, ctxDir)
+		if ctxDir != filepath.Clean(expectedSvcDir) {
+			t.Errorf("expected contextDir %s, got %s", expectedSvcDir, ctxDir)
 		}
 		if relDF != "Dockerfile" {
 			t.Errorf("expected relDF 'Dockerfile', got %s", relDF)

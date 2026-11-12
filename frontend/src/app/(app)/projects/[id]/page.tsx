@@ -15,6 +15,7 @@ import { DeploymentHistory } from '@/features/deployments/deployment-history';
 import { EnvManager } from '@/features/deployments/env-manager';
 import { TopologySection } from '@/features/projects/topology-section';
 import { RuntimeMetricsPanel } from '@/features/projects/runtime-metrics-panel';
+import { VolumesPanel } from '@/features/projects/volumes-panel';
 import { DomainsPanel } from '@/features/projects/domains-panel';
 import { WebhookSettingsPanel } from '@/features/projects/webhook-settings-panel';
 import { useDeploymentWS } from '@/lib/websocket/use-deployment-ws';
@@ -27,6 +28,7 @@ import {
   Network,
   Activity,
   Globe,
+  HardDrive,
   ArrowLeft,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
@@ -67,7 +69,7 @@ function derivePrimaryPreviewUrl(project: Project | null): string | null {
   return null;
 }
 
-type TabType = 'overview' | 'deployments' | 'logs' | 'env' | 'topology' | 'metrics' | 'domains';
+type TabType = 'overview' | 'deployments' | 'logs' | 'env' | 'topology' | 'metrics' | 'volumes' | 'domains';
 
 export default function ProjectPage({ params }: ProjectPageProps) {
   const routeParams = useParams();
@@ -681,6 +683,20 @@ export default function ProjectPage({ params }: ProjectPageProps) {
 
           <button
             type="button"
+            onClick={() => setActiveTab('volumes')}
+            className={cn(
+              'px-3 py-2 border-b-2 flex items-center gap-1.5 transition-colors -mb-px',
+              activeTab === 'volumes'
+                ? 'border-white text-white'
+                : 'border-transparent text-neutral-400 hover:text-neutral-200'
+            )}
+          >
+            <HardDrive className="w-3.5 h-3.5" />
+            <span>Storage</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setActiveTab('domains')}
             className={cn(
               'px-3 py-2 border-b-2 flex items-center gap-1.5 transition-colors -mb-px',
@@ -828,7 +844,14 @@ export default function ProjectPage({ params }: ProjectPageProps) {
           <RuntimeMetricsPanel projectId={project.id} />
         )}
 
-        {/* Tab 7: Custom Domains, Automatic HTTPS & Push-to-Deploy Webhooks */}
+        {/* Tab 7: Persistent Volumes, Backup/Restore & Disk Usage */}
+        {activeTab === 'volumes' && (
+          <div className="flex-1 min-h-0 h-full overflow-y-auto max-w-5xl pr-2">
+            <VolumesPanel projectId={project.id} />
+          </div>
+        )}
+
+        {/* Tab 8: Custom Domains, Automatic HTTPS & Push-to-Deploy Webhooks */}
         {activeTab === 'domains' && (
           <div className="flex-1 min-h-0 h-full overflow-y-auto max-w-4xl pr-2 space-y-4">
             <DomainsPanel projectId={project.id} services={services} />

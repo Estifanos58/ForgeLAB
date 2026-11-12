@@ -68,7 +68,7 @@ func (e *Engine) StopApp(ctx context.Context, projectID, ownerID uuid.UUID) erro
 	// 2. Stop all service containers for multi-service configurations
 	if e.serviceService != nil {
 		for _, svc := range svcs {
-			e.resetHealthStrike(svc.ID)
+			e.resetServiceHealthState(svc.ID)
 			if svc.Classification == models.ClassificationJob &&
 				svc.Status != models.ServiceStatusRunning &&
 				svc.Status != models.ServiceStatusDeploying &&
@@ -110,6 +110,7 @@ func (e *Engine) StopApp(ctx context.Context, projectID, ownerID uuid.UUID) erro
 		}
 	}
 
+	e.InvalidateProjectMetricsCache(projectID)
 	slog.Info("project app stopped", "project_id", projectID)
 	return nil
 }
@@ -167,7 +168,7 @@ func (e *Engine) StartApp(ctx context.Context, projectID, ownerID uuid.UUID) err
 	startedServices := 0
 	if e.serviceService != nil {
 		for _, svc := range svcs {
-			e.resetHealthStrike(svc.ID)
+			e.resetServiceHealthState(svc.ID)
 			if svc.Classification == models.ClassificationJob {
 				// Never re-run one-shot job containers during StartApp
 				continue
@@ -220,6 +221,7 @@ func (e *Engine) StartApp(ctx context.Context, projectID, ownerID uuid.UUID) err
 		}
 	}
 
+	e.InvalidateProjectMetricsCache(projectID)
 	slog.Info("project app started", "project_id", projectID, "services_started", startedServices)
 	return nil
 }
@@ -284,7 +286,7 @@ func (e *Engine) RestartApp(ctx context.Context, projectID, ownerID uuid.UUID) e
 	restartedServices := 0
 	if e.serviceService != nil {
 		for _, svc := range svcs {
-			e.resetHealthStrike(svc.ID)
+			e.resetServiceHealthState(svc.ID)
 			if svc.Classification == models.ClassificationJob {
 				// Never re-run one-shot jobs during project-wide RestartApp
 				continue
@@ -343,6 +345,7 @@ func (e *Engine) RestartApp(ctx context.Context, projectID, ownerID uuid.UUID) e
 		}
 	}
 
+	e.InvalidateProjectMetricsCache(projectID)
 	slog.Info("project app restarted", "project_id", projectID, "services_restarted", restartedServices, "legacy_restarted", restartedLegacy)
 	return nil
 }
@@ -363,7 +366,7 @@ func (e *Engine) StopService(ctx context.Context, projectID, serviceID, ownerID 
 	if svc.ProjectID != project.ID {
 		return fmt.Errorf("service %s does not belong to project %s", serviceID, project.ID)
 	}
-	e.resetHealthStrike(svc.ID)
+	e.resetServiceHealthState(svc.ID)
 	if svc.CurrentServiceDeploymentID != nil {
 		e.StopLogCollector(*svc.CurrentServiceDeploymentID)
 	}
@@ -387,6 +390,7 @@ func (e *Engine) StopService(ctx context.Context, projectID, serviceID, ownerID 
 	if err := e.projectService.UpdateProjectStatus(ctx, project.ID, newStatus); err != nil {
 		return fmt.Errorf("failed to update project status: %w", err)
 	}
+	e.InvalidateProjectMetricsCache(projectID)
 	return nil
 }
 
@@ -406,7 +410,7 @@ func (e *Engine) StartService(ctx context.Context, projectID, serviceID, ownerID
 	if svc.ProjectID != project.ID {
 		return fmt.Errorf("service %s does not belong to project %s", serviceID, project.ID)
 	}
-	e.resetHealthStrike(svc.ID)
+	e.resetServiceHealthState(svc.ID)
 	if svc.ContainerID != nil && *svc.ContainerID != "" {
 		if _, err := e.dockerClient.ContainerStart(ctx, *svc.ContainerID, client.ContainerStartOptions{}); err != nil {
 			return fmt.Errorf("failed to start service container: %w", err)
@@ -436,6 +440,7 @@ func (e *Engine) StartService(ctx context.Context, projectID, serviceID, ownerID
 	if err := e.projectService.UpdateProjectStatus(ctx, project.ID, newStatus); err != nil {
 		return fmt.Errorf("failed to update project status: %w", err)
 	}
+	e.InvalidateProjectMetricsCache(projectID)
 	return nil
 }
 

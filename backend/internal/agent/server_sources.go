@@ -221,6 +221,9 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		canonPath := session.CanonicalPath
 		sessionID := session.SourceID
 		session.mu.RUnlock()
+		if resolvedRoot, err := canonicalizeWithAncestor(canonPath); err == nil {
+			canonPath = resolvedRoot
+		}
 
 		serviceRelPath := r.URL.Query().Get("service_path")
 		cleanRelPath, pathErr := security.ValidateRelativeServicePath(serviceRelPath)
@@ -230,13 +233,12 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 		}
 
 		serviceDir := filepath.Join(canonPath, filepath.FromSlash(cleanRelPath))
-		evalServiceDir, err := filepath.EvalSymlinks(serviceDir)
+		evalServiceDir, err := security.CanonicalizeExistingPath(serviceDir)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("invalid service directory: %v", err), http.StatusBadRequest)
 			return
 		}
-		relCheck, err := filepath.Rel(canonPath, evalServiceDir)
-		if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
+		if !isWithinRoot(canonPath, evalServiceDir) {
 			http.Error(w, "invalid service path traversal", http.StatusForbidden)
 			return
 		}
@@ -314,8 +316,16 @@ func (s *AgentServer) handleSourcesRoutes(w http.ResponseWriter, r *http.Request
 			virtualFiles["Dockerfile.forgelab"] = []byte(dockerfileContent)
 			expectedDockerfile = "Dockerfile.forgelab"
 		} else {
-			if _, statErr := os.Stat(filepath.Join(evalServiceDir, "Dockerfile")); statErr == nil {
-				expectedDockerfile = "Dockerfile"
+			if entries, err := os.ReadDir(evalServiceDir); err == nil {
+				for _, entry := range entries {
+					if !entry.IsDir() && entry.Name() == "Dockerfile" {
+						expectedDockerfile = "Dockerfile"
+						break
+					}
+					if !entry.IsDir() && strings.EqualFold(entry.Name(), "Dockerfile") && expectedDockerfile == "" {
+						expectedDockerfile = entry.Name()
+					}
+				}
 			}
 		}
 
@@ -393,6 +403,9 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 	sessionID := session.SourceID
 	canonPath := session.CanonicalPath
 	session.mu.RUnlock()
+	if resolvedRoot, err := canonicalizeWithAncestor(canonPath); err == nil {
+		canonPath = resolvedRoot
+	}
 
 	resp := SourceEnvironmentResponse{
 		SourceID: sessionID,
@@ -469,12 +482,11 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 				continue
 			}
 			svcDir := filepath.Join(canonPath, filepath.FromSlash(cleanRel))
-			evalSvcDir, err := filepath.EvalSymlinks(svcDir)
+			evalSvcDir, err := security.CanonicalizeExistingPath(svcDir)
 			if err != nil {
 				continue
 			}
-			relCheck, err := filepath.Rel(canonPath, evalSvcDir)
-			if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
+			if !isWithinRoot(canonPath, evalSvcDir) {
 				continue
 			}
 
@@ -494,12 +506,11 @@ func (s *AgentServer) handleSourceEnvironment(w http.ResponseWriter, r *http.Req
 					continue
 				}
 				subDir := filepath.Join(canonPath, entry.Name())
-				evalSubDir, err := filepath.EvalSymlinks(subDir)
+				evalSubDir, err := security.CanonicalizeExistingPath(subDir)
 				if err != nil {
 					continue
 				}
-				relCheck, err := filepath.Rel(canonPath, evalSubDir)
-				if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
+				if !isWithinRoot(canonPath, evalSubDir) {
 					continue
 				}
 				subEnvPath := filepath.Join(evalSubDir, ".env")

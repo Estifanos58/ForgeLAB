@@ -1,4 +1,4 @@
-import { apiFetch, buildLogQuery } from './base';
+import { apiFetch, apiFetchBlob, buildLogQuery } from './base';
 import {
   CreateProjectInput,
   CreateShareInput,
@@ -8,9 +8,11 @@ import {
   Project,
   ProjectRuntimeMetrics,
   ProjectTopology,
+  ProjectVolumesResponse,
   PublicShare,
   ShareStatusResponse,
   UpdateProjectInput,
+  VolumeRestoreResult,
 } from './types';
 
 export const projectsClient = {
@@ -98,8 +100,37 @@ export const projectsClient = {
     return apiFetch<ProjectTopology>(`/api/projects/${id}/topology`);
   },
 
-  async getMetrics(id: string): Promise<ProjectRuntimeMetrics> {
-    return apiFetch<ProjectRuntimeMetrics>(`/api/projects/${id}/metrics`);
+  async getMetrics(id: string, options?: { refresh?: boolean }): Promise<ProjectRuntimeMetrics> {
+    const query = options?.refresh ? '?refresh=true' : '';
+    return apiFetch<ProjectRuntimeMetrics>(`/api/projects/${id}/metrics${query}`);
+  },
+
+  async getVolumes(id: string): Promise<ProjectVolumesResponse> {
+    return apiFetch<ProjectVolumesResponse>(`/api/projects/${id}/volumes`);
+  },
+
+  async backupVolume(id: string, volumeName: string): Promise<{ blob: Blob; filename: string }> {
+    return apiFetchBlob(
+      `/api/projects/${id}/volumes/${encodeURIComponent(volumeName)}/backup`,
+      { method: 'POST' }
+    );
+  },
+
+  async restoreVolume(
+    id: string,
+    volumeName: string,
+    file: File | Blob,
+    filename = 'backup.tar.gz'
+  ): Promise<VolumeRestoreResult> {
+    const formData = new FormData();
+    formData.append('file', file, file instanceof File ? file.name : filename);
+    return apiFetch<VolumeRestoreResult>(
+      `/api/projects/${id}/volumes/${encodeURIComponent(volumeName)}/restore`,
+      {
+        method: 'POST',
+        body: formData,
+      }
+    );
   },
 
   async getShare(projectId: string): Promise<ShareStatusResponse> {

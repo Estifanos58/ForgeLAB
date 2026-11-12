@@ -9,7 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
+
+	"github.com/forgelab/backend/internal/security"
 )
 
 // FingerprintOptions specifies limits and configuration for directory fingerprinting.
@@ -39,6 +40,40 @@ func ComputeDirectoryContentFingerprint(dirPath string) (string, error) {
 	return ComputeDirectoryContentFingerprintWithContext(context.Background(), dirPath)
 }
 
+func canonicalizeWithAncestor(raw string) string {
+	if resolved, err := security.CanonicalizeWithAncestor(raw); err == nil {
+		return resolved
+	}
+	abs, err := filepath.Abs(raw)
+	if err != nil {
+		return filepath.Clean(raw)
+	}
+	return filepath.Clean(abs)
+}
+
+func isWithinRoot(root, target string) bool {
+	return security.IsWithinRoot(root, target)
+}
+
+func normalizeWindowsReadlinkTarget(target string) string {
+	return security.NormalizeReadlinkTarget(target)
+}
+
+func readLinkIfReparse(path string, d os.DirEntry) (target string, isLink bool, err error) {
+	mode := d.Type()
+	if mode&(os.ModeSymlink|os.ModeIrregular) == 0 {
+		return "", false, nil
+	}
+	t, rErr := os.Readlink(path)
+	if rErr != nil {
+		if mode&os.ModeSymlink != 0 {
+			return "", true, rErr
+		}
+		return "", false, nil
+	}
+	return normalizeWindowsReadlinkTarget(t), true, nil
+}
+
 // ComputeDirectoryContentFingerprintWithContext walks a workspace directory with context cancellation
 // and traversal limits, hardened against symlink escape attacks.
 func ComputeDirectoryContentFingerprintWithContext(ctx context.Context, dirPath string, opts ...FingerprintOptions) (string, error) {
@@ -51,10 +86,7 @@ func ComputeDirectoryContentFingerprintWithContext(ctx context.Context, dirPath 
 		return "", fmt.Errorf("path is not a directory: %s", cleanDir)
 	}
 
-	canonicalDir, err := filepath.EvalSymlinks(cleanDir)
-	if err != nil {
-		canonicalDir = cleanDir
-	}
+	canonicalDir := canonicalizeWithAncestor(cleanDir)
 
 	options := DefaultFingerprintOptions()
 	if len(opts) > 0 {
@@ -78,7 +110,7 @@ func ComputeDirectoryContentFingerprintWithContext(ctx context.Context, dirPath 
 	var files []fileInfo
 	var totalBytes int64
 
-	err = filepath.WalkDir(cleanDir, func(path string, d os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(canonicalDir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return fmt.Errorf("filesystem error traversing %s: %w", path, walkErr)
 		}
@@ -88,13 +120,13 @@ func ComputeDirectoryContentFingerprintWithContext(ctx context.Context, dirPath 
 		}
 
 		if d.IsDir() {
-			if path != cleanDir && IsPrunedDir(d.Name()) {
+			if path != canonicalDir && IsPrunedDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		rel, relErr := filepath.Rel(cleanDir, path)
+		rel, relErr := filepath.Rel(canonicalDir, path)
 		if relErr != nil {
 			return fmt.Errorf("failed to compute relative path for %s: %w", path, relErr)
 		}
@@ -110,11 +142,10 @@ func ComputeDirectoryContentFingerprintWithContext(ctx context.Context, dirPath 
 			return fmt.Errorf("source directory exceeds maximum file count limit of %d files", options.MaxFiles)
 		}
 
-		// Harden symlink handling: prevent external symlinks from escaping approved source root
-		if d.Type()&os.ModeSymlink != 0 {
-			target, err := os.Readlink(path)
-			if err != nil {
-				return fmt.Errorf("failed to read symlink %s: %w", slashRel, err)
+		// Harden symlink & Windows junction handling: prevent external links from escaping approved source root
+		if target, isLink, linkErr := readLinkIfReparse(path, d); isLink {
+			if linkErr != nil {
+				return fmt.Errorf("failed to read symlink %s: %w", slashRel, linkErr)
 			}
 
 			var resolvedTarget string
@@ -123,16 +154,13 @@ func ComputeDirectoryContentFingerprintWithContext(ctx context.Context, dirPath 
 			} else {
 				resolvedTarget = filepath.Clean(filepath.Join(filepath.Dir(path), target))
 			}
-			if realTarget, err := filepath.EvalSymlinks(resolvedTarget); err == nil {
-				resolvedTarget = realTarget
-			}
+			resolvedTarget = canonicalizeWithAncestor(resolvedTarget)
 
-			relToRoot, err := filepath.Rel(canonicalDir, resolvedTarget)
-			if err != nil || strings.HasPrefix(relToRoot, "..") || filepath.IsAbs(relToRoot) {
+			if !isWithinRoot(canonicalDir, resolvedTarget) {
 				return fmt.Errorf("security violation: symlink %q points to %q outside approved source root", slashRel, target)
 			}
 
-			// Valid internal symlink: record symlink target string into fingerprint
+			// Valid internal symlink/junction: record target string into fingerprint
 			h := sha256.New()
 			h.Write([]byte("symlink:" + filepath.ToSlash(target)))
 			files = append(files, fileInfo{
@@ -146,6 +174,9 @@ func ComputeDirectoryContentFingerprintWithContext(ctx context.Context, dirPath 
 		fi, statErr := d.Info()
 		if statErr != nil {
 			return fmt.Errorf("failed to stat file %s: %w", path, statErr)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil
 		}
 
 		if fi.Size() > options.MaxFileSize {

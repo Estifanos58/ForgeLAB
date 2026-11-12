@@ -105,6 +105,21 @@ services:
       GATEWAY_AUTH_TOKEN: ${GATEWAY_AUTH_TOKEN:-}
       GATEWAY_TLS_SKIP_VERIFY: ${GATEWAY_TLS_SKIP_VERIFY:-false}
       FORGELAB_APP_HOST_IP: ${FORGELAB_APP_HOST_IP:-127.0.0.1}
+      CADDY_ADMIN_URL: ${CADDY_ADMIN_URL:-http://caddy:2019}
+      FORGELAB_INGRESS_HOST: ${FORGELAB_INGRESS_HOST:-localhost}
+      FORGELAB_CADDY_TARGET_HOST: ${FORGELAB_CADDY_TARGET_HOST:-host.docker.internal}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      FORGELAB_RUNTIME_HEALTH_CHECK_INTERVAL: ${FORGELAB_RUNTIME_HEALTH_CHECK_INTERVAL:-30s}
+      FORGELAB_AUTO_ROLLBACK_ENABLED: ${FORGELAB_AUTO_ROLLBACK_ENABLED:-true}
+      FORGELAB_AUTO_ROLLBACK_THRESHOLD: ${FORGELAB_AUTO_ROLLBACK_THRESHOLD:-3}
+      FORGELAB_AUTO_ROLLBACK_COOLDOWN: ${FORGELAB_AUTO_ROLLBACK_COOLDOWN:-5m}
+      FORGELAB_SELF_HEAL_ENABLED: ${FORGELAB_SELF_HEAL_ENABLED:-true}
+      FORGELAB_SELF_HEAL_MAX_RESTARTS: ${FORGELAB_SELF_HEAL_MAX_RESTARTS:-3}
+      FORGELAB_CRASH_LOOP_THRESHOLD: ${FORGELAB_CRASH_LOOP_THRESHOLD:-3}
+      FORGELAB_CRASH_LOOP_WINDOW: ${FORGELAB_CRASH_LOOP_WINDOW:-10m}
+      FORGELAB_METRICS_CACHE_TTL: ${FORGELAB_METRICS_CACHE_TTL:-10s}
+      FORGELAB_METRICS_SAMPLE_INTERVAL: ${FORGELAB_METRICS_SAMPLE_INTERVAL:-15s}
+      FORGELAB_METRICS_RETENTION_DAYS: ${FORGELAB_METRICS_RETENTION_DAYS:-7}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - forgelab_builds:/app/data/builds
@@ -150,8 +165,33 @@ services:
       retries: 10
       start_period: 15s
 
+  caddy:
+    image: caddy:2-alpine
+    container_name: forgelab-caddy
+    restart: unless-stopped
+    ports:
+      - "${CADDY_HTTP_PORT_BINDING:-80}:80"
+      - "${CADDY_HTTPS_PORT_BINDING:-443}:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      FORGELAB_INGRESS_HOST: ${FORGELAB_INGRESS_HOST:-localhost}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - forgelab_caddy_data:/data
+      - forgelab_caddy_config:/config
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   forgelab_pgdata:
   forgelab_redisdata:
   forgelab_builds:
   forgelab_sources:
+  forgelab_caddy_data:
+  forgelab_caddy_config:

@@ -21,6 +21,7 @@ type IntegrationHandler struct {
 	githubService *services.GitHubService
 	appManager    *services.GitHubAppManager
 	importService *services.RepositoryImportService
+	auditService  *services.AuditService
 	frontendURL   string
 	cookieSecure  bool
 }
@@ -51,6 +52,38 @@ func (h *IntegrationHandler) SetGitHubAppManager(app *services.GitHubAppManager)
 
 func (h *IntegrationHandler) SetRepositoryImportService(imp *services.RepositoryImportService) {
 	h.importService = imp
+}
+
+// SetAuditService configures operational audit logging for IntegrationHandler.
+func (h *IntegrationHandler) SetAuditService(auditSvc *services.AuditService) {
+	h.auditService = auditSvc
+}
+
+func (h *IntegrationHandler) recordImportAudit(r *http.Request, userID uuid.UUID, imp *models.RepositoryImport, action, message string) {
+	if h.auditService == nil || imp == nil {
+		return
+	}
+	meta := map[string]any{
+		"repository": imp.RepositoryFullName,
+		"branch":     imp.Branch,
+		"status":     imp.Status,
+	}
+	if imp.ProjectID != nil {
+		meta["project_id"] = imp.ProjectID.String()
+	}
+	h.auditService.RecordBestEffort(r.Context(), services.AuditRecordInput{
+		ActorID:      userID,
+		ActorLabel:   getUserEmailFromContext(r),
+		IsGuest:      models.IsGuest(userID),
+		ProjectID:    imp.ProjectID,
+		Action:       action,
+		ResourceType: "repository_import",
+		ResourceID:   imp.ID.String(),
+		Status:       models.AuditStatusSuccess,
+		Message:      message,
+		Metadata:     meta,
+		IPAddress:    getClientIP(r),
+	})
 }
 
 func (h *IntegrationHandler) getAuthenticatedUserID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
@@ -471,13 +504,53 @@ func (h *IntegrationHandler) StartImport(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	h.recordImportAudit(r, userID, imp, "import.start", "Started repository import for "+imp.RepositoryFullName)
+
 	writeJSON(w, http.StatusCreated, imp)
+}
+
+// ListImports handles GET /api/integrations/github/imports
+func (h *IntegrationHandler) ListImports(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getAuthenticatedUserID(w, r)
+	if !ok {
+		return
+	}
+
+	if h.importService == nil {
+		writeError(w, http.StatusInternalServerError, "repository import service not configured")
+		return
+	}
+
+	limit := 20
+	if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+		if parsed, err := strconv.Atoi(rawLimit); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	imports, err := h.importService.ListImports(r.Context(), userID, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list repository imports")
+		return
+	}
+	if imports == nil {
+		imports = []*models.RepositoryImport{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"imports": imports,
+	})
 }
 
 // GetImport handles GET /api/integrations/github/imports/{id}
 func (h *IntegrationHandler) GetImport(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.getAuthenticatedUserID(w, r)
 	if !ok {
+		return
+	}
+
+	if h.importService == nil {
+		writeError(w, http.StatusInternalServerError, "repository import service not configured")
 		return
 	}
 
@@ -508,6 +581,11 @@ func (h *IntegrationHandler) CancelImport(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if h.importService == nil {
+		writeError(w, http.StatusInternalServerError, "repository import service not configured")
+		return
+	}
+
 	importIDStr := chi.URLParam(r, "id")
 	importID, err := uuid.Parse(importIDStr)
 	if err != nil {
@@ -521,9 +599,15 @@ func (h *IntegrationHandler) CancelImport(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusNotFound, "import not found")
 			return
 		}
+		if errors.Is(err, services.ErrImportCannotCancelCompleted) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to cancel import")
 		return
 	}
+
+	h.recordImportAudit(r, userID, imp, "import.cancel", "Cancelled repository import for "+imp.RepositoryFullName)
 
 	writeJSON(w, http.StatusOK, imp)
 }
@@ -532,6 +616,11 @@ func (h *IntegrationHandler) CancelImport(w http.ResponseWriter, r *http.Request
 func (h *IntegrationHandler) RetryImport(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.getAuthenticatedUserID(w, r)
 	if !ok {
+		return
+	}
+
+	if h.importService == nil {
+		writeError(w, http.StatusInternalServerError, "repository import service not configured")
 		return
 	}
 
@@ -548,9 +637,19 @@ func (h *IntegrationHandler) RetryImport(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusNotFound, "import not found")
 			return
 		}
+		if errors.Is(err, services.ErrImportAlreadyActive) || errors.Is(err, services.ErrImportNotRetryable) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, services.ErrImportInvalidInput) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to retry import")
 		return
 	}
+
+	h.recordImportAudit(r, userID, imp, "import.retry", "Retried repository import for "+imp.RepositoryFullName)
 
 	writeJSON(w, http.StatusOK, imp)
 }

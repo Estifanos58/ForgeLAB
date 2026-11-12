@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -135,6 +136,13 @@ func GenerateCaddyfile(routes []ProxyRoute) string {
 // BuildCaddyConfigJSON renders a Caddy v2 JSON configuration payload suitable for POST /load.
 // Verified routes with TLSEnabled use automated ACME certificate issuance.
 func BuildCaddyConfigJSON(routes []ProxyRoute, acmeEmail string) ([]byte, error) {
+	return BuildCaddyConfigJSONWithAdmin(routes, acmeEmail, "")
+}
+
+// BuildCaddyConfigJSONWithAdmin renders a Caddy v2 JSON configuration payload while optionally
+// preserving the Admin API listener address (e.g. ":2019" inside Docker Compose networks)
+// because Caddy's POST /load replaces the root config document including top-level "admin".
+func BuildCaddyConfigJSONWithAdmin(routes []ProxyRoute, acmeEmail, adminListen string) ([]byte, error) {
 	sortedRoutes := make([]ProxyRoute, len(routes))
 	copy(sortedRoutes, routes)
 	sort.Slice(sortedRoutes, func(i, j int) bool {
@@ -229,6 +237,11 @@ func BuildCaddyConfigJSON(routes []ProxyRoute, acmeEmail string) ([]byte, error)
 	payload := map[string]any{
 		"apps": apps,
 	}
+	if trimmedAdmin := strings.TrimSpace(adminListen); trimmedAdmin != "" {
+		payload["admin"] = map[string]any{
+			"listen": trimmedAdmin,
+		}
+	}
 	return json.MarshalIndent(payload, "", "  ")
 }
 
@@ -256,13 +269,29 @@ func (c *CaddySyncer) IsConfigured() bool {
 	return c != nil && c.adminURL != ""
 }
 
+func (c *CaddySyncer) deriveAdminListen() string {
+	u, err := url.Parse(c.adminURL)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" || host == "127.0.0.1" || host == "localhost" || host == "::1" {
+		return ""
+	}
+	port := strings.TrimSpace(u.Port())
+	if port == "" {
+		port = "2019"
+	}
+	return ":" + port
+}
+
 // SyncRoutes pushes the full verified route table to Caddy's /load endpoint.
 func (c *CaddySyncer) SyncRoutes(ctx context.Context, routes []ProxyRoute) error {
 	if !c.IsConfigured() {
 		return nil
 	}
 
-	cfgBytes, err := BuildCaddyConfigJSON(routes, c.acmeEmail)
+	cfgBytes, err := BuildCaddyConfigJSONWithAdmin(routes, c.acmeEmail, c.deriveAdminListen())
 	if err != nil {
 		return fmt.Errorf("failed to build Caddy JSON config: %w", err)
 	}

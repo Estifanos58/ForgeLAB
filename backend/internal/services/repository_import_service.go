@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -20,11 +22,16 @@ import (
 )
 
 var (
-	ErrImportNotFound     = errors.New("repository import not found")
-	ErrImportNotReady     = errors.New("repository import is not in ready status")
-	ErrImportInvalidInput = errors.New("invalid repository import input")
-	ErrImportCancelled    = errors.New("repository import was cancelled")
+	ErrImportNotFound              = errors.New("repository import not found")
+	ErrImportNotReady              = errors.New("repository import is not in ready status")
+	ErrImportInvalidInput          = errors.New("invalid repository import input")
+	ErrImportCancelled             = errors.New("repository import was cancelled")
+	ErrImportAlreadyActive         = errors.New("repository import is already in progress")
+	ErrImportCannotCancelCompleted = errors.New("cannot cancel a repository import already attached to a project")
+	ErrImportNotRetryable          = errors.New("cannot retry a repository import already attached to a project")
 )
+
+const defaultImportTTL = 24 * time.Hour
 
 type StartImportInput struct {
 	Repository string `json:"repository"` // e.g. "owner/repo" or "https://github.com/owner/repo"
@@ -32,14 +39,24 @@ type StartImportInput struct {
 	RootDir    string `json:"root_dir"`   // optional subfolder path
 }
 
+type importJobHandle struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
 type RepositoryImportService struct {
 	db            *pgxpool.Pool
 	sourcesDir    string
 	githubService *GitHubService
+	importTTL     time.Duration
 
-	// activeJobs tracks in-flight import cancellations: importID -> cancelFunc
+	// activeJobs tracks in-flight import jobs: importID -> cancel/done handle
 	jobsMu     sync.Mutex
-	activeJobs map[uuid.UUID]context.CancelFunc
+	activeJobs map[uuid.UUID]*importJobHandle
+
+	// memImports provides deterministic in-memory durable state when db == nil (unit tests)
+	memMu      sync.RWMutex
+	memImports map[uuid.UUID]*models.RepositoryImport
 }
 
 func NewRepositoryImportService(
@@ -54,7 +71,24 @@ func NewRepositoryImportService(
 		db:            db,
 		sourcesDir:    sourcesDir,
 		githubService: githubService,
-		activeJobs:    make(map[uuid.UUID]context.CancelFunc),
+		importTTL:     defaultImportTTL,
+		activeJobs:    make(map[uuid.UUID]*importJobHandle),
+		memImports:    make(map[uuid.UUID]*models.RepositoryImport),
+	}
+}
+
+// IsImportInProgressStatus returns true for non-terminal import pipeline statuses.
+func IsImportInProgressStatus(status string) bool {
+	switch status {
+	case models.ImportStatusPending,
+		models.ImportStatusVerifying,
+		models.ImportStatusResolving,
+		models.ImportStatusDownloading,
+		models.ImportStatusExtracting,
+		models.ImportStatusDiscovering:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -104,6 +138,48 @@ func CleanRootDir(root string) (string, error) {
 	return clean, nil
 }
 
+func (s *RepositoryImportService) snapshotDirForImport(importID uuid.UUID) string {
+	return filepath.Join(s.sourcesDir, "imports", importID.String())
+}
+
+func (s *RepositoryImportService) purgeSnapshotDirs(importID uuid.UUID, recordedPath string) {
+	if recordedPath != "" {
+		_ = os.RemoveAll(recordedPath)
+	}
+	defaultDir := s.snapshotDirForImport(importID)
+	if defaultDir != "" && defaultDir != recordedPath {
+		_ = os.RemoveAll(defaultDir)
+	}
+}
+
+// SeedImportForTest inserts an in-memory import record when running without Postgres.
+func (s *RepositoryImportService) SeedImportForTest(imp *models.RepositoryImport) {
+	if s == nil || imp == nil || imp.ID == uuid.Nil {
+		return
+	}
+	s.memMu.Lock()
+	defer s.memMu.Unlock()
+	s.memImports[imp.ID] = cloneImportRecord(imp)
+}
+
+func cloneImportRecord(imp *models.RepositoryImport) *models.RepositoryImport {
+	if imp == nil {
+		return nil
+	}
+	cp := *imp
+	if imp.ProjectID != nil {
+		pid := *imp.ProjectID
+		cp.ProjectID = &pid
+	}
+	if imp.DiscoveryResult != nil {
+		cp.DiscoveryResult = append([]byte(nil), imp.DiscoveryResult...)
+	}
+	if imp.DeploymentPlan != nil {
+		cp.DeploymentPlan = append([]byte(nil), imp.DeploymentPlan...)
+	}
+	return &cp
+}
+
 // StartImport creates a durable repository import record and starts the async import process.
 func (s *RepositoryImportService) StartImport(ctx context.Context, userID uuid.UUID, input StartImportInput) (*models.RepositoryImport, error) {
 	owner, repo, err := CleanGitHubRepoReference(input.Repository)
@@ -119,6 +195,46 @@ func (s *RepositoryImportService) StartImport(ctx context.Context, userID uuid.U
 	repoFullName := fmt.Sprintf("%s/%s", owner, repo)
 	importID := uuid.New()
 
+	imp, err := s.createImportRecord(ctx, importID, userID, repoFullName, branch, rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create repository import: %w", err)
+	}
+
+	s.launchImportPipeline(imp.ID, userID, owner, repo, branch, rootDir, "")
+
+	return imp, nil
+}
+
+func (s *RepositoryImportService) createImportRecord(
+	ctx context.Context,
+	importID uuid.UUID,
+	ownerID uuid.UUID,
+	repoFullName string,
+	branch string,
+	rootDir string,
+) (*models.RepositoryImport, error) {
+	if s.db == nil {
+		now := time.Now().UTC()
+		imp := &models.RepositoryImport{
+			ID:                 importID,
+			OwnerID:            ownerID,
+			SourceType:         models.SourceTypeGitHub,
+			RepositoryFullName: repoFullName,
+			Branch:             branch,
+			RootDir:            rootDir,
+			Status:             models.ImportStatusPending,
+			Progress:           0,
+			Stage:              "Initializing repository import",
+			CreatedAt:          now,
+			UpdatedAt:          now,
+			ExpiresAt:          now.Add(s.importTTL),
+		}
+		s.memMu.Lock()
+		s.memImports[importID] = cloneImportRecord(imp)
+		s.memMu.Unlock()
+		return imp, nil
+	}
+
 	query := `
 		INSERT INTO repository_imports (
 			id, owner_id, source_type, repository_full_name, branch, root_dir,
@@ -129,68 +245,87 @@ func (s *RepositoryImportService) StartImport(ctx context.Context, userID uuid.U
 		          error_message, error_code, discovery_result, deployment_plan, project_id,
 		          created_at, updated_at, expires_at`
 
-	imp, err := s.scanImportRow(s.db.QueryRow(ctx, query,
-		importID, userID, models.SourceTypeGitHub, repoFullName, branch, rootDir,
+	return s.scanImportRow(s.db.QueryRow(ctx, query,
+		importID, ownerID, models.SourceTypeGitHub, repoFullName, branch, rootDir,
 		models.ImportStatusPending, 0, "Initializing repository import",
 	))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create repository import: %w", err)
-	}
-
-	// Create cancellable context for background execution
-	jobCtx, cancel := context.WithCancel(context.Background())
-	s.jobsMu.Lock()
-	s.activeJobs[importID] = cancel
-	s.jobsMu.Unlock()
-
-	go s.runImportPipeline(jobCtx, imp.ID, userID, owner, repo, branch, rootDir)
-
-	return imp, nil
 }
 
-// runImportPipeline executes the durable multi-stage import workflow in the background.
-func (s *RepositoryImportService) runImportPipeline(
-	ctx context.Context,
+func (s *RepositoryImportService) launchImportPipeline(
 	importID uuid.UUID,
 	userID uuid.UUID,
 	owner string,
 	repo string,
 	branch string,
 	rootDir string,
+	pinnedCommitSHA string,
+) bool {
+	jobCtx, cancel := context.WithCancel(context.Background())
+	handle := &importJobHandle{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+
+	s.jobsMu.Lock()
+	if _, exists := s.activeJobs[importID]; exists {
+		s.jobsMu.Unlock()
+		cancel()
+		close(handle.done)
+		return false
+	}
+	s.activeJobs[importID] = handle
+	s.jobsMu.Unlock()
+
+	go s.runImportPipeline(jobCtx, handle, importID, userID, owner, repo, branch, rootDir, pinnedCommitSHA)
+	return true
+}
+
+// runImportPipeline executes the durable multi-stage import workflow in the background.
+func (s *RepositoryImportService) runImportPipeline(
+	ctx context.Context,
+	handle *importJobHandle,
+	importID uuid.UUID,
+	userID uuid.UUID,
+	owner string,
+	repo string,
+	branch string,
+	rootDir string,
+	pinnedCommitSHA string,
 ) {
 	defer func() {
 		s.jobsMu.Lock()
-		delete(s.activeJobs, importID)
+		if cur, ok := s.activeJobs[importID]; ok && cur == handle {
+			delete(s.activeJobs, importID)
+		}
 		s.jobsMu.Unlock()
+		close(handle.done)
 	}()
 
+	snapshotDir := s.snapshotDirForImport(importID)
+
 	fail := func(err error, code string, stage string) {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			_ = os.RemoveAll(snapshotDir)
+			return
+		}
 		slog.Error("repository import failed",
 			"import_id", importID,
 			"repo", fmt.Sprintf("%s/%s", owner, repo),
 			"stage", stage,
 			"error", err,
 		)
-		_ = s.updateImportState(context.Background(), importID, models.ImportStatusFailed, 0, stage, err.Error(), code, nil, nil)
+		_, _ = s.updatePipelineState(context.Background(), importID, models.ImportStatusFailed, 0, stage, err.Error(), code, nil, nil)
 	}
 
 	// Stage 1: Verify repository access and metadata
-	_ = s.updateImportState(ctx, importID, models.ImportStatusVerifying, 15, "Verifying repository access", "", "", nil, nil)
+	updated, err := s.updatePipelineState(ctx, importID, models.ImportStatusVerifying, 15, "Verifying repository access", "", "", nil, nil)
+	if err != nil || !updated || ctx.Err() != nil {
+		return
+	}
 
 	repoMeta, err := s.githubService.GetRepo(ctx, userID, owner, repo)
 	if err != nil {
-		code := "access_denied"
-		if errors.Is(err, ErrGitHubRepoNotFound) {
-			code = "not_found"
-		} else if errors.Is(err, ErrGitHubNeedsReauth) {
-			code = "needs_reauth"
-		} else if errors.Is(err, ErrGitHubSSORequired) {
-			code = "sso_required"
-		} else if errors.Is(err, ErrGitHubRateLimited) {
-			code = "rate_limited"
-		} else if errors.Is(err, ErrGitHubNotConnected) {
-			code = "not_connected"
-		}
+		code := classifyGitHubImportError(err, "access_denied")
 		fail(err, code, "Repository verification failed")
 		return
 	}
@@ -210,81 +345,81 @@ func (s *RepositoryImportService) runImportPipeline(
 	if !repoMeta.Private {
 		sourceType = models.SourceTypeGitHubPublic
 	}
-	_, _ = s.db.Exec(context.Background(), `
-		UPDATE repository_imports
-		SET repository_id = $1, is_private = $2, branch = $3, source_type = $4, updated_at = NOW()
-		WHERE id = $5`,
-		fmt.Sprintf("%d", repoMeta.ID), repoMeta.Private, targetBranch, sourceType, importID,
-	)
-
-	// Stage 2: Resolve immutable commit SHA
-	if err := ctx.Err(); err != nil {
-		fail(ErrImportCancelled, "cancelled", "Import cancelled")
+	if okMeta, _ := s.updatePipelineMeta(context.Background(), importID, fmt.Sprintf("%d", repoMeta.ID), repoMeta.Private, targetBranch, sourceType); !okMeta {
 		return
 	}
-	_ = s.updateImportState(ctx, importID, models.ImportStatusResolving, 30, "Resolving commit SHA", "", "", nil, nil)
 
-	commitSHA, err := s.githubService.ResolveCommitSHA(ctx, userID, owner, repo, targetBranch)
-	if err != nil {
-		fail(fmt.Errorf("failed to resolve commit SHA for branch %s: %w", targetBranch, err), "commit_resolution_failed", "Commit resolution failed")
+	// Stage 2: Resolve immutable commit SHA (preserve pinned SHA on restart recovery if valid)
+	if ctx.Err() != nil {
 		return
+	}
+	if updated, _ := s.updatePipelineState(ctx, importID, models.ImportStatusResolving, 30, "Resolving commit SHA", "", "", nil, nil); !updated {
+		return
+	}
+
+	commitSHA := strings.TrimSpace(pinnedCommitSHA)
+	if len(commitSHA) != 40 {
+		commitSHA, err = s.githubService.ResolveCommitSHA(ctx, userID, owner, repo, targetBranch)
+		if err != nil {
+			code := classifyGitHubImportError(err, "commit_resolution_failed")
+			fail(fmt.Errorf("failed to resolve commit SHA for branch %s: %w", targetBranch, err), code, "Commit resolution failed")
+			return
+		}
 	}
 	if len(commitSHA) != 40 {
 		fail(fmt.Errorf("resolved commit %s is not an immutable 40-character SHA", commitSHA), "invalid_commit_sha", "Commit resolution failed")
 		return
 	}
 
-	_, _ = s.db.Exec(context.Background(), `
-		UPDATE repository_imports SET commit_sha = $1, updated_at = NOW() WHERE id = $2`,
-		commitSHA, importID,
-	)
-
-	// Stage 3 & 4: Download and extract snapshot into dedicated immutable directory
-	if err := ctx.Err(); err != nil {
-		fail(ErrImportCancelled, "cancelled", "Import cancelled")
+	if okSHA, _ := s.updatePipelineCommitSHA(context.Background(), importID, commitSHA); !okSHA {
 		return
 	}
-	_ = s.updateImportState(ctx, importID, models.ImportStatusDownloading, 50, "Downloading repository snapshot", "", "", nil, nil)
 
-	snapshotDir := filepath.Join(s.sourcesDir, "imports", importID.String())
+	// Stage 3 & 4: Download and extract snapshot into dedicated immutable directory
+	if ctx.Err() != nil {
+		return
+	}
+	if updated, _ := s.updatePipelineState(ctx, importID, models.ImportStatusDownloading, 50, "Downloading repository snapshot", "", "", nil, nil); !updated {
+		return
+	}
+
 	_ = os.RemoveAll(snapshotDir)
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		fail(fmt.Errorf("failed to create snapshot workspace: %w", err), "workspace_creation_failed", "Workspace creation failed")
 		return
 	}
 
-	_ = s.updateImportState(ctx, importID, models.ImportStatusExtracting, 65, "Safely extracting & validating archive", "", "", nil, nil)
+	if updated, _ := s.updatePipelineState(ctx, importID, models.ImportStatusExtracting, 65, "Safely extracting & validating archive", "", "", nil, nil); !updated {
+		_ = os.RemoveAll(snapshotDir)
+		return
+	}
 
 	if err := s.githubService.AcquireRepoTarball(ctx, userID, owner, repo, commitSHA, snapshotDir); err != nil {
 		_ = os.RemoveAll(snapshotDir)
-		code := "extraction_failed"
-		if errors.Is(err, ErrGitHubArchiveTooLarge) {
-			code = "archive_too_large"
-		} else if errors.Is(err, ErrGitHubTooManyFiles) {
-			code = "too_many_files"
-		} else if errors.Is(err, ErrGitHubFileTooLarge) {
-			code = "file_too_large"
-		} else if errors.Is(err, ErrGitHubExtractionTimeout) {
-			code = "extraction_timeout"
-		} else if errors.Is(err, ErrGitHubMaliciousArchive) {
-			code = "path_traversal_violation"
-		}
+		code := classifyGitHubImportError(err, "extraction_failed")
 		fail(err, code, "Extraction failed")
 		return
 	}
 
-	_, _ = s.db.Exec(context.Background(), `
-		UPDATE repository_imports SET snapshot_path = $1, updated_at = NOW() WHERE id = $2`,
-		snapshotDir, importID,
-	)
-
-	// Stage 5: Discover services on the extracted snapshot
-	if err := ctx.Err(); err != nil {
+	if ctx.Err() != nil {
 		_ = os.RemoveAll(snapshotDir)
-		fail(ErrImportCancelled, "cancelled", "Import cancelled")
 		return
 	}
-	_ = s.updateImportState(ctx, importID, models.ImportStatusDiscovering, 80, "Discovering services & configuration", "", "", nil, nil)
+
+	if okPath, _ := s.updatePipelineSnapshotPath(context.Background(), importID, snapshotDir); !okPath {
+		_ = os.RemoveAll(snapshotDir)
+		return
+	}
+
+	// Stage 5: Discover services on the extracted snapshot
+	if ctx.Err() != nil {
+		_ = os.RemoveAll(snapshotDir)
+		return
+	}
+	if updated, _ := s.updatePipelineState(ctx, importID, models.ImportStatusDiscovering, 80, "Discovering services & configuration", "", "", nil, nil); !updated {
+		_ = os.RemoveAll(snapshotDir)
+		return
+	}
 
 	targetDiscoveryDir := snapshotDir
 	if rootDir != "" {
@@ -306,30 +441,50 @@ func (s *RepositoryImportService) runImportPipeline(
 
 	discJSON, err := json.Marshal(discResult)
 	if err != nil {
+		_ = os.RemoveAll(snapshotDir)
 		fail(fmt.Errorf("failed to encode discovery result: %w", err), "discovery_failed", "Discovery encoding failed")
 		return
 	}
 
 	// Stage 6: Generate snapshot deployment plan
-	_ = s.updateImportState(ctx, importID, models.ImportStatusDiscovering, 90, "Generating deployment plan", "", "", discJSON, nil)
+	if ctx.Err() != nil {
+		_ = os.RemoveAll(snapshotDir)
+		return
+	}
+	if updated, _ := s.updatePipelineState(ctx, importID, models.ImportStatusDiscovering, 90, "Generating deployment plan", "", "", discJSON, nil); !updated {
+		_ = os.RemoveAll(snapshotDir)
+		return
+	}
 
 	plan, err := discovery.GeneratePlan(discResult, discovery.PlanOptions{
 		SourceRevision: commitSHA,
 		SourceType:     models.SourceTypeGitHub,
 	})
 	if err != nil {
+		_ = os.RemoveAll(snapshotDir)
 		fail(fmt.Errorf("deployment plan generation failed: %w", err), "plan_generation_failed", "Plan generation failed")
 		return
 	}
 
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
+		_ = os.RemoveAll(snapshotDir)
 		fail(fmt.Errorf("failed to encode deployment plan: %w", err), "plan_generation_failed", "Plan encoding failed")
 		return
 	}
 
-	// Complete: Mark ready with full discovery and deployment plan
-	_ = s.updateImportState(context.Background(), importID, models.ImportStatusReady, 100, "Repository import ready", "", "", discJSON, planJSON)
+	if ctx.Err() != nil {
+		_ = os.RemoveAll(snapshotDir)
+		return
+	}
+
+	// Complete: Mark ready with full discovery and deployment plan (only if not concurrently cancelled)
+	updated, err = s.updatePipelineState(context.Background(), importID, models.ImportStatusReady, 100, "Repository import ready", "", "", discJSON, planJSON)
+	if err != nil || !updated {
+		_ = os.RemoveAll(snapshotDir)
+		return
+	}
+
 	slog.Info("repository import completed successfully",
 		"import_id", importID,
 		"repo", fmt.Sprintf("%s/%s", owner, repo),
@@ -338,8 +493,121 @@ func (s *RepositoryImportService) runImportPipeline(
 	)
 }
 
-// updateImportState updates the status, progress, stage, and optional results of an import.
-func (s *RepositoryImportService) updateImportState(
+func classifyGitHubImportError(err error, defaultCode string) string {
+	switch {
+	case errors.Is(err, ErrGitHubRepoNotFound):
+		return "not_found"
+	case errors.Is(err, ErrGitHubNeedsReauth):
+		return "needs_reauth"
+	case errors.Is(err, ErrGitHubSSORequired):
+		return "sso_required"
+	case errors.Is(err, ErrGitHubRateLimited):
+		return "rate_limited"
+	case errors.Is(err, ErrGitHubNotConnected):
+		return "not_connected"
+	case errors.Is(err, ErrGitHubArchiveTooLarge):
+		return "archive_too_large"
+	case errors.Is(err, ErrGitHubTooManyFiles):
+		return "too_many_files"
+	case errors.Is(err, ErrGitHubFileTooLarge):
+		return "file_too_large"
+	case errors.Is(err, ErrGitHubExtractionTimeout):
+		return "extraction_timeout"
+	case errors.Is(err, ErrGitHubMaliciousArchive):
+		return "path_traversal_violation"
+	default:
+		return defaultCode
+	}
+}
+
+func (s *RepositoryImportService) updatePipelineMeta(
+	ctx context.Context,
+	importID uuid.UUID,
+	repoID string,
+	isPrivate bool,
+	branch string,
+	sourceType string,
+) (bool, error) {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || imp.Status == models.ImportStatusCancelled || imp.Status == models.ImportStatusCompleted {
+			return false, nil
+		}
+		imp.RepositoryID = repoID
+		imp.IsPrivate = isPrivate
+		imp.Branch = branch
+		imp.SourceType = sourceType
+		imp.UpdatedAt = time.Now().UTC()
+		return true, nil
+	}
+
+	tag, err := s.db.Exec(ctx, `
+		UPDATE repository_imports
+		SET repository_id = $1, is_private = $2, branch = $3, source_type = $4, updated_at = NOW()
+		WHERE id = $5 AND status NOT IN ('cancelled', 'completed')`,
+		repoID, isPrivate, branch, sourceType, importID,
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *RepositoryImportService) updatePipelineCommitSHA(ctx context.Context, importID uuid.UUID, commitSHA string) (bool, error) {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || imp.Status == models.ImportStatusCancelled || imp.Status == models.ImportStatusCompleted {
+			return false, nil
+		}
+		imp.CommitSHA = commitSHA
+		imp.UpdatedAt = time.Now().UTC()
+		return true, nil
+	}
+
+	tag, err := s.db.Exec(ctx, `
+		UPDATE repository_imports
+		SET commit_sha = $1, updated_at = NOW()
+		WHERE id = $2 AND status NOT IN ('cancelled', 'completed')`,
+		commitSHA, importID,
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *RepositoryImportService) updatePipelineSnapshotPath(ctx context.Context, importID uuid.UUID, snapshotDir string) (bool, error) {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || imp.Status == models.ImportStatusCancelled || imp.Status == models.ImportStatusCompleted {
+			return false, nil
+		}
+		imp.SnapshotPath = snapshotDir
+		imp.UpdatedAt = time.Now().UTC()
+		return true, nil
+	}
+
+	tag, err := s.db.Exec(ctx, `
+		UPDATE repository_imports
+		SET snapshot_path = $1, updated_at = NOW()
+		WHERE id = $2 AND status NOT IN ('cancelled', 'completed')`,
+		snapshotDir, importID,
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// updatePipelineState updates the status, progress, stage, and optional results of an in-flight import
+// without ever overwriting a cancelled or completed record.
+func (s *RepositoryImportService) updatePipelineState(
 	ctx context.Context,
 	importID uuid.UUID,
 	status string,
@@ -349,7 +617,29 @@ func (s *RepositoryImportService) updateImportState(
 	errCode string,
 	discoveryResult []byte,
 	planResult []byte,
-) error {
+) (bool, error) {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || imp.Status == models.ImportStatusCancelled || imp.Status == models.ImportStatusCompleted {
+			return false, nil
+		}
+		imp.Status = status
+		imp.Progress = progress
+		imp.Stage = stage
+		imp.ErrorMessage = errMsg
+		imp.ErrorCode = errCode
+		if discoveryResult != nil {
+			imp.DiscoveryResult = append([]byte(nil), discoveryResult...)
+		}
+		if planResult != nil {
+			imp.DeploymentPlan = append([]byte(nil), planResult...)
+		}
+		imp.UpdatedAt = time.Now().UTC()
+		return true, nil
+	}
+
 	query := `
 		UPDATE repository_imports
 		SET status = $1,
@@ -360,17 +650,30 @@ func (s *RepositoryImportService) updateImportState(
 		    discovery_result = COALESCE($6, discovery_result),
 		    deployment_plan = COALESCE($7, deployment_plan),
 		    updated_at = NOW()
-		WHERE id = $8`
+		WHERE id = $8 AND status NOT IN ('cancelled', 'completed')`
 
-	_, err := s.db.Exec(ctx, query,
+	tag, err := s.db.Exec(ctx, query,
 		status, progress, stage, errMsg, errCode,
 		discoveryResult, planResult, importID,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // GetImport retrieves a repository import record ensuring owner isolation.
 func (s *RepositoryImportService) GetImport(ctx context.Context, userID uuid.UUID, importID uuid.UUID) (*models.RepositoryImport, error) {
+	if s.db == nil {
+		s.memMu.RLock()
+		defer s.memMu.RUnlock()
+		imp, ok := s.memImports[importID]
+		if !ok || imp.OwnerID != userID {
+			return nil, ErrImportNotFound
+		}
+		return cloneImportRecord(imp), nil
+	}
+
 	query := `
 		SELECT id, owner_id, source_type, repository_id, repository_full_name, is_private,
 		       branch, commit_sha, root_dir, snapshot_path, status, progress, stage,
@@ -389,6 +692,58 @@ func (s *RepositoryImportService) GetImport(ctx context.Context, userID uuid.UUI
 	return imp, nil
 }
 
+// ListImports lists repository imports belonging to userID ordered newest first.
+func (s *RepositoryImportService) ListImports(ctx context.Context, userID uuid.UUID, limit int) ([]*models.RepositoryImport, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	if s.db == nil {
+		s.memMu.RLock()
+		defer s.memMu.RUnlock()
+		var out []*models.RepositoryImport
+		for _, imp := range s.memImports {
+			if imp.OwnerID == userID {
+				out = append(out, cloneImportRecord(imp))
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		})
+		if len(out) > limit {
+			out = out[:limit]
+		}
+		return out, nil
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT id, owner_id, source_type, repository_id, repository_full_name, is_private,
+		       branch, commit_sha, root_dir, snapshot_path, status, progress, stage,
+		       error_message, error_code, discovery_result, deployment_plan, project_id,
+		       created_at, updated_at, expires_at
+		FROM repository_imports
+		WHERE owner_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2`, userID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list repository imports: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.RepositoryImport
+	for rows.Next() {
+		imp, err := s.scanImportRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, imp)
+	}
+	return result, rows.Err()
+}
+
 // CancelImport cancels an in-progress import job and purges incomplete workspaces.
 func (s *RepositoryImportService) CancelImport(ctx context.Context, userID uuid.UUID, importID uuid.UUID) (*models.RepositoryImport, error) {
 	imp, err := s.GetImport(ctx, userID, importID)
@@ -396,27 +751,92 @@ func (s *RepositoryImportService) CancelImport(ctx context.Context, userID uuid.
 		return nil, err
 	}
 
+	if imp.Status == models.ImportStatusCompleted || imp.ProjectID != nil {
+		return nil, ErrImportCannotCancelCompleted
+	}
+
+	// Mark cancelled in persistent storage first so in-flight stages refuse to commit ready/failed
+	if err := s.persistCancelState(ctx, userID, importID); err != nil {
+		return nil, err
+	}
+
+	// Signal and await any running pipeline goroutine before cleaning workspace files
 	s.jobsMu.Lock()
-	if cancel, ok := s.activeJobs[importID]; ok {
-		cancel()
-		delete(s.activeJobs, importID)
-	}
+	handle := s.activeJobs[importID]
 	s.jobsMu.Unlock()
-
-	// Clean up disk workspace if not already attached to a completed project
-	if imp.ProjectID == nil && imp.SnapshotPath != "" {
-		_ = os.RemoveAll(imp.SnapshotPath)
+	if handle != nil {
+		handle.cancel()
+		select {
+		case <-handle.done:
+		case <-ctx.Done():
+		case <-time.After(3 * time.Second):
+		}
 	}
 
-	_ = s.updateImportState(ctx, importID, models.ImportStatusCancelled, 0, "Import cancelled by user", "Import cancelled by user", "cancelled", nil, nil)
+	// Clean up disk workspace since the import is not attached to a completed project
+	s.purgeSnapshotDirs(importID, imp.SnapshotPath)
+
 	return s.GetImport(ctx, userID, importID)
 }
 
-// RetryImport resets a failed or cancelled import and restarts execution.
+func (s *RepositoryImportService) persistCancelState(ctx context.Context, userID uuid.UUID, importID uuid.UUID) error {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || imp.OwnerID != userID {
+			return ErrImportNotFound
+		}
+		if imp.Status == models.ImportStatusCompleted || imp.ProjectID != nil {
+			return ErrImportCannotCancelCompleted
+		}
+		imp.Status = models.ImportStatusCancelled
+		imp.Progress = 0
+		imp.Stage = "Import cancelled by user"
+		imp.ErrorMessage = "Import cancelled by user"
+		imp.ErrorCode = "cancelled"
+		imp.SnapshotPath = ""
+		imp.UpdatedAt = time.Now().UTC()
+		return nil
+	}
+
+	tag, err := s.db.Exec(ctx, `
+		UPDATE repository_imports
+		SET status = $1,
+		    progress = 0,
+		    stage = $2,
+		    error_message = $3,
+		    error_code = 'cancelled',
+		    snapshot_path = '',
+		    updated_at = NOW()
+		WHERE id = $4 AND owner_id = $5 AND status <> 'completed' AND project_id IS NULL`,
+		models.ImportStatusCancelled, "Import cancelled by user", "Import cancelled by user", importID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to cancel repository import: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Distinguish not-found vs already-completed race
+		current, err := s.GetImport(ctx, userID, importID)
+		if err != nil {
+			return err
+		}
+		if current.Status == models.ImportStatusCompleted || current.ProjectID != nil {
+			return ErrImportCannotCancelCompleted
+		}
+	}
+	return nil
+}
+
+// RetryImport resets a failed, cancelled, or stalled import and restarts execution cleanly.
 func (s *RepositoryImportService) RetryImport(ctx context.Context, userID uuid.UUID, importID uuid.UUID) (*models.RepositoryImport, error) {
 	imp, err := s.GetImport(ctx, userID, importID)
 	if err != nil {
 		return nil, err
+	}
+
+	if imp.Status == models.ImportStatusCompleted || imp.ProjectID != nil {
+		return nil, ErrImportNotRetryable
 	}
 
 	owner, repo, err := CleanGitHubRepoReference(imp.RepositoryFullName)
@@ -424,25 +844,355 @@ func (s *RepositoryImportService) RetryImport(ctx context.Context, userID uuid.U
 		return nil, err
 	}
 
-	// Purge previous failed workspace
-	if imp.SnapshotPath != "" {
-		_ = os.RemoveAll(imp.SnapshotPath)
+	// Atomically reserve activeJobs slot before resetting state so concurrent retries cannot race
+	jobCtx, cancel := context.WithCancel(context.Background())
+	handle := &importJobHandle{
+		cancel: cancel,
+		done:   make(chan struct{}),
 	}
 
-	_ = s.updateImportState(ctx, importID, models.ImportStatusPending, 0, "Retrying repository import", "", "", nil, nil)
-
-	jobCtx, cancel := context.WithCancel(context.Background())
 	s.jobsMu.Lock()
-	s.activeJobs[importID] = cancel
+	if _, running := s.activeJobs[importID]; running {
+		s.jobsMu.Unlock()
+		cancel()
+		close(handle.done)
+		return nil, ErrImportAlreadyActive
+	}
+	s.activeJobs[importID] = handle
 	s.jobsMu.Unlock()
 
-	go s.runImportPipeline(jobCtx, imp.ID, userID, owner, repo, imp.Branch, imp.RootDir)
+	cleanupReservation := func() {
+		cancel()
+		s.jobsMu.Lock()
+		if cur, ok := s.activeJobs[importID]; ok && cur == handle {
+			delete(s.activeJobs, importID)
+		}
+		s.jobsMu.Unlock()
+		close(handle.done)
+	}
 
-	return s.GetImport(ctx, userID, importID)
+	// Purge previous workspace files
+	s.purgeSnapshotDirs(importID, imp.SnapshotPath)
+
+	resetImp, err := s.resetImportForRetry(ctx, userID, importID, "Retrying repository import")
+	if err != nil {
+		cleanupReservation()
+		return nil, err
+	}
+
+	go s.runImportPipeline(jobCtx, handle, imp.ID, userID, owner, repo, imp.Branch, imp.RootDir, "")
+
+	return resetImp, nil
+}
+
+func (s *RepositoryImportService) resetImportForRetry(ctx context.Context, userID uuid.UUID, importID uuid.UUID, stage string) (*models.RepositoryImport, error) {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || imp.OwnerID != userID {
+			return nil, ErrImportNotFound
+		}
+		if imp.Status == models.ImportStatusCompleted || imp.ProjectID != nil {
+			return nil, ErrImportNotRetryable
+		}
+		now := time.Now().UTC()
+		imp.Status = models.ImportStatusPending
+		imp.Progress = 0
+		imp.Stage = stage
+		imp.CommitSHA = ""
+		imp.SnapshotPath = ""
+		imp.ErrorMessage = ""
+		imp.ErrorCode = ""
+		imp.DiscoveryResult = nil
+		imp.DeploymentPlan = nil
+		imp.UpdatedAt = now
+		imp.ExpiresAt = now.Add(s.importTTL)
+		return cloneImportRecord(imp), nil
+	}
+
+	query := `
+		UPDATE repository_imports
+		SET status = $1,
+		    progress = 0,
+		    stage = $2,
+		    commit_sha = '',
+		    snapshot_path = '',
+		    error_message = '',
+		    error_code = '',
+		    discovery_result = NULL,
+		    deployment_plan = NULL,
+		    expires_at = NOW() + INTERVAL '24 hours',
+		    updated_at = NOW()
+		WHERE id = $3 AND owner_id = $4 AND status <> 'completed' AND project_id IS NULL
+		RETURNING id, owner_id, source_type, repository_id, repository_full_name, is_private,
+		          branch, commit_sha, root_dir, snapshot_path, status, progress, stage,
+		          error_message, error_code, discovery_result, deployment_plan, project_id,
+		          created_at, updated_at, expires_at`
+
+	imp, err := s.scanImportRow(s.db.QueryRow(ctx, query, models.ImportStatusPending, stage, importID, userID))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			current, getErr := s.GetImport(ctx, userID, importID)
+			if getErr != nil {
+				return nil, getErr
+			}
+			if current.Status == models.ImportStatusCompleted || current.ProjectID != nil {
+				return nil, ErrImportNotRetryable
+			}
+			return nil, ErrImportNotFound
+		}
+		return nil, fmt.Errorf("failed to reset import for retry: %w", err)
+	}
+	return imp, nil
+}
+
+// RecoverInterruptedImports resumes non-terminal repository imports that were interrupted
+// by a backend restart, while marking already-expired interrupted imports as failed and
+// cleaning up any partial disk directories.
+func (s *RepositoryImportService) RecoverInterruptedImports(ctx context.Context) (int, error) {
+	candidates, err := s.listInterruptedImports(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query interrupted repository imports: %w", err)
+	}
+
+	recovered := 0
+	expiredFailed := 0
+	now := time.Now().UTC()
+
+	for _, imp := range candidates {
+		s.jobsMu.Lock()
+		_, alreadyRunning := s.activeJobs[imp.ID]
+		s.jobsMu.Unlock()
+		if alreadyRunning {
+			continue
+		}
+
+		// Clean any partial extraction files on disk before failing or resuming
+		s.purgeSnapshotDirs(imp.ID, imp.SnapshotPath)
+
+		if !imp.ExpiresAt.IsZero() && !imp.ExpiresAt.After(now) {
+			if err := s.markInterruptedImportFailed(ctx, imp.ID, "Import expired before recovery", "Repository import expired before server recovery could resume it", "import_expired"); err != nil {
+				slog.Warn("failed to mark expired interrupted import as failed", "import_id", imp.ID, "error", err)
+			} else {
+				expiredFailed++
+			}
+			continue
+		}
+
+		owner, repo, parseErr := CleanGitHubRepoReference(imp.RepositoryFullName)
+		if parseErr != nil {
+			_ = s.markInterruptedImportFailed(ctx, imp.ID, "Invalid repository reference", parseErr.Error(), "invalid_repository")
+			continue
+		}
+
+		jobCtx, cancel := context.WithCancel(context.Background())
+		handle := &importJobHandle{
+			cancel: cancel,
+			done:   make(chan struct{}),
+		}
+
+		s.jobsMu.Lock()
+		if _, running := s.activeJobs[imp.ID]; running {
+			s.jobsMu.Unlock()
+			cancel()
+			close(handle.done)
+			continue
+		}
+		s.activeJobs[imp.ID] = handle
+		s.jobsMu.Unlock()
+
+		claimed, resetErr := s.claimInterruptedImportForRecovery(ctx, imp.ID)
+		if resetErr != nil || !claimed {
+			cancel()
+			s.jobsMu.Lock()
+			if cur, ok := s.activeJobs[imp.ID]; ok && cur == handle {
+				delete(s.activeJobs, imp.ID)
+			}
+			s.jobsMu.Unlock()
+			close(handle.done)
+			if resetErr != nil {
+				slog.Warn("failed to claim interrupted import for recovery", "import_id", imp.ID, "error", resetErr)
+			}
+			continue
+		}
+
+		pinnedSHA := ""
+		if len(strings.TrimSpace(imp.CommitSHA)) == 40 {
+			pinnedSHA = strings.TrimSpace(imp.CommitSHA)
+		}
+
+		go s.runImportPipeline(jobCtx, handle, imp.ID, imp.OwnerID, owner, repo, imp.Branch, imp.RootDir, pinnedSHA)
+		recovered++
+	}
+
+	if recovered > 0 || expiredFailed > 0 {
+		slog.Info("repository import startup recovery complete",
+			"recovered", recovered,
+			"expired_failed", expiredFailed,
+		)
+	}
+
+	return recovered, nil
+}
+
+func (s *RepositoryImportService) listInterruptedImports(ctx context.Context) ([]*models.RepositoryImport, error) {
+	if s.db == nil {
+		s.memMu.RLock()
+		defer s.memMu.RUnlock()
+		var out []*models.RepositoryImport
+		for _, imp := range s.memImports {
+			if IsImportInProgressStatus(imp.Status) && imp.ProjectID == nil {
+				out = append(out, cloneImportRecord(imp))
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		})
+		return out, nil
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT id, owner_id, source_type, repository_id, repository_full_name, is_private,
+		       branch, commit_sha, root_dir, snapshot_path, status, progress, stage,
+		       error_message, error_code, discovery_result, deployment_plan, project_id,
+		       created_at, updated_at, expires_at
+		FROM repository_imports
+		WHERE status IN ('pending', 'verifying', 'resolving', 'downloading', 'extracting', 'discovering')
+		  AND project_id IS NULL
+		ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []*models.RepositoryImport
+	for rows.Next() {
+		imp, err := s.scanImportRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, imp)
+	}
+	return result, rows.Err()
+}
+
+func (s *RepositoryImportService) markInterruptedImportFailed(ctx context.Context, importID uuid.UUID, stage, errMsg, errCode string) error {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || !IsImportInProgressStatus(imp.Status) || imp.ProjectID != nil {
+			return nil
+		}
+		imp.Status = models.ImportStatusFailed
+		imp.Progress = 0
+		imp.Stage = stage
+		imp.ErrorMessage = errMsg
+		imp.ErrorCode = errCode
+		imp.SnapshotPath = ""
+		imp.UpdatedAt = time.Now().UTC()
+		return nil
+	}
+
+	_, err := s.db.Exec(ctx, `
+		UPDATE repository_imports
+		SET status = $1,
+		    progress = 0,
+		    stage = $2,
+		    error_message = $3,
+		    error_code = $4,
+		    snapshot_path = '',
+		    updated_at = NOW()
+		WHERE id = $5
+		  AND status IN ('pending', 'verifying', 'resolving', 'downloading', 'extracting', 'discovering')
+		  AND project_id IS NULL`,
+		models.ImportStatusFailed, stage, errMsg, errCode, importID,
+	)
+	return err
+}
+
+func (s *RepositoryImportService) claimInterruptedImportForRecovery(ctx context.Context, importID uuid.UUID) (bool, error) {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || !IsImportInProgressStatus(imp.Status) || imp.ProjectID != nil {
+			return false, nil
+		}
+		imp.Status = models.ImportStatusPending
+		imp.Progress = 0
+		imp.Stage = "Recovering repository import after server restart"
+		imp.SnapshotPath = ""
+		imp.ErrorMessage = ""
+		imp.ErrorCode = ""
+		imp.DiscoveryResult = nil
+		imp.DeploymentPlan = nil
+		imp.UpdatedAt = time.Now().UTC()
+		return true, nil
+	}
+
+	tag, err := s.db.Exec(ctx, `
+		UPDATE repository_imports
+		SET status = $1,
+		    progress = 0,
+		    stage = 'Recovering repository import after server restart',
+		    snapshot_path = '',
+		    error_message = '',
+		    error_code = '',
+		    discovery_result = NULL,
+		    deployment_plan = NULL,
+		    updated_at = NOW()
+		WHERE id = $2
+		  AND status IN ('pending', 'verifying', 'resolving', 'downloading', 'extracting', 'discovering')
+		  AND project_id IS NULL`,
+		models.ImportStatusPending, importID,
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// Stop cancels all active import worker goroutines without overwriting their persisted
+// in-progress state in storage, allowing RecoverInterruptedImports to resume them after restart.
+func (s *RepositoryImportService) Stop(ctx context.Context) error {
+	s.jobsMu.Lock()
+	handles := make([]*importJobHandle, 0, len(s.activeJobs))
+	for _, h := range s.activeJobs {
+		handles = append(handles, h)
+	}
+	s.jobsMu.Unlock()
+
+	for _, h := range handles {
+		h.cancel()
+	}
+	for _, h := range handles {
+		select {
+		case <-h.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // MarkCompleted associates an import with a newly created project and marks it completed.
 func (s *RepositoryImportService) MarkCompleted(ctx context.Context, userID uuid.UUID, importID uuid.UUID, projectID uuid.UUID) error {
+	if s.db == nil {
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		imp, ok := s.memImports[importID]
+		if !ok || imp.OwnerID != userID {
+			return ErrImportNotFound
+		}
+		pid := projectID
+		imp.Status = models.ImportStatusCompleted
+		imp.ProjectID = &pid
+		imp.UpdatedAt = time.Now().UTC()
+		return nil
+	}
+
 	query := `
 		UPDATE repository_imports
 		SET status = $1, project_id = $2, updated_at = NOW()
@@ -461,7 +1211,18 @@ func (s *RepositoryImportService) MarkCompleted(ctx context.Context, userID uuid
 // PruneExpiredImports cleans up expired or incomplete imports older than 24 hours.
 func (s *RepositoryImportService) PruneExpiredImports(ctx context.Context) (int64, error) {
 	if s.db == nil {
-		return 0, nil
+		s.memMu.Lock()
+		defer s.memMu.Unlock()
+		now := time.Now().UTC()
+		var pruned int64
+		for id, imp := range s.memImports {
+			if imp.ProjectID == nil && !imp.ExpiresAt.IsZero() && imp.ExpiresAt.Before(now) {
+				s.purgeSnapshotDirs(id, imp.SnapshotPath)
+				delete(s.memImports, id)
+				pruned++
+			}
+		}
+		return pruned, nil
 	}
 
 	rows, err := s.db.Query(ctx, `
@@ -478,9 +1239,7 @@ func (s *RepositoryImportService) PruneExpiredImports(ctx context.Context) (int6
 		var path string
 		if err := rows.Scan(&id, &path); err == nil {
 			toDelete = append(toDelete, id)
-			if path != "" {
-				_ = os.RemoveAll(path)
-			}
+			s.purgeSnapshotDirs(id, path)
 		}
 	}
 

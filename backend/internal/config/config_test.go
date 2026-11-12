@@ -702,3 +702,149 @@ func TestConfigPublicSharing(t *testing.T) {
 		}
 	})
 }
+
+func TestConfigHealthDefaultsAndOverrides(t *testing.T) {
+	healthKeys := []string{
+		"APP_ENV",
+		"JWT_SECRET",
+		"FORGELAB_RUNTIME_HEALTH_CHECK_INTERVAL",
+		"FORGELAB_AUTO_ROLLBACK_ENABLED",
+		"FORGELAB_AUTO_ROLLBACK_THRESHOLD",
+		"FORGELAB_AUTO_ROLLBACK_COOLDOWN",
+		"FORGELAB_SELF_HEAL_ENABLED",
+		"FORGELAB_SELF_HEAL_MAX_RESTARTS",
+		"FORGELAB_CRASH_LOOP_THRESHOLD",
+		"FORGELAB_CRASH_LOOP_WINDOW",
+	}
+	cleanup := func() {
+		for _, k := range healthKeys {
+			os.Unsetenv(k)
+		}
+	}
+
+	t.Run("defaults in development", func(t *testing.T) {
+		cleanup()
+		defer cleanup()
+		t.Setenv("APP_ENV", "development")
+		t.Setenv("JWT_SECRET", "dev-secret-health")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error loading config: %v", err)
+		}
+		if cfg.Health.RuntimeCheckInterval != 30*time.Second {
+			t.Errorf("expected RuntimeCheckInterval 30s, got %v", cfg.Health.RuntimeCheckInterval)
+		}
+		if !cfg.Health.AutoRollbackEnabled {
+			t.Errorf("expected AutoRollbackEnabled true by default")
+		}
+		if cfg.Health.AutoRollbackThreshold != 3 {
+			t.Errorf("expected AutoRollbackThreshold 3, got %d", cfg.Health.AutoRollbackThreshold)
+		}
+		if cfg.Health.AutoRollbackCooldown != 5*time.Minute {
+			t.Errorf("expected AutoRollbackCooldown 5m, got %v", cfg.Health.AutoRollbackCooldown)
+		}
+		if !cfg.Health.SelfHealEnabled {
+			t.Errorf("expected SelfHealEnabled true by default")
+		}
+		if cfg.Health.SelfHealMaxRestarts != 3 {
+			t.Errorf("expected SelfHealMaxRestarts 3, got %d", cfg.Health.SelfHealMaxRestarts)
+		}
+		if cfg.Health.CrashLoopThreshold != 3 {
+			t.Errorf("expected CrashLoopThreshold 3, got %d", cfg.Health.CrashLoopThreshold)
+		}
+		if cfg.Health.CrashLoopWindow != 10*time.Minute {
+			t.Errorf("expected CrashLoopWindow 10m, got %v", cfg.Health.CrashLoopWindow)
+		}
+	})
+
+	t.Run("explicit overrides including zero values and disabling flags", func(t *testing.T) {
+		cleanup()
+		defer cleanup()
+		t.Setenv("APP_ENV", "development")
+		t.Setenv("JWT_SECRET", "dev-secret-health")
+		t.Setenv("FORGELAB_RUNTIME_HEALTH_CHECK_INTERVAL", "15s")
+		t.Setenv("FORGELAB_AUTO_ROLLBACK_ENABLED", "false")
+		t.Setenv("FORGELAB_AUTO_ROLLBACK_THRESHOLD", "5")
+		t.Setenv("FORGELAB_AUTO_ROLLBACK_COOLDOWN", "0s")
+		t.Setenv("FORGELAB_SELF_HEAL_ENABLED", "0")
+		t.Setenv("FORGELAB_SELF_HEAL_MAX_RESTARTS", "0")
+		t.Setenv("FORGELAB_CRASH_LOOP_THRESHOLD", "4")
+		t.Setenv("FORGELAB_CRASH_LOOP_WINDOW", "3m")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error loading config: %v", err)
+		}
+		if cfg.Health.RuntimeCheckInterval != 15*time.Second {
+			t.Errorf("expected RuntimeCheckInterval 15s, got %v", cfg.Health.RuntimeCheckInterval)
+		}
+		if cfg.Health.AutoRollbackEnabled {
+			t.Errorf("expected AutoRollbackEnabled false")
+		}
+		if cfg.Health.AutoRollbackThreshold != 5 {
+			t.Errorf("expected AutoRollbackThreshold 5, got %d", cfg.Health.AutoRollbackThreshold)
+		}
+		if cfg.Health.AutoRollbackCooldown != 0 {
+			t.Errorf("expected AutoRollbackCooldown 0s, got %v", cfg.Health.AutoRollbackCooldown)
+		}
+		if cfg.Health.SelfHealEnabled {
+			t.Errorf("expected SelfHealEnabled false")
+		}
+		if cfg.Health.SelfHealMaxRestarts != 0 {
+			t.Errorf("expected SelfHealMaxRestarts 0, got %d", cfg.Health.SelfHealMaxRestarts)
+		}
+		if cfg.Health.CrashLoopThreshold != 4 {
+			t.Errorf("expected CrashLoopThreshold 4, got %d", cfg.Health.CrashLoopThreshold)
+		}
+		if cfg.Health.CrashLoopWindow != 3*time.Minute {
+			t.Errorf("expected CrashLoopWindow 3m, got %v", cfg.Health.CrashLoopWindow)
+		}
+	})
+}
+
+func TestConfigMetricsSettings(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		t.Setenv("APP_ENV", "development")
+		t.Setenv("JWT_SECRET", "dev-secret-metrics")
+		t.Setenv("FORGELAB_METRICS_CACHE_TTL", "")
+		t.Setenv("FORGELAB_METRICS_SAMPLE_INTERVAL", "")
+		t.Setenv("FORGELAB_METRICS_RETENTION_DAYS", "")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error loading config: %v", err)
+		}
+		if cfg.Metrics.CacheTTL != 10*time.Second {
+			t.Errorf("expected CacheTTL 10s, got %v", cfg.Metrics.CacheTTL)
+		}
+		if cfg.Metrics.SampleInterval != 15*time.Second {
+			t.Errorf("expected SampleInterval 15s, got %v", cfg.Metrics.SampleInterval)
+		}
+		if cfg.Metrics.RetentionDays != 7 {
+			t.Errorf("expected RetentionDays 7, got %d", cfg.Metrics.RetentionDays)
+		}
+	})
+
+	t.Run("explicit overrides including zero values", func(t *testing.T) {
+		t.Setenv("APP_ENV", "development")
+		t.Setenv("JWT_SECRET", "dev-secret-metrics")
+		t.Setenv("FORGELAB_METRICS_CACHE_TTL", "0s")
+		t.Setenv("FORGELAB_METRICS_SAMPLE_INTERVAL", "30s")
+		t.Setenv("FORGELAB_METRICS_RETENTION_DAYS", "14")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error loading config: %v", err)
+		}
+		if cfg.Metrics.CacheTTL != 0 {
+			t.Errorf("expected CacheTTL 0s, got %v", cfg.Metrics.CacheTTL)
+		}
+		if cfg.Metrics.SampleInterval != 30*time.Second {
+			t.Errorf("expected SampleInterval 30s, got %v", cfg.Metrics.SampleInterval)
+		}
+		if cfg.Metrics.RetentionDays != 14 {
+			t.Errorf("expected RetentionDays 14, got %d", cfg.Metrics.RetentionDays)
+		}
+	})
+}

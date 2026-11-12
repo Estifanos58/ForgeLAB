@@ -99,8 +99,16 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Safe Shell Command Serialization** | IMPLEMENTED | NOT RECORDED | — | — | — | — | JSON array serialization for Dockerfile `CMD ["sh", "-c", ...]` escaping quotes, backslashes, and shell operators safely |
 | **Service Exposure Configuration & Isolation** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Explicit `public_exposed` selection in UI/API; database and infrastructure services default to internal; volume traversal validation error propagation |
 | **Secure Public Project Sharing** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests outbound Yamux tunnel, public gateway ingress, path traversal defense, frontend/backend routing, loopback port binding, and immediate revocation |
-| **WebSocket Compatibility & Deprecation Path** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Validates `?token=` query fallback with scrubbed deprecation warning while preferring single-use tickets (`POST /api/ws/ticket`) and HttpOnly cookies |
+| **WebSocket Query Token Rejection & Ticket Auth** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Verifies `?token=<jwt>` is strictly rejected (HTTP 401) while `POST /api/ws/ticket`, cookies, and Bearer headers succeed |
 | **Windows First-Launch Local Agent & Folder Picker** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests loopback bind readiness, offline-Docker agent status, port conflict diagnostics, interactive desktop STA `FolderBrowserDialog`, spaces/Unicode paths, and cancel/timeout recovery |
+| **Custom Domains, DNS Verification & Caddy HTTPS** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests TXT/CNAME DNS verification, `proxy_unconfigured` fallback (`https_active: false`) without Caddy, and live Caddy TLS provisioning |
+| **Tightened Frontend CSP & Security Headers** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Verifies Next.js CSP (`unsafe-eval` removed, WebSocket + `:4142` Local Agent allowed) without breaking auth, previews, or logs |
+| **Strict Docker Capability Allowlist** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Verifies `CapDrop: ["ALL"]`, `CHOWN`/`SETGID`/`SETUID` allowlist, and fail-closed `ErrCapabilityNotAllowed` rejection of disallowed caps |
+| **Restart-Recoverable Imports & Push Webhooks** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests backend-restart GitHub import reconciliation (`RecoverInterruptedImports`), cancel/retry, and HMAC-SHA256 push webhooks |
+| **Self-Healing, Crash-Loop Protection & Auto-Rollback** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests configurable health-check auto-restart, crash-loop threshold auto-rollback, and previous healthy container verification |
+| **Opt-In Zero-Downtime Blue-Green Cutover** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `deployment_mode: "blue_green"`, `/proxy/services/{serviceId}` slot routing (`X-ForgeLAB-Slot`), and healthy-slot promotion |
+| **Persistent Volumes, Disk Usage, Backup & Restore** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests volume inspection, daemon disk usage, `.tar.gz` backup, `409 ErrVolumeInUse` enforcement, and archive bounds (`100MB`/`512MB`) |
+| **Metrics History, Redacted Audit Logs & Diagnostics** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests TTL-cached live metrics, background-sampled historical metrics, redacted `audit_logs`, and `/api/diagnostics` |
 
 ---
 
@@ -114,7 +122,7 @@ Before executing any procedure, note the distinction between development environ
   PostgreSQL and Redis run via `docker compose up -d postgres redis`. Migrations are applied via `go run cmd/migrate/main.go up`. The Go backend runs directly on the host (`cd backend && go run cmd/server/main.go`) and frontend runs via `npm run dev`.
   *Prerequisite Rule:* You must run the Go backend on the host for local-repository verification, unless the backend container has been explicitly given access to the source directory through a documented host bind mount. The containerized backend cannot access host filesystem paths like `C:\dev\testapp` or `/home/user/app`.
 - **Environment B (Current Docker Compose Stack):**
-  `docker compose up --build` runs the backend inside a container without arbitrary host source directory mounts. Migrations are executed via `docker compose exec backend /app/forgelab-migrate up`. As documented in [docs/14-known-limitations.md](14-known-limitations.md), containerized frontend rewrites and host path inaccessibility currently prevent end-to-end local repository verification in Environment B.
+  `docker compose up --build` starts PostgreSQL, Redis, backend (including `caddy_admin_url` integration), Next.js frontend, and the bundled `caddy` reverse proxy (`caddy:2-alpine` with persistent `forgelab_caddy_data` and `forgelab_caddy_config` volumes). `docker-compose.yml` mounts `${FORGELAB_HOST_SOURCE_ROOT:-./}:/host-projects:ro` so directories beneath `FORGELAB_HOST_SOURCE_ROOT` are readable by the backend container; migrations run via `docker compose exec backend /app/forgelab-migrate up`. For arbitrary host directories outside that mount, run the Local Agent on the host (`:4142`) or use Environment A. See [docs/14-known-limitations.md](14-known-limitations.md).
 
 ---
 
@@ -594,12 +602,12 @@ Verify that WebSocket channels are strictly isolated by UUID and that logs or st
 3. Observe Window 2: Verify that **zero** log lines, status changes, or deployment events from Project A appear in Window 2's terminal.
 4. Trigger a deployment on Project B in Window 2.
 5. Verify Window 2 receives Project B logs and Window 1 receives no cross-project noise.
-6. In Window 1's browser DevTools Console, execute an unauthorized subscription (cookies are automatically passed via the same-origin Next.js WebSocket proxy, or using a standalone WebSocket client with query parameter token fallback):
+6. In Window 1's browser DevTools Console, execute an unauthorized subscription (cookies are automatically passed via the same-origin Next.js WebSocket proxy, or using a short-lived single-use ticket minted via `POST /api/ws/ticket`):
    ```javascript
    // In browser console on http://localhost:3000 (authenticated session cookies forwarded):
    const ws = new WebSocket('ws://localhost:3000/api/ws');
-   // For direct backend port testing:
-   // const ws = new WebSocket('ws://localhost:8080/api/ws?token=<accessToken>');
+   // For direct backend port testing after minting a ticket via POST /api/ws/ticket:
+   // const ws = new WebSocket('ws://localhost:8080/api/ws?ticket=<singleUseTicket>');
    ws.onopen = () => ws.send(JSON.stringify({ type: 'subscribe', channel: 'project:00000000-0000-0000-0000-000000000000' }));
    ws.onmessage = (e) => console.log('WS msg:', JSON.parse(e.data));
    ```
@@ -1531,19 +1539,19 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 2. Inspect the registered agent ID (e.g. `laptop-macos` or auto-generated UUID).
 3. Attempt an unauthenticated verification probe with a spoofed/mismatched agent ID:
    ```bash
-   curl -s -X POST http://127.0.0.1:8081/api/agent/verify-identity \
+   curl -s -X POST http://127.0.0.1:4142/api/agent/verify-identity \
      -H "Content-Type: application/json" \
      -d '{"expected_agent_id":"wrong-agent-id"}'
    ```
 4. Verify response returns `{"verified":false,"agent_id":""}` with HTTP 200 or 404.
 5. Probe with the correct `expected_agent_id`:
    ```bash
-   curl -s -X POST http://127.0.0.1:8081/api/agent/verify-identity \
+   curl -s -X POST http://127.0.0.1:4142/api/agent/verify-identity \
      -H "Content-Type: application/json" \
      -d '{"expected_agent_id":"<correct-id>"}'
    ```
 6. Verify response returns `{"verified":true,"agent_id":"<correct-id>"}`.
-7. Trigger an agent-backed project deployment and verify in backend logs that the control plane probes identity and confirms identity before transmitting any bearer credentials or session tokens to candidate fallback URLs (`127.0.0.1:8081` or `host.docker.internal:8081`).
+7. Trigger an agent-backed project deployment and verify in backend logs that the control plane probes identity and confirms identity before transmitting any bearer credentials or session tokens to candidate fallback URLs (`127.0.0.1:4142` or `host.docker.internal:4142`).
 8. Explicitly revoke the session token via:
    ```bash
    curl -s -X POST http://localhost:8080/api/sources/agent/session/revoke \
@@ -1768,7 +1776,7 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 
 ---
 
-### 37. WebSocket Ticket Authentication & Compatibility Fallback
+### 37. WebSocket Ticket Authentication & Strict Query-Token Rejection
 
 #### Test Procedure 37.1 — Frontend Ticket Authentication
 1. Open browser developer tools on `http://localhost:3000/projects/<id>`.
@@ -1779,16 +1787,12 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 3. Attempt to reconnect using the same ticket UUID again:
    - Verify the ticket is single-use and the second connection attempt is rejected with HTTP 401.
 
-#### Test Procedure 37.2 — Legacy Query-Token Compatibility
+#### Test Procedure 37.2 — Strict Rejection of `?token=` Query Parameter
 1. Mint or obtain a valid user JWT access token.
-2. Using a tool like `wscat` or `websocat`, connect directly with query string token:
+2. Using a tool like `wscat` or `websocat`, attempt to connect directly with a query-string JWT token:
    `wscat -c "ws://localhost:8080/api/ws?token=<valid_jwt>"`
-3. Verify connection succeeds (HTTP 101).
-4. Inspect the backend log output and confirm:
-   - A deprecation notice is logged: `[WARN] websocket: query parameter '?token=' authentication is deprecated, use short-lived tickets (POST /api/ws/ticket) or cookies`.
-   - The token value itself is strictly redacted/absent from the log line.
-5. Connect with an invalid token `?token=invalid.jwt.signature`:
-   - Verify connection is rejected with HTTP 401 Unauthorized.
+3. Verify the handshake is strictly rejected with **HTTP 401 Unauthorized** (never upgraded to HTTP 101) so tokens cannot leak into proxy access logs or browser histories.
+4. Connect with a valid `Authorization: Bearer <valid_jwt>` header, `forgelab_access_token` cookie, or fresh single-use `?ticket=<uuid>` and confirm HTTP 101 upgrade succeeds.
 
 #### Verification Record
 - **Status:** NOT RECORDED
@@ -1874,12 +1878,11 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
    - Verify the share is displayed as `Revoked` / `Not shared` rather than claiming to be `Online`.
 
 #### Verification Record
-- **Status:** CODE COMPLETE & LOCALLY TESTED (Provider Unit Tests, Router Routing Tests, Gateway Auth/Ack Tests, and Frontend Build PASS)
-- **External Internet Test:** BLOCKED: `cloudflared` executable not installed on host test environment; external connectivity through trycloudflare.com edge requires host package installation.
-- **Verified by:** Antigravity AI
-- **Date:** 2026-10-21
-- **Environment:** Linux 6.6.137+rpt-rpi-2712 aarch64, Go 1.24, Node.js v20.18.0
-- **Notes:** Automated test coverage validates provider abstraction, URL discovery parsing, config conflict error detection, longest-prefix routing, path traversal defense, gateway constant-time auth, and registration acks.
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated unit/regression test coverage passes for provider abstraction, URL discovery parsing, config conflict error detection, longest-prefix routing, path traversal defense, gateway constant-time auth, and registration acks. Physical external `cloudflared` Internet test remains pending host execution.
 
 ---
 
@@ -1951,11 +1954,11 @@ Verify the end-to-end reliability of multi-service deployments on Windows with D
 5. Verify the session remains active past the previous 30-minute idle threshold, remaining active up to 24 hours of inactivity.
 
 #### Verification Record (Section 39)
-- **Status:** CODE COMPLETE & AUTOMATED TEST COVERAGE PASS (Unit & Regression Tests PASS; Live Docker & External Physical Internet Verification Pending Live Host Environment Execution)
-- **Verified by:** Antigravity AI
-- **Date:** 2026-11-08
-- **Environment:** Windows amd64 / Go 1.27 / Node.js v24.21.0 / PostgreSQL 16 & Redis 7 (Mocks / Isolated Test Harness)
-- **Notes:** Full regression suites passing for `middleware`, `tunnel`, `models`, `config`, and `frontend`. Manual verification checklist documented above for physical host execution.
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated regression suites pass for `middleware`, `tunnel`, `models`, `config`, and `frontend`. Physical multi-tab, live Docker, and gateway TLS verification remain pending host execution.
 
 ---
 
@@ -2015,5 +2018,264 @@ Verify cold-start reliability of the Windows Local Agent (`forgelab-agent.exe`),
 - **Date:** —
 - **Environment:** —
 - **Notes:** Automated unit/subprocess tests verified `/api/agent/status` independence, `ListenAddr()`, PowerShell `-STA` + owner-form + `Dispose()` + UTF-8 Base64 output + cancel/timeout kill, port-conflict non-zero exit, and frontend `agentFetch` timeout/abort/CORS-header handling without a human clicking the physical WinForms modal dialog.
+
+---
+
+### 41. Custom Domains, DNS Verification & Caddy HTTPS Lifecycle
+
+#### Purpose
+Verify that ForgeLAB never misreports custom domain HTTPS as active unless both DNS ownership/routing checks and Caddy Admin API route provisioning succeed, and verify bundled Caddy certificate persistence.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 41.1 — Truthful `proxy_unconfigured` Status Without Caddy
+1. Run ForgeLAB without `CADDY_ADMIN_URL` set (empty string).
+2. Add a custom domain via `POST /api/projects/{id}/domains` (`{"domain": "app.example.com", "service_id": "<svc-id>"}`):
+   - Verify initial state has `verified: false`, `tls_status: "pending"`, `https_active: false`, and DNS TXT instructions `_forgelab-verify.app.example.com`.
+3. Configure DNS TXT record (or in an isolated test environment with controlled DNS) so ownership verification passes, and invoke `POST /api/projects/{id}/domains/{domainId}/verify`.
+4. Verify the response reports:
+   - `verified: true`
+   - `tls_status: "proxy_unconfigured"`
+   - `https_active: false`
+   - `last_error` explaining `CADDY_ADMIN_URL` is not configured.
+
+#### Test Procedure 41.2 — Bundled Caddy Reverse Proxy & Persistent TLS Storage
+1. Start the standard Docker Compose stack (`docker compose up -d --build`) verifying `caddy` (`caddy:2-alpine`) starts cleanly with volumes `forgelab_caddy_data` (`/data`) and `forgelab_caddy_config` (`/config`) and backend receives `CADDY_ADMIN_URL=http://caddy:2019`.
+2. Trigger DNS verification against a real domain pointed at the host (`FORGELAB_INGRESS_HOST`).
+3. Verify `POST /api/projects/{id}/domains/{domainId}/verify` synchronizes the route into Caddy and transitions the domain to `verified: true`, `tls_status: "active"`, `https_active: true`.
+4. Restart the `caddy` container (`docker compose restart caddy`) and verify certificates and state persist in `forgelab_caddy_data`.
+5. Delete the domain (`DELETE /api/projects/{id}/domains/{domainId}`) and confirm Caddy removes the dynamic route.
+
+#### Verification Record (Section 41)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated domain lifecycle and Caddy syncer tests pass using mock DNS/Caddy servers; real ACME TLS issuance against a public domain requires host execution.
+
+---
+
+### 42. Tightened Frontend Content Security Policy (CSP) & Security Headers
+
+#### Purpose
+Verify that Next.js enforces tightened CSP directives without breaking login/OAuth redirects, session cookies, live deployment previews, WebSocket streaming, or Local Agent communication on `http://127.0.0.1:4142`.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 42.1 — Browser Header & Functional Verification
+1. Build and start the frontend (`npm run build && npm run start` or Compose frontend).
+2. Inspect response headers on `GET http://localhost:3000/dashboard` using Browser DevTools -> Network:
+   - Verify `Content-Security-Policy` omits `'unsafe-eval'` in `script-src`, sets `object-src 'none'`, `frame-ancestors 'self'`, `base-uri 'self'`, `form-action 'self' https://github.com https://accounts.google.com`, and explicitly allows `ws:` / `wss:` plus `http://127.0.0.1:4142` / `http://localhost:4142` in `connect-src`.
+   - Verify `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, and `Referrer-Policy: strict-origin-when-cross-origin`.
+3. Exercise authentication (`/login`), WebSocket live logs (`/projects/<id>`), preview URLs, and Local Agent discovery in the UI while watching DevTools Console:
+   - Verify zero CSP violation errors block functional flows.
+
+#### Verification Record (Section 42)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated frontend tests and Next.js production build pass; interactive browser DevTools verification pending host execution.
+
+---
+
+### 43. Strict Docker Container Capability Allowlist
+
+#### Purpose
+Verify that runtime containers always drop all Linux capabilities (`CapDrop: ["ALL"]`) and only admit explicitly allowlisted capabilities (`CHOWN`, `SETGID`, `SETUID`), failing closed with `ErrCapabilityNotAllowed` for disallowed capabilities.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 43.1 — Capability Allowlist Enforcement
+1. Attempt to configure or deploy a service requesting a disallowed capability (e.g. `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, or `DAC_OVERRIDE`).
+2. Verify container validation/creation fails closed before starting the container with `ErrCapabilityNotAllowed`.
+3. Deploy a normal service with empty or allowlisted capabilities (`CHOWN`, `SETGID`, `SETUID`).
+4. Run `docker inspect <container_id> --format '{{json .HostConfig.CapDrop}} {{json .HostConfig.CapAdd}} {{json .HostConfig.SecurityOpt}}'`:
+   - Confirm `CapDrop` is `["ALL"]`.
+   - Confirm `CapAdd` only contains a subset of `["CHOWN", "SETGID", "SETUID"]`.
+   - Confirm `SecurityOpt` includes `no-new-privileges:true`.
+
+#### Verification Record (Section 43)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated unit tests in `trust_boundary_test.go` verify capability allowlist enforcement; live `docker inspect` confirmation pending host execution.
+
+---
+
+### 44. Restart-Recoverable GitHub Imports & Push-to-Deploy Webhooks
+
+#### Purpose
+Verify that in-flight GitHub imports survive backend restarts via PostgreSQL durable job state, support cancel/retry, and verify GitHub webhook push events trigger HMAC-SHA256 verified auto-deployments with replay protection.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 44.1 — Backend Restart Recovery, Cancel & Retry
+1. Start a GitHub repository import (`POST /api/integrations/github/imports`).
+2. While the import is `pending`/`downloading`/`extracting`, restart the ForgeLAB backend (`docker compose restart backend` or restart `go run cmd/server/main.go`).
+3. Inspect backend startup logs for `RecoverInterruptedImports` and poll `GET /api/integrations/github/imports` / `GET /api/integrations/github/imports/{id}`:
+   - Verify interrupted jobs resume/reconcile cleanly instead of remaining permanently orphaned.
+4. Start another import and call `POST /api/integrations/github/imports/{id}/cancel`:
+   - Verify status transitions to `cancelled` and temporary extraction files are removed.
+5. Call `POST /api/integrations/github/imports/{id}/retry` on a failed/cancelled import and confirm it restarts cleanly.
+
+#### Test Procedure 44.2 — Push-to-Deploy HMAC Webhook Verification
+1. Enable push-to-deploy on a GitHub project via `PATCH /api/projects/{id}/webhook` (`{"auto_deploy": true, "auto_deploy_branch": "main", "regenerate_secret": true}`):
+   - Record the returned `webhook_secret` (returned once).
+   - Call `GET /api/projects/{id}/webhook` and confirm `webhook_secret` is omitted (`has_webhook_secret: true`).
+2. Send a signed GitHub `push` payload to `POST /api/webhooks/github?project_id={id}` with valid `X-Hub-Signature-256`, `X-GitHub-Event: push`, and unique `X-GitHub-Delivery`:
+   - Verify `202 Accepted` with `"triggered": true` and a new queued `deployment_id`.
+3. Replay the exact same `X-GitHub-Delivery`:
+   - Verify `200 OK` with `"duplicate": true` and no duplicate deployment created.
+4. Send a payload with an invalid signature:
+   - Verify `401 Unauthorized`.
+
+#### Verification Record (Section 44)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated import recovery and webhook HMAC/replay tests pass; live backend restart and end-to-end GitHub webhook delivery pending host execution.
+
+---
+
+### 45. Configurable Self-Healing, Crash-Loop Protection & Automatic Rollback
+
+#### Purpose
+Verify that sustained runtime health-check failures or container crash loops automatically restart up to configured bounds, trigger automatic rollback to the previous healthy release/service deployment, and verify restoration before reporting success.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 45.1 — Crash-Loop Auto-Rollback & Previous Release Verification
+1. Configure short intervals in `.env` for testing (e.g. `FORGELAB_SELF_HEAL_ENABLED=true`, `FORGELAB_SELF_HEAL_MAX_RESTARTS=2`, `FORGELAB_AUTO_ROLLBACK_ENABLED=true`, `FORGELAB_AUTO_ROLLBACK_HEALTH_FAILURES=2`, `FORGELAB_CRASH_LOOP_MAX_RESTARTS=2`, `FORGELAB_CRASH_LOOP_WINDOW=2m`).
+2. Deploy Release #1 (healthy service returning HTTP 200 on `/health`). Confirm it reaches `running`.
+3. Trigger a new deployment that fails during startup/health check (or deploy an image that exits non-zero repeatedly).
+4. Observe runtime monitor and logs:
+   - Verify failed deployment preserves Release #1's previous healthy container or restores the verified healthy container (`VerifyPreviousHealthyContainer` / `RestorePreviousHealthyContainer`) after passing health verification.
+   - Query `GET /api/projects/{id}/audit-logs` and verify self-heal / rollback audit entries are recorded accurately.
+
+#### Verification Record (Section 45)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated runtime health monitor and rollback verification tests pass; live container crash-loop test pending host execution.
+
+---
+
+### 46. Opt-In Zero-Downtime Blue-Green Cutover
+
+#### Purpose
+Verify opt-in `blue_green` service deployment mode routes live traffic through `/proxy/services/{serviceId}`, warms up and health-checks the inactive slot before atomic traffic cutover, and retains fallback routing fidelity.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 46.1 — Blue-Green Deployment & Proxy Cutover
+1. Deploy a web service in `standard` mode and confirm it is running.
+2. Enable `blue_green` mode:
+   `PATCH /api/projects/{id}/services/{serviceId}/deployment-mode` with `{"deployment_mode": "blue_green"}`.
+3. Query `GET http://localhost:8080/proxy/services/{serviceId}/`:
+   - Confirm HTTP 200 and inspect response header `X-ForgeLAB-Slot` (e.g. `blue`).
+4. Trigger a new service deployment (`POST /api/projects/{id}/services/{serviceId}/deploy`) while polling `/proxy/services/{serviceId}/`:
+   - Confirm traffic stays up throughout build and health checking.
+   - Confirm `X-ForgeLAB-Slot` flips to the newly healthy slot (`green`) only after health verification completes.
+
+#### Verification Record (Section 46)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated blue-green router and deployment tests pass; live continuous HTTP polling across Docker container swap pending host execution.
+
+---
+
+### 47. Persistent Volume Inspection, Disk Usage, Backup & Safe Restore
+
+#### Purpose
+Verify project-scoped Docker persistent volume visibility, daemon disk usage reporting, safe streaming `.tar.gz` backup, fail-closed `409` restore protection on active volumes, and archive traversal/size limit enforcement.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 47.1 — Volume Backup, Active-Mount Guard & Offline Restore
+1. Deploy a project service with a named persistent volume (e.g. Postgres `db_data`), write sample rows/files inside the volume, and confirm `GET /api/projects/{id}/volumes` lists the volume with `in_use: true` and populated daemon `disk_usage`.
+2. Download a backup via `POST /api/projects/{id}/volumes/{volumeName}/backup` to `backup.tar.gz`.
+3. While the container is **running**, attempt `POST /api/projects/{id}/volumes/{volumeName}/restore` with `backup.tar.gz`:
+   - Verify rejection with **HTTP 409 Conflict** (`ErrVolumeInUse`).
+4. Stop the service (`POST /api/projects/{id}/services/{serviceId}/stop`), delete or alter a test file in the volume, and restore `backup.tar.gz`:
+   - Verify **HTTP 200 OK** with `files_restored` and `bytes_restored`.
+   - Start the service and confirm original data is intact.
+5. Attempt to restore a crafted archive containing `../escape.txt`:
+   - Verify rejection with **HTTP 400 Bad Request** (`ErrInvalidVolumeArchive`).
+
+#### Verification Record (Section 47)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated volume validation and archive security tests pass; live Alpine helper container backup/restore pending host execution.
+
+---
+
+### 48. Backend-Sampled Metrics History, Redacted Audit Logs & Diagnostics
+
+#### Purpose
+Verify TTL-cached live container metrics, background-sampled historical metrics with configurable retention, secret-redacted operational audit logging, and consolidated system/project diagnostics.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 48.1 — Cached Live Telemetry & Historical Metrics Query
+1. With at least one project service running, call `GET /api/projects/{id}/metrics` twice within `FORGELAB_METRICS_CACHE_TTL` (default `5s`):
+   - Confirm first response has `cached: false` and second returns `cached: true` with `cache_age_seconds > 0` without re-querying Docker.
+2. Call `GET /api/projects/{id}/metrics?refresh=true` and confirm `cached: false`.
+3. Wait >= `FORGELAB_METRICS_SAMPLE_INTERVAL` (default `30s`) and call `GET /api/projects/{id}/metrics/history?hours=1`:
+   - Confirm time-series `samples` and per-service `summaries` (`peak_cpu_percent`, `avg_cpu_percent`, `peak_memory_bytes`, `max_restart_count`) are populated.
+
+#### Test Procedure 48.2 — Audit Log Recording, Metadata Redaction & Diagnostics
+1. Set a secret env var (`POST /api/projects/{id}/env` with `{"key": "TEST_SECRET", "value": "supersecret123", "is_secret": true}`), restart a service, and verify a custom domain.
+2. Query `GET /api/projects/{id}/audit-logs` and `GET /api/audit-logs`:
+   - Confirm corresponding events (`env.set`, `service.restart`, `domain.verify`) appear in reverse chronological order.
+   - Confirm `supersecret123` never appears anywhere in `audit_logs` metadata (scrubbed to `"[REDACTED]"`).
+3. Query `GET /api/diagnostics` and `GET /api/projects/{id}/diagnostics`:
+   - Confirm `docker` connectivity, `deployment_failures`, `resources.disk_usage`, `imports`, and actionable `issues` report accurate runtime state.
+
+#### Verification Record (Section 48)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated unit/regression tests pass for metrics caching, historical rollup queries, audit metadata redaction, and diagnostics aggregation; live Docker stats & Postgres retention pruning pending host execution.
 
 

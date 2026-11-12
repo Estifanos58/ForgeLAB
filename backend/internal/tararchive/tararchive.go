@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/forgelab/backend/internal/dockerignore"
+	"github.com/forgelab/backend/internal/security"
 )
 
 var (
@@ -55,6 +56,18 @@ func getEnvInt(key string, fallback int) int {
 	return fallback
 }
 
+func canonicalizeWithAncestor(rawPath string) (string, error) {
+	return security.CanonicalizeWithAncestor(rawPath)
+}
+
+func isWithinRoot(root, target string) bool {
+	return security.IsWithinRoot(root, target)
+}
+
+func normalizeWindowsReadlinkTarget(target string) string {
+	return security.NormalizeReadlinkTarget(target)
+}
+
 // WriteBuildContext generates a strict, validated TAR stream of the build context directory
 // directly into the provided io.Writer.
 //
@@ -77,9 +90,13 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 		maxFileSize = getEnvInt64("BUILD_CONTEXT_MAX_FILE_BYTES", 100*1024*1024) // 100 MB default
 	}
 
-	canonicalContextDir, err := filepath.EvalSymlinks(opts.BuildContextDir)
-	if err != nil {
-		canonicalContextDir = filepath.Clean(opts.BuildContextDir)
+	var canonicalContextDir string
+	if strings.TrimSpace(opts.BuildContextDir) != "" {
+		var cErr error
+		canonicalContextDir, cErr = canonicalizeWithAncestor(opts.BuildContextDir)
+		if cErr != nil {
+			canonicalContextDir = filepath.Clean(opts.BuildContextDir)
+		}
 	}
 
 	if opts.EmitLog != nil {
@@ -133,8 +150,8 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 	}
 
 	// 2. Walk build context directory
-	if opts.BuildContextDir != "" {
-		walkErr := filepath.WalkDir(opts.BuildContextDir, func(p string, d os.DirEntry, err error) error {
+	if canonicalContextDir != "" {
+		walkErr := filepath.WalkDir(canonicalContextDir, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
 				if os.IsPermission(err) {
 					return fmt.Errorf("%w: permission denied accessing %s: %v", ErrBuildContextAccessDenied, p, err)
@@ -148,7 +165,7 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 			default:
 			}
 
-			relPath, err := filepath.Rel(opts.BuildContextDir, p)
+			relPath, err := filepath.Rel(canonicalContextDir, p)
 			if err != nil {
 				return err
 			}
@@ -169,7 +186,7 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 				if isDir && opts.Matcher.CanSkipDir(slashRelPath) {
 					return filepath.SkipDir
 				}
-				if opts.Matcher.Matches(slashRelPath, isDir) {
+				if opts.Matcher.Matches(slashRelPath, isDir) || (d.Type()&os.ModeIrregular != 0 && opts.Matcher.Matches(slashRelPath, true)) {
 					if isDir {
 						return filepath.SkipDir
 					}
@@ -177,12 +194,17 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 				}
 			}
 
-			// Handle symlinks
-			if d.Type()&os.ModeSymlink != 0 {
-				target, err := os.Readlink(p)
-				if err != nil {
-					return fmt.Errorf("%w: failed reading symlink %s: %v", ErrBuildContextAccessDenied, slashRelPath, err)
+			// Handle symlinks and Windows NTFS junctions/reparse points
+			if d.Type()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+				target, rErr := os.Readlink(p)
+				if rErr != nil {
+					if d.Type()&os.ModeSymlink != 0 {
+						return fmt.Errorf("%w: failed reading symlink %s: %v", ErrBuildContextAccessDenied, slashRelPath, rErr)
+					}
+					// Skip non-link irregular files (e.g. sockets/FIFOs)
+					return nil
 				}
+				target = normalizeWindowsReadlinkTarget(target)
 
 				var resolvedTarget string
 				if filepath.IsAbs(target) {
@@ -190,11 +212,12 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 				} else {
 					resolvedTarget = filepath.Clean(filepath.Join(filepath.Dir(p), target))
 				}
-				if realTarget, err := filepath.EvalSymlinks(resolvedTarget); err == nil {
-					resolvedTarget = realTarget
+				if canonTarget, cErr := canonicalizeWithAncestor(resolvedTarget); cErr == nil {
+					resolvedTarget = canonTarget
+				} else if errors.Is(cErr, security.ErrRestrictedSystemPath) {
+					return fmt.Errorf("%w: symlink %s points to restricted target %s", ErrSymlinkEscape, slashRelPath, target)
 				}
-				relToRoot, err := filepath.Rel(canonicalContextDir, resolvedTarget)
-				if err != nil || strings.HasPrefix(relToRoot, "..") || filepath.IsAbs(relToRoot) {
+				if !isWithinRoot(canonicalContextDir, resolvedTarget) {
 					return fmt.Errorf("%w: symlink %s points to %s outside build context", ErrSymlinkEscape, slashRelPath, target)
 				}
 
@@ -203,11 +226,33 @@ func WriteBuildContext(ctx context.Context, w io.Writer, opts BuildContextOption
 					return fmt.Errorf("stat failed for symlink %s: %w", slashRelPath, err)
 				}
 
-				header, err := tar.FileInfoHeader(info, target)
-				if err != nil {
-					return fmt.Errorf("failed creating tar header for symlink %s: %w", slashRelPath, err)
+				linkTarget := target
+				if !filepath.IsAbs(linkTarget) {
+					linkTarget = filepath.ToSlash(linkTarget)
+				} else if relTarget, relErr := filepath.Rel(filepath.Dir(p), resolvedTarget); relErr == nil {
+					// Preserve container portability for internal absolute links (e.g. Windows junctions within build context)
+					linkTarget = filepath.ToSlash(relTarget)
 				}
-				header.Name = slashRelPath
+
+				var header *tar.Header
+				if info.Mode()&os.ModeSymlink != 0 {
+					header, err = tar.FileInfoHeader(info, linkTarget)
+					if err != nil {
+						return fmt.Errorf("failed creating tar header for symlink %s: %w", slashRelPath, err)
+					}
+					header.Name = slashRelPath
+				} else {
+					// NTFS junctions carry os.ModeIrregular, which tar.FileInfoHeader rejects.
+					// Emit a portable TAR symlink entry targeting the validated internal relative path.
+					header = &tar.Header{
+						Name:     slashRelPath,
+						Mode:     0777,
+						Size:     0,
+						ModTime:  info.ModTime(),
+						Typeflag: tar.TypeSymlink,
+						Linkname: linkTarget,
+					}
+				}
 
 				if err := tw.WriteHeader(header); err != nil {
 					return fmt.Errorf("failed writing tar header for symlink %s: %w", slashRelPath, err)

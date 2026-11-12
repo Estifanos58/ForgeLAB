@@ -231,17 +231,14 @@ func DiscoverWithContext(ctx context.Context, repoRoot string) (*DiscoveryResult
 }
 
 func quickStatScan(ctx context.Context, cleanRoot string) (totalFiles int, totalBytes int64) {
-	canonicalRoot, err := filepath.EvalSymlinks(cleanRoot)
-	if err != nil {
-		canonicalRoot = cleanRoot
-	}
+	canonicalRoot := canonicalizeWithAncestor(cleanRoot)
 
 	const (
 		maxFilesScan = 50000
 		maxBytesScan = 500 * 1024 * 1024 // 500 MB
 	)
 
-	_ = filepath.WalkDir(cleanRoot, func(path string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(canonicalRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -252,28 +249,25 @@ func quickStatScan(ctx context.Context, cleanRoot string) (totalFiles int, total
 			return filepath.SkipAll
 		}
 		if d.IsDir() {
-			if path != cleanRoot && IsPrunedDir(d.Name()) {
+			if path != canonicalRoot && IsPrunedDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		// Handle symlink escape protection
-		if d.Type()&os.ModeSymlink != 0 {
-			target, err := os.Readlink(path)
-			if err != nil {
+		// Handle symlink & Windows NTFS junction escape protection
+		if target, isLink, linkErr := readLinkIfReparse(path, d); isLink || d.Type()&os.ModeIrregular != 0 {
+			if linkErr != nil || !isLink {
 				return nil
 			}
 			resolved := target
 			if !filepath.IsAbs(resolved) {
 				resolved = filepath.Join(filepath.Dir(path), target)
 			}
-			if real, err := filepath.EvalSymlinks(resolved); err == nil {
-				resolved = real
+			resolved = canonicalizeWithAncestor(resolved)
+			if !isWithinRoot(canonicalRoot, resolved) {
+				return nil // skip symlink/junction pointing outside workspace
 			}
-			rel, err := filepath.Rel(canonicalRoot, resolved)
-			if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-				return nil // skip symlink pointing outside workspace
-			}
+			return nil
 		}
 		if !IsSecretFile(d.Name()) {
 			totalFiles++
@@ -293,13 +287,14 @@ func readDirectoryManifests(dirPath string) (map[string][]byte, error) {
 	)
 	files := make(map[string][]byte)
 	var totalBytes int64
+	canonicalDir := canonicalizeWithAncestor(dirPath)
 
-	_ = filepath.WalkDir(dirPath, func(path string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(canonicalDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			if path != dirPath && IsPrunedDir(d.Name()) {
+			if path != canonicalDir && IsPrunedDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -310,8 +305,21 @@ func readDirectoryManifests(dirPath string) (map[string][]byte, error) {
 		if IsSecretFile(d.Name()) {
 			return nil
 		}
+		if target, isLink, linkErr := readLinkIfReparse(path, d); isLink || d.Type()&os.ModeIrregular != 0 {
+			if linkErr != nil || !isLink {
+				return nil
+			}
+			resolved := target
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(filepath.Dir(path), target)
+			}
+			resolved = canonicalizeWithAncestor(resolved)
+			if !isWithinRoot(canonicalDir, resolved) {
+				return nil
+			}
+		}
 
-		rel, _ := filepath.Rel(dirPath, path)
+		rel, _ := filepath.Rel(canonicalDir, path)
 		slashRel := filepath.ToSlash(rel)
 		if strings.Count(slashRel, "/") <= 2 && isManifestOrConfigFile(filepath.Base(path)) {
 			if data, err := readSmallFile(path, 256*1024); err == nil {
@@ -394,13 +402,28 @@ func inspectServiceDirectory(repoRoot, dirPath, relPath string) (*DiscoveredServ
 
 	var filesCount int
 	var totalBytes int64
-	_ = filepath.WalkDir(dirPath, func(path string, d os.DirEntry, err error) error {
+	canonicalServiceRoot := canonicalizeWithAncestor(dirPath)
+	_ = filepath.WalkDir(canonicalServiceRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			if path != dirPath && IsPrunedDir(d.Name()) {
+			if path != canonicalServiceRoot && IsPrunedDir(d.Name()) {
 				return filepath.SkipDir
+			}
+			return nil
+		}
+		if target, isLink, linkErr := readLinkIfReparse(path, d); isLink || d.Type()&os.ModeIrregular != 0 {
+			if linkErr != nil || !isLink {
+				return nil
+			}
+			resolved := target
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(filepath.Dir(path), target)
+			}
+			resolved = canonicalizeWithAncestor(resolved)
+			if !isWithinRoot(canonicalServiceRoot, resolved) {
+				return nil
 			}
 			return nil
 		}

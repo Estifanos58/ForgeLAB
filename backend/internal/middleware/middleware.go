@@ -733,7 +733,9 @@ func MaxBodySize(defaultLimitBytes int64, uploadLimitBytes int64) func(http.Hand
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Body != nil {
 				limit := defaultLimitBytes
-				if strings.HasSuffix(r.URL.Path, "/upload") || strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
+				if strings.HasSuffix(r.URL.Path, "/upload") ||
+					strings.HasSuffix(r.URL.Path, "/restore") ||
+					strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
 					limit = uploadLimitBytes
 				}
 				r.Body = http.MaxBytesReader(w, r.Body, limit)

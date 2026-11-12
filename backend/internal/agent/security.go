@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/forgelab/backend/internal/security"
 )
 
 var (
@@ -45,14 +47,19 @@ type PathValidator struct {
 	allowedRoots []string
 }
 
+func canonicalizeWithAncestor(rawPath string) (string, error) {
+	return security.CanonicalizeWithAncestor(rawPath)
+}
+
+func isWithinRoot(root, target string) bool {
+	return security.IsWithinRoot(root, target)
+}
+
 func NewPathValidator(allowedRoots []string) *PathValidator {
 	var cleanRoots []string
 	for _, r := range allowedRoots {
-		trimmed := strings.TrimSpace(r)
-		if trimmed != "" {
-			if abs, err := filepath.Abs(trimmed); err == nil {
-				cleanRoots = append(cleanRoots, filepath.Clean(abs))
-			}
+		if canon, err := security.CanonicalizeWithAncestor(r); err == nil {
+			cleanRoots = append(cleanRoots, canon)
 		}
 	}
 	return &PathValidator{allowedRoots: cleanRoots}
@@ -63,6 +70,10 @@ func (v *PathValidator) ValidateSourcePath(rawPath string) (string, error) {
 	trimmed := strings.TrimSpace(rawPath)
 	if trimmed == "" {
 		return "", errors.New("path is required")
+	}
+
+	if runtime.GOOS == "windows" && (strings.HasPrefix(trimmed, `\\`) || strings.HasPrefix(trimmed, `//`)) {
+		return "", ErrRestrictedSystemPath
 	}
 
 	absPath, err := filepath.Abs(trimmed)
@@ -85,22 +96,27 @@ func (v *PathValidator) ValidateSourcePath(rawPath string) (string, error) {
 		return "", ErrPathNotDirectory
 	}
 
-	// Resolve symlinks to detect symlink escape
-	realPath, err := filepath.EvalSymlinks(cleanPath)
+	// Resolve symlinks, Windows NTFS junctions/reparse points, and 8.3 short paths (e.g. RUNNER~1)
+	realClean, err := security.CanonicalizeExistingPath(cleanPath)
 	if err != nil {
+		if errors.Is(err, security.ErrRestrictedSystemPath) {
+			return "", ErrRestrictedSystemPath
+		}
 		return "", fmt.Errorf("failed to resolve path symlinks: %w", err)
 	}
-	realClean := filepath.Clean(realPath)
 
 	// Reject system roots
 	lower := strings.ToLower(realClean)
 	if runtime.GOOS == "windows" {
+		if strings.HasPrefix(realClean, `\\`) {
+			return "", ErrRestrictedSystemPath
+		}
 		// Reject drive roots like C:\ or D:\
 		if len(lower) <= 3 && strings.HasSuffix(lower, ":\\") {
 			return "", ErrRestrictedSystemPath
 		}
 		for _, prefix := range restrictedWindowsPrefixes {
-			if strings.HasPrefix(lower, prefix) {
+			if lower == prefix || strings.HasPrefix(lower, prefix+`\`) {
 				return "", ErrRestrictedSystemPath
 			}
 		}
@@ -120,8 +136,7 @@ func (v *PathValidator) ValidateSourcePath(rawPath string) (string, error) {
 	if len(v.allowedRoots) > 0 {
 		allowed := false
 		for _, root := range v.allowedRoots {
-			rel, err := filepath.Rel(root, realClean)
-			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			if isWithinRoot(root, realClean) {
 				allowed = true
 				break
 			}

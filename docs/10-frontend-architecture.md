@@ -80,6 +80,8 @@ frontend/
 │   │   │   │   └── page.tsx          # Authenticated project dashboard
 │   │   │   └── projects/[id]/
 │   │   │       └── page.tsx          # Operational project & deployment console
+│   │   ├── api/[[...path]]/
+│   │   │   └── route.ts              # Same-origin Next.js API reverse proxy to Go backend
 │   │   ├── globals.css               # Design tokens, typography & base styling
 │   │   └── layout.tsx                # Root layout with AuthProvider & metadata
 │   ├── components/
@@ -87,16 +89,17 @@ frontend/
 │   │   ├── layout/                   # Navbar, AppHeader, Footer
 │   │   ├── auth/                     # LoginForm, RegisterForm, OAuthButtons
 │   │   ├── marketing/                # Hero, Workflow, Features, Architecture, CTA
-│   │   └── dashboard/                # ProjectStats, ProjectCard, CreateProjectModal
+│   │   └── dashboard/                # ProjectStats, ProjectCard, CreateProjectModal & source sub-components
 │   ├── features/
 │   │   ├── auth/                     # AuthContext, useAuth hook (session state)
-│   │   └── deployments/              # LifecycleControls, TerminalViewer, History, EnvManager
+│   │   ├── deployments/              # LifecycleControls, TerminalViewer, History, EnvManager
+│   │   └── projects/                 # DomainsPanel, VolumesPanel, RuntimeMetricsPanel, TopologySection, ShareModal
 │   ├── lib/
-│   │   ├── api/                      # Modular domain API clients (base, auth, projects, services, env, integrations, sources, agent, discovery, client facade)
+│   │   ├── api/                      # Modular domain API clients (base, auth, projects, services, env, integrations, sources, agent, discovery, observability, client facade)
 │   │   ├── auth/                     # Centralized SessionManager (cross-tab Web Locks, BroadcastChannel, upload preflight)
 │   │   └── websocket/                # Scoped WebSocket streaming hook (use-deployment-ws)
 │   └── proxy.ts                      # Next.js 16 proxy convention for route protection
-├── next.config.ts                    # Backend reverse-proxy rewrite configuration
+├── next.config.ts                    # Security headers & tightened Content Security Policy (CSP)
 ├── tailwind.config.ts                # Tailwind design system configuration
 ├── eslint.config.mjs                 # Flat ESLint 9 configuration with @next/eslint-plugin-next
 ├── Dockerfile                        # Multi-stage production build (Node 22 Alpine)
@@ -140,22 +143,22 @@ The UI provides unified authentication across:
 
 ---
 
-## 4. Container Networking & Reverse Proxy
+## 4. Container Networking, Same-Origin API Proxy & Tightened CSP
 
-When running in Docker Compose:
-- The browser accesses ForgeLAB at `http://localhost:3000`.
-- The Next.js server proxies `/api/:path*` internally to `BACKEND_INTERNAL_URL` (default: `http://backend:8080/api/:path*`) via `next.config.ts` rewrites:
-  ```typescript
-  async rewrites() {
-    return [
-      {
-        source: '/api/:path*',
-        destination: `${process.env.BACKEND_INTERNAL_URL || 'http://backend:8080'}/api/:path*`,
-      },
-    ];
-  }
-  ```
-- This ensures that browser requests never need to resolve internal Docker service names such as `http://backend:8080`.
+When running in Docker Compose (or standalone Node):
+- The browser accesses ForgeLAB at `http://localhost:3000` (or via Caddy on `:80`/`:443`).
+- Same-origin `/api/*` requests are proxied by the Next.js Route Handler **`frontend/src/app/api/[[...path]]/route.ts`** (not `next.config.ts rewrites()`) to `BACKEND_INTERNAL_URL || BACKEND_URL || 'http://localhost:8080'` (`http://backend:8080` in Docker Compose):
+  - Transparently preserves incoming `Cookie`, `Authorization`, query parameters, request method, and streaming bodies (`duplex: 'half'`).
+  - Preserves multiple backend `Set-Cookie` headers (`response.headers.getSetCookie()`) and OAuth `Location` redirects (`redirect: 'manual'`).
+  - Strips client-supplied spoofed forwarding headers (`x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`, `x-forwarded-port`, `forwarded`) before setting authoritative proxy headers (`extractClientIp`), ensuring browser requests never need to resolve internal Docker service DNS names such as `http://backend:8080`.
+- **Security Headers & Hardened Content Security Policy (`frontend/next.config.ts`):**
+  - Applied across `/:path*`:
+    - `X-Content-Type-Options: nosniff`
+    - `X-Frame-Options: DENY`
+    - `Referrer-Policy: strict-origin-when-cross-origin`
+    - `Permissions-Policy: camera=(), microphone=(), geolocation=()`
+    - `Strict-Transport-Security: max-age=31536000; includeSubDomains` (conditionally emitted when `COOKIE_SECURE === 'true'` or `ENABLE_HSTS === 'true'`).
+  - **Content Security Policy:** `default-src 'self'`, `script-src 'self' 'unsafe-inline'` in production (`'unsafe-eval'` included **only** when `NODE_ENV === 'development'` for React Fast Refresh), `style-src 'self' 'unsafe-inline'`, `img-src 'self' data: blob: https://avatars.githubusercontent.com https://lh3.googleusercontent.com`, `font-src 'self' data:`, `connect-src 'self' ws: wss: http://127.0.0.1:4142 http://localhost:4142` (plus configured backend/preview origins), `worker-src 'self' blob:`, `form-action 'self'`, `frame-ancestors 'none'`, `object-src 'none'`, `base-uri 'self'`.
 
 ---
 

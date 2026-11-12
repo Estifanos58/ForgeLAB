@@ -26,6 +26,7 @@ var (
 	ErrDomainNotFound     = errors.New("custom domain not found")
 	ErrDomainExists       = errors.New("custom domain is already registered")
 	ErrDomainVerification = errors.New("custom domain DNS verification failed")
+	ErrCaddyNotConfigured = errors.New("Caddy reverse proxy is not configured")
 )
 
 // DNSResolver abstracts DNS TXT/CNAME/A lookups for testability.
@@ -84,6 +85,25 @@ func (s *DomainService) SetDNSResolver(resolver DNSResolver) {
 // SetProjectService configures the project service for target port fallback resolution.
 func (s *DomainService) SetProjectService(projectSvc *ProjectService) {
 	s.projectService = projectSvc
+}
+
+// IsCaddyConfigured returns true when a Caddy Admin API endpoint is configured for TLS/route provisioning.
+func (s *DomainService) IsCaddyConfigured() bool {
+	return s != nil && s.caddySyncer != nil && s.caddySyncer.IsConfigured()
+}
+
+func (s *DomainService) populateEffectiveState(d *models.CustomDomain) {
+	if d == nil {
+		return
+	}
+	if !s.IsCaddyConfigured() && d.Verified && d.TLSStatus == models.DomainTLSStatusActive {
+		d.TLSStatus = models.DomainTLSStatusProxyUnconfigured
+		if d.LastError == nil || strings.TrimSpace(*d.LastError) == "" {
+			msg := "DNS verified, but HTTPS routing is inactive because CADDY_ADMIN_URL is not configured"
+			d.LastError = &msg
+		}
+	}
+	d.PopulateDNSInstructions(s.ingressHost)
 }
 
 func generateDomainVerificationToken() (string, error) {
@@ -249,7 +269,7 @@ func (s *DomainService) ListDomains(ctx context.Context, projectID uuid.UUID) ([
 		for _, d := range s.memDomains {
 			if d.ProjectID == projectID {
 				cp := *d
-				cp.PopulateDNSInstructions(s.ingressHost)
+				s.populateEffectiveState(&cp)
 				list = append(list, &cp)
 			}
 		}
@@ -282,7 +302,7 @@ func (s *DomainService) ListDomains(ctx context.Context, projectID uuid.UUID) ([
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan custom domain: %w", err)
 		}
-		d.PopulateDNSInstructions(s.ingressHost)
+		s.populateEffectiveState(d)
 		domains = append(domains, d)
 	}
 	return domains, rows.Err()
@@ -298,7 +318,7 @@ func (s *DomainService) GetDomain(ctx context.Context, projectID, domainID uuid.
 			return nil, ErrDomainNotFound
 		}
 		cp := *d
-		cp.PopulateDNSInstructions(s.ingressHost)
+		s.populateEffectiveState(&cp)
 		return &cp, nil
 	}
 
@@ -320,7 +340,7 @@ func (s *DomainService) GetDomain(ctx context.Context, projectID, domainID uuid.
 		}
 		return nil, fmt.Errorf("failed to load custom domain: %w", err)
 	}
-	d.PopulateDNSInstructions(s.ingressHost)
+	s.populateEffectiveState(d)
 	return d, nil
 }
 
@@ -449,7 +469,20 @@ func (s *DomainService) VerifyDomain(ctx context.Context, projectID, domainID uu
 	}
 
 	d.Verified = true
-	d.TLSStatus = models.DomainTLSStatusActive
+
+	// Never report HTTPS as active unless Caddy Admin API is configured AND route synchronization succeeds.
+	if !s.IsCaddyConfigured() {
+		msg := "DNS verified, but HTTPS routing is inactive because CADDY_ADMIN_URL is not configured"
+		d.TLSStatus = models.DomainTLSStatusProxyUnconfigured
+		d.LastError = &msg
+		if err := s.persistDomainState(ctx, d); err != nil {
+			return nil, fmt.Errorf("failed to persist verified domain status: %w", err)
+		}
+		s.populateEffectiveState(d)
+		return d, nil
+	}
+
+	d.TLSStatus = models.DomainTLSStatusPending
 	d.LastError = nil
 	if err := s.persistDomainState(ctx, d); err != nil {
 		return nil, fmt.Errorf("failed to persist verified domain status: %w", err)
@@ -460,11 +493,17 @@ func (s *DomainService) VerifyDomain(ctx context.Context, projectID, domainID uu
 		d.TLSStatus = models.DomainTLSStatusError
 		d.LastError = &msg
 		_ = s.persistDomainState(ctx, d)
-		d.PopulateDNSInstructions(s.ingressHost)
+		s.populateEffectiveState(d)
 		return d, fmt.Errorf("failed to provision HTTPS route in Caddy: %w", err)
 	}
 
-	d.PopulateDNSInstructions(s.ingressHost)
+	d.TLSStatus = models.DomainTLSStatusActive
+	d.LastError = nil
+	if err := s.persistDomainState(ctx, d); err != nil {
+		return nil, fmt.Errorf("failed to persist active HTTPS domain status: %w", err)
+	}
+
+	s.populateEffectiveState(d)
 	return d, nil
 }
 

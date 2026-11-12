@@ -62,7 +62,8 @@
 | R4.3 | Private and public repositories supported under user's grant | IMPLEMENTED |
 | R4.4 | Branch selection and remote framework detection during import | IMPLEMENTED |
 | R4.5 | GitHub tokens encrypted at rest via AES-256-GCM | IMPLEMENTED |
-| R4.6 | Foundation for future automated push webhooks | Future |
+| R4.6 | Automated push-to-deploy webhooks with HMAC-SHA256 verification & replay deduplication | IMPLEMENTED |
+| R4.7 | Restart-recoverable GitHub repository imports with cancel & retry support | IMPLEMENTED |
 
 ### R5. Deployment Lifecycle
 
@@ -94,9 +95,9 @@
 | ID | Requirement | Status |
 |----|------------|--------|
 | R7.1 | Support application health checking (e.g., GET /health) | MVP |
-| R7.2 | Determine states: RUNNING, UNHEALTHY, STOPPED, CRASHED, DEPLOYING | MVP |
+| R7.2 | Determine states: RUNNING, DEGRADED, UNHEALTHY, STOPPED, CRASHED, DEPLOYING, FAILED | IMPLEMENTED |
 | R7.3 | Health check path must be configurable (not hardcoded) | MVP |
-| R7.4 | Configurable interval, timeout, failure threshold | Future |
+| R7.4 | Configurable runtime health check interval, self-healing restart caps, crash-loop detection, and automatic rollback | IMPLEMENTED |
 
 ### R8. Live Logs & Realtime
 
@@ -142,17 +143,21 @@
 
 ---
 
-## Out of Scope for MVP (Explicitly)
+## Out of Scope / Remaining Deferred Items
 
-- Automatic deployments from webhooks
-- Custom domains / DNS
-- HTTPS automation (Caddy reverse proxy routing)
+### Implemented Since Initial MVP
+- Automatic deployments from GitHub push webhooks (`WebhookService`, HMAC-SHA256 + replay deduplication)
+- Custom domains with DNS TXT verification & Caddy automatic HTTPS (`CADDY_ADMIN_URL`, `proxy_unconfigured` fallback)
+- Configurable runtime self-healing & automatic rollback preserving/verifying previous healthy containers
+- Opt-in per-service `blue_green` traffic switching via `TrafficRouter`
+- Redacted operational audit logging (`AuditService`, `audit_logs`)
+- Backend-sampled/cached live metrics & PostgreSQL historical telemetry retention (`metrics_history`)
+- Persistent volume disk usage visibility, backup streaming, & bounded archive restore
+
+### Still Explicitly Out of Scope
 - Teams / RBAC / multi-user organizations
-- CLI tool
-- Self-healing / automatic recovery (continuous health inspection is implemented; automated remediation/rollback is deferred)
-- Zero-downtime deployments
-- Multi-node / worker separation
-- Audit logging (beyond basic)
-- Observability dashboards / OpenTelemetry metrics
+- Standalone general CLI tool (beyond the host local-agent binary)
+- Multi-node / worker separation or Kubernetes orchestration
+- OpenTelemetry / Prometheus `/api/metrics` exporter (native metrics & diagnostics are implemented)
 - PostgreSQL replication
 - Ephemeral storage quotas (requires host filesystem quota support; rejected explicitly)

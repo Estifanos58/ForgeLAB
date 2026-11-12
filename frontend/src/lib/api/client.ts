@@ -11,6 +11,7 @@ import { discoveryClient } from './discovery-client';
 import { domainsClient } from './domains-client';
 import { envClient } from './env-client';
 import { integrationsClient } from './integrations-client';
+import { observabilityClient } from './observability-client';
 import { projectsClient } from './projects-client';
 import { servicesClient } from './services-client';
 import { sourcesClient } from './sources-client';
@@ -39,4 +40,5 @@ export const api = {
   sources: sourcesClient,
   agent: agentClient,
   discovery: discoveryClient,
+  observability: observabilityClient,
 };

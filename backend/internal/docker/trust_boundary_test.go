@@ -238,3 +238,40 @@ func TestTrustBoundary_EnforcesMountAllowlist(t *testing.T) {
 		t.Fatalf("expected ErrHostMountNotAllowed for mount outside allowlist, got %v", err)
 	}
 }
+
+func TestTrustBoundary_EnforcesStrictCapabilityAllowlist(t *testing.T) {
+	// Allowlisted capabilities (including CAP_ prefix / lowercase) succeed
+	cfg, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
+		CapAdd: []string{"chown", "CAP_SETGID", "SETUID"},
+	})
+	if err != nil {
+		t.Fatalf("expected allowlisted capabilities to pass, got: %v", err)
+	}
+	if len(cfg.CapAdd) != 3 {
+		t.Fatalf("expected 3 capabilities in CapAdd, got %v", cfg.CapAdd)
+	}
+
+	// Disallowed capabilities (both previously-blacklisted and unlisted dangerous caps) MUST fail closed
+	disallowedCaps := []string{
+		"ALL",
+		"CAP_ALL",
+		"DAC_OVERRIDE",
+		"FOWNER",
+		"SYS_ADMIN",
+		"CAP_NET_ADMIN",
+		"NET_RAW",
+		"SYS_CHROOT",
+		"SETPCAP",
+		"BPF",
+		"  ",
+		"UNKNOWN_CUSTOM_CAP",
+	}
+	for _, capName := range disallowedCaps {
+		_, err := ValidateAndBuildSecureHostConfig(ContainerSecurityOptions{
+			CapAdd: []string{capName},
+		})
+		if err == nil || !errors.Is(err, ErrCapabilityNotAllowed) {
+			t.Errorf("expected ErrCapabilityNotAllowed for capability %q, got %v", capName, err)
+		}
+	}
+}

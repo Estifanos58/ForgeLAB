@@ -162,33 +162,35 @@ To maintain engineering truth, this roadmap strictly distinguishes:
 
 These capabilities are intentionally deferred until Phase 9 physical verification is complete:
 
-### Phase 10: GitHub OAuth Integration & Webhooks
+### Phase 10: GitHub OAuth Integration & Webhooks ✅ [IMPLEMENTED]
 - [x] Dedicated OAuth application handshake (`repo,read:user` scopes) and encrypted token persistence via AES-256-GCM (`IMPLEMENTED`)
 - [x] Authorized repository and branch picker API (`GET /api/integrations/github/...`) (`IMPLEMENTED`)
 - [x] Remote framework & runtime heuristic detection (`IMPLEMENTED`)
-- [x] Automated tarball acquisition into isolated build context (`IMPLEMENTED`)
-- [ ] HMAC-signed GitHub webhook receiver for automated push-to-deploy (`DEFERRED`)
+- [x] Automated tarball acquisition & restart-recoverable import pipeline (`repository_imports`, cancel, retry) (`IMPLEMENTED`)
+- [x] HMAC-SHA256 verified GitHub push webhook receiver (`POST /api/webhooks/github`, `WebhookService`, delivery replay deduplication) (`IMPLEMENTED`)
 
-### Phase 11: Edge Routing & Reverse Proxy (Caddy)
-- Caddy reverse proxy integration via dynamic configuration API
-- Automatic subdomain routing (`<project-slug>.forgelab.local`)
-- Automated Let's Encrypt TLS certificate issuance for public domains
-- True zero-downtime rolling deployments via proxy traffic shifting
+### Phase 11: Edge Routing & Reverse Proxy (Caddy) ✅ [IMPLEMENTED]
+- [x] Caddy reverse proxy (`caddy:2-alpine`, `infra/caddy/Caddyfile`) integrated into `docker-compose.yml` (`CADDY_ADMIN_URL`, persistent certificate volumes) (`IMPLEMENTED`)
+- [x] Custom domain DNS TXT verification, automatic HTTPS provisioning, and truthful `proxy_unconfigured` status reporting (`IMPLEMENTED`)
+- [x] Opt-in per-service `blue_green` zero-downtime switching via `TrafficRouter` (`/proxy/services/{serviceId}`) (`IMPLEMENTED`)
+- [ ] Automatic subdomain routing without DNS TXT (e.g. wildcard `<project-slug>.forgelab.local`) (`DEFERRED`)
 
-### Phase 12: Reliability & Continuous Self-Healing
-- Background runtime health monitoring loop
-- Automated container restart on unexpected exit with exponential backoff
-- Configurable health check thresholds (interval, timeout, retries)
-- Automated rollback trigger on sustained runtime container crashes
+### Phase 12: Reliability & Continuous Self-Healing ✅ [IMPLEMENTED]
+- [x] Background runtime health monitoring loop (`CheckContinuousRuntimeHealth`) (`IMPLEMENTED`)
+- [x] Configurable restart-capped self-healing & crash-loop detection (`FORGELAB_SELF_HEAL_*`, `FORGELAB_CRASH_LOOP_*`) (`IMPLEMENTED`)
+- [x] Cooldown-guarded automatic rollback preserving and inspect-verifying prior healthy containers (`FORGELAB_AUTO_ROLLBACK_*`) (`IMPLEMENTED`)
+- [x] Persistent volume inspection, disk usage reporting, streaming backups & bounded restores (`IMPLEMENTED`)
 
-### Phase 13: Observability & Operational Hardening
-- OpenTelemetry distributed tracing and metrics exporter
-- Container CPU, memory, and disk I/O metrics streaming
-- Enforced container resource quotas (`NanoCPUs`, `Memory`)
-- Terminal log rendering virtualization in frontend
+### Phase 13: Observability & Operational Hardening ✅ [PARTIALLY IMPLEMENTED]
+- [x] Backend-sampled/cached live CPU, memory, network & restart metrics + `metrics_history` retention (`IMPLEMENTED`)
+- [x] Actionable system & project diagnostics (`GET /api/diagnostics`, `GET /api/projects/{id}/diagnostics`) (`IMPLEMENTED`)
+- [x] Enforced container resource quotas (`NanoCPUs`, `Memory`, `PidsLimit`) (`IMPLEMENTED`)
+- [x] Redacted operational audit trail (`audit_logs`, `AuditService`) (`IMPLEMENTED`)
+- [ ] OpenTelemetry distributed tracing and Prometheus `/api/metrics` exporter (`DEFERRED`)
+- [ ] Terminal log rendering virtualization in frontend (`DEFERRED`)
 
-### Phase 14: Enterprise & Team Governance
-- Multi-user organizations and workspaces
-- Role-Based Access Control (RBAC: Owner, Admin, Developer, Viewer)
-- Immutable audit log of configuration edits, secret changes, and deployments
-- ForgeLAB CLI tool (`forge deploy`, `forge logs`)
+### Phase 14: Enterprise & Team Governance [DEFERRED]
+- [ ] Multi-user organizations and workspaces (`DEFERRED`)
+- [ ] Role-Based Access Control (RBAC: Owner, Admin, Developer, Viewer) (`DEFERRED`)
+- [ ] Standalone general CLI tool (`forge deploy`, `forge logs`) (`DEFERRED`)
+- [ ] Pull-Request Ephemeral Preview Environments & Multi-Node Workers (`DEFERRED`)

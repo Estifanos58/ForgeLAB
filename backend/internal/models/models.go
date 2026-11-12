@@ -498,6 +498,16 @@ const (
 	ImportStatusExpired     = "expired"
 )
 
+// IsImportInProgressStatus reports whether a repository import status is actively executing or queued.
+func IsImportInProgressStatus(status string) bool {
+	switch status {
+	case ImportStatusPending, ImportStatusVerifying, ImportStatusResolving,
+		ImportStatusDownloading, ImportStatusExtracting, ImportStatusDiscovering:
+		return true
+	}
+	return false
+}
+
 // RepositoryImport represents a durable repository import lifecycle record.
 type RepositoryImport struct {
 	ID                 uuid.UUID       `json:"id"`
@@ -746,9 +756,10 @@ type RefreshToken struct {
 
 // Custom domain TLS status constants.
 const (
-	DomainTLSStatusPending = "pending"
-	DomainTLSStatusActive  = "active"
-	DomainTLSStatusError   = "error"
+	DomainTLSStatusPending           = "pending"
+	DomainTLSStatusActive            = "active"
+	DomainTLSStatusProxyUnconfigured = "proxy_unconfigured"
+	DomainTLSStatusError             = "error"
 )
 
 // CustomDomain represents a verified or pending custom hostname bound to a project/service.
@@ -760,6 +771,7 @@ type CustomDomain struct {
 	VerificationToken       string     `json:"verification_token"`
 	Verified                bool       `json:"verified"`
 	TLSStatus               string     `json:"tls_status"`
+	HTTPSActive             bool       `json:"https_active"`
 	TargetPort              int        `json:"target_port"`
 	VerificationRecordName  string     `json:"verification_record_name"`
 	VerificationRecordValue string     `json:"verification_record_value"`
@@ -775,6 +787,7 @@ func (d *CustomDomain) PopulateDNSInstructions(ingressHost string) {
 	if d == nil {
 		return
 	}
+	d.HTTPSActive = d.Verified && d.TLSStatus == DomainTLSStatusActive
 	d.VerificationRecordName = "_forgelab-verify." + d.Domain
 	d.VerificationRecordValue = d.VerificationToken
 	host := strings.TrimSpace(ingressHost)

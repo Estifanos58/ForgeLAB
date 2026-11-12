@@ -175,13 +175,39 @@ func TestAgentServer_SelectPath_ValidAndAnalyze(t *testing.T) {
 		t.Fatalf("expected non-empty source_id")
 	}
 
+	// Verify path is NOT exposed in initial response
+	respBytes, _ := json.Marshal(sessionResp)
+	if strings.Contains(string(respBytes), tempDir) {
+		t.Errorf("security violation: raw filesystem path leaked in agent API response: %s", string(respBytes))
+	}
+
+	// If initial 1s grace window elapsed before background analysis finished (e.g. under parallel test CPU load),
+	// poll GET /api/agent/sources/{id} until ready.
+	deadline := time.Now().Add(5 * time.Second)
+	for sessionResp["status"] != "ready" && sessionResp["status"] != "failed" && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		pollReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/agent/sources/"+sourceID, nil)
+		pollReq.Header.Set("Authorization", "Bearer "+authSession.Token)
+		pollResp, pollErr := http.DefaultClient.Do(pollReq)
+		if pollErr != nil {
+			t.Fatalf("failed to poll source session: %v", pollErr)
+		}
+		var polled map[string]interface{}
+		_ = json.NewDecoder(pollResp.Body).Decode(&polled)
+		pollResp.Body.Close()
+		sessionResp = polled
+	}
+	if sessionResp["status"] != "ready" {
+		t.Fatalf("expected source status 'ready', got %v (error=%v)", sessionResp["status"], sessionResp["error"])
+	}
+
 	services := sessionResp["services"].([]interface{})
 	if len(services) != 2 {
 		t.Fatalf("expected 2 discovered services, got %d", len(services))
 	}
 
-	// Verify path is NOT exposed in response
-	respBytes, _ := json.Marshal(sessionResp)
+	// Verify path is NOT exposed in polled response either
+	respBytes, _ = json.Marshal(sessionResp)
 	if strings.Contains(string(respBytes), tempDir) {
 		t.Errorf("security violation: raw filesystem path leaked in agent API response: %s", string(respBytes))
 	}
@@ -296,12 +322,16 @@ func TestAgentServer_Security_RestrictedPathsAndTraversal(t *testing.T) {
 	validator := NewPathValidator([]string{allowedDir})
 
 	// 1. Allowed path succeeds
+	expectedAllowed, evalErr := filepath.EvalSymlinks(allowedDir)
+	if evalErr != nil {
+		expectedAllowed = filepath.Clean(allowedDir)
+	}
 	validPath, err := validator.ValidateSourcePath(allowedDir)
 	if err != nil {
 		t.Errorf("expected allowed path to succeed, got %v", err)
 	}
-	if validPath != allowedDir {
-		t.Errorf("expected %s, got %s", allowedDir, validPath)
+	if validPath != filepath.Clean(expectedAllowed) {
+		t.Errorf("expected %s, got %s", expectedAllowed, validPath)
 	}
 
 	// 2. Disallowed path fails
@@ -443,21 +473,30 @@ func TestAgentServer_SelectPath_PollingLifecycle_SameToken(t *testing.T) {
 	sourceID := sessionResp["source_id"].(string)
 
 	// 2. Poll session with exact matching token until status reaches ready
-	pollReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/agent/sources/"+sourceID, nil)
-	pollReq.Header.Set("Authorization", "Bearer "+authSession.Token)
-
-	pollResp, err := http.DefaultClient.Do(pollReq)
-	if err != nil {
-		t.Fatalf("poll failed: %v", err)
-	}
-	defer pollResp.Body.Close()
-
-	if pollResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK on poll, got %d", pollResp.StatusCode)
-	}
-
 	var pollData map[string]interface{}
-	_ = json.NewDecoder(pollResp.Body).Decode(&pollData)
+	pollDeadline := time.Now().Add(5 * time.Second)
+	for {
+		pollReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/agent/sources/"+sourceID, nil)
+		pollReq.Header.Set("Authorization", "Bearer "+authSession.Token)
+
+		pollResp, err := http.DefaultClient.Do(pollReq)
+		if err != nil {
+			t.Fatalf("poll failed: %v", err)
+		}
+		if pollResp.StatusCode != http.StatusOK {
+			pollResp.Body.Close()
+			t.Fatalf("expected 200 OK on poll, got %d", pollResp.StatusCode)
+		}
+
+		pollData = nil
+		_ = json.NewDecoder(pollResp.Body).Decode(&pollData)
+		pollResp.Body.Close()
+
+		if pollData["status"] == "ready" || pollData["status"] == "failed" || time.Now().After(pollDeadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	if pollData["status"] != "ready" {
 		t.Errorf("expected status 'ready', got %v", pollData["status"])

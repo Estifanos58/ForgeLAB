@@ -63,16 +63,21 @@ ForgeLab provides these capabilities through a **web interface and API**.
 - A microservices demo
 - A marketing website with a dashboard
 
-## Explicit Non-Goals for MVP
+## Explicit Non-Goals for MVP & Single-Node Boundaries
 
+### Implemented Beyond Original MVP Baseline (Post-MVP Stabilization)
+- Custom domains with DNS TXT verification & Caddy automatic HTTPS (`proxy_unconfigured` fallback when Caddy is unset)
+- GitHub push-to-deploy webhooks (`POST /api/webhooks/github`) & restart-recoverable GitHub imports
+- Configurable runtime self-healing & automatic rollback preserving/verifying previous healthy containers
+- Opt-in per-service `blue_green` zero-downtime switching (`TrafficRouter`)
+- Persistent volume inspection, disk usage telemetry, backup streaming & bounded restore
+- Backend-cached runtime metrics, PostgreSQL historical telemetry retention, redacted operational audit trail, & actionable system/project diagnostics
+
+### Remaining Explicit Exclusions (Not Implemented)
 - UI polish / decorative complexity
-- Custom domains / advanced DNS
-- Automatic GitHub webhooks / auto-deployment
-- Full RBAC / team management
-- CLI tool
-- Self-healing automation
-- Zero-downtime rollout strategies
-- Multi-node scheduling
+- Full RBAC / team organizations (single-owner + isolated guest session model active)
+- Standalone general CLI tool (host agent CLI exists solely for local directory streaming)
+- Multi-node scheduling / distributed workers
 - Kubernetes integration
 - Service mesh
 - Cloud infrastructure provisioning

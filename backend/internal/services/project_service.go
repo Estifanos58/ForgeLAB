@@ -836,7 +836,7 @@ func (s *ProjectService) CreateProject(ctx context.Context, ownerID uuid.UUID, i
 		if s.importService != nil {
 			_ = s.importService.MarkCompleted(ctx, ownerID, importedRecord.ID, project.ID)
 		} else if s.db != nil {
-			_, _ = s.db.Exec(ctx, `UPDATE repository_imports SET status = 'completed', project_id = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND owner_id = $3`, project.ID, importedRecord.ID, ownerID)
+			_, _ = s.db.Exec(ctx, `UPDATE repository_imports SET status = 'completed', project_id = $1, updated_at = NOW() WHERE id = $2 AND owner_id = $3`, project.ID, importedRecord.ID, ownerID)
 		}
 	}
 

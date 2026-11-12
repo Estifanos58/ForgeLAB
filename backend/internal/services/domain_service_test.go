@@ -171,3 +171,81 @@ func TestDomainService_LifecycleAndVerification(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, listedAfter)
 }
+
+func TestDomainService_NeverReportsHTTPSActiveUnlessCaddyConfiguredAndSynced(t *testing.T) {
+	ctx := context.Background()
+	projectID := uuid.New()
+	serviceID := uuid.New()
+	hostPort := 19123
+
+	svcSvc := NewServiceService(nil)
+	svcSvc.SetGetServiceForTest(func(_ context.Context, id uuid.UUID) (*models.Service, error) {
+		return &models.Service{
+			ID:           serviceID,
+			ProjectID:    projectID,
+			Name:         "web",
+			InternalPort: 3000,
+			HostPort:     &hostPort,
+		}, nil
+	})
+	project := &models.Project{ID: projectID, OwnerID: uuid.New(), Name: "demo", InternalPort: 3000}
+
+	// 1. Unconfigured Caddy syncer: DNS TXT passes, but domain MUST NOT report tls_status=active or https_active=true
+	unconfiguredSvc := NewDomainService(nil, svcSvc, proxy.NewTrafficRouter(), proxy.NewCaddySyncer("", "", nil), "", "127.0.0.1")
+	resolver := &stubDNSResolver{
+		txtRecords: make(map[string][]string),
+		cnames:     make(map[string]string),
+		hosts:      make(map[string][]string),
+	}
+	unconfiguredSvc.SetDNSResolver(resolver)
+
+	dom, err := unconfiguredSvc.AddDomain(ctx, project, "nocaddy.example.org", &serviceID)
+	require.NoError(t, err)
+	resolver.txtRecords[dom.VerificationRecordName] = []string{dom.VerificationToken}
+
+	verifiedNoCaddy, err := unconfiguredSvc.VerifyDomain(ctx, projectID, dom.ID)
+	require.NoError(t, err)
+	assert.True(t, verifiedNoCaddy.Verified)
+	assert.Equal(t, models.DomainTLSStatusProxyUnconfigured, verifiedNoCaddy.TLSStatus)
+	assert.False(t, verifiedNoCaddy.HTTPSActive, "HTTPSActive MUST be false when Caddy is unconfigured")
+	require.NotNil(t, verifiedNoCaddy.LastError)
+	assert.Contains(t, *verifiedNoCaddy.LastError, "CADDY_ADMIN_URL")
+
+	// ListDomains & GetDomain must preserve non-active HTTPS truth
+	fetched, err := unconfiguredSvc.GetDomain(ctx, projectID, dom.ID)
+	require.NoError(t, err)
+	assert.Equal(t, models.DomainTLSStatusProxyUnconfigured, fetched.TLSStatus)
+	assert.False(t, fetched.HTTPSActive)
+
+	// 2. Configured Caddy syncer failing HTTP /load MUST NOT report active
+	failingCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "caddy reload rejected", http.StatusBadGateway)
+	}))
+	defer failingCaddy.Close()
+
+	failingSvc := NewDomainService(
+		nil,
+		svcSvc,
+		proxy.NewTrafficRouter(),
+		proxy.NewCaddySyncer(failingCaddy.URL, "", failingCaddy.Client()),
+		"edge.forgelab.dev",
+		"127.0.0.1",
+	)
+	failingResolver := &stubDNSResolver{
+		txtRecords: make(map[string][]string),
+		cnames:     map[string]string{"failing.example.org": "edge.forgelab.dev"},
+		hosts:      make(map[string][]string),
+	}
+	failingSvc.SetDNSResolver(failingResolver)
+
+	failingDom, err := failingSvc.AddDomain(ctx, project, "failing.example.org", &serviceID)
+	require.NoError(t, err)
+	failingResolver.txtRecords[failingDom.VerificationRecordName] = []string{failingDom.VerificationToken}
+
+	afterFailDom, err := failingSvc.VerifyDomain(ctx, projectID, failingDom.ID)
+	require.Error(t, err)
+	assert.True(t, afterFailDom.Verified)
+	assert.Equal(t, models.DomainTLSStatusError, afterFailDom.TLSStatus)
+	assert.False(t, afterFailDom.HTTPSActive, "HTTPSActive MUST be false when Caddy provisioning fails")
+	assert.NotEqual(t, models.DomainTLSStatusActive, afterFailDom.TLSStatus)
+}

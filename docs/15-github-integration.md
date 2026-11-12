@@ -13,8 +13,8 @@
 - [docs/00-current-state.md](00-current-state.md) — Current state snapshot & matrix
 - [docs/02-functional-requirements.md](02-functional-requirements.md) — R4 GitHub import requirements
 - [docs/05-security-trust-boundaries.md](05-security-trust-boundaries.md) — Token encryption & untrusted source code trust model
-- [docs/09-api-contract.md](09-api-contract.md) — GitHub OAuth, App, and Repository Integration endpoints
-- [docs/13-decisions.md](13-decisions.md) — DEC-008 (Repository Selection), DEC-010 (OAuth Authentication), DEC-011 (Universal Source Ingestion), & DEC-015 (GitHub App & Durable Import Pipeline)
+- [docs/09-api-contract.md](09-api-contract.md) — GitHub OAuth, App, Repository Integration, and Webhook endpoints
+- [docs/13-decisions.md](13-decisions.md) — DEC-008 (Repository Selection), DEC-010 (OAuth Authentication), DEC-011 (Universal Source Ingestion), DEC-015 (DeploymentPlan & Import Pipeline), & DEC-017 (Stabilization & Recoverable Imports)
 - [docs/14-known-limitations.md](14-known-limitations.md) — Known limits & boundary constraints
 
 ---
@@ -100,8 +100,8 @@ To enable GitHub App installation-based repository importing:
 1. **Create a GitHub App** in GitHub Developer Settings:
    - **GitHub App name:** `ForgeLAB-Local` (or your company name)
    - **Homepage URL:** `http://localhost:3000`
-   - **Callback URL:** `http://localhost:3000/integrations/github/app/callback`
-   - **Webhook URL:** `http://localhost:3000/api/webhooks/github` (optional in dev)
+   - **Callback URL:** `http://localhost:3000/api/integrations/github/app/callback`
+   - **Webhook URL:** `https://<your-public-host>/api/webhooks/github?project_id=<uuid>` (or per-project secret configured via **Settings -> Webhooks**)
    - **Permissions:**
      - Repository Permissions -> **Contents**: Read-only
      - Repository Permissions -> **Metadata**: Read-only
@@ -113,25 +113,43 @@ To enable GitHub App installation-based repository importing:
 
 3. **Configure ForgeLAB Environment:**
    ```bash
-   FORGELAB_GITHUB_APP_ID=123456
-   FORGELAB_GITHUB_APP_PRIVATE_KEY_PATH=/path/to/forgelab-app.private-key.pem
-   FORGELAB_GITHUB_APP_SLUG=forgelab-local
-   FORGELAB_GITHUB_APP_WEBHOOK_SECRET=your-random-webhook-secret
+   GITHUB_APP_ID=123456
+   GITHUB_APP_PRIVATE_KEY_PATH=/path/to/forgelab-app.private-key.pem
+   # Or inline multi-line / escaped PEM:
+   # GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n..."
+   GITHUB_APP_SLUG=forgelab-local
+   GITHUB_APP_WEBHOOK_SECRET=your-random-webhook-secret
+   # Optional for GitHub App user-to-server OAuth flow:
+   GITHUB_APP_CLIENT_ID=...
+   GITHUB_APP_CLIENT_SECRET=...
    ```
 
 ---
 
-## 3. API Contract Summary
+## 3. Restart Recovery, Push Webhooks & API Summary
+
+### Restart-Recoverable Imports (`RecoverInterruptedImports`)
+- Every import creates a durable row in `repository_imports` before background work starts.
+- On backend startup (`backend/cmd/server/main.go`), `RepositoryImportService.RecoverInterruptedImports` transitions non-expired interrupted jobs (`pending`, `verifying`, `resolving`, `downloading`, `extracting`) or orphaned intermediate states back through bounded recovery execution or marks corrupt snapshots failed with clear remediation messages.
+- Clients can list recent imports (`GET /api/integrations/github/imports`), cancel active imports (`POST .../cancel` — returning the updated `RepositoryImport` record), or retry failed/cancelled imports (`POST .../retry`).
+
+### Push-to-Deploy Webhooks (`WebhookService`)
+- Each GitHub-backed project can enable branch-filtered automatic deployments and generate an AES-256-GCM encrypted webhook secret (`GET` / `PATCH /api/projects/{id}/webhook`). The plaintext secret is returned **once** upon generation/rotation.
+- `POST /api/webhooks/github?project_id=<uuid>` enforces a 1 MiB body limit, verifies `X-Hub-Signature-256` with constant-time HMAC-SHA256 comparison (`ErrInvalidWebhookSignature`), deduplicates `X-GitHub-Delivery` IDs (`webhook_deliveries` / bounded memory map) against replay attacks, ignores non-matching branches/deletions, and enqueues new deployments onto Redis (`DeploymentEnqueuer`).
 
 | Endpoint | Method | Description | Auth Required |
 |---|---|---|---|
-| `/api/integrations/github/status` | GET | Connection state, auth type (`app`, `oauth`, `pat`), installations, and reconnect guidance | Guest or Auth |
+| `/api/integrations/github` | GET | Connection state, auth type (`app`, `oauth`, `pat`), installations, and reconnect guidance | Guest or Auth |
 | `/api/integrations/github/app/install` | GET | URL to install the GitHub App | Auth |
-| `/api/integrations/github/app/callback` | GET | OAuth/App installation callback | Public |
-| `/api/integrations/github/imports` | POST | Initiate background import lifecycle (`repository`, `branch`, `root_dir`) | Guest or Auth |
+| `/api/integrations/github/app/callback` | GET | GitHub App installation callback | Public |
+| `/api/integrations/github/connect` | GET / POST | Initiate GitHub OAuth `repo` authorization flow | Auth |
+| `/api/integrations/github/callback` | GET | GitHub OAuth `repo` authorization callback | Public |
+| `/api/integrations/github/imports` | GET / POST | List durable imports or initiate background import lifecycle (`repository`, `branch`, `root_dir`) | Guest or Auth |
 | `/api/integrations/github/imports/{id}` | GET | Poll import progress, stage, error, discovery, and deployment plan | Guest or Auth |
-| `/api/integrations/github/imports/{id}/cancel` | POST | Cancel in-flight import and cleanup workspace | Guest or Auth |
-| `/api/integrations/github/imports/{id}/retry` | POST | Retry failed import | Guest or Auth |
+| `/api/integrations/github/imports/{id}/cancel` | POST | Cancel in-flight import, cleanup workspace, and return updated import record | Guest or Auth |
+| `/api/integrations/github/imports/{id}/retry` | POST | Retry failed or cancelled import | Guest or Auth |
 | `/api/integrations/github/repositories` | GET | List authorized personal and organization repositories | Auth |
-| `/api/integrations/github/pat` | POST | Connect using Personal Access Token | Auth |
+| `/api/integrations/github/token` | POST | Connect using Personal Access Token (AES-256-GCM encrypted at rest) | Auth |
 | `/api/integrations/github/disconnect` | POST | Disconnect integration and purge stored credentials | Auth |
+| `/api/projects/{id}/webhook` | GET / PATCH | View or update push-to-deploy branch/auto-deploy settings & rotate secret | Guest or Auth |
+| `/api/webhooks/github` | POST | Public HMAC-SHA256 verified GitHub push webhook receiver | HMAC-SHA256 |
