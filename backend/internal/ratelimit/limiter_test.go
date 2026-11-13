@@ -242,3 +242,76 @@ func TestExtractClientIP_TrustedProxies(t *testing.T) {
 		}
 	})
 }
+
+func TestLimiter_RedisFallbackObservability(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis error: %v", err)
+	}
+	addr := mr.Addr()
+	// Close miniredis immediately so connection attempts to addr fail immediately
+	mr.Close()
+
+	client := redis.NewClient(&redis.Options{
+		Addr:        addr,
+		DialTimeout: 20 * time.Millisecond,
+		MaxRetries:  0,
+	})
+	defer client.Close()
+
+	limiter := NewLimiter(client, true)
+	ctx := context.Background()
+
+	var hookInvoked bool
+	var capturedCat, capturedID string
+	var capturedErr error
+	limiter.SetFallbackHook(func(category, identifier string, err error) {
+		hookInvoked = true
+		capturedCat = category
+		capturedID = identifier
+		capturedErr = err
+	})
+
+	if limiter.FallbackCount() != 0 {
+		t.Fatalf("expected initial FallbackCount to be 0, got %d", limiter.FallbackCount())
+	}
+
+	window := 10 * time.Second
+
+	// 1st request should fall back to in-memory and succeed
+	allowed, _, err := limiter.Allow(ctx, "auth", "test-user", 2, window)
+	if err != nil {
+		t.Fatalf("expected nil error on fallback, got %v", err)
+	}
+	if !allowed {
+		t.Fatalf("expected 1st request to be allowed via in-memory fallback")
+	}
+
+	if limiter.FallbackCount() != 1 {
+		t.Fatalf("expected FallbackCount to be 1, got %d", limiter.FallbackCount())
+	}
+	if !hookInvoked {
+		t.Fatalf("expected fallback hook to be invoked")
+	}
+	if capturedCat != "auth" || capturedID != "test-user" || capturedErr == nil {
+		t.Fatalf("unexpected hook parameters: cat=%s id=%s err=%v", capturedCat, capturedID, capturedErr)
+	}
+
+	// 2nd request allowed
+	allowed2, _, _ := limiter.Allow(ctx, "auth", "test-user", 2, window)
+	if !allowed2 {
+		t.Fatalf("expected 2nd request to be allowed via in-memory fallback")
+	}
+	if limiter.FallbackCount() != 2 {
+		t.Fatalf("expected FallbackCount to be 2, got %d", limiter.FallbackCount())
+	}
+
+	// 3rd request throttled by in-memory fallback
+	allowed3, retryAfter, _ := limiter.Allow(ctx, "auth", "test-user", 2, window)
+	if allowed3 {
+		t.Fatalf("expected 3rd request to be throttled by in-memory bucket")
+	}
+	if retryAfter <= 0 {
+		t.Fatalf("expected positive retryAfter from in-memory fallback, got %v", retryAfter)
+	}
+}

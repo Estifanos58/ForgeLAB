@@ -17,6 +17,82 @@ import (
 	"github.com/moby/moby/client"
 )
 
+var (
+	ErrBuildSecurityInsecureForbidden = errors.New("insecure BuildKit entitlement (RUN --security=insecure) is strictly forbidden for build execution isolation")
+	ErrBuildHostNetworkForbidden      = errors.New("host networking entitlement (RUN --network=host) is strictly forbidden for build execution isolation")
+)
+
+// ValidateDockerfileSecurity inspects Dockerfile instructions for dangerous build directives or entitlements
+// that could break out of container isolation, access the host network, or request unconfined host capabilities.
+func ValidateDockerfileSecurity(content []byte) error {
+	if len(content) == 0 {
+		return nil
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(content))
+	var logicalLines []string
+	var currentLine strings.Builder
+
+	for scanner.Scan() {
+		raw := scanner.Text()
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+			continue
+		}
+		if strings.HasSuffix(trimmed, "\\") {
+			currentLine.WriteString(strings.TrimSuffix(trimmed, "\\"))
+			currentLine.WriteString(" ")
+			continue
+		}
+		currentLine.WriteString(trimmed)
+		if currentLine.Len() > 0 {
+			logicalLines = append(logicalLines, currentLine.String())
+			currentLine.Reset()
+		}
+	}
+	if currentLine.Len() > 0 {
+		logicalLines = append(logicalLines, currentLine.String())
+	}
+
+	for _, line := range logicalLines {
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "RUN ") || strings.HasPrefix(upper, "RUN\t") {
+			args := line[3:]
+			lowerArgs := strings.ToLower(args)
+
+			// Enforce safe BuildKit security entitlements: reject insecure entitlement requests
+			if strings.Contains(lowerArgs, "--security=insecure") {
+				return ErrBuildSecurityInsecureForbidden
+			}
+			// Reject other non-sandbox security arguments if any are passed
+			if idx := strings.Index(lowerArgs, "--security="); idx != -1 {
+				secVal := lowerArgs[idx+len("--security="):]
+				if spaceIdx := strings.IndexAny(secVal, " \t\r\n"); spaceIdx != -1 {
+					secVal = secVal[:spaceIdx]
+				}
+				if secVal != "" && secVal != "sandbox" {
+					return fmt.Errorf("%w: requested security mode %q", ErrBuildSecurityInsecureForbidden, secVal)
+				}
+			}
+
+			// Enforce build network isolation: reject host network access during image builds
+			if strings.Contains(lowerArgs, "--network=host") {
+				return ErrBuildHostNetworkForbidden
+			}
+			if idx := strings.Index(lowerArgs, "--network="); idx != -1 {
+				netVal := lowerArgs[idx+len("--network="):]
+				if spaceIdx := strings.IndexAny(netVal, " \t\r\n"); spaceIdx != -1 {
+					netVal = netVal[:spaceIdx]
+				}
+				if strings.HasPrefix(netVal, "container:") || netVal == "host" {
+					return fmt.Errorf("%w: requested network mode %q", ErrBuildHostNetworkForbidden, netVal)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // DetectDockerfileRequiresBuildKit inspects Dockerfile contents and determines whether
 // BuildKit is required by examining syntax directives, RUN mount options, link flags,
 // heredocs, and other BuildKit-only features.
@@ -267,6 +343,13 @@ func (e *Engine) resolveBuilder(
 	options client.ImageBuildOptions,
 	onLogLine func(string),
 ) (client.ImageBuildOptions, error) {
+	if err := ValidateDockerfileSecurity(dfContent); err != nil {
+		if onLogLine != nil {
+			onLogLine(fmt.Sprintf("Security violation in Dockerfile: %v", err))
+		}
+		return options, err
+	}
+
 	daemonBuilderVer, pingErr := e.detectDaemonBuilderCapability(ctx)
 	if pingErr == nil && onLogLine != nil {
 		onLogLine("Docker daemon available")

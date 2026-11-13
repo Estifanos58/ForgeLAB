@@ -32,10 +32,16 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 FROM alpine:3.21
 
 RUN success=0; for i in 1 2 3 4 5; do \
-        if apk add --no-cache ca-certificates curl docker-cli; then success=1; break; fi; \
+        if apk add --no-cache ca-certificates curl docker-cli su-exec; then success=1; break; fi; \
         echo "Retrying apk add in 3s..." && sleep 3; \
     done; \
     [ "$success" -eq 1 ] || exit 1
+
+# Create unprivileged runtime user and group for ForgeLAB control plane
+RUN addgroup -g 10001 -S forgelab && \
+    adduser -u 10001 -S -G forgelab -h /app -s /sbin/nologin forgelab && \
+    addgroup -g 999 -S docker 2>/dev/null || true && \
+    addgroup forgelab docker 2>/dev/null || true
 
 # Install official cloudflared binary for domainless public sharing with pinned version and checksum verification
 ARG CLOUDFLARED_VERSION=2026.10.7
@@ -52,8 +58,8 @@ RUN ARCH=$(uname -m) && \
     fi && \
     success=0; for i in 1 2 3 4 5; do \
         if curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${CLOUDFLARED_ARCH}" && \
-           echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c - && \
-           chmod +x /usr/local/bin/cloudflared; then \
+            echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c - && \
+            chmod +x /usr/local/bin/cloudflared; then \
             success=1; break; \
         fi; \
         echo "Retrying cloudflared download/verification in 3s..." && rm -f /usr/local/bin/cloudflared && sleep 3; \
@@ -65,7 +71,13 @@ WORKDIR /app
 COPY --from=builder /app/forgelab-server .
 COPY --from=builder /app/forgelab-migrate .
 COPY migrations ./migrations
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
+
+RUN chmod +x ./docker-entrypoint.sh && \
+    mkdir -p /app/data/builds /app/data/sources && \
+    chown -R forgelab:forgelab /app
 
 EXPOSE 8080
 
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["./forgelab-server"]

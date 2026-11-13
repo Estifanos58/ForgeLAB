@@ -99,16 +99,19 @@ func ParseJob(item string) (Job, error) {
 type TerminalChecker func(ctx context.Context, job Job) (bool, error)
 
 type DeploymentQueue struct {
-	client             *redis.Client
-	maxRetries         int
-	workerCount        int
-	retryBackoff       time.Duration
-	leaseTTL           time.Duration
-	heartbeatInterval  time.Duration
-	terminalChecker    TerminalChecker
-	totalRecoveredJobs int64
-	wg                 sync.WaitGroup
-	cancel             context.CancelFunc
+	client                *redis.Client
+	maxRetries            int
+	workerCount           int
+	retryBackoff          time.Duration
+	leaseTTL              time.Duration
+	heartbeatInterval     time.Duration
+	terminalChecker       TerminalChecker
+	totalRecoveredJobs    int64
+	totalRetryAttempts    int64
+	totalDeadLetterJobs   int64
+	totalTerminalCleanups int64
+	wg                    sync.WaitGroup
+	cancel                context.CancelFunc
 }
 
 func NewDeploymentQueue(client *redis.Client) *DeploymentQueue {
@@ -236,15 +239,18 @@ type DeadLetterEntry struct {
 
 // QueueDiagnostics provides diagnostic metrics for queue monitoring and recovery observability.
 type QueueDiagnostics struct {
-	PendingJobs        int64             `json:"pending_jobs"`
-	ProcessingJobs     int64             `json:"processing_jobs"`
-	DeadLetterJobs     int64             `json:"dead_letter_jobs"`
-	TotalRecoveredJobs int64             `json:"total_recovered_jobs"`
-	MaxRetries         int               `json:"max_retries"`
-	LeaseTTLSeconds    int64             `json:"lease_ttl_seconds"`
-	RetryingJobs       int64             `json:"retrying_jobs"`
-	ActiveLeases       []ActiveLeaseInfo `json:"active_leases,omitempty"`
-	DeadLetterEntries  []DeadLetterEntry `json:"dead_letter_entries,omitempty"`
+	QueueDepth          int64             `json:"queue_depth"`
+	PendingJobs         int64             `json:"pending_jobs"`
+	ProcessingJobs      int64             `json:"processing_jobs"`
+	DeadLetterJobs      int64             `json:"dead_letter_jobs"`
+	TotalRecoveredJobs  int64             `json:"total_recovered_jobs"`
+	TotalRetryAttempts  int64             `json:"total_retry_attempts"`
+	TotalDeadLetterJobs int64             `json:"total_dead_letter_jobs"`
+	MaxRetries          int               `json:"max_retries"`
+	LeaseTTLSeconds     int64             `json:"lease_ttl_seconds"`
+	RetryingJobs        int64             `json:"retrying_jobs"`
+	ActiveLeases        []ActiveLeaseInfo `json:"active_leases,omitempty"`
+	DeadLetterEntries   []DeadLetterEntry `json:"dead_letter_entries,omitempty"`
 }
 
 func extractWorkerIDFromLeaseToken(token string) string {
@@ -289,12 +295,15 @@ func (q *DeploymentQueue) GetQueueDiagnostics(ctx context.Context) (QueueDiagnos
 	}
 
 	diag := QueueDiagnostics{
-		PendingJobs:        p,
-		ProcessingJobs:     proc,
-		DeadLetterJobs:     dlq,
-		TotalRecoveredJobs: atomic.LoadInt64(&q.totalRecoveredJobs),
-		MaxRetries:         q.maxRetries,
-		LeaseTTLSeconds:    int64(q.leaseTTL.Seconds()),
+		QueueDepth:          p + proc,
+		PendingJobs:         p,
+		ProcessingJobs:      proc,
+		DeadLetterJobs:      dlq,
+		TotalRecoveredJobs:  atomic.LoadInt64(&q.totalRecoveredJobs),
+		TotalRetryAttempts:  atomic.LoadInt64(&q.totalRetryAttempts),
+		TotalDeadLetterJobs: atomic.LoadInt64(&q.totalDeadLetterJobs),
+		MaxRetries:          q.maxRetries,
+		LeaseTTLSeconds:     int64(q.leaseTTL.Seconds()),
 	}
 
 	// Index job types from processing queue so active leases include job_type
@@ -385,4 +394,14 @@ func (q *DeploymentQueue) GetQueueDiagnostics(ctx context.Context) (QueueDiagnos
 // GetTotalRecoveredJobs returns the total count of abandoned jobs successfully recovered by this queue instance.
 func (q *DeploymentQueue) GetTotalRecoveredJobs() int64 {
 	return atomic.LoadInt64(&q.totalRecoveredJobs)
+}
+
+// GetTotalRetryAttempts returns the total count of retry attempts handled by this queue instance.
+func (q *DeploymentQueue) GetTotalRetryAttempts() int64 {
+	return atomic.LoadInt64(&q.totalRetryAttempts)
+}
+
+// GetTotalDeadLetterJobs returns the total count of jobs moved to DLQ by this queue instance.
+func (q *DeploymentQueue) GetTotalDeadLetterJobs() int64 {
+	return atomic.LoadInt64(&q.totalDeadLetterJobs)
 }

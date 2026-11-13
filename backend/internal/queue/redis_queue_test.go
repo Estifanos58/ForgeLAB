@@ -1676,6 +1676,9 @@ func TestDeploymentQueue_GetQueueDiagnostics_LeasesRetriesAndDLQ(t *testing.T) {
 		t.Fatalf("GetQueueDiagnostics failed: %v", err)
 	}
 
+	if diag.QueueDepth != 2 {
+		t.Errorf("expected queue_depth=2, got %d", diag.QueueDepth)
+	}
 	if diag.PendingJobs != 1 {
 		t.Errorf("expected pending_jobs=1, got %d", diag.PendingJobs)
 	}
@@ -1724,4 +1727,326 @@ func TestDeploymentQueue_GetQueueDiagnostics_LeasesRetriesAndDLQ(t *testing.T) {
 	if diag.DeadLetterEntries[1].JobID != dlqID.String() || diag.DeadLetterEntries[1].Attempts != 4 {
 		t.Errorf("unexpected second DLQ entry: %+v", diag.DeadLetterEntries[1])
 	}
+}
+
+func TestDeploymentQueue_RecoverAbandonedJobs_PipelinedLeaseBypass(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis error: %v", err)
+	}
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+
+	var terminalChecks atomic.Int64
+	q.SetTerminalChecker(func(ctx context.Context, job Job) (bool, error) {
+		terminalChecks.Add(1)
+		return false, nil
+	})
+
+	// Job 1: Active lease (worker currently running)
+	activeJobID := uuid.New()
+	activeJob := Job{
+		Type:                JobTypeServiceDeployment,
+		ID:                  activeJobID,
+		ServiceDeploymentID: activeJobID,
+	}
+	client.LPush(ctx, ProcessingQueueKey, activeJob.Encode())
+	client.Set(ctx, JobLeasePrefix+activeJobID.String(), "worker-1:token-1", 60*time.Second)
+
+	// Job 2: Expired / absent lease (worker crashed)
+	crashedJobID := uuid.New()
+	crashedJob := Job{
+		Type:         JobTypeDeployment,
+		ID:           crashedJobID,
+		DeploymentID: &crashedJobID,
+	}
+	client.LPush(ctx, ProcessingQueueKey, crashedJob.Encode())
+
+	// Run recovery sweep
+	recovered, err := q.RecoverAbandonedJobs(ctx)
+	if err != nil {
+		t.Fatalf("RecoverAbandonedJobs failed: %v", err)
+	}
+
+	if recovered != 1 {
+		t.Fatalf("expected 1 job recovered, got %d", recovered)
+	}
+
+	// Active job should have been skipped in 0 Redis operations without invoking terminalChecker!
+	// Only crashedJob should have invoked terminalChecker!
+	if terminalChecks.Load() != 1 {
+		t.Fatalf("expected exactly 1 terminalChecker invocation for crashed job, got %d", terminalChecks.Load())
+	}
+
+	// Verify active job remains in processing queue with its lease untouched
+	inProc, _ := client.LRange(ctx, ProcessingQueueKey, 0, -1).Result()
+	if len(inProc) != 1 || inProc[0] != activeJob.Encode() {
+		t.Fatalf("active job should remain in processing queue, got %+v", inProc)
+	}
+
+	// Verify crashed job was moved to deployment queue
+	inDeploy, _ := client.LRange(ctx, DeploymentQueueKey, 0, -1).Result()
+	if len(inDeploy) != 1 || inDeploy[0] != crashedJob.Encode() {
+		t.Fatalf("crashed job should be re-enqueued to deployment queue, got %+v", inDeploy)
+	}
+}
+
+func TestDeploymentQueue_WorkerCancellationDuringRetryBackoff(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis error: %v", err)
+	}
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.SetWorkerCount(1)
+	// Set a very long backoff: 30 seconds
+	q.SetRetryBackoff(30 * time.Second)
+
+	jobID := uuid.New()
+	err = q.EnqueueServiceDeployment(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+
+	jobStarted := make(chan struct{})
+	go q.StartJobWorker(workerCtx, func(ctx context.Context, job Job) error {
+		close(jobStarted)
+		return errors.New("simulated failure requiring retry")
+	})
+
+	// Wait for job handler to execute and fail
+	select {
+	case <-jobStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("job did not start within timeout")
+	}
+
+	// Give worker a moment to enter retry backoff sleep
+	time.Sleep(50 * time.Millisecond)
+
+	// Now cancel workerCtx: the worker should terminate IMMEDIATELY, not sleep 30 seconds!
+	startCancel := time.Now()
+	cancelWorker()
+	q.Stop()
+	elapsed := time.Since(startCancel)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("expected worker to stop immediately on context cancellation, but took %v", elapsed)
+	}
+}
+
+func TestDeploymentQueue_CountersAndStatsTracking(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis error: %v", err)
+	}
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	ctx := context.Background()
+
+	if q.GetTotalRetryAttempts() != 0 {
+		t.Fatalf("initial retry attempts should be 0, got %d", q.GetTotalRetryAttempts())
+	}
+	if q.GetTotalDeadLetterJobs() != 0 {
+		t.Fatalf("initial dead letter jobs should be 0, got %d", q.GetTotalDeadLetterJobs())
+	}
+	if q.GetTotalRecoveredJobs() != 0 {
+		t.Fatalf("initial recovered jobs should be 0, got %d", q.GetTotalRecoveredJobs())
+	}
+
+	// Enqueue a job and verify queue depth
+	_ = q.EnqueueDeployment(ctx, uuid.New())
+	diag, err := q.GetQueueDiagnostics(ctx)
+	if err != nil {
+		t.Fatalf("GetQueueDiagnostics failed: %v", err)
+	}
+	if diag.QueueDepth != 1 {
+		t.Fatalf("expected QueueDepth=1, got %d", diag.QueueDepth)
+	}
+}
+
+func TestDeploymentQueue_FailureInjection_CancelledDeploymentViaTerminalChecker(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis error: %v", err)
+	}
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.heartbeatInterval = 25 * time.Millisecond
+	q.workerCount = 1
+
+	var isCancelled atomic.Bool
+	q.SetTerminalChecker(func(ctx context.Context, job Job) (bool, error) {
+		return isCancelled.Load(), nil
+	})
+
+	jobID := uuid.New()
+	handlerStarted := make(chan struct{})
+	jobCancelledSuccessfully := make(chan struct{})
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	defer cancelWorker()
+
+	go q.StartJobWorker(workerCtx, func(ctx context.Context, job Job) error {
+		close(handlerStarted)
+		select {
+		case <-ctx.Done():
+			close(jobCancelledSuccessfully)
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+			return errors.New("timed out waiting for heartbeat cancellation")
+		}
+	})
+
+	err = q.EnqueueDeployment(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handler did not start in time")
+	}
+
+	// Trigger cancellation via terminalChecker
+	isCancelled.Store(true)
+
+	select {
+	case <-jobCancelledSuccessfully:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("heartbeat did not cancel job within expected window")
+	}
+
+	q.Stop()
+}
+
+func TestDeploymentQueue_FailureInjection_LostLeaseDuringExecution(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis error: %v", err)
+	}
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.heartbeatInterval = 25 * time.Millisecond
+	q.workerCount = 1
+
+	jobID := uuid.New()
+	handlerStarted := make(chan struct{})
+	lostLeaseCancelled := make(chan struct{})
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	defer cancelWorker()
+
+	go q.StartJobWorker(workerCtx, func(ctx context.Context, job Job) error {
+		close(handlerStarted)
+		select {
+		case <-ctx.Done():
+			close(lostLeaseCancelled)
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+			return errors.New("timed out waiting for lease loss cancellation")
+		}
+	})
+
+	err = q.EnqueueDeployment(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handler did not start in time")
+	}
+
+	// Simulate another worker stealing or overwriting the lease token
+	leaseKey := JobLeasePrefix + jobID.String()
+	client.Set(context.Background(), leaseKey, "stolen-token-by-replacement-worker", time.Minute)
+
+	select {
+	case <-lostLeaseCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("heartbeat did not cancel job on lease token mismatch")
+	}
+
+	q.Stop()
+}
+
+func TestDeploymentQueue_FailureInjection_RedisInterruptionDuringHeartbeat(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis error: %v", err)
+	}
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	q := NewDeploymentQueue(client)
+	q.heartbeatInterval = 25 * time.Millisecond
+	q.workerCount = 1
+
+	jobID := uuid.New()
+	handlerStarted := make(chan struct{})
+	interruptionCancelled := make(chan struct{})
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	defer cancelWorker()
+
+	go q.StartJobWorker(workerCtx, func(ctx context.Context, job Job) error {
+		close(handlerStarted)
+		select {
+		case <-ctx.Done():
+			close(interruptionCancelled)
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+			return errors.New("timed out waiting for redis interruption cancellation")
+		}
+	})
+
+	err = q.EnqueueDeployment(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handler did not start in time")
+	}
+
+	// Abruptly terminate Redis server to simulate network partition or crash
+	mr.Close()
+
+	select {
+	case <-interruptionCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("heartbeat did not cancel job on Redis network interruption")
+	}
+
+	q.Stop()
 }

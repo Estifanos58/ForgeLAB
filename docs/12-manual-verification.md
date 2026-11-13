@@ -109,6 +109,7 @@ All entries currently reflect the unverified baseline (`NOT RECORDED`). As tests
 | **Opt-In Zero-Downtime Blue-Green Cutover** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests `deployment_mode: "blue_green"`, `/proxy/services/{serviceId}` slot routing (`X-ForgeLAB-Slot`), and healthy-slot promotion |
 | **Persistent Volumes, Disk Usage, Backup & Restore** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests volume inspection, daemon disk usage, `.tar.gz` backup, `409 ErrVolumeInUse` enforcement, and archive bounds (`100MB`/`512MB`) |
 | **Metrics History, Redacted Audit Logs & Diagnostics** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests TTL-cached live metrics, background-sampled historical metrics, redacted `audit_logs`, and `/api/diagnostics` |
+| **Non-Root Hardening, BuildKit Safety & Queue Resilience** | IMPLEMENTED | NOT RECORDED | — | — | — | — | Tests non-root backend user (UID 10001), Docker socket GID adaptation, BuildKit insecure entitlement rejection, explicit CSP WebSocket origins, pipelined queue recovery, and rate limit fallback observability |
 
 ---
 
@@ -2277,5 +2278,114 @@ Verify TTL-cached live container metrics, background-sampled historical metrics 
 - **Date:** —
 - **Environment:** —
 - **Notes:** Automated unit/regression tests pass for metrics caching, historical rollup queries, audit metadata redaction, and diagnostics aggregation; live Docker stats & Postgres retention pruning pending host execution.
+
+---
+
+### 49. Container Hardening, BuildKit Isolation & Queue Resilience
+
+#### Purpose
+Verify non-root backend container execution, dynamic Docker socket group permissions, safe BuildKit entitlement enforcement, explicit production CSP WebSocket origins, pipelined queue recovery, and rate limit fallback observability.
+
+#### Implementation Status
+`IMPLEMENTED`
+
+#### Physical Verification Status
+`NOT RECORDED`
+
+#### Test Procedure 49.1 — Non-Root Backend Runtime User & Docker Socket Access
+1. Start the Docker Compose stack:
+   ```bash
+   docker compose up -d --build backend
+   ```
+2. Verify the backend process runs under unprivileged UID 10001 (`forgelab`):
+   ```bash
+   docker compose exec backend id -u
+   ```
+   - Expected Output: `10001` (NOT `0`).
+3. Verify the user has access to the Docker socket:
+   ```bash
+   docker compose exec backend id
+   ```
+   - Expected Output: `uid=10001(forgelab) gid=10001(forgelab) groups=10001(forgelab),<docker_gid>(docker-sock)`
+4. Test Docker Engine SDK communication from the non-root backend:
+   ```bash
+   curl -s http://localhost:8080/health | jq .
+   ```
+   - Expected Output: `{"status": "ok"}`
+   ```bash
+   curl -s http://localhost:8080/ready | jq .components.docker
+   ```
+   - Expected Output: `{"status": "up"}`
+
+#### Test Procedure 49.2 — BuildKit Entitlement & Dockerfile Network Security
+1. Create a test project with a custom `Dockerfile` containing insecure BuildKit entitlement:
+   ```dockerfile
+   # syntax=docker/dockerfile:1
+   FROM alpine:3.19
+   RUN --security=insecure whoami
+   CMD ["sh", "-c", "echo hello"]
+   ```
+2. Trigger deployment via `POST /api/projects/{id}/deploy` or Web UI.
+3. Observe build failure:
+   - Expected Result: Deployment transitions immediately to `FAILED` with explicit error:
+     `insecure BuildKit entitlement --security=insecure is forbidden`
+   - No image or container is created.
+4. Update the `Dockerfile` with host network access:
+   ```dockerfile
+   # syntax=docker/dockerfile:1
+   FROM alpine:3.19
+   RUN --network=host echo test
+   CMD ["sh", "-c", "echo hello"]
+   ```
+5. Trigger deployment:
+   - Expected Result: Deployment fails closed with:
+     `build instruction --network=host is forbidden`
+
+#### Test Procedure 49.3 — Production CSP Explicit WebSocket Origins
+1. Build and run the frontend in production mode:
+   ```bash
+   cd frontend && npm run build && npm run start
+   ```
+2. Inspect the `Content-Security-Policy` header on root and dashboard responses:
+   ```bash
+   curl -I http://localhost:3000
+   ```
+3. Verify the `connect-src` directive in the CSP header:
+   - Contains explicit trusted WebSocket origins: `'self'`, configured API URL, configured WebSocket URL, and loopback agent `ws://127.0.0.1:4142`.
+   - **Does NOT** contain wildcard `ws:` or `wss:` protocol schemes.
+
+#### Test Procedure 49.4 — Queue Abandoned-Job Recovery Pipelined Bypass & Cancellation
+1. Enqueue multiple long-running deployments so that jobs enter the `forgelab:queue:processing` list.
+2. In another terminal or worker thread, trigger periodic abandoned job recovery:
+   ```bash
+   # Recovery runs automatically every 30s or can be queried via /health/queue
+   curl -s http://localhost:8080/health/queue | jq .
+   ```
+3. Inspect Redis query logs (`redis-cli MONITOR`):
+   - Confirm active jobs with valid leases (`forgelab:lease:<job_id>`) are verified in a single pipelined `EXISTS` check.
+   - Confirm zero database queries or Lua state changes are executed for active jobs.
+4. Stop or cancel a deployment worker while in retry backoff:
+   - Send SIGINT or cancel worker context.
+   - Confirm worker terminates in <100ms without sleeping for the full 30-second retry backoff duration.
+
+#### Test Procedure 49.5 — Rate Limit Redis Fallback Observability
+1. Stop the Redis container:
+   ```bash
+   docker compose stop redis
+   ```
+2. Send requests to `/api/auth/login` beyond the per-minute threshold (`RATE_LIMIT_AUTH_PER_MINUTE`, default 30).
+3. Observe backend logs:
+   - Confirm structured warning:
+     `WARN rate limiter: redis error, falling back to in-memory store category=auth error=...`
+4. Confirm rate limiting continues to enforce 429 Too Many Requests using the in-memory fixed-window fallback store.
+5. Restart Redis (`docker compose start redis`) and confirm rate limiting resumes Redis operations cleanly.
+
+#### Verification Record (Section 49)
+- **Status:** NOT RECORDED
+- **Verified by:** —
+- **Date:** —
+- **Environment:** —
+- **Notes:** Automated regression tests pass for non-root entrypoint script, BuildKit entitlement validation, explicit WebSocket CSP, pipelined recovery bypass, worker cancellation during retry backoff, and rate limit fallback observability; live container verification pending host execution.
+
 
 

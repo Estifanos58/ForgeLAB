@@ -257,6 +257,19 @@ func (e *Engine) buildImage(
 	options.Remove = true
 	options.ForceRemove = true
 
+	// Enforce build network isolation: reject host and container network sharing during build
+	if options.NetworkMode == "host" || strings.HasPrefix(options.NetworkMode, "container:") {
+		return fmt.Errorf("build network security violation: %w", ErrBuildHostNetworkForbidden)
+	}
+
+	// Apply build resource limits if configured
+	if memLimit := getDockerBuildMemoryLimit(); memLimit > 0 && options.Memory == 0 {
+		options.Memory = memLimit
+	}
+	if cpuShares := getDockerBuildCPUShares(); cpuShares > 0 && options.CPUShares == 0 {
+		options.CPUShares = cpuShares
+	}
+
 	// 1. Acquire Docker build slot under configurable concurrency limit (BuildSemaphore) if not already held.
 	// Acquired BEFORE the build-maintenance lock so that queued builds waiting for a build slot do not
 	// unnecessarily block Docker image pruning or maintenance operations.
@@ -344,6 +357,14 @@ func (e *Engine) buildImage(
 	var dfContent []byte
 	dfContent, _ = extractDockerfileFromTar(validatedArchiveFile, options.Dockerfile)
 	_, _ = validatedArchiveFile.Seek(0, io.SeekStart)
+
+	if secErr := ValidateDockerfileSecurity(dfContent); secErr != nil {
+		slog.Error("dockerfile security validation failed", "error", secErr)
+		if onLogLine != nil {
+			onLogLine(fmt.Sprintf("Security violation in Dockerfile: %v", secErr))
+		}
+		return fmt.Errorf("build security violation: %w", secErr)
+	}
 
 	requiresBuildKit, _ := DetectDockerfileRequiresBuildKit(dfContent)
 	_, hasCachedVer := e.getCachedBuilderVersion()

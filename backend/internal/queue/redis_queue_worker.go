@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -70,7 +71,11 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 							continue
 						}
 						slog.Error("redis queue pop error", "worker", workerName, "error", err)
-						time.Sleep(1 * time.Second)
+						select {
+						case <-workerCtx.Done():
+							return
+						case <-time.After(1 * time.Second):
+						}
 						continue
 					}
 
@@ -117,7 +122,11 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 							acquired = true
 						} else {
 							// Handled safely (requeued, aborted, or duplicate removed without resetting active state).
-							time.Sleep(500 * time.Millisecond)
+							select {
+							case <-workerCtx.Done():
+								return
+							case <-time.After(500 * time.Millisecond):
+							}
 							continue
 						}
 					}
@@ -214,12 +223,19 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 									"current_attempts", attempts,
 									"backoff", q.retryBackoff,
 								)
-								time.Sleep(q.retryBackoff)
+								select {
+								case <-workerCtx.Done():
+									slog.Info("worker context cancelled during retry backoff; immediately re-queueing without blocking", "job_id", job.ID)
+									_, _, _ = q.FailAndRequeue(context.Background(), job.ID, leaseToken, itemStr)
+									return
+								case <-time.After(q.retryBackoff):
+								}
 								newAtt, ok, err := q.FailAndRequeue(context.Background(), job.ID, leaseToken, itemStr)
 								if err != nil || !ok {
 									slog.Warn("worker lost lease; aborted requeue to protect replacement worker",
 										"worker", workerName, "job_id", job.ID, "err", err)
 								} else {
+									atomic.AddInt64(&q.totalRetryAttempts, 1)
 									slog.Info("re-queued failed deployment job", "job_id", job.ID, "new_attempts", newAtt)
 								}
 							} else {
@@ -232,6 +248,7 @@ func (q *DeploymentQueue) StartJobWorker(parentCtx context.Context, handler func
 									slog.Warn("worker lost lease; aborted DLQ transfer to protect replacement worker",
 										"worker", workerName, "job_id", job.ID, "err", err)
 								} else {
+									atomic.AddInt64(&q.totalDeadLetterJobs, 1)
 									slog.Info("transferred failed deployment to DLQ", "job_id", job.ID, "final_attempts", newAtt)
 								}
 							}

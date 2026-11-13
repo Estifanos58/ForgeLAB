@@ -710,3 +710,70 @@ func TestRegression_EnsureStreamingTransport_NegotiatesAPIVersion(t *testing.T) 
 	assert.True(t, pingCalled, "ensureStreamingTransport must trigger API-version negotiation against daemon")
 	assert.Equal(t, "1.42", eng.dockerClient.ClientVersion(), "ClientVersion must be negotiated to daemon version")
 }
+
+func TestRegression_ValidateDockerfileSecurity_RejectsInsecureEntitlements(t *testing.T) {
+	t.Run("rejects RUN --security=insecure", func(t *testing.T) {
+		df := []byte(`
+FROM alpine:3.21
+RUN --security=insecure cat /etc/shadow
+CMD ["echo", "done"]
+`)
+		err := ValidateDockerfileSecurity(df)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrBuildSecurityInsecureForbidden)
+	})
+
+	t.Run("rejects RUN --network=host", func(t *testing.T) {
+		df := []byte(`
+FROM alpine:3.21
+RUN --network=host curl http://localhost:8080/api/secrets
+CMD ["echo", "done"]
+`)
+		err := ValidateDockerfileSecurity(df)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrBuildHostNetworkForbidden)
+	})
+
+	t.Run("rejects RUN --network=container:other", func(t *testing.T) {
+		df := []byte(`
+FROM alpine:3.21
+RUN --network=container:sensitive-db psql
+CMD ["echo", "done"]
+`)
+		err := ValidateDockerfileSecurity(df)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrBuildHostNetworkForbidden)
+	})
+
+	t.Run("accepts safe buildkit instructions", func(t *testing.T) {
+		df := []byte(`
+# syntax=docker/dockerfile:1
+FROM golang:1.26-alpine
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/root/.cache/go-build go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o server .
+CMD ["/app/server"]
+`)
+		err := ValidateDockerfileSecurity(df)
+		require.NoError(t, err, "standard safe BuildKit instructions must be allowed")
+	})
+}
+
+func TestRegression_ResolveBuilder_RejectsInsecureDockerfile(t *testing.T) {
+	eng := &Engine{}
+	insecureDF := []byte("FROM alpine\nRUN --security=insecure whoami\n")
+	_, err := eng.resolveBuilder(context.Background(), insecureDF, client.ImageBuildOptions{}, nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrBuildSecurityInsecureForbidden)
+}
+
+func TestRegression_BuildImage_RejectsHostNetworkMode(t *testing.T) {
+	eng := &Engine{}
+	err := eng.buildImage(context.Background(), nil, client.ImageBuildOptions{
+		NetworkMode: "host",
+	}, nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrBuildHostNetworkForbidden)
+}

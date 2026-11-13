@@ -444,6 +444,16 @@ These are identified codebase behaviors that require investigation and resolutio
 - **Location:** [`backend/internal/docker/engine_metrics.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_metrics.go), [`backend/internal/services/metrics_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/metrics_service.go), [`backend/internal/services/audit_service.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/services/audit_service.go), [`backend/internal/docker/engine_diagnostics.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_diagnostics.go)
 - **Resolution:** Added backend-sampled/cached live metrics (`FORGELAB_METRICS_CACHE_TTL`, single-flight deduplication), configurable historical metrics persistence and retention (`FORGELAB_METRICS_SAMPLE_INTERVAL`, `FORGELAB_METRICS_RETENTION_DAYS`), secret-redacted operational audit trail (`audit_logs`), and aggregated diagnostics (`GET /api/diagnostics`, `GET /api/projects/{id}/diagnostics`).
 
+### 62. Non-Root Backend Container, BuildKit Safety & Queue Resilience (`RESOLVED IN ARCHITECTURE`)
+- **Location:** [`backend/Dockerfile`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/Dockerfile), [`backend/docker-entrypoint.sh`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/docker-entrypoint.sh), [`backend/internal/docker/builder.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/builder.go), [`backend/internal/docker/engine_build.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine_build.go), [`backend/internal/queue/redis_queue_recovery.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/queue/redis_queue_recovery.go), [`backend/internal/queue/redis_queue_worker.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/queue/redis_queue_worker.go), [`backend/internal/ratelimit/limiter.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/ratelimit/limiter.go), [`frontend/next.config.ts`](file:///c:/Users/estif/Desktop/ForgeLAB/frontend/next.config.ts)
+- **Resolution:**
+  - Hardened backend container: Added `forgelab:forgelab` (UID/GID 10001) runtime user. Container entrypoint (`docker-entrypoint.sh`) dynamically maps the host `/var/run/docker.sock` GID to the `forgelab` user, chowns `/app/data`, and permanently drops root privileges via `su-exec forgelab:forgelab "$@"` before starting the control plane.
+  - BuildKit & Dockerfile Security: `ValidateDockerfileSecurity` detects and rejects unsafe BuildKit entitlements (`RUN --security=insecure`) and host network directives (`RUN --network=host`). Image builds enforce safe network modes and respect configured build memory limits (`FORGELAB_BUILD_MEMORY_MB`) and CPU shares (`FORGELAB_BUILD_CPU_SHARES`).
+  - Production CSP WebSocket Hardening: Replaced wildcard `ws:` and `wss:` with explicit trusted origins (same-origin, explicit API/WS URL, backend port, and local agent loopback), preserving localhost WebSockets strictly during development.
+  - Queue Recovery Optimization: `RecoverAbandonedJobs` performs pipelined `EXISTS` checks in Redis, bypassing active jobs upfront without querying PostgreSQL or contending on Lua recovery locks.
+  - Context-Aware Worker Retries: Replaced blocking sleeps in `redis_queue_worker.go` with context-aware `select` listening to `workerCtx.Done()`, unblocking workers within <100ms on cancellation.
+  - Rate Limit Fallback Observability: Added atomic `FallbackCount()`, structured warning logs, and observability hooks when Redis rate limiting falls back to in-memory fixed-window storage.
+
 
 ---
 
@@ -455,9 +465,10 @@ These are identified codebase behaviors that require investigation and resolutio
    - Single-use ticket authentication (`POST /api/ws/ticket` -> `?ticket=<uuid>`), HttpOnly cookies, and `Authorization: Bearer` headers are enforced; `?token=...` query string authentication is strictly rejected with `401 Unauthorized`.
 3. **Permissive WebSocket CORS / Origin Check (`RESOLVED IN ARCHITECTURE`):**
    - Strict origin validation is enforced across all WebSocket upgrades, matching against configured frontend URLs (`CORS_ALLOWED_ORIGINS` and `FRONTEND_URL`) or same-origin host headers.
-4. **Backend Docker Socket Trust (Inherent Architectural Boundary):**
-   - The Go backend mounts `/var/run/docker.sock` with root-equivalent Docker Engine control.
-   - Architectural Hardening Required for Complete Elimination: Because the Docker daemon does not offer granular per-tenant Unix socket ACLs, root-equivalent control over the host cannot be eliminated purely in software on a shared single-node daemon. Complete architectural mitigation requires Docker-in-Docker (DinD), Rootless Docker, or isolated microVM hypervisors (Firecracker/gVisor). Active defense-in-depth mitigations (rejection of socket mounts into tenant containers, `CapDrop: ALL`, strict capability allowlist, `no-new-privileges`, strict path validation) are currently enforced.
+4. **Backend Docker Socket Trust (Inherent Architectural Boundary & Non-Root Hardening):**
+   - The Go backend mounts `/var/run/docker.sock` to orchestrate builds and runtime containers.
+   - *Mitigation Implemented:* The backend container no longer runs as root (UID 0); it runs as unprivileged user `forgelab` (UID 10001), dynamically mapped to the socket's group ID at startup via `su-exec`.
+   - *Architectural Hardening Required for Complete Elimination:* Because the Docker daemon does not offer granular per-tenant Unix socket ACLs, root-equivalent control over the host cannot be eliminated purely in software on a shared single-node daemon. Complete architectural isolation requires Docker-in-Docker (DinD), Rootless Docker, or microVM hypervisors (Firecracker/gVisor). Active defense-in-depth mitigations (rejection of socket mounts into tenant containers, `CapDrop: ALL`, strict capability allowlist, `no-new-privileges`, strict path validation, and BuildKit entitlement validation) are currently enforced.
 5. **Container Resource Limits (`RESOLVED IN ARCHITECTURE`):**
    - `ValidateAndBuildSecureHostConfig` enforces CPU (`NanoCPUs`), Memory (`Memory`), and PIDs (`PidsLimit`) quotas per service within `container.HostConfig.Resources`. Ephemeral storage quotas are explicitly rejected.
 
@@ -477,4 +488,7 @@ Do not implement these capabilities during current stabilization verification; t
    - Organization-level user permissions and team workspaces (single-owner per-project model active).
 5. **Packaged / Signed Local Agent Installers:**
    - Code-signed OS installers / installers via Homebrew/winget for `forgelab-agent` rather than script-based host startup (`start-agent.ps1` / `start-agent.sh`).
+6. **Playwright End-to-End Test Suite Integration:**
+   - *Evaluation:* Currently, ForgeLAB maintains fast, hermetic unit/integration test suites across Go and Node.js (`npm test` runs 77 tests in <10s). Full end-to-end browser testing of project creation, Docker builds, log streaming over WebSockets, and rollback requires a live Compose stack (Postgres, Redis, Docker socket, backend, frontend) and ~300MB of headless Chromium binaries.
+   - *Recommendation:* Keep standard PR CI lightweight and hermetic (avoiding Docker-in-Docker flakiness and 5-minute build delays). Maintain the dedicated E2E test specification for nightly or staging environments targeting a live `docker compose up` stack.
 

@@ -95,6 +95,10 @@ func (q *DeploymentQueue) RemoveDuplicateIfLeaseHeld(ctx context.Context, jobID 
 // If a job's lease has expired (e.g. worker process crashed), it checks whether
 // the deployment is already terminal. If not terminal and attempts < maxRetries,
 // it atomically re-enqueues the job instead of waiting and failing.
+//
+// Performance & Reliability Optimization:
+// Active jobs with valid unexpired leases are skipped upfront via pipelined lease checks,
+// completely avoiding expensive database terminal checks and Lua contention on healthy jobs.
 func (q *DeploymentQueue) RecoverAbandonedJobs(ctx context.Context) (int, error) {
 	items, err := q.client.LRange(ctx, ProcessingQueueKey, 0, -1).Result()
 	if err != nil {
@@ -103,24 +107,62 @@ func (q *DeploymentQueue) RecoverAbandonedJobs(ctx context.Context) (int, error)
 		}
 		return 0, fmt.Errorf("failed to inspect processing queue: %w", err)
 	}
+	if len(items) == 0 {
+		return 0, nil
+	}
 
-	recovered := 0
+	type candidateJob struct {
+		item string
+		job  Job
+	}
+
+	var candidates []candidateJob
+	var corruptItems []string
+
 	for _, item := range items {
 		job, err := ParseJob(item)
 		if err != nil {
-			// Corrupt / untyped payload in processing queue -> atomically move to DLQ
-			_, _ = corruptToDLQScript.Run(ctx, q.client,
-				[]string{ProcessingQueueKey, DeadLetterQueueKey},
-				item,
-			).Result()
+			corruptItems = append(corruptItems, item)
+			continue
+		}
+		candidates = append(candidates, candidateJob{item: item, job: job})
+	}
+
+	// Move corrupt items to DLQ atomically
+	for _, item := range corruptItems {
+		_, _ = corruptToDLQScript.Run(ctx, q.client,
+			[]string{ProcessingQueueKey, DeadLetterQueueKey},
+			item,
+		).Result()
+		atomic.AddInt64(&q.totalDeadLetterJobs, 1)
+	}
+
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	// Pipeline lease existence checks for all candidate jobs in a single Redis round-trip.
+	// Active jobs with valid unexpired leases are skipped immediately without expensive DB queries.
+	pipe := q.client.Pipeline()
+	leaseCmds := make([]*redis.IntCmd, len(candidates))
+	for i, c := range candidates {
+		leaseCmds[i] = pipe.Exists(ctx, JobLeasePrefix+c.job.ID.String())
+	}
+	_, _ = pipe.Exec(ctx)
+
+	recovered := 0
+	for i, c := range candidates {
+		// If lease is active in Redis (worker is currently processing), skip upfront.
+		// Avoids expensive database terminalChecker queries and unnecessary Lua lock contention.
+		if leaseCmds[i].Val() > 0 {
 			continue
 		}
 
-		// Check if job already reached terminal state
+		// Job's lease has expired or is absent -> investigate for abandoned job recovery
 		isTerminal := false
 		if q.terminalChecker != nil {
 			checkCtx, checkCancel := context.WithTimeout(ctx, 5*time.Second)
-			term, termErr := q.terminalChecker(checkCtx, job)
+			term, termErr := q.terminalChecker(checkCtx, c.job)
 			checkCancel()
 			if termErr == nil && term {
 				isTerminal = true
@@ -128,20 +170,22 @@ func (q *DeploymentQueue) RecoverAbandonedJobs(ctx context.Context) (int, error)
 		}
 
 		// Atomically check lease absence, check/increment attempts, and move job
-		res, recErr := q.RecoverJobAtomic(ctx, item, job.ID, q.maxRetries, isTerminal)
+		res, recErr := q.RecoverJobAtomic(ctx, c.item, c.job.ID, q.maxRetries, isTerminal)
 		if recErr != nil {
-			slog.Error("failed to recover abandoned job", "job_id", job.ID, "error", recErr)
+			slog.Error("failed to recover abandoned job", "job_id", c.job.ID, "error", recErr)
 			continue
 		}
 		if res == 1 {
 			slog.Info("re-enqueued recoverable orphaned deployment job with expired lease",
-				"job_id", job.ID)
+				"job_id", c.job.ID)
 			recovered++
 		} else if res == 2 {
-			slog.Warn("abandoned job exceeded max retries, moved to DLQ", "job_id", job.ID)
+			slog.Warn("abandoned job exceeded max retries, moved to DLQ", "job_id", c.job.ID)
+			atomic.AddInt64(&q.totalDeadLetterJobs, 1)
 		} else if res == 3 {
 			slog.Info("abandoned job is already in terminal state; cleaned up from processing queue",
-				"job_id", job.ID, "type", job.Type)
+				"job_id", c.job.ID, "type", c.job.Type)
+			atomic.AddInt64(&q.totalTerminalCleanups, 1)
 		}
 	}
 

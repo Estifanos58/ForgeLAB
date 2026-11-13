@@ -14,21 +14,40 @@ function extractOrigin(rawUrl?: string): string | null {
   }
 }
 
+function toWebSocketOrigin(origin: string): string | null {
+  try {
+    const u = new URL(origin);
+    if (u.protocol === 'http:') {
+      u.protocol = 'ws:';
+      return u.origin;
+    } else if (u.protocol === 'https:') {
+      u.protocol = 'wss:';
+      return u.origin;
+    } else if (u.protocol === 'ws:' || u.protocol === 'wss:') {
+      return u.origin;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function buildConnectSrc(): string {
   const sources = new Set<string>([
     "'self'",
-    // Allow WebSocket upgrades across same-origin proxies, custom domains, and standalone dev ports
-    'ws:',
-    'wss:',
-    // ForgeLAB Local Agent loopback endpoints
+    // ForgeLAB Local Agent loopback endpoints (HTTP and WebSocket)
     'http://127.0.0.1:4142',
     'http://localhost:4142',
+    'ws://127.0.0.1:4142',
+    'ws://localhost:4142',
   ]);
 
   const backendPort = (process.env.NEXT_PUBLIC_BACKEND_PORT || '8080').trim();
   if (/^\d+$/.test(backendPort)) {
     sources.add(`http://127.0.0.1:${backendPort}`);
     sources.add(`http://localhost:${backendPort}`);
+    sources.add(`ws://127.0.0.1:${backendPort}`);
+    sources.add(`ws://localhost:${backendPort}`);
   }
 
   for (const candidate of [
@@ -40,7 +59,18 @@ function buildConnectSrc(): string {
     const origin = extractOrigin(candidate);
     if (origin) {
       sources.add(origin);
+      const wsOrigin = toWebSocketOrigin(origin);
+      if (wsOrigin) {
+        sources.add(wsOrigin);
+      }
     }
+  }
+
+  // In development, also permit standard dev ports or localhost WebSocket upgrades if needed.
+  // In production, wildcard 'ws:' and 'wss:' are strictly omitted and replaced with explicit trusted origins.
+  if (isDev) {
+    sources.add('ws://localhost:*');
+    sources.add('ws://127.0.0.1:*');
   }
 
   return Array.from(sources).join(' ');

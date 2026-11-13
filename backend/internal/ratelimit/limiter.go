@@ -3,8 +3,10 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/forgelab/backend/internal/middleware"
@@ -42,6 +44,8 @@ type Limiter struct {
 	mu             sync.Mutex
 	memStore       map[string]*inMemoryBucket
 	lastPrune      time.Time
+	fallbackCount  atomic.Int64
+	fallbackHook   func(category, identifier string, err error)
 }
 
 // FixedWindowLimiter is an alias for Limiter to make the algorithm explicitly named.
@@ -75,6 +79,18 @@ func (l *Limiter) TrustedProxies() []string {
 	return cp
 }
 
+// FallbackCount returns the total number of times the rate limiter fell back from Redis to in-memory storage.
+func (l *Limiter) FallbackCount() int64 {
+	return l.fallbackCount.Load()
+}
+
+// SetFallbackHook registers an optional observability callback invoked when falling back from Redis to in-memory rate limiting.
+func (l *Limiter) SetFallbackHook(fn func(category, identifier string, err error)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.fallbackHook = fn
+}
+
 // Allow checks if the given identifier is permitted under the rate limit for the category in the current fixed window.
 // Returns: allowed (bool), retryAfter (time.Duration), err (error).
 func (l *Limiter) Allow(ctx context.Context, category, identifier string, limit int, window time.Duration) (bool, time.Duration, error) {
@@ -101,7 +117,21 @@ func (l *Limiter) Allow(ctx context.Context, category, identifier string, limit 
 				return true, 0, nil
 			}
 		}
-		// If Redis encounters a transient error, fall through to in-memory limiter to avoid blocking traffic
+		// Redis error: record fallback observability metrics and log structured warning
+		l.fallbackCount.Add(1)
+		slog.Warn("rate limiter: redis error, falling back to in-memory store",
+			"key", key,
+			"category", category,
+			"identifier", identifier,
+			"error", err,
+			"fallback_count", l.fallbackCount.Load(),
+		)
+		l.mu.Lock()
+		hook := l.fallbackHook
+		l.mu.Unlock()
+		if hook != nil {
+			hook(category, identifier, err)
+		}
 	}
 
 	// In-memory fallback (fixed-window bucket)

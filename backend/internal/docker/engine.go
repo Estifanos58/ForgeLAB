@@ -612,6 +612,24 @@ func getDockerBuildTimeout() time.Duration {
 	return 45 * time.Minute
 }
 
+func getDockerBuildMemoryLimit() int64 {
+	if raw := os.Getenv("FORGELAB_BUILD_MEMORY_MB"); raw != "" {
+		if mb, err := strconv.ParseInt(raw, 10, 64); err == nil && mb > 0 {
+			return mb * 1024 * 1024
+		}
+	}
+	return 0
+}
+
+func getDockerBuildCPUShares() int64 {
+	if raw := os.Getenv("FORGELAB_BUILD_CPU_SHARES"); raw != "" {
+		if shares, err := strconv.ParseInt(raw, 10, 64); err == nil && shares > 0 {
+			return shares
+		}
+	}
+	return 0
+}
+
 // SetServiceService configures the service management service.
 func (e *Engine) SetServiceService(ss *services.ServiceService) {
 	e.serviceService = ss

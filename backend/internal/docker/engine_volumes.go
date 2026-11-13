@@ -233,14 +233,14 @@ func (e *Engine) ListProjectVolumesWithOptions(ctx context.Context, projectID uu
 	// Query containers, volumes, and daemon disk usage concurrently with bounded timeouts
 	// so a slow/stalled `system/df` never hangs the entire Storage response.
 	var (
-		wg                     sync.WaitGroup
-		containerList          client.ContainerListResult
-		listContErr            error
-		dfSummary              DiskUsageSummary
-		usageByDockerName      map[string]volumeDiskUsage
-		dfErr                  error
-		volListRes             client.VolumeListResult
-		volListErr             error
+		wg                sync.WaitGroup
+		containerList     client.ContainerListResult
+		listContErr       error
+		dfSummary         DiskUsageSummary
+		usageByDockerName map[string]volumeDiskUsage
+		dfErr             error
+		volListRes        client.VolumeListResult
+		volListErr        error
 	)
 
 	wg.Add(3)
