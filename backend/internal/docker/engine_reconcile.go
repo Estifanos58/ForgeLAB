@@ -69,6 +69,7 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 
 	// Track IDs of containers that are legitimately active in the database
 	legitimateContainers := make(map[string]bool)
+	promotedDeployments := make(map[uuid.UUID]*models.Service)
 
 	// 2. Reconcile active multi-service configurations
 	if e.serviceService != nil {
@@ -78,6 +79,9 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 		} else {
 			touchedProjects := make(map[uuid.UUID]bool)
 			for _, svc := range services {
+				if svc.CurrentServiceDeploymentID != nil {
+					promotedDeployments[*svc.CurrentServiceDeploymentID] = svc
+				}
 				touchedProjects[svc.ProjectID] = true
 				if svc.ContainerID == nil || *svc.ContainerID == "" {
 					if svc.Status == models.ServiceStatusRunning || svc.Status == models.ServiceStatusDegraded {
@@ -194,9 +198,40 @@ func (e *Engine) ReconcileDaemonContainers(ctx context.Context) error {
 						(!sd.CreatedAt.IsZero() && !sd.CreatedAt.Before(e.startTime)) {
 						continue
 					}
+
+					// Self-healing: if this deployment was successfully promoted in the database,
+					// and its container is currently running healthy in Docker, heal the status to RUNNING!
+					if svc, isPromoted := promotedDeployments[sd.ID]; isPromoted && svc != nil {
+						checkCID := ""
+						if sd.ContainerID != nil && *sd.ContainerID != "" {
+							checkCID = *sd.ContainerID
+						} else if svc.ContainerID != nil && *svc.ContainerID != "" {
+							checkCID = *svc.ContainerID
+						}
+						if checkCID != "" {
+							if dockCont, exists := containerMap[checkCID]; exists && dockCont.State == container.StateRunning {
+								slog.Info("reconciliation: self-healed promoted service deployment status to running", "service_deployment_id", sd.ID, "service_id", svc.ID, "container_id", checkCID)
+								_ = e.deploymentService.UpdateServiceDeploymentStatus(ctx, sd.ID, models.DeployStatusRunning, nil)
+								legitimateContainers[dockCont.ID] = true
+								if len(dockCont.ID) > 12 {
+									legitimateContainers[dockCont.ID[:12]] = true
+								}
+								continue
+							}
+						}
+					}
+
 					reason := "Deployment interrupted: backend restarted while service deployment was in progress"
 					_ = e.deploymentService.FailServiceDeployment(ctx, sd.ID, reason)
 					slog.Info("reconciliation: interrupted in-flight service deployment marked failed", "service_deployment_id", sd.ID, "status", sd.Status)
+
+					// Clean up any un-promoted orphaned container that was left running by the interrupted deployment
+					if sd.ContainerID != nil && *sd.ContainerID != "" && !legitimateContainers[*sd.ContainerID] {
+						e.StopContainerLogCollector(*sd.ContainerID)
+						stopTimeout := 5
+						_, _ = e.dockerClient.ContainerStop(ctx, *sd.ContainerID, client.ContainerStopOptions{Timeout: &stopTimeout})
+						_, _ = e.dockerClient.ContainerRemove(ctx, *sd.ContainerID, client.ContainerRemoveOptions{Force: true, RemoveVolumes: false})
+					}
 					continue
 				}
 

@@ -170,3 +170,104 @@ func TestGateway_AuthenticationAndRouting(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 }
+
+func TestGateway_ProtectionControls(t *testing.T) {
+	t.Run("Enforces per-share rate limits", func(t *testing.T) {
+		gw := NewServer(Config{
+			BaseDomain:        "preview.test",
+			AuthSecret:        "secret",
+			RateLimitPerShare: 3,
+			RateLimitWindow:   time.Minute,
+		})
+		handler := gw.HTTPHandler()
+
+		for i := 1; i <= 3; i++ {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "http://share-test.preview.test/path", nil)
+			req.Host = "share-test.preview.test"
+			req.RemoteAddr = "192.168.1.100:1234"
+			handler.ServeHTTP(rec, req)
+			// Offline share returns 503, but not 429 rate limit
+			assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		}
+
+		// 4th request must be rate limited with HTTP 429
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://share-test.preview.test/path", nil)
+		req.Host = "share-test.preview.test"
+		req.RemoteAddr = "192.168.1.100:1234"
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusTooManyRequests, rec.Code)
+		assert.Contains(t, rec.Body.String(), "Rate Limit Exceeded")
+		assert.Equal(t, "5", rec.Header().Get("Retry-After"))
+	})
+
+	t.Run("Enforces per-IP rate limits across shares", func(t *testing.T) {
+		gw := NewServer(Config{
+			BaseDomain:        "preview.test",
+			AuthSecret:        "secret",
+			RateLimitPerShare: 100,
+			RateLimitPerIP:    2,
+			RateLimitWindow:   time.Minute,
+		})
+		handler := gw.HTTPHandler()
+
+		// 2 requests from same client IP
+		for i := 1; i <= 2; i++ {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "http://share-ip.preview.test/path", nil)
+			req.Host = "share-ip.preview.test"
+			req.RemoteAddr = "10.0.0.50:54321"
+			handler.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		}
+
+		// 3rd request from same client IP exceeds IP limit
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://share-different.preview.test/path", nil)
+		req.Host = "share-different.preview.test"
+		req.RemoteAddr = "10.0.0.50:54321"
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusTooManyRequests, rec.Code)
+		assert.Contains(t, rec.Body.String(), "Rate Limit Exceeded")
+	})
+
+	t.Run("Enforces per-share connection limits", func(t *testing.T) {
+		gw := NewServer(Config{
+			BaseDomain:             "preview.test",
+			AuthSecret:             "secret",
+			MaxConnectionsPerShare: 2,
+			RateLimitPerShare:      100,
+		})
+
+		// Acquire 2 slots
+		ok1, _ := gw.acquireConnection("share-conn")
+		assert.True(t, ok1)
+		ok2, _ := gw.acquireConnection("share-conn")
+		assert.True(t, ok2)
+		assert.Equal(t, 2, gw.GetActiveShareConnections("share-conn"))
+
+		// 3rd connection exceeds limit
+		handler := gw.HTTPHandler()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://share-conn.preview.test/path", nil)
+		req.Host = "share-conn.preview.test"
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusTooManyRequests, rec.Code)
+		assert.Contains(t, rec.Body.String(), "Connection Limit Reached")
+
+		// Release 1 slot
+		gw.releaseConnection("share-conn")
+		assert.Equal(t, 1, gw.GetActiveShareConnections("share-conn"))
+
+		// Now connection can be acquired
+		ok3, _ := gw.acquireConnection("share-conn")
+		assert.True(t, ok3)
+		gw.releaseConnection("share-conn")
+		gw.releaseConnection("share-conn")
+		assert.Equal(t, 0, gw.GetActiveShareConnections("share-conn"))
+	})
+}

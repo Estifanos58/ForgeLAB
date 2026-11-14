@@ -759,6 +759,122 @@ CMD ["/app/server"]
 		err := ValidateDockerfileSecurity(df)
 		require.NoError(t, err, "standard safe BuildKit instructions must be allowed")
 	})
+
+	t.Run("rejects backtick escape continuation bypass attempt", func(t *testing.T) {
+		df := []byte("# escape=`\nFROM alpine:3.21\nRUN `\n    --security=insecure `\n    whoami\n")
+		err := ValidateDockerfileSecurity(df)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrBuildSecurityInsecureForbidden)
+	})
+
+	t.Run("rejects backtick escape continuation with comments", func(t *testing.T) {
+		df := []byte("# escape=`\nFROM alpine:3.21\nRUN `\n    # inline comment\n    --network=host `\n    curl http://169.254.169.254\n")
+		err := ValidateDockerfileSecurity(df)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrBuildHostNetworkForbidden)
+	})
+
+	t.Run("rejects backslash continuation with comments", func(t *testing.T) {
+		df := []byte("FROM alpine:3.21\nRUN \\\n    # innocent comment\n    --security=insecure \\\n    whoami\n")
+		err := ValidateDockerfileSecurity(df)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrBuildSecurityInsecureForbidden)
+	})
+
+	t.Run("rejects quoted flag values and space variations", func(t *testing.T) {
+		variations := []string{
+			"FROM alpine\nRUN --security=\"insecure\" whoami\n",
+			"FROM alpine\nRUN --security='insecure' whoami\n",
+			"FROM alpine\nRUN --security = insecure whoami\n",
+			"FROM alpine\nRUN --security insecure whoami\n",
+			"FROM alpine\nRUN --security \"insecure\" whoami\n",
+			"FROM alpine\nRUN --SECURITY=INSECURE whoami\n",
+			"FROM alpine\nRUN --security=custom whoami\n",
+		}
+		for _, v := range variations {
+			err := ValidateDockerfileSecurity([]byte(v))
+			require.Error(t, err, "must reject variation: %s", v)
+			assert.ErrorIs(t, err, ErrBuildSecurityInsecureForbidden)
+		}
+	})
+
+	t.Run("rejects quoted network flags and container network modes", func(t *testing.T) {
+		variations := []string{
+			"FROM alpine\nRUN --network=\"host\" curl http://internal\n",
+			"FROM alpine\nRUN --network='host' curl http://internal\n",
+			"FROM alpine\nRUN --network = host curl http://internal\n",
+			"FROM alpine\nRUN --network host curl http://internal\n",
+			"FROM alpine\nRUN --network \"host\" curl http://internal\n",
+			"FROM alpine\nRUN --network=container:db whoami\n",
+			"FROM alpine\nRUN --network container:db whoami\n",
+			"FROM alpine\nRUN --NETWORK=HOST curl http://internal\n",
+		}
+		for _, v := range variations {
+			err := ValidateDockerfileSecurity([]byte(v))
+			require.Error(t, err, "must reject variation: %s", v)
+			assert.ErrorIs(t, err, ErrBuildHostNetworkForbidden)
+		}
+	})
+
+	t.Run("rejects directives with unusual spacing and uppercase", func(t *testing.T) {
+		df := []byte("   #   ESCAPE   =   `   \nFROM alpine\nRUN `\n  --security=insecure whoami\n")
+		err := ValidateDockerfileSecurity(df)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrBuildSecurityInsecureForbidden)
+	})
+
+	t.Run("fails closed on empty content", func(t *testing.T) {
+		assert.ErrorIs(t, ValidateDockerfileSecurity(nil), ErrDockerfileEmpty)
+		assert.ErrorIs(t, ValidateDockerfileSecurity([]byte{}), ErrDockerfileEmpty)
+		assert.ErrorIs(t, ValidateDockerfileSecurity([]byte("   \n\t  ")), ErrDockerfileEmpty)
+	})
+
+	t.Run("fails closed on oversized Dockerfile", func(t *testing.T) {
+		oversized := make([]byte, MaxDockerFileSize+10)
+		for i := range oversized {
+			oversized[i] = 'A'
+		}
+		err := ValidateDockerfileSecurity(oversized)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrDockerfileOversized)
+	})
+
+	t.Run("fails closed on null bytes in Dockerfile", func(t *testing.T) {
+		df := []byte("FROM alpine:3.21\x00\nRUN whoami\n")
+		err := ValidateDockerfileSecurity(df)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrDockerfileInvalidSyntax)
+	})
+
+	t.Run("fails closed on malformed or duplicate parser directives", func(t *testing.T) {
+		dupEscape := []byte("# escape=\\\n# escape=`\nFROM alpine\nRUN whoami\n")
+		assert.ErrorIs(t, ValidateDockerfileSecurity(dupEscape), ErrDockerfileInvalidSyntax)
+
+		invalidEscape := []byte("# escape=x\nFROM alpine\nRUN whoami\n")
+		assert.ErrorIs(t, ValidateDockerfileSecurity(invalidEscape), ErrDockerfileInvalidSyntax)
+	})
+
+	t.Run("tar extraction fails closed on oversized Dockerfile or missing Dockerfile", func(t *testing.T) {
+		// Missing Dockerfile in tar
+		emptyArchive := createTarArchiveWithFiles(t, map[string][]byte{
+			"app.go": []byte("package main"),
+		})
+		_, err := extractDockerfileFromTar(bytes.NewReader(emptyArchive), "Dockerfile")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+
+		// Oversized Dockerfile in tar
+		hugeContent := make([]byte, MaxDockerFileSize+1024)
+		for i := range hugeContent {
+			hugeContent[i] = '#'
+		}
+		hugeArchive := createTarArchiveWithFiles(t, map[string][]byte{
+			"Dockerfile": hugeContent,
+		})
+		_, err = extractDockerfileFromTar(bytes.NewReader(hugeArchive), "Dockerfile")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrDockerfileOversized)
+	})
 }
 
 func TestRegression_ResolveBuilder_RejectsInsecureDockerfile(t *testing.T) {

@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,12 +18,31 @@ import (
 	"github.com/forgelab/backend/internal/models"
 )
 
+// RouterOptions specifies configurable timeouts for public share and local tunnels.
+type RouterOptions struct {
+	ResponseHeaderTimeout time.Duration
+	DialTimeout           time.Duration
+	IdleConnTimeout       time.Duration
+	StreamIdleTimeout     time.Duration
+}
+
+// DefaultRouterOptions returns standard operational timeout defaults for tunnel routers.
+func DefaultRouterOptions() RouterOptions {
+	return RouterOptions{
+		ResponseHeaderTimeout: 30 * time.Second,
+		DialTimeout:           5 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		StreamIdleTimeout:     10 * time.Minute,
+	}
+}
+
 // ShareScopedRouter serves HTTP and WebSocket requests for an individual active share.
 type ShareScopedRouter struct {
 	share            *models.PublicShare
 	serviceLookup    ServiceLookup
 	upstreamResolver UpstreamResolver
 	httpClient       *http.Client
+	options          RouterOptions
 }
 
 // NewShareScopedRouter creates a new ShareScopedRouter bound to a specific PublicShare.
@@ -31,23 +51,47 @@ func NewShareScopedRouter(
 	serviceLookup ServiceLookup,
 	upstreamResolver UpstreamResolver,
 ) *ShareScopedRouter {
+	return NewShareScopedRouterWithOptions(share, serviceLookup, upstreamResolver, DefaultRouterOptions())
+}
+
+// NewShareScopedRouterWithOptions creates a new ShareScopedRouter with custom timeout options.
+func NewShareScopedRouterWithOptions(
+	share *models.PublicShare,
+	serviceLookup ServiceLookup,
+	upstreamResolver UpstreamResolver,
+	opts RouterOptions,
+) *ShareScopedRouter {
+	if opts.ResponseHeaderTimeout <= 0 {
+		opts.ResponseHeaderTimeout = 30 * time.Second
+	}
+	if opts.DialTimeout <= 0 {
+		opts.DialTimeout = 5 * time.Second
+	}
+	if opts.IdleConnTimeout <= 0 {
+		opts.IdleConnTimeout = 90 * time.Second
+	}
+	if opts.StreamIdleTimeout <= 0 {
+		opts.StreamIdleTimeout = 10 * time.Minute
+	}
+
 	return &ShareScopedRouter{
 		share:            share,
 		serviceLookup:    serviceLookup,
 		upstreamResolver: upstreamResolver,
+		options:          opts,
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 0, // Unbounded streaming for SSE, file downloads and long-running requests
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
 				DialContext: (&net.Dialer{
-					Timeout:   5 * time.Second,
+					Timeout:   opts.DialTimeout,
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
 				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
+				IdleConnTimeout:       opts.IdleConnTimeout,
 				TLSHandshakeTimeout:   5 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
+				ResponseHeaderTimeout: opts.ResponseHeaderTimeout,
 			},
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				// Do not follow redirects automatically; pass redirect headers back to visitor
@@ -98,17 +142,17 @@ func (r *ShareScopedRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) 
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
-	defer cancel()
-
+	lookupCtx, lookupCancel := context.WithTimeout(req.Context(), 10*time.Second)
 	// 3. Service validation
-	targetService, err := r.serviceLookup.GetService(ctx, matchedMapping.ServiceID)
+	targetService, err := r.serviceLookup.GetService(lookupCtx, matchedMapping.ServiceID)
 	if err != nil || targetService == nil {
+		lookupCancel()
 		r.renderError(w, http.StatusBadGateway, "Service Unavailable", "The target service mapped to this route could not be found.")
 		return
 	}
 
 	if targetService.ProjectID != r.share.ProjectID {
+		lookupCancel()
 		slog.Error("security boundary violation: route mapped service does not belong to share project",
 			"share_id", r.share.ID, "service_id", targetService.ID, "service_project_id", targetService.ProjectID)
 		r.renderError(w, http.StatusForbidden, "Access Denied", "Security boundary violation.")
@@ -116,13 +160,15 @@ func (r *ShareScopedRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) 
 	}
 
 	if targetService.Status != models.ServiceStatusRunning && targetService.Status != models.ServiceStatusDegraded {
+		lookupCancel()
 		r.renderError(w, http.StatusServiceUnavailable, "Service Stopped",
 			fmt.Sprintf("Service '%s' is currently %s. Please start the service in ForgeLAB.", targetService.Name, targetService.Status))
 		return
 	}
 
 	// 4. Discover reachable upstream address
-	upstreamBase, err := r.upstreamResolver.ResolveUpstream(ctx, targetService)
+	upstreamBase, err := r.upstreamResolver.ResolveUpstream(lookupCtx, targetService)
+	lookupCancel()
 	if err != nil || upstreamBase == "" {
 		slog.Warn("share router failed to resolve upstream for service", "service", targetService.Name, "error", err)
 		r.renderError(w, http.StatusBadGateway, "Upstream Unreachable",
@@ -153,7 +199,7 @@ func (r *ShareScopedRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) 
 	}
 
 	// 7. Standard HTTP / Streaming Proxy
-	r.proxyHTTP(ctx, w, req, upstreamBase, targetPath)
+	r.proxyHTTP(req.Context(), w, req, upstreamBase, targetPath)
 }
 
 func (r *ShareScopedRouter) isPathTraversal(req *http.Request) bool {
@@ -186,7 +232,19 @@ func (r *ShareScopedRouter) proxyHTTP(
 		targetURL += "?" + req.URL.RawQuery
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(ctx, req.Method, targetURL, req.Body)
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	var idleTimer *time.Timer
+	if r.options.StreamIdleTimeout > 0 {
+		idleTimer = time.AfterFunc(r.options.StreamIdleTimeout, func() {
+			slog.Debug("terminating idle streaming connection", "target", targetURL, "idle_timeout", r.options.StreamIdleTimeout)
+			cancelStream()
+		})
+		defer idleTimer.Stop()
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(streamCtx, req.Method, targetURL, req.Body)
 	if err != nil {
 		r.renderError(w, http.StatusInternalServerError, "Proxy Error", "Failed to construct upstream request.")
 		return
@@ -225,11 +283,19 @@ func (r *ShareScopedRouter) proxyHTTP(
 
 	resp, err := r.httpClient.Do(upstreamReq)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return
+		}
 		slog.Warn("upstream HTTP request failed", "target", targetURL, "error", err)
 		r.renderError(w, http.StatusBadGateway, "Bad Gateway", fmt.Sprintf("Failed to communicate with service: %v", err))
 		return
 	}
 	defer resp.Body.Close()
+
+	// Reset idle timer once headers have been received
+	if idleTimer != nil {
+		idleTimer.Reset(r.options.StreamIdleTimeout)
+	}
 
 	// Copy response headers
 	for k, vv := range resp.Header {
@@ -240,12 +306,21 @@ func (r *ShareScopedRouter) proxyHTTP(
 
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream response body back with flusher support
+	// Stream response body back with flusher support and stream idle detection
 	flusher, hasFlusher := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
+		select {
+		case <-streamCtx.Done():
+			return
+		default:
+		}
+
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			if idleTimer != nil {
+				idleTimer.Reset(r.options.StreamIdleTimeout)
+			}
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				return
 			}

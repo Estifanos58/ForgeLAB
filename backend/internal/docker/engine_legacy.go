@@ -498,7 +498,14 @@ func (e *Engine) executeLegacySingleContainerDeployment(ctx context.Context, dep
 			},
 		}
 
-		if resolvedOpts, err := e.resolveBuilder(ctx, dfContent, buildOpts, nil); err == nil {
+		if len(dfContent) > 0 {
+			resolvedOpts, err := e.resolveBuilder(ctx, dfContent, buildOpts, nil)
+			if err != nil {
+				reason := fmt.Sprintf("Build configuration error: %v", err)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				updateStatus(models.DeployStatusFailed, &reason)
+				return errors.New(reason)
+			}
 			buildOpts = resolvedOpts
 		}
 

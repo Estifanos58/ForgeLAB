@@ -361,3 +361,12 @@ The `docs/` directory represents ForgeLAB's persistent engineering memory:
 - [docs/13-decisions.md](docs/13-decisions.md) — Architecture Decision Records (DEC-001 to DEC-017)
 - [docs/14-known-limitations.md](docs/14-known-limitations.md) — Identified limitations, investigation items, and backlog
 - [docs/15-github-integration.md](docs/15-github-integration.md) — GitHub App, OAuth, recoverable imports & push-to-deploy design
+
+---
+
+## Security, Contributing & License
+
+- **Security Policy:** See [SECURITY.md](SECURITY.md) for our vulnerability reporting process, Docker socket isolation limitations, multi-tenancy requirements, and defense-in-depth mitigations.
+- **Contributing Guidelines:** See [CONTRIBUTING.md](CONTRIBUTING.md) for architectural invariants, coding conventions, and setup instructions.
+- **License:** See [LICENSE](LICENSE) for copyright and licensing terms. All rights reserved by Estifanos Kebe (@Estifanos58) pending formal open-source release.
+

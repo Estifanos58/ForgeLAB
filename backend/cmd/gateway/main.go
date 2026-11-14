@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/forgelab/backend/internal/gateway"
 )
@@ -28,6 +29,11 @@ func main() {
 	authSecret := flag.String("secret", getEnv("GATEWAY_AUTH_SECRET", getEnv("GATEWAY_AUTH_TOKEN", "")), "Tunnel authentication secret")
 	tlsCert := flag.String("tls-cert", getEnv("GATEWAY_TLS_CERT", ""), "TLS certificate file path")
 	tlsKey := flag.String("tls-key", getEnv("GATEWAY_TLS_KEY", ""), "TLS private key file path")
+	maxConns := flag.Int("max-conns", getEnvInt("GATEWAY_MAX_CONNS", 0), "Global maximum concurrent connections (0 = unlimited)")
+	maxConnsPerShare := flag.Int("max-conns-per-share", getEnvInt("GATEWAY_MAX_CONNS_PER_SHARE", 50), "Maximum concurrent connections per share (0 = unlimited)")
+	rateLimitPerShare := flag.Int("rate-limit-per-share", getEnvInt("GATEWAY_RATE_LIMIT_PER_SHARE", 120), "Maximum requests per window per share (0 = unlimited)")
+	rateLimitPerIP := flag.Int("rate-limit-per-ip", getEnvInt("GATEWAY_RATE_LIMIT_PER_IP", 60), "Maximum requests per window per visitor IP (0 = unlimited)")
+	rateLimitWindow := flag.Duration("rate-limit-window", getEnvDuration("GATEWAY_RATE_LIMIT_WINDOW", time.Minute), "Rate limit window duration (e.g. 1m)")
 	flag.Parse()
 
 	// Normalize port-only values (e.g. "8082" -> ":8082")
@@ -61,14 +67,19 @@ func main() {
 	fmt.Printf("====================================================\n")
 
 	server := gateway.NewServer(gateway.Config{
-		HTTPAddr:    *httpAddr,
-		HTTPSAddr:   *httpsAddr,
-		TunnelAddr:  *tunnelAddr,
-		BaseDomain:  *baseDomain,
-		AuthSecret:  *authSecret,
-		TLSCertPath: *tlsCert,
-		TLSKeyPath:  *tlsKey,
-		TLSEnabled:  *tlsCert != "" && *tlsKey != "",
+		HTTPAddr:               *httpAddr,
+		HTTPSAddr:              *httpsAddr,
+		TunnelAddr:             *tunnelAddr,
+		BaseDomain:             *baseDomain,
+		AuthSecret:             *authSecret,
+		TLSCertPath:            *tlsCert,
+		TLSKeyPath:             *tlsKey,
+		TLSEnabled:             *tlsCert != "" && *tlsKey != "",
+		MaxConnections:         *maxConns,
+		MaxConnectionsPerShare: *maxConnsPerShare,
+		RateLimitPerShare:      *rateLimitPerShare,
+		RateLimitPerIP:         *rateLimitPerIP,
+		RateLimitWindow:        *rateLimitWindow,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -93,6 +104,25 @@ func normalizeAddr(addr string) string {
 func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if val := os.Getenv(key); val != "" {
+		var i int
+		if _, err := fmt.Sscanf(val, "%d", &i); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if val := os.Getenv(key); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			return d
+		}
 	}
 	return fallback
 }

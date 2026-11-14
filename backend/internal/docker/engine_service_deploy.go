@@ -196,15 +196,40 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 	}
 
 	emitStatus := func(newStatus string, hostPort *int, failureReason *string) {
-		if err := e.deploymentService.UpdateServiceDeploymentStatus(ctx, serviceDeploy.ID, newStatus, failureReason); err != nil {
+		persistCtx := ctx
+		isTerminal := models.IsDeploymentTerminalStatus(newStatus)
+		if isTerminal && ctx.Err() != nil {
+			persistCtx = context.Background()
+		}
+		var err error
+		maxRetries := 1
+		if isTerminal {
+			maxRetries = 3
+		}
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			callCtx, cancel := context.WithTimeout(persistCtx, 5*time.Second)
+			err = e.deploymentService.UpdateServiceDeploymentStatus(callCtx, serviceDeploy.ID, newStatus, failureReason)
+			cancel()
+			if err == nil {
+				break
+			}
+			if attempt < maxRetries-1 {
+				time.Sleep(time.Duration(100*(attempt+1)) * time.Millisecond)
+			}
+		}
+		if err != nil {
 			slog.Warn("failed to update service deployment status in db", "service_deployment_id", serviceDeploy.ID, "status", newStatus, "error", err)
 			return
 		}
 		coarseStatus := toCoarseServiceStatus(newStatus, hasPreviousHealthy)
-		if err := e.serviceService.UpdateServiceStatus(ctx, service.ID, coarseStatus, nil, nil, nil); err != nil {
+		callCtx, cancel := context.WithTimeout(persistCtx, 5*time.Second)
+		if err := e.serviceService.UpdateServiceStatus(callCtx, service.ID, coarseStatus, nil, nil, nil); err != nil {
 			slog.Warn("failed to update coarse service status", "service_id", service.ID, "status", coarseStatus, "error", err)
 		}
-		newProjStatus, err := e.recalculateAndUpdateProjectStatus(ctx, project.ID)
+		cancel()
+		callCtx2, cancel2 := context.WithTimeout(persistCtx, 5*time.Second)
+		newProjStatus, err := e.recalculateAndUpdateProjectStatus(callCtx2, project.ID)
+		cancel2()
 		if err != nil {
 			slog.Warn("failed to recalculate project status", "project_id", project.ID, "error", err)
 		}
@@ -974,7 +999,14 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 		}
 
 		// Pre-resolve builder capability before starting build
-		if resolvedOpts, err := e.resolveBuilder(execCtx, dfContent, buildOpts, nil); err == nil {
+		if len(dfContent) > 0 {
+			resolvedOpts, err := e.resolveBuilder(execCtx, dfContent, buildOpts, nil)
+			if err != nil {
+				reason := fmt.Sprintf("Build configuration error: %v", err)
+				emitLog(models.LogPhaseBuild, models.LogStreamStderr, reason)
+				emitStatus(models.DeployStatusFailed, nil, &reason)
+				return errors.New(reason)
+			}
 			buildOpts = resolvedOpts
 		}
 
@@ -1835,7 +1867,9 @@ func (e *Engine) ExecuteServiceDeployment(ctx context.Context, serviceDeployment
 
 	e.resetServiceHealthState(service.ID)
 	if err := e.deploymentService.UpdateServiceDeploymentContainer(execCtx, serviceDeploy.ID, containerID, hostPort); err != nil {
-		slog.Warn("failed to update service deployment container on promotion", "service_deployment_id", serviceDeploy.ID, "error", err)
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = e.deploymentService.UpdateServiceDeploymentContainer(bgCtx, serviceDeploy.ID, containerID, hostPort)
+		bgCancel()
 	}
 	emitStatus(models.DeployStatusRunning, hostPort, nil)
 

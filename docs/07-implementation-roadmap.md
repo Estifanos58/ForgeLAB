@@ -158,9 +158,9 @@ To maintain engineering truth, this roadmap strictly distinguishes:
 
 ---
 
-## Future Platform Phases (POST-MVP / DEFERRED)
+## Implemented Advanced Platform Phases (Awaiting Physical Verification)
 
-These capabilities are intentionally deferred until Phase 9 physical verification is complete:
+The following advanced capabilities have been implemented in the codebase and are pending end-to-end physical verification:
 
 ### Phase 10: GitHub OAuth Integration & Webhooks ✅ [IMPLEMENTED]
 - [x] Dedicated OAuth application handshake (`repo,read:user` scopes) and encrypted token persistence via AES-256-GCM (`IMPLEMENTED`)

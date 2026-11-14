@@ -83,7 +83,8 @@ func (tr *TrafficRouter) buildProxy(rawURL, slot string) (*httputil.ReverseProxy
 	}
 
 	rp := &httputil.ReverseProxy{
-		Transport: transport,
+		Transport:     transport,
+		FlushInterval: -1, // Flush immediately after each write for SSE and streaming
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(parsed)
 			pr.SetXForwarded()

@@ -44,6 +44,7 @@ type DeploymentService struct {
 	rollbackServiceDeploymentForTest         func(ctx context.Context, project *models.Project, targetService *models.Service) (*models.ServiceDeployment, error)
 	addDeploymentServiceLogForTest           func(ctx context.Context, deploymentID, serviceDeploymentID, serviceID *uuid.UUID, phase, stream, message string) (*models.DeploymentLog, error)
 	createDeploymentWithCommitForTest        func(ctx context.Context, project *models.Project, commitSHA *string) (*models.Deployment, error)
+	listActiveServiceDeploymentsForTest      func(ctx context.Context) ([]*models.ServiceDeployment, error)
 }
 
 // NewDeploymentService creates a new DeploymentService.
@@ -119,6 +120,11 @@ func (s *DeploymentService) SetAddDeploymentServiceLogForTest(fn func(ctx contex
 // SetCreateDeploymentWithCommitForTest configures a test hook for CreateDeploymentWithCommit.
 func (s *DeploymentService) SetCreateDeploymentWithCommitForTest(fn func(ctx context.Context, project *models.Project, commitSHA *string) (*models.Deployment, error)) {
 	s.createDeploymentWithCommitForTest = fn
+}
+
+// SetListActiveServiceDeploymentsForTest configures a test hook for ListActiveServiceDeployments.
+func (s *DeploymentService) SetListActiveServiceDeploymentsForTest(fn func(ctx context.Context) ([]*models.ServiceDeployment, error)) {
+	s.listActiveServiceDeploymentsForTest = fn
 }
 
 // SetSecretService sets the SecretService instance for env hash calculations.

@@ -26,15 +26,24 @@ var validShareTokenRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{3,62}$`)
 
 // Config holds configuration for the Public Gateway server.
 type Config struct {
-	HTTPAddr       string // Ingress HTTP listen address (e.g. ":80" or ":8082")
-	HTTPSAddr      string // Ingress HTTPS listen address (e.g. ":443", optional)
-	TunnelAddr     string // Tunnel listener address (e.g. ":8443")
-	BaseDomain     string // Base public share domain (e.g. "preview.example.com")
-	AuthSecret     string // Required secret for authenticating ForgeLAB tunnel connections
-	TLSCertPath    string // Optional TLS certificate file for HTTPS / TLS tunnel
-	TLSKeyPath     string // Optional TLS private key file
-	TLSEnabled     bool   // Whether TLS is terminated by gateway (false if behind reverse proxy/ALB)
-	MaxConnections int
+	HTTPAddr               string        // Ingress HTTP listen address (e.g. ":80" or ":8082")
+	HTTPSAddr              string        // Ingress HTTPS listen address (e.g. ":443", optional)
+	TunnelAddr             string        // Tunnel listener address (e.g. ":8443")
+	BaseDomain             string        // Base public share domain (e.g. "preview.example.com")
+	AuthSecret             string        // Required secret for authenticating ForgeLAB tunnel connections
+	TLSCertPath            string        // Optional TLS certificate file for HTTPS / TLS tunnel
+	TLSKeyPath             string        // Optional TLS private key file
+	TLSEnabled             bool          // Whether TLS is terminated by gateway (false if behind reverse proxy/ALB)
+	MaxConnections         int           // Global maximum concurrent active connections (0 = unlimited)
+	MaxConnectionsPerShare int           // Maximum concurrent active connections per share (0 = unlimited, default: 50)
+	RateLimitPerShare      int           // Maximum requests per window per share (0 = unlimited, default: 120)
+	RateLimitWindow        time.Duration // Time window for rate limiting (default: 1 minute)
+	RateLimitPerIP         int           // Optional maximum requests per window per visitor IP (0 = unlimited, default: 60)
+}
+
+type rateWindow struct {
+	start time.Time
+	count int
 }
 
 // Server represents the internet-facing public gateway.
@@ -45,6 +54,16 @@ type Server struct {
 	routes        map[string]*yamux.Session          // shareToken -> active yamux session
 	sessionShares map[*yamux.Session]map[string]bool // session -> registered shareTokens
 	closed        bool
+
+	// Active connection tracking & limits:
+	connMu     sync.Mutex
+	shareConns map[string]int // shareToken -> in-flight connections
+	totalConns int
+
+	// Rate limiting state:
+	rateMu         sync.Mutex
+	shareRateLimit map[string]*rateWindow // shareToken -> rate counter
+	ipRateLimit    map[string]*rateWindow // clientIP -> rate counter
 }
 
 // NewServer creates a new Gateway Server.
@@ -54,11 +73,101 @@ func NewServer(cfg Config) *Server {
 	}
 	cfg.BaseDomain = strings.ToLower(strings.TrimPrefix(cfg.BaseDomain, "."))
 
-	return &Server{
-		config:        cfg,
-		routes:        make(map[string]*yamux.Session),
-		sessionShares: make(map[*yamux.Session]map[string]bool),
+	if cfg.RateLimitWindow <= 0 {
+		cfg.RateLimitWindow = time.Minute
 	}
+
+	return &Server{
+		config:         cfg,
+		routes:         make(map[string]*yamux.Session),
+		sessionShares:  make(map[*yamux.Session]map[string]bool),
+		shareConns:     make(map[string]int),
+		shareRateLimit: make(map[string]*rateWindow),
+		ipRateLimit:    make(map[string]*rateWindow),
+	}
+}
+
+// acquireConnection attempts to reserve an active connection slot for the shareToken.
+// Returns false if global or per-share connection limits are exceeded.
+func (s *Server) acquireConnection(shareToken string) (bool, string) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
+	if s.config.MaxConnections > 0 && s.totalConns >= s.config.MaxConnections {
+		return false, "global gateway connection limit reached"
+	}
+
+	maxPerShare := s.config.MaxConnectionsPerShare
+	if maxPerShare > 0 && s.shareConns[shareToken] >= maxPerShare {
+		return false, fmt.Sprintf("connection limit of %d for share %q reached", maxPerShare, shareToken)
+	}
+
+	s.shareConns[shareToken]++
+	s.totalConns++
+	return true, ""
+}
+
+// releaseConnection releases an active connection slot.
+func (s *Server) releaseConnection(shareToken string) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
+	if s.shareConns[shareToken] > 0 {
+		s.shareConns[shareToken]--
+		if s.shareConns[shareToken] == 0 {
+			delete(s.shareConns, shareToken)
+		}
+	}
+	if s.totalConns > 0 {
+		s.totalConns--
+	}
+}
+
+// GetActiveShareConnections returns the current active connections for a share.
+func (s *Server) GetActiveShareConnections(shareToken string) int {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.shareConns[shareToken]
+}
+
+// checkRateLimits verifies whether the request is within rate limit thresholds.
+func (s *Server) checkRateLimits(shareToken, clientIP string) (bool, string) {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+
+	now := time.Now()
+	window := s.config.RateLimitWindow
+	if window <= 0 {
+		window = time.Minute
+	}
+
+	// 1. Check share-level rate limit
+	if s.config.RateLimitPerShare > 0 {
+		tracker, exists := s.shareRateLimit[shareToken]
+		if !exists || now.Sub(tracker.start) >= window {
+			s.shareRateLimit[shareToken] = &rateWindow{start: now, count: 1}
+		} else {
+			tracker.count++
+			if tracker.count > s.config.RateLimitPerShare {
+				return false, "share rate limit exceeded"
+			}
+		}
+	}
+
+	// 2. Check client IP rate limit
+	if s.config.RateLimitPerIP > 0 && clientIP != "" {
+		tracker, exists := s.ipRateLimit[clientIP]
+		if !exists || now.Sub(tracker.start) >= window {
+			s.ipRateLimit[clientIP] = &rateWindow{start: now, count: 1}
+		} else {
+			tracker.count++
+			if tracker.count > s.config.RateLimitPerIP {
+				return false, "IP rate limit exceeded"
+			}
+		}
+	}
+
+	return true, ""
 }
 
 // Start begins listening for both tunnel connections and public visitor HTTP/HTTPS traffic.
@@ -319,6 +428,12 @@ func (s *Server) deregisterShare(token string, session *yamux.Session) error {
 		if s.sessionShares[sess] != nil {
 			delete(s.sessionShares[sess], token)
 		}
+		s.connMu.Lock()
+		delete(s.shareConns, token)
+		s.connMu.Unlock()
+		s.rateMu.Lock()
+		delete(s.shareRateLimit, token)
+		s.rateMu.Unlock()
 	}
 	return nil
 }
@@ -328,9 +443,15 @@ func (s *Server) unregisterSession(session *yamux.Session) {
 	defer s.mu.Unlock()
 
 	if tokens, ok := s.sessionShares[session]; ok {
+		s.connMu.Lock()
+		s.rateMu.Lock()
 		for token := range tokens {
 			delete(s.routes, token)
+			delete(s.shareConns, token)
+			delete(s.shareRateLimit, token)
 		}
+		s.rateMu.Unlock()
+		s.connMu.Unlock()
 		delete(s.sessionShares, session)
 	}
 }
@@ -369,7 +490,39 @@ func (s *Server) HTTPHandler() http.Handler {
 			return
 		}
 
-		// 2. Find active tunnel session
+		// Extract client IP
+		clientIP := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(clientIP); err == nil {
+			clientIP = host
+		}
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if comma := strings.Index(xff, ","); comma != -1 {
+				clientIP = strings.TrimSpace(xff[:comma])
+			} else {
+				clientIP = strings.TrimSpace(xff)
+			}
+		}
+
+		// 2. Check Rate Limits (per-share and per-IP)
+		if allowed, reason := s.checkRateLimits(shareToken, clientIP); !allowed {
+			slog.Warn("gateway rate limit triggered", "share_token", shareToken, "client_ip", clientIP, "reason", reason)
+			w.Header().Set("Retry-After", "5")
+			s.renderError(w, http.StatusTooManyRequests, "Rate Limit Exceeded",
+				"Too many requests to this preview share. Please slow down and try again shortly.")
+			return
+		}
+
+		// 3. Check and Acquire Connection Limits (per-share and global)
+		if ok, reason := s.acquireConnection(shareToken); !ok {
+			slog.Warn("gateway connection limit triggered", "share_token", shareToken, "reason", reason)
+			w.Header().Set("Retry-After", "5")
+			s.renderError(w, http.StatusTooManyRequests, "Connection Limit Reached",
+				"Too many concurrent connections to this preview share. Please try again shortly.")
+			return
+		}
+		defer s.releaseConnection(shareToken)
+
+		// 4. Find active tunnel session
 		session := s.getSession(shareToken)
 		if session == nil {
 			s.renderError(w, http.StatusServiceUnavailable, "Share Offline",
@@ -377,7 +530,7 @@ func (s *Server) HTTPHandler() http.Handler {
 			return
 		}
 
-		// 3. Open Yamux stream to ForgeLAB
+		// 5. Open Yamux stream to ForgeLAB
 		stream, err := session.OpenStream()
 		if err != nil {
 			s.renderError(w, http.StatusBadGateway, "Gateway Error", "Failed to establish tunnel stream to application host.")
@@ -387,10 +540,6 @@ func (s *Server) HTTPHandler() http.Handler {
 
 		// Set forwarding identification headers
 		r.Header.Set(tunnel.HeaderForgeLabShareToken, shareToken)
-		clientIP := r.RemoteAddr
-		if host, _, err := net.SplitHostPort(clientIP); err == nil {
-			clientIP = host
-		}
 		r.Header.Set(tunnel.HeaderForgeLabClientIP, clientIP)
 
 		// 4. Handle WebSocket Upgrade

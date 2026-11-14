@@ -226,7 +226,7 @@ A critical distinction in ForgeLAB's architecture:
   - If any attempt returns HTTP 2xx or 3xx: the deployment is promoted to `RUNNING`, traffic is active, and the old container is stopped.
   - If 10 attempts fail: the deployment transitions to `FAILED`, the broken container is removed, and the previous running deployment is kept intact.
 - **Docker Engine Restart Behavior (CURRENT IMPLEMENTATION — IMPLEMENTED):**
-  Deployed containers are configured with `RestartPolicy: { Name: "unless-stopped" }` in [`backend/internal/docker/engine.go`](file:///c:/Users/estif/Desktop/ForgeLAB/backend/internal/docker/engine.go). The underlying Docker daemon automatically restarts stopped or crashed containers at the container-engine layer.
+  Deployed containers are configured with `RestartPolicy: { Name: "unless-stopped" }` in [`backend/internal/docker/engine.go`](../backend/internal/docker/engine.go). The underlying Docker daemon automatically restarts stopped or crashed containers at the container-engine layer.
 - **ForgeLAB-Level Continuous Health Monitoring, Self-Healing & Auto-Rollback (IMPLEMENTED — CONFIGURABLE):**
   A dedicated background runtime monitor (`CheckContinuousRuntimeHealth` in `engine_runtime_health.go`, running every `FORGELAB_RUNTIME_HEALTH_CHECK_INTERVAL`, default `30s`) inspects running containers via the Docker daemon:
   - Tracks consecutive unhealthy health-check streaks, unexpected exits (distinguishing intentional stops from crashes/exit codes), kernel OOM kills (`insp.State.OOMKilled`), and crash loops (`FORGELAB_CRASH_LOOP_THRESHOLD` / `FORGELAB_CRASH_LOOP_WINDOW`).

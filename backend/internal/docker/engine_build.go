@@ -355,7 +355,15 @@ func (e *Engine) buildImage(
 
 	// 4. Inspect Dockerfile and resolve builder capability
 	var dfContent []byte
-	dfContent, _ = extractDockerfileFromTar(validatedArchiveFile, options.Dockerfile)
+	var dfErr error
+	dfContent, dfErr = extractDockerfileFromTar(validatedArchiveFile, options.Dockerfile)
+	if dfErr != nil {
+		slog.Error("failed to extract dockerfile from build context", "error", dfErr)
+		if onLogLine != nil {
+			onLogLine(fmt.Sprintf("Failed to extract Dockerfile from build context: %v", dfErr))
+		}
+		return fmt.Errorf("build context validation failed: %w", dfErr)
+	}
 	_, _ = validatedArchiveFile.Seek(0, io.SeekStart)
 
 	if secErr := ValidateDockerfileSecurity(dfContent); secErr != nil {

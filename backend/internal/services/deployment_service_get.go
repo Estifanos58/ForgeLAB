@@ -167,6 +167,9 @@ func (s *DeploymentService) ListActiveDeployments(ctx context.Context) ([]*model
 
 // ListActiveServiceDeployments retrieves all service deployments that are currently in-flight or actively running.
 func (s *DeploymentService) ListActiveServiceDeployments(ctx context.Context) ([]*models.ServiceDeployment, error) {
+	if s.listActiveServiceDeploymentsForTest != nil {
+		return s.listActiveServiceDeploymentsForTest(ctx)
+	}
 	if s.db == nil {
 		return []*models.ServiceDeployment{}, nil
 	}

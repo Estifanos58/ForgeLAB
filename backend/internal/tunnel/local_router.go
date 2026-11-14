@@ -42,31 +42,59 @@ type LocalRouter struct {
 	serviceLookup    ServiceLookup
 	upstreamResolver UpstreamResolver
 	httpClient       *http.Client
+	options          RouterOptions
 }
 
-// NewLocalRouter creates a new LocalRouter.
+// NewLocalRouter creates a new LocalRouter with default timeout options.
 func NewLocalRouter(
 	shareLookup ShareLookup,
 	serviceLookup ServiceLookup,
 	upstreamResolver UpstreamResolver,
 ) *LocalRouter {
+	return NewLocalRouterWithOptions(shareLookup, serviceLookup, upstreamResolver, DefaultRouterOptions())
+}
+
+// NewLocalRouterWithOptions creates a new LocalRouter with custom router options.
+func NewLocalRouterWithOptions(
+	shareLookup ShareLookup,
+	serviceLookup ServiceLookup,
+	upstreamResolver UpstreamResolver,
+	opts RouterOptions,
+) *LocalRouter {
+	if opts.ResponseHeaderTimeout <= 0 {
+		opts.ResponseHeaderTimeout = 30 * time.Second
+	}
+	if opts.DialTimeout <= 0 {
+		opts.DialTimeout = 5 * time.Second
+	}
+	if opts.IdleConnTimeout <= 0 {
+		opts.IdleConnTimeout = 90 * time.Second
+	}
+	if opts.StreamIdleTimeout <= 0 {
+		opts.StreamIdleTimeout = 10 * time.Minute
+	}
+
 	return &LocalRouter{
 		shareLookup:      shareLookup,
 		serviceLookup:    serviceLookup,
 		upstreamResolver: upstreamResolver,
+		options:          opts,
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 0, // Unbounded streaming for SSE, downloads and long-running requests
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
 				DialContext: (&net.Dialer{
-					Timeout:   5 * time.Second,
+					Timeout:   opts.DialTimeout,
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
 				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
+				IdleConnTimeout:       opts.IdleConnTimeout,
 				TLSHandshakeTimeout:   5 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
+				ResponseHeaderTimeout: opts.ResponseHeaderTimeout,
+			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
 			},
 		},
 	}
@@ -99,10 +127,9 @@ func (r *LocalRouter) HandleStream(stream net.Conn) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	share, err := r.shareLookup.GetShareByToken(ctx, shareToken)
+	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	share, err := r.shareLookup.GetShareByToken(lookupCtx, shareToken)
+	lookupCancel()
 	if err != nil || share == nil || !share.IsActive() {
 		r.writeErrorResponse(stream, http.StatusNotFound, "Share Not Found", "The requested public share link does not exist, has been revoked, or has expired.")
 		return
@@ -148,7 +175,9 @@ func (r *LocalRouter) HandleStream(stream net.Conn) {
 	}
 
 	// 4. Validate target service existence and running status
-	targetService, err := r.serviceLookup.GetService(ctx, matchedMapping.ServiceID)
+	svcCtx, svcCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	targetService, err := r.serviceLookup.GetService(svcCtx, matchedMapping.ServiceID)
+	svcCancel()
 	if err != nil || targetService == nil {
 		r.writeErrorResponse(stream, http.StatusBadGateway, "Service Unavailable", "The target service mapped to this route could not be found.")
 		return
@@ -168,7 +197,9 @@ func (r *LocalRouter) HandleStream(stream net.Conn) {
 	}
 
 	// 5. Discover reachable upstream address
-	upstreamBase, err := r.upstreamResolver.ResolveUpstream(ctx, targetService)
+	resCtx, resCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	upstreamBase, err := r.upstreamResolver.ResolveUpstream(resCtx, targetService)
+	resCancel()
 	if err != nil || upstreamBase == "" {
 		slog.Warn("local router failed to resolve upstream for service", "service", targetService.Name, "error", err)
 		r.writeErrorResponse(stream, http.StatusBadGateway, "Upstream Unreachable",
@@ -193,7 +224,7 @@ func (r *LocalRouter) HandleStream(stream net.Conn) {
 	}
 
 	// 7. Standard HTTP / Streaming Proxy
-	r.proxyHTTP(ctx, stream, req, upstreamBase, cleanPath, share)
+	r.proxyHTTP(context.Background(), stream, req, upstreamBase, cleanPath, share)
 }
 
 // proxyHTTP proxies standard HTTP requests with streaming request and response bodies.
@@ -210,7 +241,20 @@ func (r *LocalRouter) proxyHTTP(
 		targetURL += "?" + req.URL.RawQuery
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(ctx, req.Method, targetURL, req.Body)
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	var idleTimer *time.Timer
+	if r.options.StreamIdleTimeout > 0 {
+		idleTimer = time.AfterFunc(r.options.StreamIdleTimeout, func() {
+			slog.Debug("terminating idle local stream", "target", targetURL, "idle_timeout", r.options.StreamIdleTimeout)
+			cancelStream()
+			_ = stream.Close()
+		})
+		defer idleTimer.Stop()
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(streamCtx, req.Method, targetURL, req.Body)
 	if err != nil {
 		r.writeErrorResponse(stream, http.StatusInternalServerError, "Proxy Error", "Failed to construct upstream request.")
 		return
@@ -247,16 +291,47 @@ func (r *LocalRouter) proxyHTTP(
 
 	resp, err := r.httpClient.Do(upstreamReq)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(streamCtx.Err(), context.Canceled) {
+			return
+		}
 		slog.Warn("upstream HTTP request failed", "target", targetURL, "error", err)
 		r.writeErrorResponse(stream, http.StatusBadGateway, "Bad Gateway", fmt.Sprintf("Failed to communicate with service: %v", err))
 		return
 	}
 	defer resp.Body.Close()
 
+	// Reset idle timer once headers have been received
+	if idleTimer != nil {
+		idleTimer.Reset(r.options.StreamIdleTimeout)
+	}
+
+	// Wrap response body with idle watchdog reset
+	if idleTimer != nil && resp.Body != nil {
+		resp.Body = &idleResetReadCloser{
+			ReadCloser: resp.Body,
+			onRead: func() {
+				idleTimer.Reset(r.options.StreamIdleTimeout)
+			},
+		}
+	}
+
 	// Stream response back into Yamux stream
 	if err := resp.Write(stream); err != nil {
 		slog.Debug("failed to write upstream response to stream", "error", err)
 	}
+}
+
+type idleResetReadCloser struct {
+	io.ReadCloser
+	onRead func()
+}
+
+func (r *idleResetReadCloser) Read(p []byte) (n int, err error) {
+	n, err = r.ReadCloser.Read(p)
+	if n > 0 && r.onRead != nil {
+		r.onRead()
+	}
+	return n, err
 }
 
 // proxyWebSocket handles WebSocket upgrade by establishing a raw TCP stream to the upstream service.
